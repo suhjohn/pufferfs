@@ -8,8 +8,11 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
@@ -706,44 +709,99 @@ func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID
 func (s *Server) processSync(ctx context.Context, orgID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	resp := &models.SyncResponse{RootID: req.RootID}
 	processed := 0
+	workers := syncWorkerCount()
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
 
 	for _, change := range req.Changes {
-		switch change.Status {
-		case models.StatusAdded, models.StatusModified:
-			if job != nil {
-				_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "chunking", processed)
-			}
-			if err := s.processFileAdd(ctx, orgID, req.RootID, change); err != nil {
-				return nil, fmt.Errorf("processing %s (%s): %w", change.Path, change.Status, err)
-			}
-			resp.ChunksAdded++
-			resp.FilesProcessed++
-
-		case models.StatusRemoved:
-			if err := s.processFileRemove(ctx, orgID, req.RootID, change); err != nil {
-				return nil, fmt.Errorf("removing %s: %w", change.Path, err)
-			}
-			resp.ChunksRemoved++
-			resp.FilesProcessed++
-
-		case models.StatusMoved, models.StatusRenamed:
-			if err := s.processFileMove(ctx, orgID, req.RootID, change); err != nil {
-				return nil, fmt.Errorf("moving %s -> %s: %w", change.OldPath, change.Path, err)
-			}
-			resp.ChunksMoved++
-			resp.FilesProcessed++
-
-		case models.StatusUnchanged:
-			// nothing to do
+		change := change
+		if change.Status == models.StatusUnchanged {
+			processed++
+			continue
 		}
 
-		processed++
-		if job != nil && processed%5 == 0 {
-			_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "embedding", processed)
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			result, err := s.processSyncChange(ctx, orgID, req.RootID, change)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			if err == nil {
+				resp.ChunksAdded += result.chunksAdded
+				resp.ChunksRemoved += result.chunksRemoved
+				resp.ChunksMoved += result.chunksMoved
+				resp.FilesProcessed += result.filesProcessed
+			}
+			processed++
+			if job != nil && processed%5 == 0 {
+				_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "embedding", processed)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
 	return resp, nil
+}
+
+type syncChangeResult struct {
+	chunksAdded    int
+	chunksRemoved  int
+	chunksMoved    int
+	filesProcessed int
+}
+
+func (s *Server) processSyncChange(ctx context.Context, orgID, rootID string, change models.FileChange) (syncChangeResult, error) {
+	switch change.Status {
+	case models.StatusAdded, models.StatusModified:
+		if err := s.processFileAdd(ctx, orgID, rootID, change); err != nil {
+			return syncChangeResult{}, fmt.Errorf("processing %s (%s): %w", change.Path, change.Status, err)
+		}
+		return syncChangeResult{chunksAdded: 1, filesProcessed: 1}, nil
+
+	case models.StatusRemoved:
+		if err := s.processFileRemove(ctx, orgID, rootID, change); err != nil {
+			return syncChangeResult{}, fmt.Errorf("removing %s: %w", change.Path, err)
+		}
+		return syncChangeResult{chunksRemoved: 1, filesProcessed: 1}, nil
+
+	case models.StatusMoved, models.StatusRenamed:
+		if err := s.processFileMove(ctx, orgID, rootID, change); err != nil {
+			return syncChangeResult{}, fmt.Errorf("moving %s -> %s: %w", change.OldPath, change.Path, err)
+		}
+		return syncChangeResult{chunksMoved: 1, filesProcessed: 1}, nil
+
+	default:
+		return syncChangeResult{}, nil
+	}
+}
+
+func syncWorkerCount() int {
+	const defaultWorkers = 4
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_WORKERS"))
+	if raw == "" {
+		return defaultWorkers
+	}
+	workers, err := strconv.Atoi(raw)
+	if err != nil || workers < 1 {
+		return defaultWorkers
+	}
+	if workers > 16 {
+		return 16
+	}
+	return workers
 }
 
 // tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
