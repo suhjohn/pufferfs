@@ -790,6 +790,11 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 	}
 
 	if len(chunkResp.Chunks) == 0 {
+		if len(oldIDs) > 0 {
+			if err := s.tp.DeleteIDs(ns, oldIDs); err != nil {
+				return fmt.Errorf("deleting stale chunks for %s: %w", change.Path, err)
+			}
+		}
 		return nil
 	}
 

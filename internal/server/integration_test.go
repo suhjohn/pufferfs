@@ -193,18 +193,31 @@ func waitForPort(t *testing.T, port string, timeout time.Duration) {
 // ---------------------------------------------------------------------------
 
 type mockModal struct {
-	srv    *httptest.Server
-	client *server.ModalClient
+	srv            *httptest.Server
+	client         *server.ModalClient
+	mu             sync.Mutex
+	zeroChunkPaths map[string]bool
 }
 
 func newMockModal(t *testing.T) *mockModal {
 	t.Helper()
+	modal := &mockModal{
+		zeroChunkPaths: make(map[string]bool),
+	}
 	mux := http.NewServeMux()
 
 	// Chunk endpoint
 	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
 		var req server.ChunkFileRequest
 		json.NewDecoder(r.Body).Decode(&req)
+
+		modal.mu.Lock()
+		zeroChunks := modal.zeroChunkPaths[req.FilePath]
+		modal.mu.Unlock()
+		if zeroChunks {
+			json.NewEncoder(w).Encode(server.ChunkFileResponse{Count: 0})
+			return
+		}
 
 		// Return 2 deterministic chunks per file
 		resp := server.ChunkFileResponse{
@@ -284,10 +297,21 @@ func newMockModal(t *testing.T) *mockModal {
 	os.Setenv("MODAL_EMBED_ENDPOINT", srv.URL+"/embed")
 	os.Setenv("MODAL_QUERY_EMBED_ENDPOINT", srv.URL+"/embed-query")
 
-	return &mockModal{
-		srv:    srv,
-		client: server.NewModalClient(),
-	}
+	modal.srv = srv
+	modal.client = server.NewModalClient()
+	return modal
+}
+
+func (m *mockModal) reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.zeroChunkPaths = make(map[string]bool)
+}
+
+func (m *mockModal) setZeroChunks(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.zeroChunkPaths[path] = true
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +528,7 @@ type testEnv struct {
 func setupTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	db, s3Client, modal, tp := setupTestInfra(t)
+	modal.reset()
 
 	srv := server.New(db, s3Client, modal.client, tp.client)
 
@@ -898,6 +923,70 @@ func TestIntegration_SyncWithModifiedAndRemoved(t *testing.T) {
 	}
 	if int(result["chunks_removed"].(float64)) != 1 {
 		t.Errorf("expected 1 chunk removed, got %v", result["chunks_removed"])
+	}
+}
+
+func TestIntegration_ModifiedFileWithZeroChunksDeletesOldIndexRows(t *testing.T) {
+	env := setupTestEnv(t)
+
+	_, result := env.doRequest(t, "POST", "/roots", map[string]any{
+		"name":        "zero-chunk-modify-test",
+		"source_path": "/home/user/project-zero-chunks",
+	})
+	rootID := result["id"].(string)
+
+	originalContent := []byte("original searchable content")
+	env.doRequestRaw(t, "POST", fmt.Sprintf("/roots/%s/upload?path=file.txt", rootID), originalContent, "application/octet-stream")
+
+	syncReq := models.SyncRequest{
+		RootID: rootID,
+		Changes: []models.FileChange{
+			{Path: "file.txt", Status: models.StatusAdded, ContentHash: "sha256:original-zero"},
+		},
+		State: map[string]models.FileState{
+			"file.txt": {Size: int64(len(originalContent)), ContentHash: "sha256:original-zero"},
+		},
+		ContentProof: &models.ContentProofData{
+			FileHashes: map[string]string{"file.txt": "sha256:original-zero"},
+			RootHash:   "sha256:root-original-zero",
+		},
+	}
+	status, _ := env.doRequest(t, "POST", "/roots/"+rootID+"/sync", syncReq)
+	if !isSuccess(status) {
+		t.Fatalf("first sync: expected 200, got %d", status)
+	}
+
+	ns := fmt.Sprintf("org-%s-root-%s", env.orgID, rootID)
+	if count := env.tp.docCount(ns); count != 2 {
+		t.Fatalf("expected 2 indexed rows after first sync, got %d", count)
+	}
+
+	env.modal.setZeroChunks("file.txt")
+	newContent := []byte("binary content with no chunks")
+	env.doRequestRaw(t, "POST", fmt.Sprintf("/roots/%s/upload?path=file.txt", rootID), newContent, "application/octet-stream")
+
+	syncReq = models.SyncRequest{
+		RootID: rootID,
+		Changes: []models.FileChange{
+			{Path: "file.txt", Status: models.StatusModified, ContentHash: "sha256:modified-zero"},
+		},
+		State: map[string]models.FileState{
+			"file.txt": {Size: int64(len(newContent)), ContentHash: "sha256:modified-zero"},
+		},
+		ContentProof: &models.ContentProofData{
+			FileHashes: map[string]string{"file.txt": "sha256:modified-zero"},
+			RootHash:   "sha256:root-modified-zero",
+		},
+	}
+	status, result = env.doRequest(t, "POST", "/roots/"+rootID+"/sync", syncReq)
+	if !isSuccess(status) {
+		t.Fatalf("modify sync: expected 200, got %d: %v", status, result)
+	}
+	if int(result["files_processed"].(float64)) != 1 {
+		t.Errorf("expected 1 file processed, got %v", result["files_processed"])
+	}
+	if count := env.tp.docCount(ns); count != 0 {
+		t.Fatalf("expected zero indexed rows after zero-chunk modify, got %d", count)
 	}
 }
 
