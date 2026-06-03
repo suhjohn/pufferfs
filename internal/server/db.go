@@ -113,9 +113,11 @@ func (db *DB) migrateFallback() error {
 			name        TEXT NOT NULL,
 			source_path TEXT NOT NULL,
 			simhash     TEXT NOT NULL DEFAULT '',
+			visible_generation_id TEXT NOT NULL DEFAULT '',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE roots ADD COLUMN IF NOT EXISTS visible_generation_id TEXT NOT NULL DEFAULT '';
 
 		CREATE TABLE IF NOT EXISTS root_states (
 			root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
@@ -152,6 +154,18 @@ func (db *DB) migrateFallback() error {
 			errors       JSONB NOT NULL DEFAULT '[]',
 			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			finished_at  TIMESTAMPTZ
+		);
+
+		CREATE TABLE IF NOT EXISTS sync_generations (
+			id                 TEXT PRIMARY KEY,
+			org_id             TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			root_id            TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			sync_job_id        TEXT REFERENCES sync_jobs(id) ON DELETE SET NULL,
+			base_generation_id TEXT NOT NULL DEFAULT '',
+			status             TEXT NOT NULL DEFAULT 'building',
+			manifest_ref       TEXT NOT NULL DEFAULT '',
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			visible_at         TIMESTAMPTZ
 		);
 
 		CREATE TABLE IF NOT EXISTS content_proofs (
@@ -500,6 +514,63 @@ func (db *DB) LoadState(ctx context.Context, rootID string) (map[string]models.F
 func (db *DB) UpdateRootTimestamp(ctx context.Context, rootID string) error {
 	_, err := db.pool.Exec(ctx,
 		`UPDATE roots SET updated_at = NOW() WHERE id = $1`, rootID,
+	)
+	return err
+}
+
+func (db *DB) GetVisibleGeneration(ctx context.Context, rootID string) (string, error) {
+	var generationID string
+	err := db.pool.QueryRow(ctx,
+		`SELECT visible_generation_id FROM roots WHERE id = $1`, rootID,
+	).Scan(&generationID)
+	return generationID, err
+}
+
+func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef string) (string, error) {
+	baseGenerationID, err := db.GetVisibleGeneration(ctx, rootID)
+	if err != nil {
+		return "", err
+	}
+	generationID := uuid.New().String()
+	_, err = db.pool.Exec(ctx,
+		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, status, manifest_ref)
+		 VALUES ($1, $2, $3, $4, $5, 'building', $6)`,
+		generationID, orgID, rootID, syncJobID, baseGenerationID, manifestRef,
+	)
+	if err != nil {
+		return "", err
+	}
+	return generationID, nil
+}
+
+func (db *DB) MarkSyncGenerationVisible(ctx context.Context, rootID, generationID string) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`UPDATE sync_generations SET status = 'visible', visible_at = NOW() WHERE id = $1`,
+		generationID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE roots SET visible_generation_id = $1, updated_at = NOW() WHERE id = $2`,
+		generationID, rootID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (db *DB) MarkSyncGenerationFailed(ctx context.Context, generationID string) error {
+	if generationID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_generations SET status = 'failed' WHERE id = $1 AND status = 'building'`,
+		generationID,
 	)
 	return err
 }

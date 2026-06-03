@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
@@ -152,14 +154,10 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 	changeCount := countChanges(result)
 	fmt.Printf("Syncing %d changes to root %s...\n", changeCount, rootID)
 
-	// Upload files that are ADDED or MODIFIED
-	for _, change := range result.Changes {
-		if change.Status == models.StatusAdded || change.Status == models.StatusModified {
-			localPath := filepath.Join(dir, filepath.FromSlash(change.Path))
-			if err := uploadFile(client, rootID, change.Path, localPath); err != nil {
-				return fmt.Errorf("uploading %s: %w", change.Path, err)
-			}
-		}
+	changes := filterChanges(result)
+	manifestRef, err := uploadChangedFiles(client, rootID, dir, changes)
+	if err != nil {
+		return err
 	}
 
 	// Build content proof from Merkle tree
@@ -173,10 +171,11 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
 		RootID:       rootID,
-		Changes:      filterChanges(result),
+		Changes:      changes,
 		State:        currentState,
 		SimHash:      currentTree.SimHashHex(),
 		ContentProof: contentProof,
+		ManifestRef:  manifestRef,
 	}
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync", rootID), syncReq)
@@ -355,14 +354,180 @@ func findLocalRootID(name, sourcePath string) (string, error) {
 	return "", fmt.Errorf("local root metadata not found")
 }
 
-func uploadFile(client *apiClient, rootID, relPath, localPath string) error {
+type bundleManifestEntry struct {
+	Path        string `json:"path"`
+	ContentHash string `json:"content_hash"`
+	Size        int64  `json:"size"`
+	BundleKey   string `json:"bundle_key,omitempty"`
+	ObjectKey   string `json:"object_key,omitempty"`
+	Offset      int64  `json:"offset,omitempty"`
+	Length      int64  `json:"length,omitempty"`
+}
+
+func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.FileChange) (string, error) {
+	smallLimit := uploadBundleSmallFileLimit()
+	maxBundleBytes := uploadBundleMaxBytes()
+	var manifest []bundleManifestEntry
+	var bundle bytes.Buffer
+	bundleID := fmt.Sprintf("%d", time.Now().UnixNano())
+	bundleIndex := 0
+	var bundleKey string
+
+	flushBundle := func() error {
+		if bundle.Len() == 0 {
+			return nil
+		}
+		key, err := uploadBundle(client, rootID, fmt.Sprintf("%s-%06d", bundleID, bundleIndex), bundle.Bytes(), "application/octet-stream")
+		if err != nil {
+			return err
+		}
+		for i := range changes {
+			if changes[i].SourceKey == "__pending_bundle__" {
+				changes[i].SourceKey = key
+			}
+		}
+		for i := range manifest {
+			if manifest[i].BundleKey == "__pending_bundle__" {
+				manifest[i].BundleKey = key
+			}
+		}
+		bundle.Reset()
+		bundleIndex++
+		bundleKey = ""
+		return nil
+	}
+
+	for i := range changes {
+		change := &changes[i]
+		if change.Status != models.StatusAdded && change.Status != models.StatusModified {
+			continue
+		}
+		localPath := filepath.Join(dir, filepath.FromSlash(change.Path))
+		info, err := os.Stat(localPath)
+		if err != nil {
+			return "", fmt.Errorf("stat %s: %w", change.Path, err)
+		}
+		if info.Size() > smallLimit {
+			key, err := uploadFile(client, rootID, change.Path, localPath)
+			if err != nil {
+				return "", fmt.Errorf("uploading %s: %w", change.Path, err)
+			}
+			change.SourceKey = key
+			change.SourceOffset = 0
+			change.SourceLength = info.Size()
+			manifest = append(manifest, bundleManifestEntry{
+				Path:        change.Path,
+				ContentHash: change.ContentHash,
+				Size:        info.Size(),
+				ObjectKey:   key,
+				Length:      info.Size(),
+			})
+			continue
+		}
+
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			return "", fmt.Errorf("reading %s: %w", change.Path, err)
+		}
+		if bundle.Len() > 0 && int64(bundle.Len()+len(data)) > maxBundleBytes {
+			if err := flushBundle(); err != nil {
+				return "", err
+			}
+		}
+		if bundleKey == "" {
+			bundleKey = "__pending_bundle__"
+		}
+		offset := int64(bundle.Len())
+		if _, err := bundle.Write(data); err != nil {
+			return "", err
+		}
+		change.SourceKey = bundleKey
+		change.SourceOffset = offset
+		change.SourceLength = int64(len(data))
+		manifest = append(manifest, bundleManifestEntry{
+			Path:        change.Path,
+			ContentHash: change.ContentHash,
+			Size:        int64(len(data)),
+			BundleKey:   bundleKey,
+			Offset:      offset,
+			Length:      int64(len(data)),
+		})
+	}
+	if err := flushBundle(); err != nil {
+		return "", err
+	}
+	if len(manifest) == 0 {
+		return "", nil
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		return "", err
+	}
+	key, err := uploadBundle(client, rootID, bundleID+"-manifest", manifestBytes, "application/json")
+	if err != nil {
+		return "", fmt.Errorf("uploading source manifest: %w", err)
+	}
+	return key, nil
+}
+
+func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, error) {
 	data, err := os.ReadFile(localPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, url.QueryEscape(relPath))
-	_, err = client.postRaw(url, data, "application/octet-stream")
-	return err
+	respBody, err := client.postRaw(url, data, "application/octet-stream")
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", err
+	}
+	return resp.Key, nil
+}
+
+func uploadBundle(client *apiClient, rootID, bundleID string, data []byte, contentType string) (string, error) {
+	url := fmt.Sprintf("/roots/%s/upload-bundle?bundle_id=%s", rootID, url.QueryEscape(bundleID))
+	respBody, err := client.postRaw(url, data, contentType)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", err
+	}
+	return resp.Key, nil
+}
+
+func uploadBundleSmallFileLimit() int64 {
+	const defaultBytes = 8 << 20
+	raw := os.Getenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES")
+	if raw == "" {
+		return defaultBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 1 {
+		return defaultBytes
+	}
+	return value
+}
+
+func uploadBundleMaxBytes() int64 {
+	const defaultBytes = 256 << 20
+	raw := os.Getenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES")
+	if raw == "" {
+		return defaultBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 1 {
+		return defaultBytes
+	}
+	return value
 }
 
 func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileState, error) {

@@ -90,6 +90,24 @@ func (c *Client) Download(ctx context.Context, key string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
+// DownloadRange gets a byte range from an object in S3.
+func (c *Client) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if length <= 0 {
+		return c.Download(ctx, key)
+	}
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &c.bucket,
+		Key:    &key,
+		Range:  &rangeHeader,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
 // Delete removes an object from S3.
 func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{

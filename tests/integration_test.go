@@ -86,6 +86,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		t.Cleanup(func() {
 			deleteTPNamespace(t, services, namespace)
 		})
+		assertMinioHasPrefix(t, fmt.Sprintf("bundles/%s/", rootID))
 
 		assertNestedRowsIndexed(t, services, namespace, fixtures)
 		assertPDFPageRows(t, services, namespace, fixtures.pdfs)
@@ -360,6 +361,40 @@ func createMinioBucket(t *testing.T) {
 	})
 	if err != nil && !strings.Contains(err.Error(), "BucketAlreadyOwnedByYou") {
 		t.Logf("create bucket warning: %v", err)
+	}
+}
+
+func newMinioClient(t *testing.T) *s3sdk.Client {
+	t.Helper()
+
+	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(e2eMinioUser, e2eMinioPass, "")),
+	)
+	if err != nil {
+		t.Fatalf("loading AWS config: %v", err)
+	}
+	return s3sdk.NewFromConfig(awsCfg, func(o *s3sdk.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+		o.UsePathStyle = true
+	})
+}
+
+func assertMinioHasPrefix(t *testing.T, prefix string) {
+	t.Helper()
+
+	client := newMinioClient(t)
+	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
+		Bucket:  aws.String(e2eMinioBucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		t.Fatalf("listing MinIO prefix %s: %v", prefix, err)
+	}
+	if len(resp.Contents) == 0 {
+		t.Fatalf("expected at least one object with prefix %s", prefix)
 	}
 }
 

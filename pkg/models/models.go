@@ -102,11 +102,14 @@ const (
 
 // FileChange describes a single file's change between two states.
 type FileChange struct {
-	Path        string           `json:"path"`
-	Status      FileChangeStatus `json:"status"`
-	OldPath     string           `json:"old_path,omitempty"`
-	ContentHash string           `json:"content_hash"`
-	Size        int64            `json:"size"`
+	Path         string           `json:"path"`
+	Status       FileChangeStatus `json:"status"`
+	OldPath      string           `json:"old_path,omitempty"`
+	ContentHash  string           `json:"content_hash"`
+	Size         int64            `json:"size"`
+	SourceKey    string           `json:"source_key,omitempty"`
+	SourceOffset int64            `json:"source_offset,omitempty"`
+	SourceLength int64            `json:"source_length,omitempty"`
 }
 
 // DiffStats summarises counts per status.
@@ -160,6 +163,7 @@ type SyncRequest struct {
 	State        map[string]FileState `json:"state"`
 	SimHash      string               `json:"simhash,omitempty"`
 	ContentProof *ContentProofData    `json:"content_proof,omitempty"`
+	ManifestRef  string               `json:"manifest_ref,omitempty"`
 }
 
 // ContentProofData is the serialized content proof sent with sync/query requests.

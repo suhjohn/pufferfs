@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -70,6 +71,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
 	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
+	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
 	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
@@ -363,6 +365,68 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
 }
 
+func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+		return
+	}
+
+	rootID := r.PathValue("id")
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
+	bundleID := strings.TrimSpace(r.URL.Query().Get("bundle_id"))
+	if bundleID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bundle_id query param required"})
+		return
+	}
+	bundleID = safeObjectName(bundleID)
+	if bundleID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bundle_id"})
+		return
+	}
+
+	const maxUploadSize = 1024 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reading body: " + err.Error()})
+		return
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	s3Key := fmt.Sprintf("bundles/%s/%s", rootID, bundleID)
+	if err := s.s3.Upload(r.Context(), s3Key, data, contentType); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
+}
+
+func safeObjectName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
@@ -452,10 +516,26 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Printf("warning: failed to create sync job: %v", err)
 	}
+	syncJobID := ""
+	if job != nil {
+		syncJobID = job.ID
+	}
+	generationID, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef)
+	if err != nil {
+		if job != nil {
+			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync generation: " + err.Error()})
+		return
+	}
+	if err := s.writeQueueStateArtifact(r.Context(), generationID, "chunk", req.ManifestRef); err != nil {
+		log.Printf("warning: failed to write queue state artifact: %v", err)
+	}
 
-	resp, err := s.processSync(r.Context(), id.OrgID, &req, job)
+	resp, err := s.processSync(r.Context(), id.OrgID, generationID, &req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
+		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
@@ -466,6 +546,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if req.ContentProof != nil {
 		proofBytes, _ := json.Marshal(req.ContentProof)
 		if err := s.db.UpsertContentProof(r.Context(), id.OrgID, id.UserID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
+			_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
 			if job != nil {
 				_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 			}
@@ -476,6 +557,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	// Persist state
 	if err := s.db.SaveState(r.Context(), rootID, req.State); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
@@ -483,10 +565,19 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.db.UpdateRootTimestamp(r.Context(), rootID); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updating root timestamp: " + err.Error()})
+		return
+	}
+	if err := s.db.MarkSyncGenerationVisible(r.Context(), rootID, generationID); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
+		if job != nil {
+			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "marking generation visible: " + err.Error()})
 		return
 	}
 
@@ -706,7 +797,7 @@ func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID
 // Sync processing
 // ---------------------------------------------------------------------------
 
-func (s *Server) processSync(ctx context.Context, orgID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+func (s *Server) processSync(ctx context.Context, orgID, generationID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	resp := &models.SyncResponse{RootID: req.RootID}
 	processed := 0
 	workers := syncWorkerCount()
@@ -716,9 +807,10 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 	mutations := make(chan syncMutation, workers)
 	streamResult := make(chan syncMutation, 1)
 	streamErr := make(chan error, 1)
+	sourceCache := newSyncSourceCache(s.s3)
 
 	go func() {
-		deferred, err := s.streamSyncMutations(streamCtx, orgID, req.RootID, mutations)
+		deferred, err := s.streamSyncMutations(streamCtx, orgID, req.RootID, generationID, mutations)
 		if err != nil {
 			cancel()
 		}
@@ -743,7 +835,7 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, mutation, err := s.processSyncChange(streamCtx, orgID, req.RootID, change)
+			result, mutation, err := s.processSyncChange(streamCtx, orgID, generationID, req.RootID, change, sourceCache)
 
 			mu.Lock()
 			if err != nil && firstErr == nil {
@@ -812,10 +904,51 @@ type syncChangeResult struct {
 	filesProcessed int
 }
 
-func (s *Server) processSyncChange(ctx context.Context, orgID, rootID string, change models.FileChange) (syncChangeResult, syncMutation, error) {
+type syncSourceCache struct {
+	s3      *storage.Client
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newSyncSourceCache(s3 *storage.Client) *syncSourceCache {
+	return &syncSourceCache{s3: s3, objects: make(map[string][]byte)}
+}
+
+func (c *syncSourceCache) read(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	if key == "" {
+		return nil, fmt.Errorf("empty source key")
+	}
+	if !strings.HasPrefix(key, "bundles/") {
+		return c.s3.DownloadRange(ctx, key, offset, length)
+	}
+	c.mu.Lock()
+	data, ok := c.objects[key]
+	if !ok {
+		var err error
+		data, err = c.s3.Download(ctx, key)
+		if err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.objects[key] = data
+	}
+	c.mu.Unlock()
+	if length <= 0 {
+		return data, nil
+	}
+	end := offset + length
+	if offset < 0 || end < offset || end > int64(len(data)) {
+		return nil, fmt.Errorf("invalid range offset=%d length=%d object_bytes=%d", offset, length, len(data))
+	}
+	out := make([]byte, length)
+	copy(out, data[offset:end])
+	return out, nil
+}
+
+func (s *Server) processSyncChange(ctx context.Context, orgID, generationID, rootID string, change models.FileChange, sourceCache *syncSourceCache) (syncChangeResult, syncMutation, error) {
 	switch change.Status {
 	case models.StatusAdded, models.StatusModified:
-		mutation, err := s.processFileAdd(ctx, orgID, rootID, change)
+		mutation, err := s.processFileAdd(ctx, orgID, generationID, rootID, change, sourceCache)
 		if err != nil {
 			return syncChangeResult{}, syncMutation{}, fmt.Errorf("processing %s (%s): %w", change.Path, change.Status, err)
 		}
@@ -829,7 +962,7 @@ func (s *Server) processSyncChange(ctx context.Context, orgID, rootID string, ch
 		return syncChangeResult{chunksRemoved: 1, filesProcessed: 1}, mutation, nil
 
 	case models.StatusMoved, models.StatusRenamed:
-		mutation, err := s.processFileMove(ctx, orgID, rootID, change)
+		mutation, err := s.processFileMove(ctx, orgID, generationID, rootID, change)
 		if err != nil {
 			return syncChangeResult{}, syncMutation{}, fmt.Errorf("moving %s -> %s: %w", change.OldPath, change.Path, err)
 		}
@@ -856,7 +989,7 @@ func syncWorkerCount() int {
 	return workers
 }
 
-func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID string, mutations <-chan syncMutation) (syncMutation, error) {
+func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID, generationID string, mutations <-chan syncMutation) (syncMutation, error) {
 	ns := tpNamespace(orgID, rootID)
 	flushRows := syncMutationFlushRows()
 	flushEvery := syncMutationFlushInterval()
@@ -876,6 +1009,9 @@ func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID string, 
 			if err := s.resolvePendingEmbeddings(ctx, orgID, pendingEmbeddings); err != nil {
 				return err
 			}
+		}
+		if err := s.writeIndexRowsArtifact(ctx, generationID, reason, upsertRows); err != nil {
+			return err
 		}
 		if err := s.upsertRowsInBatches(ns, upsertRows); err != nil {
 			return err
@@ -912,6 +1048,52 @@ func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID string, 
 			return syncMutation{}, ctx.Err()
 		}
 	}
+}
+
+func (s *Server) writeIndexRowsArtifact(ctx context.Context, generationID, reason string, rows []map[string]any) error {
+	if generationID == "" || len(rows) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, row := range rows {
+		if err := enc.Encode(row); err != nil {
+			return fmt.Errorf("encoding index row artifact: %w", err)
+		}
+	}
+	key := fmt.Sprintf("syncs/%s/index_rows/%d-%s.jsonl", generationID, time.Now().UnixNano(), safeObjectName(reason))
+	if err := s.s3.Upload(ctx, key, buf.Bytes(), "application/x-ndjson"); err != nil {
+		return fmt.Errorf("uploading index row artifact %s: %w", key, err)
+	}
+	return nil
+}
+
+func (s *Server) writeQueueStateArtifact(ctx context.Context, generationID, stage, payloadRef string) error {
+	if generationID == "" || payloadRef == "" {
+		return nil
+	}
+	queue := map[string]any{
+		"generation_id": generationID,
+		"stage":         stage,
+		"jobs": []map[string]any{
+			{
+				"job_id":      generationID + "-" + stage + "-000001",
+				"stage":       stage,
+				"payload_ref": payloadRef,
+				"status":      "queued",
+				"attempts":    0,
+			},
+		},
+	}
+	data, err := json.Marshal(queue)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("syncs/%s/queues/%s.queue.json", generationID, safeObjectName(stage))
+	if err := s.s3.Upload(ctx, key, data, "application/json"); err != nil {
+		return fmt.Errorf("uploading queue state artifact %s: %w", key, err)
+	}
+	return nil
 }
 
 func (s *Server) applyDeferredSyncMutations(ctx context.Context, orgID, rootID string, mutation syncMutation) error {
@@ -1061,7 +1243,7 @@ func tpNamespace(orgID, rootID string) string {
 	return fmt.Sprintf("org-%s-root-%s", orgID, rootID)
 }
 
-func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, change models.FileChange) (syncMutation, error) {
+func (s *Server) processFileAdd(ctx context.Context, orgID, generationID, rootID string, change models.FileChange, sourceCache *syncSourceCache) (syncMutation, error) {
 	totalStart := time.Now()
 	ns := tpNamespace(orgID, rootID)
 
@@ -1085,10 +1267,13 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 		}
 	}
 
-	s3Key := fmt.Sprintf("files/%s/%s", rootID, change.Path)
+	s3Key := change.SourceKey
+	if s3Key == "" {
+		s3Key = fmt.Sprintf("files/%s/%s", rootID, change.Path)
+	}
 
 	downloadStart := time.Now()
-	fileData, err := s.s3.Download(ctx, s3Key)
+	fileData, err := sourceCache.read(ctx, s3Key, change.SourceOffset, change.SourceLength)
 	if err != nil {
 		return syncMutation{}, fmt.Errorf("downloading %s from S3: %w", s3Key, err)
 	}
@@ -1145,7 +1330,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 	rows := make([]map[string]any, len(chunkResp.Chunks))
 	pending := make([]pendingEmbedding, 0, uncachedCount)
 	for i, c := range chunkResp.Chunks {
-		row := indexedChunkFromModal(rootID, change.ContentHash, c)
+		row := indexedChunkFromModal(rootID, generationID, change.ContentHash, c)
 		rowMap := row.mapRow()
 
 		if emb, ok := cachedRows[i]; ok {
@@ -1187,8 +1372,7 @@ func (s *Server) processFileRemove(ctx context.Context, orgID, rootID string, ch
 		}
 	}
 	return syncMutation{
-		deleteIDs:    deleteIDs,
-		s3DeleteKeys: []string{fmt.Sprintf("files/%s/%s", rootID, change.Path)},
+		deleteIDs: deleteIDs,
 	}, nil
 }
 
@@ -1219,6 +1403,9 @@ func modalChunkPayload(row map[string]any) map[string]any {
 		"file_type":    row["file_type"],
 		"root_id":      row["root_id"],
 	}
+	if generationID, ok := row["generation_id"]; ok && generationID != nil {
+		chunk["generation_id"] = generationID
+	}
 	if pageNumber, ok := row["page_number"]; ok && pageNumber != nil {
 		chunk["page_number"] = pageNumber
 	}
@@ -1228,16 +1415,8 @@ func modalChunkPayload(row map[string]any) map[string]any {
 	return chunk
 }
 
-func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, change models.FileChange) (syncMutation, error) {
+func (s *Server) processFileMove(ctx context.Context, orgID, generationID, rootID string, change models.FileChange) (syncMutation, error) {
 	totalStart := time.Now()
-	oldFileKey := fmt.Sprintf("files/%s/%s", rootID, change.OldPath)
-	newFileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
-	s3RenameStart := time.Now()
-	if err := s.s3.Rename(ctx, oldFileKey, newFileKey); err != nil {
-		return syncMutation{}, fmt.Errorf("renaming %s to %s in S3: %w", change.OldPath, change.Path, err)
-	}
-	log.Printf("timing move=%s->%s stage=s3_rename elapsed=%s", change.OldPath, change.Path, time.Since(s3RenameStart))
-
 	ns := tpNamespace(orgID, rootID)
 	queryStart := time.Now()
 	rows, err := s.tp.Query(ns,
@@ -1286,7 +1465,7 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 				chunkIdx = int(f)
 			}
 		}
-		chunk := indexedChunkFromExisting(rootID, change.Path, change.ContentHash, chunkIdx, row)
+		chunk := indexedChunkFromExisting(rootID, generationID, change.Path, change.ContentHash, chunkIdx, row)
 		chunk.ID = models.MakeChunkID(rootID, change.Path, chunkIdx)
 		newRows[i] = chunk.mapRow()
 
@@ -1429,12 +1608,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := tpNamespace(id.OrgID, req.RootID)
-	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"}
+	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id"}
 
-	// Build filter from glob + ACL denied paths
-	var filters any
+	var filters []any
 	if req.Glob != "" {
-		filters = []any{"file_path", "Glob", req.Glob}
+		filters = append(filters, []any{"file_path", "Glob", req.Glob})
+	}
+	if visibleGeneration, err := s.db.GetVisibleGeneration(r.Context(), req.RootID); err == nil && visibleGeneration != "" {
+		filters = append(filters, []any{"generation_id", "Eq", visibleGeneration})
 	}
 
 	// Get denied paths from ACLs and filter results post-query
@@ -1446,7 +1627,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = s.tp.Query(ns, rankBy, req.TopK, filters, includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, req.TopK, tpAndFilter(filters), includeAttrs)
 
 	case "vector":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1455,7 +1636,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = s.tp.Query(ns, rankBy, req.TopK, filters, includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, req.TopK, tpAndFilter(filters), includeAttrs)
 
 	case "hybrid":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1463,7 +1644,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
 			return
 		}
-		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, req.TopK, req.Glob)
+		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, req.TopK, tpAndFilter(filters))
 
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
@@ -1544,6 +1725,19 @@ func detectFileType(path string) string {
 		return "image"
 	default:
 		return "auto"
+	}
+}
+
+func tpAndFilter(filters []any) any {
+	switch len(filters) {
+	case 0:
+		return nil
+	case 1:
+		return filters[0]
+	default:
+		out := []any{"And"}
+		out = append(out, filters...)
+		return out
 	}
 }
 

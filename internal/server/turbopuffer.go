@@ -68,14 +68,15 @@ func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric s
 				"type":             "string",
 				"full_text_search": true,
 			},
-			"file_path":    map[string]any{"type": "string"},
-			"chunk_index":  map[string]any{"type": "uint"},
-			"content_hash": map[string]any{"type": "string"},
-			"file_hash":    map[string]any{"type": "string"},
-			"file_type":    map[string]any{"type": "string"},
-			"page_number":  map[string]any{"type": "uint"},
-			"image_path":   map[string]any{"type": "string"},
-			"root_id":      map[string]any{"type": "string"},
+			"file_path":     map[string]any{"type": "string"},
+			"chunk_index":   map[string]any{"type": "uint"},
+			"content_hash":  map[string]any{"type": "string"},
+			"file_hash":     map[string]any{"type": "string"},
+			"file_type":     map[string]any{"type": "string"},
+			"page_number":   map[string]any{"type": "uint"},
+			"image_path":    map[string]any{"type": "string"},
+			"root_id":       map[string]any{"type": "string"},
+			"generation_id": map[string]any{"type": "string"},
 		},
 	}
 	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
@@ -183,8 +184,8 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 }
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
-func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, globFilter string) ([]map[string]any, error) {
-	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"}
+func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, filters any) ([]map[string]any, error) {
+	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id"}
 
 	queries := []map[string]any{
 		{
@@ -199,10 +200,9 @@ func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float
 		},
 	}
 
-	// Add glob filter if specified
-	if globFilter != "" {
+	if filters != nil {
 		for i := range queries {
-			queries[i]["filters"] = []any{"file_path", "Glob", globFilter}
+			queries[i]["filters"] = filters
 		}
 	}
 
