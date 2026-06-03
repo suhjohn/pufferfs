@@ -522,7 +522,9 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if job != nil {
-		_ = s.db.CompleteSyncJob(r.Context(), job.ID, "completed", nil)
+		if err := s.db.CompleteSyncJob(r.Context(), job.ID, "completed", nil); err != nil {
+			log.Printf("error completing sync job %s: %v", job.ID, err)
+		}
 		resp.SyncJobID = job.ID
 	}
 
@@ -930,14 +932,14 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 			resp.FilesProcessed++
 
 		case models.StatusRemoved:
-			if err := s.processFileRemove(ctx, req.RootID, change); err != nil {
+			if err := s.processFileRemove(ctx, orgID, req.RootID, change); err != nil {
 				return nil, fmt.Errorf("removing %s: %w", change.Path, err)
 			}
 			resp.ChunksRemoved++
 			resp.FilesProcessed++
 
 		case models.StatusMoved, models.StatusRenamed:
-			if err := s.processFileMove(ctx, req.RootID, change); err != nil {
+			if err := s.processFileMove(ctx, orgID, req.RootID, change); err != nil {
 				return nil, fmt.Errorf("moving %s -> %s: %w", change.OldPath, change.Path, err)
 			}
 			resp.ChunksMoved++
@@ -1001,7 +1003,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 		}
 	}
 
-	cached, err := s.db.GetCachedEmbeddings(ctx, contentHashes)
+	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup failed: %v", err)
 		cached = make(map[string][]float64)
@@ -1044,7 +1046,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 				newCacheEntries[hash] = embFloat
 			}
 		}
-		if err := s.db.SaveCachedEmbeddings(ctx, newCacheEntries); err != nil {
+		if err := s.db.SaveCachedEmbeddings(ctx, orgID, newCacheEntries); err != nil {
 			log.Printf("warning: failed to save embedding cache: %v", err)
 		}
 	}
@@ -1082,21 +1084,21 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 	return s.tp.UpsertRows(ns, rows, "cosine_distance")
 }
 
-func (s *Server) processFileRemove(ctx context.Context, rootID string, change models.FileChange) error {
+func (s *Server) processFileRemove(ctx context.Context, orgID, rootID string, change models.FileChange) error {
+	ns := tpNamespace(orgID, rootID)
 	filter := []any{"file_path", "Eq", change.Path}
-	// Note: we can't scope by org here since we don't have orgID in context easily,
-	// but the namespace is already org-scoped via tpNamespace
-	return s.tp.DeleteByFilter(rootID, filter)
+	return s.tp.DeleteByFilter(ns, filter)
 }
 
-func (s *Server) processFileMove(ctx context.Context, rootID string, change models.FileChange) error {
+func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, change models.FileChange) error {
 	oldFileKey := fmt.Sprintf("files/%s/%s", rootID, change.OldPath)
 	newFileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 	if err := s.s3.Rename(ctx, oldFileKey, newFileKey); err != nil {
 		log.Printf("warning: S3 rename failed (may not exist): %v", err)
 	}
 
-	rows, err := s.tp.Query(rootID,
+	ns := tpNamespace(orgID, rootID)
+	rows, err := s.tp.Query(ns,
 		[]any{"file_path", "asc"},
 		10000,
 		[]any{"file_path", "Eq", change.OldPath},
@@ -1114,7 +1116,7 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 	for i, row := range rows {
 		oldIDs[i] = fmt.Sprintf("%v", row["id"])
 	}
-	if err := s.tp.DeleteIDs(rootID, oldIDs); err != nil {
+	if err := s.tp.DeleteIDs(ns, oldIDs); err != nil {
 		return fmt.Errorf("deleting old chunks: %w", err)
 	}
 
@@ -1125,7 +1127,7 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		}
 	}
 
-	cached, err := s.db.GetCachedEmbeddings(ctx, contentHashes)
+	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup for move failed: %v", err)
 		cached = make(map[string][]float64)
@@ -1175,7 +1177,7 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		}
 	}
 
-	return s.tp.UpsertRows(rootID, newRows, "cosine_distance")
+	return s.tp.UpsertRows(ns, newRows, "cosine_distance")
 }
 
 // ---------------------------------------------------------------------------

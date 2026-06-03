@@ -12,9 +12,10 @@ import (
 
 // TPClient talks to the Turbopuffer API.
 type TPClient struct {
-	apiKey     string
-	region     string
-	httpClient *http.Client
+	apiKey       string
+	region       string
+	httpClient   *http.Client
+	baseOverride string
 }
 
 // NewTPClient creates a Turbopuffer client.
@@ -29,7 +30,20 @@ func NewTPClient(apiKey, region string) *TPClient {
 	}
 }
 
+// NewTPClientWithURL creates a TP client with a custom base URL (for testing).
+func NewTPClientWithURL(apiKey, baseURL string) *TPClient {
+	return &TPClient{
+		apiKey:       apiKey,
+		region:       "test",
+		httpClient:   &http.Client{Timeout: 120 * time.Second},
+		baseOverride: baseURL,
+	}
+}
+
 func (t *TPClient) baseURL() string {
+	if t.baseOverride != "" {
+		return t.baseOverride
+	}
 	return "https://api.turbopuffer.com"
 }
 
@@ -39,8 +53,7 @@ func namespaceName(rootID string) string {
 }
 
 // UpsertRows writes documents to a namespace.
-func (t *TPClient) UpsertRows(rootID string, rows []map[string]any, distanceMetric string) error {
-	ns := namespaceName(rootID)
+func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric string) error {
 	body := map[string]any{
 		"upsert_rows":    rows,
 		"distance_metric": distanceMetric,
@@ -63,8 +76,7 @@ func (t *TPClient) UpsertRows(rootID string, rows []map[string]any, distanceMetr
 }
 
 // DeleteByFilter deletes documents matching a filter.
-func (t *TPClient) DeleteByFilter(rootID string, filter any) error {
-	ns := namespaceName(rootID)
+func (t *TPClient) DeleteByFilter(ns string, filter any) error {
 	body := map[string]any{
 		"delete_by_filter": filter,
 	}
@@ -73,8 +85,7 @@ func (t *TPClient) DeleteByFilter(rootID string, filter any) error {
 }
 
 // DeleteIDs deletes documents by their IDs.
-func (t *TPClient) DeleteIDs(rootID string, ids []string) error {
-	ns := namespaceName(rootID)
+func (t *TPClient) DeleteIDs(ns string, ids []string) error {
 	body := map[string]any{
 		"deletes": ids,
 	}
@@ -83,8 +94,7 @@ func (t *TPClient) DeleteIDs(rootID string, ids []string) error {
 }
 
 // Query performs a search query.
-func (t *TPClient) Query(rootID string, rankBy any, limit int, filters any, includeAttrs []string) ([]map[string]any, error) {
-	ns := namespaceName(rootID)
+func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeAttrs []string) ([]map[string]any, error) {
 	body := map[string]any{
 		"rank_by":            rankBy,
 		"limit":              limit,
@@ -108,8 +118,7 @@ func (t *TPClient) Query(rootID string, rankBy any, limit int, filters any, incl
 }
 
 // MultiQuery performs multiple queries (for hybrid search) via the /query endpoint.
-func (t *TPClient) MultiQuery(rootID string, queries []map[string]any) ([][]map[string]any, error) {
-	ns := namespaceName(rootID)
+func (t *TPClient) MultiQuery(ns string, queries []map[string]any) ([][]map[string]any, error) {
 	body := map[string]any{
 		"queries": queries,
 	}
@@ -167,7 +176,7 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 }
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
-func (t *TPClient) HybridSearch(rootID string, queryText string, queryVector []float64, topK int, globFilter string) ([]map[string]any, error) {
+func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, globFilter string) ([]map[string]any, error) {
 	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "page_number", "image_path"}
 
 	queries := []map[string]any{
@@ -190,7 +199,7 @@ func (t *TPClient) HybridSearch(rootID string, queryText string, queryVector []f
 		}
 	}
 
-	resultSets, err := t.MultiQuery(rootID, queries)
+	resultSets, err := t.MultiQuery(ns, queries)
 	if err != nil {
 		return nil, err
 	}

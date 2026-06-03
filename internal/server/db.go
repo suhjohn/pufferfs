@@ -112,6 +112,7 @@ func (db *DB) migrateFallback() error {
 			org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
 			name        TEXT NOT NULL,
 			source_path TEXT NOT NULL,
+			simhash     TEXT NOT NULL DEFAULT '',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
@@ -123,10 +124,11 @@ func (db *DB) migrateFallback() error {
 		);
 
 		CREATE TABLE IF NOT EXISTS embedding_cache (
-			content_hash TEXT PRIMARY KEY,
-			org_id       TEXT REFERENCES organizations(id) ON DELETE CASCADE,
+			org_id       TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			content_hash TEXT NOT NULL,
 			embedding    BYTEA NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, content_hash)
 		);
 
 		CREATE TABLE IF NOT EXISTS root_acls (
@@ -150,6 +152,16 @@ func (db *DB) migrateFallback() error {
 			errors       JSONB NOT NULL DEFAULT '[]',
 			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			finished_at  TIMESTAMPTZ
+		);
+
+		CREATE TABLE IF NOT EXISTS content_proofs (
+			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			root_id    TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			root_hash  TEXT NOT NULL DEFAULT '',
+			proof      JSONB NOT NULL DEFAULT '{}',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, user_id, root_id)
 		);
 	`)
 	return err
@@ -496,16 +508,16 @@ func (db *DB) UpdateRootTimestamp(ctx context.Context, rootID string) error {
 // Embedding Cache
 // ---------------------------------------------------------------------------
 
-// GetCachedEmbeddings looks up cached embeddings by content hash.
-func (db *DB) GetCachedEmbeddings(ctx context.Context, hashes []string) (map[string][]float64, error) {
+// GetCachedEmbeddings looks up cached embeddings by content hash within an org.
+func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID string, hashes []string) (map[string][]float64, error) {
 	result := make(map[string][]float64)
 	if len(hashes) == 0 {
 		return result, nil
 	}
 
 	rows, err := db.pool.Query(ctx,
-		`SELECT content_hash, embedding FROM embedding_cache WHERE content_hash = ANY($1)`,
-		hashes,
+		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND content_hash = ANY($2)`,
+		orgID, hashes,
 	)
 	if err != nil {
 		return nil, err
@@ -528,25 +540,26 @@ func (db *DB) GetCachedEmbeddings(ctx context.Context, hashes []string) (map[str
 }
 
 // SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value INSERT.
-func (db *DB) SaveCachedEmbeddings(ctx context.Context, entries map[string][]float64) error {
+func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID string, entries map[string][]float64) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO embedding_cache (content_hash, embedding, created_at) VALUES `)
-	args := make([]any, 0, len(entries)*2)
+	sb.WriteString(`INSERT INTO embedding_cache (org_id, content_hash, embedding, created_at) VALUES `)
+	args := make([]any, 0, len(entries)*3)
+	args = append(args, orgID) // $1 = org_id
 	i := 0
 	for hash, emb := range entries {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		p := i*2 + 1
-		fmt.Fprintf(&sb, "($%d, $%d, NOW())", p, p+1)
+		p := i*2 + 2 // starts at $2 since $1 is org_id
+		fmt.Fprintf(&sb, "($1, $%d, $%d, NOW())", p, p+1)
 		args = append(args, hash, encodeEmbedding(emb))
 		i++
 	}
-	sb.WriteString(` ON CONFLICT (content_hash) DO NOTHING`)
+	sb.WriteString(` ON CONFLICT (org_id, content_hash) DO NOTHING`)
 
 	_, err := db.pool.Exec(ctx, sb.String(), args...)
 	return err
@@ -684,6 +697,9 @@ func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string, pro
 
 // CompleteSyncJob marks a sync job as completed or failed.
 func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors []map[string]string) error {
+	if errors == nil {
+		errors = []map[string]string{}
+	}
 	_, err := db.pool.Exec(ctx,
 		`UPDATE sync_jobs SET status = $1, finished_at = NOW(), errors = $2 WHERE id = $3`,
 		status, errors, jobID,
