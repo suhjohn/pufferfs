@@ -585,7 +585,7 @@ func createNestedProject(t *testing.T, projectDir string) fixtureSet {
 		},
 		largeMarkdownPath: "docs/research/wiki/llm-wiki.md",
 		officeDocs:        []officeDocumentFixture{
-			// R2/user-provided DOCX/PPTX fixtures are appended dynamically from the manifest.
+			// R2/user-provided DOCX/PPTX fixtures are appended dynamically.
 		},
 		modifyPath:     "docs/product/strategy/roadmap.md",
 		watchPath:      "ops/runbooks/deploy/rollback.txt",
@@ -603,7 +603,6 @@ func createNestedProject(t *testing.T, projectDir string) fixtureSet {
 
 	fixtures.pdfs = copyPDFFixtures(t, projectDir)
 	applyR2WorkspaceFixtures(t, projectDir, &fixtures)
-	applyExternalFixtureManifest(t, projectDir, &fixtures)
 	applyDiscoveredWorkspaceFixtures(t, projectDir, &fixtures)
 	fixtures.stablePaths = stableFixturePaths(fixtures)
 	return fixtures
@@ -771,11 +770,7 @@ func writeDownloadedTextFixture(t *testing.T, root, relPath, sourceURL string) {
 	}
 }
 
-type fixtureManifest struct {
-	Files []manifestFile `json:"files"`
-}
-
-type manifestFile struct {
+type fixtureSource struct {
 	URL            string   `json:"url"`
 	Path           string   `json:"path"`
 	SHA256         string   `json:"sha256,omitempty"`
@@ -845,7 +840,7 @@ func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixture
 		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
 			t.Fatalf("writing R2 fixture %s: %v", relPath, err)
 		}
-		registerManifestFixture(t, fixtures, r2FixtureManifestFile(cfg, object.key, relPath), relPath)
+		registerFixtureSource(t, fixtures, r2FixtureSource(cfg, object.key, relPath), relPath)
 	}
 }
 
@@ -912,8 +907,8 @@ func r2FixtureRelPath(t *testing.T, prefix, key string) string {
 	return cleanFixturePath(t, strings.TrimPrefix(key, prefix))
 }
 
-func r2FixtureManifestFile(cfg *r2FixtureConfig, key, relPath string) manifestFile {
-	file := manifestFile{
+func r2FixtureSource(cfg *r2FixtureConfig, key, relPath string) fixtureSource {
+	file := fixtureSource{
 		Path:     relPath,
 		FileType: fixtureFileType(relPath),
 	}
@@ -984,32 +979,6 @@ func r2SmokeMaxBytes(envName string, fallback int64) int64 {
 	return value
 }
 
-func applyExternalFixtureManifest(t *testing.T, projectDir string, fixtures *fixtureSet) {
-	t.Helper()
-
-	manifest := loadFixtureManifest(t)
-	if manifest == nil {
-		return
-	}
-	for _, file := range manifest.Files {
-		relPath := cleanFixturePath(t, file.Path)
-		body := downloadFixtureBytes(t, file.URL)
-		if file.SHA256 != "" {
-			sum := sha256.Sum256(body)
-			got := hex.EncodeToString(sum[:])
-			if !strings.EqualFold(got, file.SHA256) {
-				t.Fatalf("fixture %s sha256 mismatch: got %s want %s", relPath, got, file.SHA256)
-			}
-		}
-		fullPath := filepath.Join(projectDir, filepath.FromSlash(relPath))
-		mkdirAll(t, filepath.Dir(fullPath))
-		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
-			t.Fatalf("writing external fixture %s: %v", relPath, err)
-		}
-		registerManifestFixture(t, fixtures, file, relPath)
-	}
-}
-
 func applyDiscoveredWorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixtureSet) {
 	t.Helper()
 
@@ -1040,7 +1009,7 @@ func applyDiscoveredWorkspaceFixtures(t *testing.T, projectDir string, fixtures 
 		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
 			t.Fatalf("writing discovered fixture %s: %v", relPath, err)
 		}
-		registerManifestFixture(t, fixtures, manifestFile{
+		registerFixtureSource(t, fixtures, fixtureSource{
 			URL:      current.String(),
 			Path:     relPath,
 			FileType: fixtureFileType(relPath),
@@ -1139,23 +1108,7 @@ func looksLikeFixtureFile(name string) bool {
 	}
 }
 
-func loadFixtureManifest(t *testing.T) *fixtureManifest {
-	t.Helper()
-
-	manifestURL := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_FIXTURE_MANIFEST_URL"))
-	if manifestURL == "" {
-		return nil
-	}
-	raw := string(downloadFixtureBytes(t, manifestURL))
-
-	var manifest fixtureManifest
-	if err := json.Unmarshal([]byte(raw), &manifest); err != nil {
-		t.Fatalf("decoding fixture manifest: %v", err)
-	}
-	return &manifest
-}
-
-func registerManifestFixture(t *testing.T, fixtures *fixtureSet, file manifestFile, relPath string) {
+func registerFixtureSource(t *testing.T, fixtures *fixtureSet, file fixtureSource, relPath string) {
 	t.Helper()
 
 	fileType := strings.TrimSpace(file.FileType)
