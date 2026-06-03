@@ -482,6 +482,68 @@ func cliCreateUser(t *testing.T) string {
 	return rawKey
 }
 
+func cliCopyPDFFixtures(t *testing.T, projectDir string) []string {
+	t.Helper()
+
+	var sources []string
+	if list := os.Getenv("PUFFERFS_CLI_PDF_FIXTURES"); list != "" {
+		sources = append(sources, filepath.SplitList(list)...)
+	}
+	if dir := os.Getenv("PUFFERFS_CLI_PDF_FIXTURE_DIR"); dir != "" {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("reading PDF fixture dir: %v", err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".pdf" {
+				continue
+			}
+			sources = append(sources, filepath.Join(dir, entry.Name()))
+		}
+	}
+	if len(sources) == 0 {
+		return nil
+	}
+
+	docsDir := filepath.Join(projectDir, "docs")
+	if err := os.MkdirAll(docsDir, 0o755); err != nil {
+		t.Fatalf("creating docs dir: %v", err)
+	}
+
+	var copied []string
+	for _, source := range sources {
+		if strings.TrimSpace(source) == "" {
+			continue
+		}
+		if strings.ToLower(filepath.Ext(source)) != ".pdf" {
+			continue
+		}
+		src, err := os.Open(source)
+		if err != nil {
+			t.Fatalf("opening PDF fixture %s: %v", source, err)
+		}
+
+		relPath := filepath.ToSlash(filepath.Join("docs", filepath.Base(source)))
+		dstPath := filepath.Join(projectDir, filepath.FromSlash(relPath))
+		dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			src.Close()
+			t.Fatalf("creating PDF fixture copy %s: %v", dstPath, err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			src.Close()
+			dst.Close()
+			t.Fatalf("copying PDF fixture %s: %v", source, err)
+		}
+		src.Close()
+		if err := dst.Close(); err != nil {
+			t.Fatalf("closing PDF fixture copy %s: %v", dstPath, err)
+		}
+		copied = append(copied, relPath)
+	}
+	return copied
+}
+
 // ---------------------------------------------------------------------------
 // Test: Full CLI user journey
 // ---------------------------------------------------------------------------
@@ -540,6 +602,8 @@ func TestCLI_FullUserJourney(t *testing.T) {
 	os.WriteFile(filepath.Join(projectDir, "src", "utils.go"),
 		[]byte("package main\n\nfunc add(a, b int) int { return a + b }\n"), 0o644)
 
+	pdfFixtures := cliCopyPDFFixtures(t, projectDir)
+
 	// ---- Scenario 2: First sync ----
 	t.Run("first_sync", func(t *testing.T) {
 		stdout, stderr, err := runPufferfs(t, homeDir, serverURL, apiKey, "sync", projectDir, "--name", "my-project")
@@ -581,6 +645,23 @@ func TestCLI_FullUserJourney(t *testing.T) {
 			t.Error("expected results, got none")
 		}
 	})
+
+	if len(pdfFixtures) > 0 {
+		t.Run("query_pdf_fixtures", func(t *testing.T) {
+			stdout, stderr, err := runPufferfs(t, homeDir, serverURL, apiKey, "query", "pdf", "--root", "my-project", "--mode", "fts", "--glob", "*.pdf", "--top-k", "50")
+			if err != nil {
+				t.Fatalf("query PDF fixtures failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+			}
+			if strings.Contains(stdout, "No results found") {
+				t.Fatalf("expected PDF fixture results, got none")
+			}
+			for _, relPath := range pdfFixtures {
+				if !strings.Contains(stdout, relPath) {
+					t.Fatalf("expected PDF result for %s, got: %s", relPath, stdout)
+				}
+			}
+		})
+	}
 
 	// ---- Scenario 4: Modify file + re-sync ----
 	t.Run("modify_and_resync", func(t *testing.T) {
