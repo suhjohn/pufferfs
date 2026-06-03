@@ -59,6 +59,15 @@ func queryCmd() *cobra.Command {
 func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK int) error {
 	client := newAPIClient(cfg)
 
+	// Resolve root name to ID if it's not a UUID
+	if rootID != "" && !isUUID(rootID) {
+		resolvedID, err := resolveRootName(client, rootID)
+		if err != nil {
+			return fmt.Errorf("resolving root %q: %w", rootID, err)
+		}
+		rootID = resolvedID
+	}
+
 	req := models.QueryRequest{
 		Query:  queryText,
 		Mode:   mode,
@@ -135,4 +144,35 @@ func detectRootFromCwd() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no root matches cwd %s", cwd)
+}
+
+func resolveRootName(client *apiClient, name string) (string, error) {
+	respBody, err := client.get("/roots")
+	if err != nil {
+		return "", err
+	}
+	var roots []models.RootMetadata
+	if err := json.Unmarshal(respBody, &roots); err != nil {
+		return "", err
+	}
+	for _, r := range roots {
+		if r.Name == name {
+			return r.ID, nil
+		}
+	}
+	return "", fmt.Errorf("root %q not found", name)
+}
+
+func isUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }

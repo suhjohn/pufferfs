@@ -23,6 +23,7 @@ chunking_image = (
         "python-docx>=1.1.0",
         "python-pptx>=0.6.23",
         "Pillow>=10.0.0",
+        "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py")
     .add_local_file("chunkers.py", "/root/chunkers.py")
@@ -33,6 +34,7 @@ embedding_image = (
     .pip_install(
         "sentence-transformers>=3.0.0",
         "torch>=2.0.0",
+        "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py")
 )
@@ -67,8 +69,11 @@ def file_to_chunks(
     file_path: str,
     file_type: str,
     root_id: str,
+    content_b64: str | None = None,
 ) -> list[dict]:
-    """Download a file from S3, chunk it based on type, return Chunk dicts."""
+    """Chunk a file. If content_b64 is provided, uses it directly; otherwise downloads from S3."""
+    import base64
+
     import boto3
     from chunkers import (
         CODE_EXTENSIONS,
@@ -81,45 +86,56 @@ def file_to_chunks(
         detect_file_type,
     )
 
-    # Resolve file type if not provided
     if not file_type or file_type == "auto":
         file_type = detect_file_type(file_path)
 
-    # Set up S3 client
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-    )
-    bucket = os.environ["AWS_BUCKET_NAME"]
+    # Get file bytes: either from base64 content or S3
+    s3 = None
+    bucket = None
+    if content_b64:
+        file_bytes = base64.b64decode(content_b64)
+    else:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        )
+        bucket = os.environ["AWS_BUCKET_NAME"]
+        resp = s3.get_object(Bucket=bucket, Key=s3_key)
+        file_bytes = resp["Body"].read()
 
-    # Download the file
-    resp = s3.get_object(Bucket=bucket, Key=s3_key)
-    file_bytes = resp["Body"].read()
-
-    # Route to the right chunker
     chunks: list[Chunk] = []
 
     if file_type == "pdf":
+        if not s3:
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            )
+            bucket = os.environ["AWS_BUCKET_NAME"]
         chunks = chunk_pdf(file_bytes, root_id, file_path, s3, bucket)
     elif file_type == "docx":
         chunks = chunk_docx(file_bytes, root_id, file_path)
     elif file_type == "pptx":
         chunks = chunk_pptx(file_bytes, root_id, file_path)
     elif file_type == "image":
+        if not s3:
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            )
+            bucket = os.environ["AWS_BUCKET_NAME"]
         chunks = chunk_image(file_bytes, root_id, file_path, s3, bucket)
     elif file_type in CODE_EXTENSIONS:
         text = file_bytes.decode("utf-8", errors="replace")
-        # Also upload the extracted text as markdown
-        md_key = f"files/{root_id}/{file_path}.md"
-        s3.put_object(Bucket=bucket, Key=md_key, Body=text.encode(), ContentType="text/markdown")
         chunks = chunk_code(text, root_id, file_path, file_type)
     else:
-        # Default: treat as text / markdown
         text = file_bytes.decode("utf-8", errors="replace")
-        md_key = f"files/{root_id}/{file_path}.md"
-        s3.put_object(Bucket=bucket, Key=md_key, Body=text.encode(), ContentType="text/markdown")
         chunks = chunk_markdown(text, root_id, file_path, file_type)
 
     return [asdict(c) for c in chunks]
@@ -138,7 +154,7 @@ EMBEDDING_DIM = 768
     gpu="T4",
     timeout=600,
     memory=4096,
-    container_idle_timeout=300,
+    scaledown_window=300,
 )
 class Embedder:
     """Persistent embedding model container."""
@@ -186,14 +202,15 @@ class Embedder:
     timeout=600,
     memory=2048,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def chunk_file_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {s3_key, file_path, file_type, root_id} -> {chunks: [...]}"""
+    """HTTP endpoint: POST {s3_key, file_path, file_type, root_id, content_b64?} -> {chunks: [...]}"""
     chunks = file_to_chunks.local(
-        s3_key=item["s3_key"],
+        s3_key=item.get("s3_key", ""),
         file_path=item["file_path"],
         file_type=item.get("file_type", "auto"),
         root_id=item["root_id"],
+        content_b64=item.get("content_b64"),
     )
     return {"chunks": chunks, "count": len(chunks)}
 
@@ -204,7 +221,7 @@ def chunk_file_endpoint(item: dict) -> dict:
     timeout=600,
     memory=4096,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def embed_chunks_endpoint(item: dict) -> dict:
     """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
     embedder = Embedder()
@@ -218,7 +235,7 @@ def embed_chunks_endpoint(item: dict) -> dict:
     timeout=600,
     memory=4096,
 )
-@modal.web_endpoint(method="POST")
+@modal.fastapi_endpoint(method="POST")
 def embed_query_endpoint(item: dict) -> dict:
     """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
     embedder = Embedder()

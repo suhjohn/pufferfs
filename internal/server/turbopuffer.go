@@ -29,7 +29,7 @@ func NewTPClient(apiKey, region string) *TPClient {
 }
 
 func (t *TPClient) baseURL() string {
-	return fmt.Sprintf("https://%s.turbopuffer.com", t.region)
+	return "https://api.turbopuffer.com"
 }
 
 // namespaceName returns the tp namespace for a root.
@@ -106,13 +106,13 @@ func (t *TPClient) Query(rootID string, rankBy any, limit int, filters any, incl
 	return result.Rows, nil
 }
 
-// MultiQuery performs multiple queries (for hybrid search).
+// MultiQuery performs multiple queries (for hybrid search) via the /query endpoint.
 func (t *TPClient) MultiQuery(rootID string, queries []map[string]any) ([][]map[string]any, error) {
 	ns := namespaceName(rootID)
 	body := map[string]any{
 		"queries": queries,
 	}
-	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/multi_query", ns), body)
+	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
 	if err != nil {
 		return nil, err
 	}

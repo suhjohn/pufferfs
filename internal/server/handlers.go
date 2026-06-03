@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -211,12 +212,19 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 	// The CLI uploads the file to S3 before calling sync
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 
-	// Call Modal to chunk the file
+	// Download file content from S3 to send inline to Modal
+	fileData, err := s.s3.Download(ctx, s3Key)
+	if err != nil {
+		return fmt.Errorf("downloading %s from S3: %w", s3Key, err)
+	}
+
+	// Call Modal to chunk the file (send content inline as base64)
 	chunkResp, err := s.modal.ChunkFile(ChunkFileRequest{
-		S3Key:    s3Key,
-		FilePath: change.Path,
-		FileType: detectFileType(change.Path),
-		RootID:   rootID,
+		S3Key:      s3Key,
+		FilePath:   change.Path,
+		FileType:   detectFileType(change.Path),
+		RootID:     rootID,
+		ContentB64: base64.StdEncoding.EncodeToString(fileData),
 	})
 	if err != nil {
 		return fmt.Errorf("chunking: %w", err)
