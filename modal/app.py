@@ -25,8 +25,8 @@ chunking_image = (
         "google-genai>=1.0.0",
         "fastapi[standard]",
     )
-    .add_local_file("models.py", "/root/models.py")
-    .add_local_file("chunkers.py", "/root/chunkers.py")
+    .add_local_file("models.py", "/root/models.py", copy=True)
+    .add_local_file("chunkers.py", "/root/chunkers.py", copy=True)
 )
 
 embedding_image = (
@@ -108,6 +108,7 @@ def file_to_chunks(
         resp = s3.get_object(Bucket=bucket, Key=s3_key)
         file_bytes = resp["Body"].read()
 
+    # Only use S3 from Modal when NOT using inline content (i.e., Modal can reach S3)
     def _ensure_s3():
         nonlocal s3, bucket
         if not s3:
@@ -120,16 +121,20 @@ def file_to_chunks(
             bucket = os.environ["AWS_BUCKET_NAME"]
         return s3, bucket
 
+    # When content is inline, S3 is managed by the Go server — skip S3 ops in Modal
+    s3c = None
+    bkt = None
+    if not content_b64:
+        s3c, bkt = _ensure_s3()
+
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     chunks: list[Chunk] = []
 
     if file_type in ("pdf", "docx", "pptx"):
-        s3c, bkt = _ensure_s3()
         chunks = chunk_document_via_images(
             file_bytes, root_id, file_path, file_type, s3c, bkt, gemini_key,
         )
     elif file_type == "image":
-        s3c, bkt = _ensure_s3()
         chunks = chunk_image(file_bytes, root_id, file_path, s3c, bkt, gemini_key)
     elif file_type in CODE_EXTENSIONS:
         text = file_bytes.decode("utf-8", errors="replace")

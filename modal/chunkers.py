@@ -206,14 +206,15 @@ def chunk_document_via_images(
         pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("jpeg")
 
-        # Upload page image to S3
+        # Upload page image to S3 (skipped when s3_client is None, e.g. inline content)
         image_key = _page_image_key(root_id, file_path, page_num)
-        s3_client.put_object(
-            Bucket=bucket,
-            Key=image_key,
-            Body=img_bytes,
-            ContentType="image/jpeg",
-        )
+        if s3_client and bucket:
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=image_key,
+                Body=img_bytes,
+                ContentType="image/jpeg",
+            )
 
         # Extract text via Gemini vision
         if gemini_api_key:
@@ -255,16 +256,18 @@ def chunk_image(
     bucket: str,
     gemini_api_key: str,
 ) -> list[Chunk]:
-    """For images: upload to S3, call Gemini for text extraction/captioning."""
-    # Upload original image to S3
+    """For images: optionally upload to S3, call Gemini for text extraction/captioning."""
     image_key = f"chunks/{root_id}/{file_path}"
     content_type = _guess_image_content_type(file_path)
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=image_key,
-        Body=file_bytes,
-        ContentType=content_type,
-    )
+
+    # Upload original image to S3 (skipped when s3_client is None)
+    if s3_client and bucket:
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=image_key,
+            Body=file_bytes,
+            ContentType=content_type,
+        )
 
     # Call Gemini for text extraction / captioning
     if gemini_api_key:
