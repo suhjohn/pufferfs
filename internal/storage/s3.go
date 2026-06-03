@@ -61,6 +61,30 @@ func (c *Client) Upload(ctx context.Context, key string, data []byte, contentTyp
 	return err
 }
 
+// UploadCAS puts an object only if the supplied ETag precondition matches.
+func (c *Client) UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error) {
+	input := &s3.PutObjectInput{
+		Bucket:      &c.bucket,
+		Key:         &key,
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	}
+	if ifMatch != "" {
+		input.IfMatch = &ifMatch
+	}
+	if ifNoneMatch != "" {
+		input.IfNoneMatch = &ifNoneMatch
+	}
+	resp, err := c.s3.PutObject(ctx, input)
+	if err != nil {
+		return "", err
+	}
+	if resp.ETag == nil {
+		return "", nil
+	}
+	return *resp.ETag, nil
+}
+
 // UploadFile uploads a local file to S3.
 func (c *Client) UploadFile(ctx context.Context, key string, filePath string) error {
 	f, err := os.Open(filePath)
@@ -79,15 +103,29 @@ func (c *Client) UploadFile(ctx context.Context, key string, filePath string) er
 
 // Download gets an object from S3.
 func (c *Client) Download(ctx context.Context, key string) ([]byte, error) {
+	data, _, err := c.DownloadWithETag(ctx, key)
+	return data, err
+}
+
+// DownloadWithETag gets an object and returns its ETag for conditional writes.
+func (c *Client) DownloadWithETag(ctx context.Context, key string) ([]byte, string, error) {
 	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &c.bucket,
 		Key:    &key,
 	})
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	etag := ""
+	if resp.ETag != nil {
+		etag = *resp.ETag
+	}
+	return data, etag, nil
 }
 
 // DownloadRange gets a byte range from an object in S3.

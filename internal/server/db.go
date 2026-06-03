@@ -25,6 +25,14 @@ type DB struct {
 	pool *pgxpool.Pool
 }
 
+type SyncGeneration struct {
+	ID                string
+	RootID            string
+	BaseGenerationID  string
+	Seq               int64
+	BaseGenerationSeq int64
+}
+
 // NewDB creates a connection pool and runs migrations.
 func NewDB(databaseURL string) (*DB, error) {
 	pool, err := pgxpool.New(context.Background(), databaseURL)
@@ -526,21 +534,52 @@ func (db *DB) GetVisibleGeneration(ctx context.Context, rootID string) (string, 
 	return generationID, err
 }
 
-func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef string) (string, error) {
+func (db *DB) GetGenerationSeq(ctx context.Context, generationID string) (int64, error) {
+	if generationID == "" {
+		return 0, nil
+	}
+	var seq int64
+	err := db.pool.QueryRow(ctx,
+		`SELECT seq FROM sync_generations WHERE id = $1`, generationID,
+	).Scan(&seq)
+	return seq, err
+}
+
+func (db *DB) GetVisibleGenerationSeq(ctx context.Context, rootID string) (int64, error) {
+	visibleID, err := db.GetVisibleGeneration(ctx, rootID)
+	if err != nil || visibleID == "" {
+		return 0, err
+	}
+	return db.GetGenerationSeq(ctx, visibleID)
+}
+
+func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef string) (*SyncGeneration, error) {
 	baseGenerationID, err := db.GetVisibleGeneration(ctx, rootID)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	baseSeq, err := db.GetGenerationSeq(ctx, baseGenerationID)
+	if err != nil {
+		return nil, err
 	}
 	generationID := uuid.New().String()
-	_, err = db.pool.Exec(ctx,
-		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, status, manifest_ref)
-		 VALUES ($1, $2, $3, $4, $5, 'building', $6)`,
-		generationID, orgID, rootID, syncJobID, baseGenerationID, manifestRef,
-	)
+	var seq int64
+	err = db.pool.QueryRow(ctx,
+		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, base_generation_seq, status, manifest_ref)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'building', $7)
+		 RETURNING seq`,
+		generationID, orgID, rootID, syncJobID, baseGenerationID, baseSeq, manifestRef,
+	).Scan(&seq)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return generationID, nil
+	return &SyncGeneration{
+		ID:                generationID,
+		RootID:            rootID,
+		BaseGenerationID:  baseGenerationID,
+		Seq:               seq,
+		BaseGenerationSeq: baseSeq,
+	}, nil
 }
 
 func (db *DB) MarkSyncGenerationVisible(ctx context.Context, rootID, generationID string) error {

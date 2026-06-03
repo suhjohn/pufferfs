@@ -178,7 +178,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		ManifestRef:  manifestRef,
 	}
 
-	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync", rootID), syncReq)
+	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
 	if err != nil {
 		return fmt.Errorf("sync request: %w", err)
 	}
@@ -186,6 +186,11 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 	var syncResp models.SyncResponse
 	if err := json.Unmarshal(respBody, &syncResp); err != nil {
 		return fmt.Errorf("parsing sync response: %w", err)
+	}
+	if syncResp.SyncJobID != "" {
+		if err := pollSyncJob(client, rootID, syncResp.SyncJobID); err != nil {
+			return err
+		}
 	}
 
 	// Save Merkle tree locally (replaces flat state)
@@ -207,6 +212,29 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
 
 	return nil
+}
+
+func pollSyncJob(client *apiClient, rootID, jobID string) error {
+	fmt.Printf("Sync job %s started; polling until committed...\n", jobID)
+	for {
+		body, err := client.get(fmt.Sprintf("/roots/%s/sync/status?job_id=%s", rootID, url.QueryEscape(jobID)))
+		if err != nil {
+			return fmt.Errorf("polling sync job: %w", err)
+		}
+		var job models.SyncJob
+		if err := json.Unmarshal(body, &job); err != nil {
+			return fmt.Errorf("parsing sync job status: %w", err)
+		}
+		switch job.Status {
+		case "completed":
+			return nil
+		case "failed":
+			return fmt.Errorf("sync job failed: %s", string(job.Errors))
+		default:
+			fmt.Printf("Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
+			time.Sleep(2 * time.Second)
+		}
+	}
 }
 
 // merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.

@@ -87,6 +87,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			deleteTPNamespace(t, services, namespace)
 		})
 		assertMinioHasPrefix(t, fmt.Sprintf("bundles/%s/", rootID))
+		assertMinioHasPrefix(t, "syncs/")
 
 		assertNestedRowsIndexed(t, services, namespace, fixtures)
 		assertPDFPageRows(t, services, namespace, fixtures.pdfs)
@@ -139,6 +140,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		requireOutputContains(t, stdout, "Sync complete")
 		assertNoTPRows(t, services, namespace, oldMovePath)
+		assertClosedTPRows(t, services, namespace, oldMovePath)
 		assertHasTPRows(t, services, namespace, newMovePath)
 
 		removedPath := fixtures.removePath
@@ -151,6 +153,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		requireOutputContains(t, stdout, "Sync complete")
 		assertNoTPRows(t, services, namespace, removedPath)
+		assertClosedTPRows(t, services, namespace, removedPath)
 
 		watchPath := fixtures.watchPath
 		beforeWatch := rowsDigest(queryTPRowsForPath(t, services, namespace, watchPath))
@@ -1491,13 +1494,26 @@ func tpBaseURL(services realServices) string {
 
 func queryTPRowsForPath(t *testing.T, services realServices, namespace, relPath string) []map[string]any {
 	t.Helper()
+	return queryTPRowsForPathWithFilter(t, services, namespace, []any{"And", []any{
+		[]any{"file_path", "Eq", relPath},
+		[]any{"valid_to_generation_seq", "Eq", 0},
+	}})
+}
+
+func queryTPAllRowsForPath(t *testing.T, services realServices, namespace, relPath string) []map[string]any {
+	t.Helper()
+	return queryTPRowsForPathWithFilter(t, services, namespace, []any{"file_path", "Eq", relPath})
+}
+
+func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespace string, filter any) []map[string]any {
+	t.Helper()
 
 	body := map[string]any{
 		"rank_by": []any{"id", "asc"},
 		"limit":   1000,
-		"filters": []any{"file_path", "Eq", relPath},
+		"filters": filter,
 		"include_attributes": []string{
-			"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path",
+			"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq",
 		},
 	}
 	data, err := json.Marshal(body)
@@ -1515,7 +1531,7 @@ func queryTPRowsForPath(t *testing.T, services realServices, namespace, relPath 
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("querying TP rows for %s: %v", relPath, err)
+		t.Fatalf("querying TP rows: %v", err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
@@ -1523,7 +1539,7 @@ func queryTPRowsForPath(t *testing.T, services realServices, namespace, relPath 
 		t.Fatalf("reading TP response: %v", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		t.Fatalf("querying TP rows for %s: HTTP %d: %s", relPath, resp.StatusCode, string(respBody))
+		t.Fatalf("querying TP rows: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -1571,6 +1587,27 @@ func assertNoTPRows(t *testing.T, services realServices, namespace, relPath stri
 	if len(rows) != 0 {
 		t.Fatalf("expected no TP rows for %s, got %#v", relPath, rows)
 	}
+}
+
+func assertClosedTPRows(t *testing.T, services realServices, namespace, relPath string) {
+	t.Helper()
+	rows := queryTPAllRowsForPath(t, services, namespace, relPath)
+	if len(rows) == 0 {
+		t.Fatalf("expected inactive TP rows for %s", relPath)
+	}
+	for _, row := range rows {
+		attrs := rowAttributes(row)
+		if validToSeq, ok := attrs["valid_to_generation_seq"].(float64); !ok || validToSeq <= 0 {
+			t.Fatalf("expected %s row to be closed, got %#v", relPath, row)
+		}
+	}
+}
+
+func rowAttributes(row map[string]any) map[string]any {
+	if attrs, ok := row["attributes"].(map[string]any); ok {
+		return attrs
+	}
+	return row
 }
 
 type rowDigest []string

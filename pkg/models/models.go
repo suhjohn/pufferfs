@@ -16,6 +16,13 @@ func MakeChunkID(rootID, filePath string, chunkIndex int) string {
 	return fmt.Sprintf("%s:%d", pathHash, chunkIndex)
 }
 
+// MakeGenerationChunkID produces a stable row ID for one generation's copy of a chunk.
+func MakeGenerationChunkID(rootID, generationID, filePath string, chunkIndex int) string {
+	h := sha256.Sum256([]byte(rootID + ":" + generationID + ":" + filePath))
+	pathHash := hex.EncodeToString(h[:])[:16]
+	return fmt.Sprintf("%s:%d", pathHash, chunkIndex)
+}
+
 // ---------------------------------------------------------------------------
 // Organizations
 // ---------------------------------------------------------------------------

@@ -520,7 +520,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if job != nil {
 		syncJobID = job.ID
 	}
-	generationID, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef)
+	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef)
 	if err != nil {
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
@@ -528,67 +528,76 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync generation: " + err.Error()})
 		return
 	}
-	if err := s.writeQueueStateArtifact(r.Context(), generationID, "chunk", req.ManifestRef); err != nil {
-		log.Printf("warning: failed to write queue state artifact: %v", err)
+	if r.URL.Query().Get("async") == "true" {
+		go func(req models.SyncRequest, generation *SyncGeneration, job *models.SyncJob) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			defer cancel()
+			if _, err := s.runSyncJob(ctx, id.OrgID, id.UserID, rootID, generation, &req, job); err != nil {
+				log.Printf("async sync error for root %s: %v", rootID, err)
+			}
+		}(req, generation, job)
+		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job)})
+		return
 	}
 
-	resp, err := s.processSync(r.Context(), id.OrgID, generationID, &req, job)
+	resp, err := s.runSyncJob(r.Context(), id.OrgID, id.UserID, rootID, generation, &req, job)
 	if err != nil {
-		log.Printf("sync error for root %s: %v", rootID, err)
-		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
-		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+	resp, err := s.processSync(ctx, orgID, generation, req, job)
+	if err != nil {
+		log.Printf("sync error for root %s: %v", rootID, err)
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if job != nil {
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return nil, err
 	}
 
 	if req.ContentProof != nil {
 		proofBytes, _ := json.Marshal(req.ContentProof)
-		if err := s.db.UpsertContentProof(r.Context(), id.OrgID, id.UserID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
-			_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
+		if err := s.db.UpsertContentProof(ctx, orgID, userID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
+			_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 			if job != nil {
-				_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+				_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "storing content proof: " + err.Error()})
-			return
+			return nil, fmt.Errorf("storing content proof: %w", err)
 		}
 	}
 
-	// Persist state
-	if err := s.db.SaveState(r.Context(), rootID, req.State); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
+	if err := s.db.SaveState(ctx, rootID, req.State); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "saving state: " + err.Error()})
-		return
+		return nil, fmt.Errorf("saving state: %w", err)
 	}
-	if err := s.db.UpdateRootTimestamp(r.Context(), rootID); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
+	if err := s.db.UpdateRootTimestamp(ctx, rootID); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updating root timestamp: " + err.Error()})
-		return
+		return nil, fmt.Errorf("updating root timestamp: %w", err)
 	}
-	if err := s.db.MarkSyncGenerationVisible(r.Context(), rootID, generationID); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(r.Context(), generationID)
+	if err := s.db.MarkSyncGenerationVisible(ctx, rootID, generation.ID); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "marking generation visible: " + err.Error()})
-		return
+		return nil, fmt.Errorf("marking generation visible: %w", err)
 	}
-
 	if job != nil {
-		if err := s.db.CompleteSyncJob(r.Context(), job.ID, "completed", nil); err != nil {
+		if err := s.db.CompleteSyncJob(ctx, job.ID, "completed", nil); err != nil {
 			log.Printf("error completing sync job %s: %v", job.ID, err)
 		}
 		resp.SyncJobID = job.ID
 	}
-
-	writeJSON(w, http.StatusOK, resp)
+	return resp, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +612,15 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	rootID := r.PathValue("id")
 
-	job, err := s.db.GetLatestSyncJob(r.Context(), id.OrgID, rootID)
+	var (
+		job *models.SyncJob
+		err error
+	)
+	if jobID := r.URL.Query().Get("job_id"); jobID != "" {
+		job, err = s.db.GetSyncJob(r.Context(), id.OrgID, jobID)
+	} else {
+		job, err = s.db.GetLatestSyncJob(r.Context(), id.OrgID, rootID)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no sync jobs found"})
 		return
@@ -797,7 +814,7 @@ func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID
 // Sync processing
 // ---------------------------------------------------------------------------
 
-func (s *Server) processSync(ctx context.Context, orgID, generationID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+func (s *Server) legacyProcessSync(ctx context.Context, orgID, generationID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	resp := &models.SyncResponse{RootID: req.RootID}
 	processed := 0
 	workers := syncWorkerCount()
@@ -1190,6 +1207,22 @@ func (s *Server) deleteIDsInBatches(ns string, ids []string) error {
 	return nil
 }
 
+func (s *Server) patchRowsInBatches(ns string, rows []map[string]any) error {
+	batchSize := tpWriteBatchSize()
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		writeStart := time.Now()
+		if err := s.tp.PatchRows(ns, rows[start:end]); err != nil {
+			return err
+		}
+		log.Printf("timing stage=tp_patch_batch batch=%d/%d rows=%d elapsed=%s", start/batchSize+1, (len(rows)+batchSize-1)/batchSize, end-start, time.Since(writeStart))
+	}
+	return nil
+}
+
 func tpWriteBatchSize() int {
 	const defaultRows = 512
 	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_WRITE_BATCH_ROWS"))
@@ -1330,7 +1363,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, generationID, rootID
 	rows := make([]map[string]any, len(chunkResp.Chunks))
 	pending := make([]pendingEmbedding, 0, uncachedCount)
 	for i, c := range chunkResp.Chunks {
-		row := indexedChunkFromModal(rootID, generationID, change.ContentHash, c)
+		row := indexedChunkFromModal(rootID, generationID, 0, change.ContentHash, c)
 		rowMap := row.mapRow()
 
 		if emb, ok := cachedRows[i]; ok {
@@ -1403,9 +1436,6 @@ func modalChunkPayload(row map[string]any) map[string]any {
 		"file_type":    row["file_type"],
 		"root_id":      row["root_id"],
 	}
-	if generationID, ok := row["generation_id"]; ok && generationID != nil {
-		chunk["generation_id"] = generationID
-	}
 	if pageNumber, ok := row["page_number"]; ok && pageNumber != nil {
 		chunk["page_number"] = pageNumber
 	}
@@ -1465,8 +1495,7 @@ func (s *Server) processFileMove(ctx context.Context, orgID, generationID, rootI
 				chunkIdx = int(f)
 			}
 		}
-		chunk := indexedChunkFromExisting(rootID, generationID, change.Path, change.ContentHash, chunkIdx, row)
-		chunk.ID = models.MakeChunkID(rootID, change.Path, chunkIdx)
+		chunk := indexedChunkFromExisting(rootID, generationID, 0, change.Path, change.ContentHash, chunkIdx, row)
 		newRows[i] = chunk.mapRow()
 
 		hash, _ := row["content_hash"].(string)
@@ -1608,14 +1637,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := tpNamespace(id.OrgID, req.RootID)
-	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id"}
+	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	var filters []any
 	if req.Glob != "" {
 		filters = append(filters, []any{"file_path", "Glob", req.Glob})
 	}
-	if visibleGeneration, err := s.db.GetVisibleGeneration(r.Context(), req.RootID); err == nil && visibleGeneration != "" {
-		filters = append(filters, []any{"generation_id", "Eq", visibleGeneration})
+	if visibleSeq, err := s.db.GetVisibleGenerationSeq(r.Context(), req.RootID); err == nil && visibleSeq > 0 {
+		filters = append(filters, activeGenerationFilter(visibleSeq))
 	}
 
 	// Get denied paths from ACLs and filter results post-query
@@ -1735,9 +1764,7 @@ func tpAndFilter(filters []any) any {
 	case 1:
 		return filters[0]
 	default:
-		out := []any{"And"}
-		out = append(out, filters...)
-		return out
+		return []any{"And", filters}
 	}
 }
 
