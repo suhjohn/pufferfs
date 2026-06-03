@@ -11,17 +11,18 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
-	db      *DB
-	s3      *storage.Client
-	modal   *ModalClient
-	tp      *TPClient
-	mux     *http.ServeMux
+	db    *DB
+	s3    *storage.Client
+	modal *ModalClient
+	tp    *TPClient
+	mux   *http.ServeMux
 }
 
 // New creates a new Server with all dependencies.
@@ -43,21 +44,221 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("GET /health", s.handleHealth)
+	// Health
+	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
+	s.mux.HandleFunc("GET /health", s.handleHealthz) // backward compat
+
+	// Auth
+	s.mux.HandleFunc("GET /auth/me", s.handleMe)
+	s.mux.HandleFunc("POST /auth/api-keys", s.handleCreateAPIKey)
+	s.mux.HandleFunc("GET /auth/api-keys", s.handleListAPIKeys)
+	s.mux.HandleFunc("DELETE /auth/api-keys/{id}", s.handleDeleteAPIKey)
+
+	// Org management
+	s.mux.HandleFunc("GET /org", s.handleGetOrg)
+	s.mux.HandleFunc("GET /org/members", s.handleListMembers)
+	s.mux.HandleFunc("POST /org/members", s.handleAddMember)
+	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleRemoveMember)
+
+	// Roots (org-scoped)
 	s.mux.HandleFunc("POST /roots", s.handleCreateRoot)
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
 	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
+	s.mux.HandleFunc("GET /roots/{id}/sync/status", s.handleSyncStatus)
+	s.mux.HandleFunc("GET /roots/{id}/sync/jobs", s.handleListSyncJobs)
+
+	// ACLs
+	s.mux.HandleFunc("POST /roots/{id}/acls", s.handleCreateACL)
+	s.mux.HandleFunc("GET /roots/{id}/acls", s.handleListACLs)
+	s.mux.HandleFunc("DELETE /roots/{id}/acls/{aclId}", s.handleDeleteACL)
+
+	// Query
 	s.mux.HandleFunc("POST /query", s.handleQuery)
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.db.Ping(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready", "error": "database: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	user, err := s.db.GetUser(r.Context(), id.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user":   user,
+		"org_id": id.OrgID,
+		"role":   id.Role,
+	})
+}
+
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	var req struct {
+		Name   string   `json:"name"`
+		Scopes []string `json:"scopes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Name == "" {
+		req.Name = "CLI Key"
+	}
+	if len(req.Scopes) == 0 {
+		req.Scopes = []string{"sync", "query"}
+	}
+
+	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, req.Scopes)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"key":  rawKey,
+		"note": "Store this key securely. It will not be shown again.",
+	})
+}
+
+func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	keys, err := s.db.ListAPIKeys(r.Context(), id.OrgID, id.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, keys)
+}
+
+func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	keyID := r.PathValue("id")
+	if err := s.db.DeleteAPIKey(r.Context(), id.OrgID, keyID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ---------------------------------------------------------------------------
+// Org management
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleGetOrg(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	org, err := s.db.GetOrganization(r.Context(), id.OrgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, org)
+}
+
+func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	members, err := s.db.ListOrgMembers(r.Context(), id.OrgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, members)
+}
+
+func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+
+	var req struct {
+		UserID string `json:"user_id"`
+		Role   string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if err := s.db.AddOrgMember(r.Context(), id.OrgID, req.UserID, auth.Role(req.Role)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
+}
+
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	userID := r.PathValue("userId")
+	if err := s.db.RemoveOrgMember(r.Context(), id.OrgID, userID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}
+
+// ---------------------------------------------------------------------------
+// Roots (org-scoped)
+// ---------------------------------------------------------------------------
+
 func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+		return
+	}
+
 	var req struct {
 		Name       string `json:"name"`
 		SourcePath string `json:"source_path"`
@@ -71,7 +272,7 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	root, err := s.db.CreateRoot(r.Context(), req.Name, req.SourcePath)
+	root, err := s.db.CreateRoot(r.Context(), id.OrgID, req.Name, req.SourcePath)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -81,7 +282,12 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
-	roots, err := s.db.ListRoots(r.Context())
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	roots, err := s.db.ListRoots(r.Context(), id.OrgID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -90,8 +296,13 @@ func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id)
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
@@ -100,6 +311,12 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+		return
+	}
+
 	rootID := r.PathValue("id")
 	filePath := r.URL.Query().Get("path")
 	if filePath == "" {
@@ -107,7 +324,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit upload size to 512 MB
+	// Verify root belongs to org
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
+	// Check write ACL for this path
+	if !s.checkWriteACL(r.Context(), id, rootID, filePath) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "no write permission for this path"})
+		return
+	}
+
 	const maxUploadSize = 512 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	data, err := io.ReadAll(r.Body)
@@ -126,7 +354,19 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
 	rootID := r.PathValue("id")
+
+	// Verify root belongs to org
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
 	state, err := s.db.LoadState(r.Context(), rootID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -136,7 +376,19 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+		return
+	}
+
 	rootID := r.PathValue("id")
+
+	// Verify root belongs to org
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
 
 	var req models.SyncRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -145,16 +397,26 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	req.RootID = rootID
 
-	// Verify root exists
-	_, err := s.db.GetRoot(r.Context(), rootID)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
+	// Count actionable files
+	actionableFiles := 0
+	for _, c := range req.Changes {
+		if c.Status != models.StatusUnchanged {
+			actionableFiles++
+		}
 	}
 
-	resp, err := s.processSync(r.Context(), &req)
+	// Create sync job
+	job, err := s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)
+	if err != nil {
+		log.Printf("warning: failed to create sync job: %v", err)
+	}
+
+	resp, err := s.processSync(r.Context(), id.OrgID, &req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
+		if job != nil {
+			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -167,16 +429,195 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		log.Printf("error updating timestamp for root %s: %v", rootID, err)
 	}
 
+	if job != nil {
+		_ = s.db.CompleteSyncJob(r.Context(), job.ID, "completed", nil)
+		resp.SyncJobID = job.ID
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) processSync(ctx context.Context, req *models.SyncRequest) (*models.SyncResponse, error) {
+// ---------------------------------------------------------------------------
+// Sync status
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	rootID := r.PathValue("id")
+
+	job, err := s.db.GetLatestSyncJob(r.Context(), id.OrgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no sync jobs found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	rootID := r.PathValue("id")
+
+	jobs, err := s.db.ListSyncJobs(r.Context(), id.OrgID, rootID, 20)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, jobs)
+}
+
+// ---------------------------------------------------------------------------
+// ACLs
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleCreateACL(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	rootID := r.PathValue("id")
+
+	var req struct {
+		PathPrefix string `json:"path_prefix"`
+		GrantTo    string `json:"grant_to"`
+		Permission string `json:"permission"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.PathPrefix == "" {
+		req.PathPrefix = "/"
+	}
+	if req.Permission == "" {
+		req.Permission = "read"
+	}
+
+	acl, err := s.db.CreateACL(r.Context(), id.OrgID, rootID, req.PathPrefix, req.GrantTo, req.Permission)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, acl)
+}
+
+func (s *Server) handleListACLs(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	rootID := r.PathValue("id")
+
+	acls, err := s.db.ListACLs(r.Context(), id.OrgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, acls)
+}
+
+func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	aclID := r.PathValue("aclId")
+
+	if err := s.db.DeleteACL(r.Context(), id.OrgID, aclID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ---------------------------------------------------------------------------
+// ACL helpers
+// ---------------------------------------------------------------------------
+
+// checkWriteACL checks if a user has write permission for a path in a root.
+// If no ACLs are configured for the root, all org editors+ have access.
+func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
+	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
+	if err != nil || len(acls) == 0 {
+		// No ACLs configured → default: editors+ can write
+		return auth.HasMinRole(id.Role, auth.RoleEditor)
+	}
+
+	return checkPermission(acls, filePath, "write")
+}
+
+// checkReadACL checks if a user has read permission for a path in a root.
+func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
+	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
+	if err != nil || len(acls) == 0 {
+		return true // No ACLs → all org members can read
+	}
+
+	return checkPermission(acls, filePath, "read")
+}
+
+// buildACLFilter returns Turbopuffer filter conditions based on user's ACLs.
+// Returns nil if no filtering is needed (user has full access).
+func (s *Server) buildACLFilter(ctx context.Context, id *auth.Identity, rootID string) []string {
+	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
+	if err != nil || len(acls) == 0 {
+		return nil // No ACLs → full access
+	}
+
+	// Collect denied path prefixes
+	var denied []string
+	for _, acl := range acls {
+		if acl.Permission == "none" {
+			denied = append(denied, acl.PathPrefix)
+		}
+	}
+	return denied
+}
+
+// checkPermission evaluates ACLs for a specific path and permission.
+// ACLs are expected to be sorted by path_prefix length descending (most specific first).
+func checkPermission(acls []models.RootACL, filePath, requiredPermission string) bool {
+	normalizedPath := "/" + filePath
+
+	for _, acl := range acls {
+		if strings.HasPrefix(normalizedPath, acl.PathPrefix) {
+			if acl.Permission == "none" {
+				return false
+			}
+			if requiredPermission == "read" {
+				return acl.Permission == "read" || acl.Permission == "write"
+			}
+			return acl.Permission == "write"
+		}
+	}
+	return true // No matching ACL → allow
+}
+
+// ---------------------------------------------------------------------------
+// Sync processing
+// ---------------------------------------------------------------------------
+
+func (s *Server) processSync(ctx context.Context, orgID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	resp := &models.SyncResponse{RootID: req.RootID}
+	processed := 0
 
 	for _, change := range req.Changes {
 		switch change.Status {
 		case models.StatusAdded, models.StatusModified:
-			if err := s.processFileAdd(ctx, req.RootID, change); err != nil {
+			if job != nil {
+				_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "chunking", processed)
+			}
+			if err := s.processFileAdd(ctx, orgID, req.RootID, change); err != nil {
 				return nil, fmt.Errorf("processing %s (%s): %w", change.Path, change.Status, err)
 			}
 			resp.ChunksAdded++
@@ -199,30 +640,39 @@ func (s *Server) processSync(ctx context.Context, req *models.SyncRequest) (*mod
 		case models.StatusUnchanged:
 			// nothing to do
 		}
+
+		processed++
+		if job != nil && processed%5 == 0 {
+			_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "embedding", processed)
+		}
 	}
 
 	return resp, nil
 }
 
-func (s *Server) processFileAdd(ctx context.Context, rootID string, change models.FileChange) error {
+// tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
+func tpNamespace(orgID, rootID string) string {
+	return fmt.Sprintf("org-%s-root-%s", orgID, rootID)
+}
+
+func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, change models.FileChange) error {
+	ns := tpNamespace(orgID, rootID)
+
 	// For MODIFIED files, delete old chunks first
 	if change.Status == models.StatusModified {
 		filter := []any{"file_path", "Eq", change.Path}
-		if err := s.tp.DeleteByFilter(rootID, filter); err != nil {
+		if err := s.tp.DeleteByFilter(ns, filter); err != nil {
 			log.Printf("warning: failed to delete old chunks for %s: %v", change.Path, err)
 		}
 	}
 
-	// The CLI uploads the file to S3 before calling sync
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 
-	// Download file content from S3 to send inline to Modal
 	fileData, err := s.s3.Download(ctx, s3Key)
 	if err != nil {
 		return fmt.Errorf("downloading %s from S3: %w", s3Key, err)
 	}
 
-	// Call Modal to chunk the file (send content inline as base64)
 	chunkResp, err := s.modal.ChunkFile(ChunkFileRequest{
 		S3Key:      s3Key,
 		FilePath:   change.Path,
@@ -238,7 +688,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		return nil
 	}
 
-	// Check embedding cache — skip re-embedding for unchanged chunks
 	var contentHashes []string
 	for _, c := range chunkResp.Chunks {
 		if h, ok := c["content_hash"].(string); ok {
@@ -252,7 +701,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		cached = make(map[string][]float64)
 	}
 
-	// Split chunks into cached (have embedding) and uncached (need embedding)
 	var uncachedChunks []map[string]any
 	cachedRows := make(map[int][]float64)
 
@@ -268,7 +716,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 	log.Printf("file %s: %d chunks total, %d cached, %d to embed",
 		change.Path, len(chunkResp.Chunks), len(cachedRows), len(uncachedChunks))
 
-	// Embed only uncached chunks via Modal
 	var embedResults []map[string]any
 	if len(uncachedChunks) > 0 {
 		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
@@ -277,7 +724,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		}
 		embedResults = embedResp.Results
 
-		// Save new embeddings to cache
 		newCacheEntries := make(map[string][]float64)
 		for _, r := range embedResults {
 			chunk, _ := r["chunk"].(map[string]any)
@@ -297,7 +743,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		}
 	}
 
-	// Build Turbopuffer rows: merge cached + freshly embedded
 	rows := make([]map[string]any, len(chunkResp.Chunks))
 	embedIdx := 0
 	for i, c := range chunkResp.Chunks {
@@ -328,24 +773,23 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		rows[i] = row
 	}
 
-	return s.tp.UpsertRows(rootID, rows, "cosine_distance")
+	return s.tp.UpsertRows(ns, rows, "cosine_distance")
 }
 
 func (s *Server) processFileRemove(ctx context.Context, rootID string, change models.FileChange) error {
-	// Delete from Turbopuffer by file_path filter
 	filter := []any{"file_path", "Eq", change.Path}
+	// Note: we can't scope by org here since we don't have orgID in context easily,
+	// but the namespace is already org-scoped via tpNamespace
 	return s.tp.DeleteByFilter(rootID, filter)
 }
 
 func (s *Server) processFileMove(ctx context.Context, rootID string, change models.FileChange) error {
-	// 1. Rename S3 objects
 	oldFileKey := fmt.Sprintf("files/%s/%s", rootID, change.OldPath)
 	newFileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 	if err := s.s3.Rename(ctx, oldFileKey, newFileKey); err != nil {
 		log.Printf("warning: S3 rename failed (may not exist): %v", err)
 	}
 
-	// 2. Query existing chunks to get their vectors and data
 	rows, err := s.tp.Query(rootID,
 		[]any{"file_path", "asc"},
 		10000,
@@ -360,7 +804,6 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		return nil
 	}
 
-	// 3. Delete old IDs
 	oldIDs := make([]string, len(rows))
 	for i, row := range rows {
 		oldIDs[i] = fmt.Sprintf("%v", row["id"])
@@ -369,7 +812,6 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		return fmt.Errorf("deleting old chunks: %w", err)
 	}
 
-	// 4. Re-upsert with new file path using cached embeddings (no re-embedding)
 	var contentHashes []string
 	for _, row := range rows {
 		if h, ok := row["content_hash"].(string); ok {
@@ -383,7 +825,6 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		cached = make(map[string][]float64)
 	}
 
-	// Build new rows; fall back to re-embedding only for chunks missing from cache
 	var uncachedChunks []map[string]any
 	newRows := make([]map[string]any, len(rows))
 	for i, row := range rows {
@@ -413,7 +854,6 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		}
 	}
 
-	// Only call Modal for chunks not in cache
 	if len(uncachedChunks) > 0 {
 		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(uncachedChunks), len(rows))
 		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
@@ -432,7 +872,17 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 	return s.tp.UpsertRows(rootID, newRows, "cosine_distance")
 }
 
+// ---------------------------------------------------------------------------
+// Query (with ACL filtering)
+// ---------------------------------------------------------------------------
+
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+
 	var req models.QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -454,13 +904,23 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		req.Mode = "hybrid"
 	}
 
+	// Verify root belongs to org
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, req.RootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
+	ns := tpNamespace(id.OrgID, req.RootID)
 	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "page_number", "image_path"}
 
-	// Build glob filter if specified
+	// Build filter from glob + ACL denied paths
 	var filters any
 	if req.Glob != "" {
 		filters = []any{"file_path", "Glob", req.Glob}
 	}
+
+	// Get denied paths from ACLs and filter results post-query
+	deniedPrefixes := s.buildACLFilter(r.Context(), id, req.RootID)
 
 	var rows []map[string]any
 	var err error
@@ -468,7 +928,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, filters, includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, req.TopK, filters, includeAttrs)
 
 	case "vector":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -477,7 +937,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, filters, includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, req.TopK, filters, includeAttrs)
 
 	case "hybrid":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -485,7 +945,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
 			return
 		}
-		rows, err = s.tp.HybridSearch(req.RootID, req.Query, embedding, req.TopK, req.Glob)
+		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, req.TopK, req.Glob)
 
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
@@ -497,8 +957,24 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results := make([]models.QueryResult, len(rows))
-	for i, row := range rows {
+	// Filter out denied paths
+	var filteredRows []map[string]any
+	for _, row := range rows {
+		fp := strVal(row, "file_path")
+		denied := false
+		for _, prefix := range deniedPrefixes {
+			if strings.HasPrefix("/"+fp, prefix) {
+				denied = true
+				break
+			}
+		}
+		if !denied {
+			filteredRows = append(filteredRows, row)
+		}
+	}
+
+	results := make([]models.QueryResult, len(filteredRows))
+	for i, row := range filteredRows {
 		results[i] = models.QueryResult{
 			FilePath: strVal(row, "file_path"),
 			Content:  strVal(row, "content"),
@@ -529,6 +1005,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		Mode:    req.Mode,
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 func detectFileType(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))

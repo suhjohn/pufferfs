@@ -4,6 +4,7 @@ package models
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -15,9 +16,63 @@ func MakeChunkID(rootID, filePath string, chunkIndex int) string {
 	return fmt.Sprintf("%s:%d", pathHash, chunkIndex)
 }
 
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+// Organization represents a tenant.
+type Organization struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+// User represents an authenticated user.
+type User struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	AvatarURL string    `json:"avatar_url"`
+	Provider  string    `json:"provider"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// OrgMember is a user's membership in an org.
+type OrgMember struct {
+	UserID    string    `json:"user_id"`
+	Email     string    `json:"email"`
+	Name      string    `json:"name"`
+	AvatarURL string    `json:"avatar_url"`
+	Role      string    `json:"role"`
+	JoinedAt  time.Time `json:"joined_at"`
+}
+
+// ---------------------------------------------------------------------------
+// API Keys
+// ---------------------------------------------------------------------------
+
+// APIKey represents an API key (never includes the raw key value).
+type APIKey struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Scopes    []string   `json:"scopes"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Roots & Files
+// ---------------------------------------------------------------------------
+
 // RootMetadata represents a synced directory root.
 type RootMetadata struct {
 	ID         string    `json:"id" db:"id"`
+	OrgID      string    `json:"org_id" db:"org_id"`
 	Name       string    `json:"name" db:"name"`
 	SourcePath string    `json:"source_path" db:"source_path"`
 	CreatedAt  time.Time `json:"created_at" db:"created_at"`
@@ -26,9 +81,9 @@ type RootMetadata struct {
 
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {
-	Size        int64   `json:"size"`
-	ContentHash string  `json:"content_hash"`
-	Mtime       int64   `json:"mtime"`
+	Size        int64  `json:"size"`
+	ContentHash string `json:"content_hash"`
+	Mtime       int64  `json:"mtime"`
 }
 
 // FileChangeStatus enumerates possible diff outcomes.
@@ -71,16 +126,20 @@ type DiffResult struct {
 	Stats   DiffStats    `json:"stats"`
 }
 
+// ---------------------------------------------------------------------------
+// Chunks & Embeddings
+// ---------------------------------------------------------------------------
+
 // Chunk is a text chunk extracted from a file.
 type Chunk struct {
-	ID          string `json:"id"`
-	RootID      string `json:"root_id"`
-	FilePath    string `json:"file_path"`
-	ChunkIndex  int    `json:"chunk_index"`
-	Content     string `json:"content"`
-	ContentHash string `json:"content_hash"`
-	FileType    string `json:"file_type"`
-	PageNumber  *int   `json:"page_number,omitempty"`
+	ID          string  `json:"id"`
+	RootID      string  `json:"root_id"`
+	FilePath    string  `json:"file_path"`
+	ChunkIndex  int     `json:"chunk_index"`
+	Content     string  `json:"content"`
+	ContentHash string  `json:"content_hash"`
+	FileType    string  `json:"file_type"`
+	PageNumber  *int    `json:"page_number,omitempty"`
 	ImagePath   *string `json:"image_path,omitempty"`
 }
 
@@ -90,26 +149,35 @@ type ChunkWithEmbedding struct {
 	Embedding []float64 `json:"embedding"`
 }
 
+// ---------------------------------------------------------------------------
+// Sync
+// ---------------------------------------------------------------------------
+
 // SyncRequest is sent from CLI to server to trigger a sync.
 type SyncRequest struct {
-	RootID  string       `json:"root_id"`
-	Changes []FileChange `json:"changes"`
-	State   map[string]FileState `json:"state"`
+	RootID  string                  `json:"root_id"`
+	Changes []FileChange            `json:"changes"`
+	State   map[string]FileState    `json:"state"`
 }
 
 // SyncResponse is returned from server after sync completes.
 type SyncResponse struct {
-	RootID       string    `json:"root_id"`
-	ChunksAdded  int       `json:"chunks_added"`
-	ChunksRemoved int      `json:"chunks_removed"`
-	ChunksMoved  int       `json:"chunks_moved"`
-	FilesProcessed int     `json:"files_processed"`
+	RootID         string `json:"root_id"`
+	SyncJobID      string `json:"sync_job_id,omitempty"`
+	ChunksAdded    int    `json:"chunks_added"`
+	ChunksRemoved  int    `json:"chunks_removed"`
+	ChunksMoved    int    `json:"chunks_moved"`
+	FilesProcessed int    `json:"files_processed"`
 }
+
+// ---------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------
 
 // QueryRequest is sent from CLI to server to query indexed content.
 type QueryRequest struct {
 	Query  string `json:"query"`
-	Mode   string `json:"mode"`   // "fts", "vector", "hybrid"
+	Mode   string `json:"mode"`
 	RootID string `json:"root_id"`
 	Glob   string `json:"glob,omitempty"`
 	TopK   int    `json:"top_k"`
@@ -131,4 +199,37 @@ type QueryResponse struct {
 	Results []QueryResult `json:"results"`
 	Query   string        `json:"query"`
 	Mode    string        `json:"mode"`
+}
+
+// ---------------------------------------------------------------------------
+// ACLs
+// ---------------------------------------------------------------------------
+
+// RootACL represents a folder-level access control entry.
+type RootACL struct {
+	ID         string    `json:"id"`
+	OrgID      string    `json:"org_id"`
+	RootID     string    `json:"root_id"`
+	PathPrefix string    `json:"path_prefix"`
+	GrantTo    string    `json:"grant_to"`
+	Permission string    `json:"permission"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+// ---------------------------------------------------------------------------
+// Sync Jobs
+// ---------------------------------------------------------------------------
+
+// SyncJob tracks the lifecycle of a sync operation.
+type SyncJob struct {
+	ID         string              `json:"id"`
+	OrgID      string              `json:"org_id"`
+	RootID     string              `json:"root_id"`
+	UserID     string              `json:"user_id"`
+	Status     string              `json:"status"`
+	TotalFiles int                 `json:"total_files"`
+	Processed  int                 `json:"processed"`
+	Errors     json.RawMessage     `json:"errors"`
+	StartedAt  time.Time           `json:"started_at"`
+	FinishedAt *time.Time          `json:"finished_at,omitempty"`
 }

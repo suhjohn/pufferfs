@@ -48,14 +48,42 @@ func main() {
 	// Server
 	srv := server.New(db, s3Client, modalClient, tpClient)
 
-	// Wrap with auth middleware
-	apiKey := os.Getenv("PUFFERFS_API_KEY")
-	var handler http.Handler = srv.Handler()
-	if apiKey != "" {
-		handler = auth.Middleware(apiKey)(handler)
-		log.Println("API key authentication enabled")
+	// JWT secret
+	jwtSecret := []byte(os.Getenv("JWT_SECRET"))
+	if len(jwtSecret) == 0 {
+		jwtSecret = []byte("pufferfs-dev-secret-change-in-production")
+		log.Println("WARNING: Using default JWT secret. Set JWT_SECRET in production.")
+	}
+
+	// Auth middleware: supports both JWT and API key
+	handler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
+
+	// OAuth2 handler (Google)
+	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
+	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	redirectURL := os.Getenv("OAUTH_REDIRECT_URL")
+	if redirectURL == "" {
+		redirectURL = "http://localhost:8080/auth/callback"
+	}
+
+	if googleClientID != "" && googleClientSecret != "" {
+		oauthHandler := auth.NewOAuthHandler(auth.OAuthConfig{
+			GoogleClientID:     googleClientID,
+			GoogleClientSecret: googleClientSecret,
+			RedirectURL:        redirectURL,
+			JWTSecret:          jwtSecret,
+		}, db.UpsertUser)
+
+		// Register OAuth routes on a separate mux that wraps the auth-protected one
+		topMux := http.NewServeMux()
+		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)
+		topMux.HandleFunc("GET /auth/callback", oauthHandler.HandleCallback)
+		topMux.Handle("/", handler)
+		handler = topMux
+
+		log.Println("Google OAuth2 enabled")
 	} else {
-		log.Println("WARNING: No PUFFERFS_API_KEY set, running without authentication")
+		log.Println("Google OAuth2 disabled (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to enable)")
 	}
 
 	addr := os.Getenv("LISTEN_ADDR")
@@ -64,8 +92,11 @@ func main() {
 	}
 
 	httpSrv := &http.Server{
-		Addr:    addr,
-		Handler: handler,
+		Addr:         addr,
+		Handler:      handler,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 600 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Graceful shutdown

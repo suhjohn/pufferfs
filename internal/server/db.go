@@ -5,12 +5,18 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pressly/goose/v3"
 
+	// pgx stdlib adapter for goose
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -27,7 +33,7 @@ func NewDB(databaseURL string) (*DB, error) {
 	}
 
 	db := &DB{pool: pool}
-	if err := db.migrate(); err != nil {
+	if err := db.runMigrations(databaseURL); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("running migrations: %w", err)
 	}
@@ -39,10 +45,71 @@ func (db *DB) Close() {
 	db.pool.Close()
 }
 
-func (db *DB) migrate() error {
+func (db *DB) runMigrations(databaseURL string) error {
+	migrationsDir := os.Getenv("MIGRATIONS_DIR")
+	if migrationsDir == "" {
+		migrationsDir = "migrations"
+	}
+
+	// Check if migrations directory exists; fall back to inline if not
+	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
+		return db.migrateFallback()
+	}
+
+	gooseDB, err := goose.OpenDBWithDriver("pgx", databaseURL)
+	if err != nil {
+		return fmt.Errorf("goose open: %w", err)
+	}
+	defer gooseDB.Close()
+
+	if err := goose.Up(gooseDB, migrationsDir); err != nil {
+		return fmt.Errorf("goose up: %w", err)
+	}
+	return nil
+}
+
+// migrateFallback runs inline SQL migrations when goose files aren't available.
+func (db *DB) migrateFallback() error {
 	_, err := db.pool.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS organizations (
+			id         TEXT PRIMARY KEY,
+			name       TEXT NOT NULL,
+			slug       TEXT NOT NULL UNIQUE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS users (
+			id          TEXT PRIMARY KEY,
+			email       TEXT NOT NULL UNIQUE,
+			name        TEXT NOT NULL DEFAULT '',
+			avatar_url  TEXT NOT NULL DEFAULT '',
+			provider    TEXT NOT NULL DEFAULT 'google',
+			provider_id TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS org_members (
+			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			role      TEXT NOT NULL DEFAULT 'viewer',
+			joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, user_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS api_keys (
+			id         TEXT PRIMARY KEY,
+			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			key_hash   TEXT NOT NULL UNIQUE,
+			name       TEXT NOT NULL DEFAULT '',
+			scopes     TEXT[] NOT NULL DEFAULT '{}',
+			expires_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
 		CREATE TABLE IF NOT EXISTS roots (
 			id          TEXT PRIMARY KEY,
+			org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
 			name        TEXT NOT NULL,
 			source_path TEXT NOT NULL,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -57,17 +124,278 @@ func (db *DB) migrate() error {
 
 		CREATE TABLE IF NOT EXISTS embedding_cache (
 			content_hash TEXT PRIMARY KEY,
+			org_id       TEXT REFERENCES organizations(id) ON DELETE CASCADE,
 			embedding    BYTEA NOT NULL,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS root_acls (
+			id          TEXT PRIMARY KEY,
+			org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			root_id     TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			path_prefix TEXT NOT NULL DEFAULT '/',
+			grant_to    TEXT NOT NULL,
+			permission  TEXT NOT NULL DEFAULT 'read',
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS sync_jobs (
+			id           TEXT PRIMARY KEY,
+			org_id       TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			root_id      TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			user_id      TEXT NOT NULL REFERENCES users(id),
+			status       TEXT NOT NULL DEFAULT 'pending',
+			total_files  INT NOT NULL DEFAULT 0,
+			processed    INT NOT NULL DEFAULT 0,
+			errors       JSONB NOT NULL DEFAULT '[]',
+			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			finished_at  TIMESTAMPTZ
 		);
 	`)
 	return err
 }
 
-// CreateRoot creates a new root metadata entry.
-func (db *DB) CreateRoot(ctx context.Context, name, sourcePath string) (*models.RootMetadata, error) {
+// ---------------------------------------------------------------------------
+// Organizations
+// ---------------------------------------------------------------------------
+
+func (db *DB) CreateOrganization(ctx context.Context, name, slug string) (*models.Organization, error) {
+	org := &models.Organization{
+		ID:        uuid.New().String(),
+		Name:      name,
+		Slug:      slug,
+		CreatedAt: time.Now(),
+	}
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO organizations (id, name, slug, created_at) VALUES ($1, $2, $3, $4)`,
+		org.ID, org.Name, org.Slug, org.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return org, nil
+}
+
+func (db *DB) GetOrganization(ctx context.Context, id string) (*models.Organization, error) {
+	org := &models.Organization{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, name, slug, created_at FROM organizations WHERE id = $1`, id,
+	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return org, nil
+}
+
+// ---------------------------------------------------------------------------
+// Users
+// ---------------------------------------------------------------------------
+
+// UpsertUser creates or updates a user from OAuth info, returning the user ID.
+// Also creates a personal org if the user is new.
+func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider string) (userID, orgID string, role auth.Role, err error) {
+	// Check if user exists
+	var existingID string
+	err = db.pool.QueryRow(ctx,
+		`SELECT id FROM users WHERE email = $1`, info.Email,
+	).Scan(&existingID)
+
+	if err == nil {
+		// User exists — update profile
+		_, err = db.pool.Exec(ctx,
+			`UPDATE users SET name = $1, avatar_url = $2, provider_id = $3 WHERE id = $4`,
+			info.Name, info.Picture, info.ID, existingID,
+		)
+		if err != nil {
+			return "", "", "", fmt.Errorf("updating user: %w", err)
+		}
+
+		// Find their org membership (pick first org)
+		err = db.pool.QueryRow(ctx,
+			`SELECT org_id, role FROM org_members WHERE user_id = $1 LIMIT 1`, existingID,
+		).Scan(&orgID, &role)
+		if err != nil {
+			return "", "", "", fmt.Errorf("looking up org membership: %w", err)
+		}
+		return existingID, orgID, role, nil
+	}
+
+	// New user — create user + personal org
+	userID = uuid.New().String()
+	_, err = db.pool.Exec(ctx,
+		`INSERT INTO users (id, email, name, avatar_url, provider, provider_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+		userID, info.Email, info.Name, info.Picture, provider, info.ID,
+	)
+	if err != nil {
+		return "", "", "", fmt.Errorf("creating user: %w", err)
+	}
+
+	// Create a personal org
+	slug := strings.Split(info.Email, "@")[0]
+	org, err := db.CreateOrganization(ctx, info.Name+"'s Workspace", slug)
+	if err != nil {
+		return "", "", "", fmt.Errorf("creating personal org: %w", err)
+	}
+
+	// Add user as owner
+	_, err = db.pool.Exec(ctx,
+		`INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'owner')`,
+		org.ID, userID,
+	)
+	if err != nil {
+		return "", "", "", fmt.Errorf("adding org membership: %w", err)
+	}
+
+	return userID, org.ID, auth.RoleOwner, nil
+}
+
+// GetUser retrieves a user by ID.
+func (db *DB) GetUser(ctx context.Context, id string) (*models.User, error) {
+	u := &models.User{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, email, name, avatar_url, provider, created_at FROM users WHERE id = $1`, id,
+	).Scan(&u.ID, &u.Email, &u.Name, &u.AvatarURL, &u.Provider, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// ---------------------------------------------------------------------------
+// API Keys
+// ---------------------------------------------------------------------------
+
+// CreateAPIKey creates a new API key for a user in an org.
+func (db *DB) CreateAPIKey(ctx context.Context, orgID, userID, name string, scopes []string) (rawKey string, err error) {
+	id := uuid.New().String()
+	rawKey = "pfs_" + uuid.New().String()
+	keyHash := auth.HashAPIKey(rawKey)
+
+	_, err = db.pool.Exec(ctx,
+		`INSERT INTO api_keys (id, org_id, user_id, key_hash, name, scopes, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+		id, orgID, userID, keyHash, name, scopes,
+	)
+	if err != nil {
+		return "", err
+	}
+	return rawKey, nil
+}
+
+// ResolveAPIKey looks up an API key by its hash and returns the associated identity.
+func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity, error) {
+	var orgID, userID, role string
+	err := db.pool.QueryRow(ctx,
+		`SELECT ak.org_id, ak.user_id, om.role
+		 FROM api_keys ak
+		 JOIN org_members om ON om.org_id = ak.org_id AND om.user_id = ak.user_id
+		 WHERE ak.key_hash = $1
+		   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`,
+		keyHash,
+	).Scan(&orgID, &userID, &role)
+	if err != nil {
+		return nil, err
+	}
+
+	var email string
+	_ = db.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
+
+	return &auth.Identity{
+		UserID: userID,
+		OrgID:  orgID,
+		Role:   auth.Role(role),
+		Email:  email,
+	}, nil
+}
+
+// ListAPIKeys lists all API keys for a user in an org.
+func (db *DB) ListAPIKeys(ctx context.Context, orgID, userID string) ([]models.APIKey, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, name, scopes, created_at, expires_at
+		 FROM api_keys WHERE org_id = $1 AND user_id = $2 ORDER BY created_at DESC`,
+		orgID, userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []models.APIKey
+	for rows.Next() {
+		var k models.APIKey
+		if err := rows.Scan(&k.ID, &k.Name, &k.Scopes, &k.CreatedAt, &k.ExpiresAt); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+// DeleteAPIKey deletes an API key by ID (scoped to org).
+func (db *DB) DeleteAPIKey(ctx context.Context, orgID, keyID string) error {
+	_, err := db.pool.Exec(ctx,
+		`DELETE FROM api_keys WHERE id = $1 AND org_id = $2`, keyID, orgID,
+	)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Org Members
+// ---------------------------------------------------------------------------
+
+// AddOrgMember adds a user to an org with a role.
+func (db *DB) AddOrgMember(ctx context.Context, orgID, userID string, role auth.Role) error {
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO org_members (org_id, user_id, role)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3`,
+		orgID, userID, string(role),
+	)
+	return err
+}
+
+// ListOrgMembers lists all members of an org.
+func (db *DB) ListOrgMembers(ctx context.Context, orgID string) ([]models.OrgMember, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT u.id, u.email, u.name, u.avatar_url, om.role, om.joined_at
+		 FROM org_members om JOIN users u ON u.id = om.user_id
+		 WHERE om.org_id = $1 ORDER BY om.joined_at`,
+		orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []models.OrgMember
+	for rows.Next() {
+		var m models.OrgMember
+		if err := rows.Scan(&m.UserID, &m.Email, &m.Name, &m.AvatarURL, &m.Role, &m.JoinedAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, nil
+}
+
+// RemoveOrgMember removes a user from an org.
+func (db *DB) RemoveOrgMember(ctx context.Context, orgID, userID string) error {
+	_, err := db.pool.Exec(ctx,
+		`DELETE FROM org_members WHERE org_id = $1 AND user_id = $2`, orgID, userID,
+	)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Roots (org-scoped)
+// ---------------------------------------------------------------------------
+
+// CreateRoot creates a new root metadata entry scoped to an org.
+func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{
 		ID:         uuid.New().String(),
+		OrgID:      orgID,
 		Name:       name,
 		SourcePath: sourcePath,
 		CreatedAt:  time.Now(),
@@ -75,9 +403,9 @@ func (db *DB) CreateRoot(ctx context.Context, name, sourcePath string) (*models.
 	}
 
 	_, err := db.pool.Exec(ctx,
-		`INSERT INTO roots (id, name, source_path, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		root.ID, root.Name, root.SourcePath, root.CreatedAt, root.UpdatedAt,
+		`INSERT INTO roots (id, org_id, name, source_path, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		root.ID, root.OrgID, root.Name, root.SourcePath, root.CreatedAt, root.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -85,34 +413,37 @@ func (db *DB) CreateRoot(ctx context.Context, name, sourcePath string) (*models.
 	return root, nil
 }
 
-// GetRoot retrieves a root by ID.
-func (db *DB) GetRoot(ctx context.Context, id string) (*models.RootMetadata, error) {
+// GetRoot retrieves a root by ID, scoped to an org.
+func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, name, source_path, created_at, updated_at FROM roots WHERE id = $1`, id,
-	).Scan(&root.ID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
+		`SELECT id, org_id, name, source_path, created_at, updated_at
+		 FROM roots WHERE id = $1 AND org_id = $2`, id, orgID,
+	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return root, nil
 }
 
-// GetRootByName retrieves a root by name.
-func (db *DB) GetRootByName(ctx context.Context, name string) (*models.RootMetadata, error) {
+// GetRootByName retrieves a root by name, scoped to an org.
+func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, name, source_path, created_at, updated_at FROM roots WHERE name = $1`, name,
-	).Scan(&root.ID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
+		`SELECT id, org_id, name, source_path, created_at, updated_at
+		 FROM roots WHERE name = $1 AND org_id = $2`, name, orgID,
+	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return root, nil
 }
 
-// ListRoots returns all roots.
-func (db *DB) ListRoots(ctx context.Context) ([]models.RootMetadata, error) {
+// ListRoots returns all roots for an org.
+func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadata, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT id, name, source_path, created_at, updated_at FROM roots ORDER BY created_at DESC`,
+		`SELECT id, org_id, name, source_path, created_at, updated_at
+		 FROM roots WHERE org_id = $1 ORDER BY created_at DESC`, orgID,
 	)
 	if err != nil {
 		return nil, err
@@ -122,7 +453,7 @@ func (db *DB) ListRoots(ctx context.Context) ([]models.RootMetadata, error) {
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.Name, &r.SourcePath, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
@@ -148,7 +479,7 @@ func (db *DB) LoadState(ctx context.Context, rootID string) (map[string]models.F
 		`SELECT state FROM root_states WHERE root_id = $1`, rootID,
 	).Scan(&state)
 	if err != nil {
-		return make(map[string]models.FileState), nil // Return empty on not found
+		return make(map[string]models.FileState), nil
 	}
 	return state, nil
 }
@@ -161,8 +492,11 @@ func (db *DB) UpdateRootTimestamp(ctx context.Context, rootID string) error {
 	return err
 }
 
+// ---------------------------------------------------------------------------
+// Embedding Cache
+// ---------------------------------------------------------------------------
+
 // GetCachedEmbeddings looks up cached embeddings by content hash.
-// Returns a map from content_hash -> embedding (as float64 slice).
 func (db *DB) GetCachedEmbeddings(ctx context.Context, hashes []string) (map[string][]float64, error) {
 	result := make(map[string][]float64)
 	if len(hashes) == 0 {
@@ -199,7 +533,6 @@ func (db *DB) SaveCachedEmbeddings(ctx context.Context, entries map[string][]flo
 		return nil
 	}
 
-	// Build a multi-value INSERT: INSERT INTO ... VALUES ($1,$2,$3), ($4,$5,$6), ...
 	var sb strings.Builder
 	sb.WriteString(`INSERT INTO embedding_cache (content_hash, embedding, created_at) VALUES `)
 	args := make([]any, 0, len(entries)*2)
@@ -219,7 +552,216 @@ func (db *DB) SaveCachedEmbeddings(ctx context.Context, entries map[string][]flo
 	return err
 }
 
-// encodeEmbedding converts a float64 slice to bytes (little-endian float64s).
+// ---------------------------------------------------------------------------
+// ACLs
+// ---------------------------------------------------------------------------
+
+// CreateACL creates a folder-level ACL entry.
+func (db *DB) CreateACL(ctx context.Context, orgID, rootID, pathPrefix, grantTo, permission string) (*models.RootACL, error) {
+	acl := &models.RootACL{
+		ID:         uuid.New().String(),
+		OrgID:      orgID,
+		RootID:     rootID,
+		PathPrefix: pathPrefix,
+		GrantTo:    grantTo,
+		Permission: permission,
+		CreatedAt:  time.Now(),
+	}
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO root_acls (id, org_id, root_id, path_prefix, grant_to, permission, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		acl.ID, acl.OrgID, acl.RootID, acl.PathPrefix, acl.GrantTo, acl.Permission, acl.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return acl, nil
+}
+
+// GetACLsForUser returns all ACL entries that apply to a user for a root.
+// Matches both direct user grants and role-based grants.
+func (db *DB) GetACLsForUser(ctx context.Context, orgID, rootID, userID string, role auth.Role) ([]models.RootACL, error) {
+	grantTargets := []string{
+		userID,
+		"role:" + string(role),
+	}
+	// Also include lower roles (e.g., admin gets editor+viewer grants)
+	for _, r := range []auth.Role{auth.RoleViewer, auth.RoleEditor, auth.RoleAdmin, auth.RoleOwner} {
+		if auth.Role(r) != role {
+			grantTargets = append(grantTargets, "role:"+string(r))
+		}
+	}
+
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at
+		 FROM root_acls
+		 WHERE org_id = $1 AND root_id = $2 AND grant_to = ANY($3)
+		 ORDER BY length(path_prefix) DESC`,
+		orgID, rootID, grantTargets,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var acls []models.RootACL
+	for rows.Next() {
+		var a models.RootACL
+		if err := rows.Scan(&a.ID, &a.OrgID, &a.RootID, &a.PathPrefix, &a.GrantTo, &a.Permission, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		acls = append(acls, a)
+	}
+	return acls, nil
+}
+
+// ListACLs returns all ACLs for a root.
+func (db *DB) ListACLs(ctx context.Context, orgID, rootID string) ([]models.RootACL, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at
+		 FROM root_acls WHERE org_id = $1 AND root_id = $2 ORDER BY path_prefix`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var acls []models.RootACL
+	for rows.Next() {
+		var a models.RootACL
+		if err := rows.Scan(&a.ID, &a.OrgID, &a.RootID, &a.PathPrefix, &a.GrantTo, &a.Permission, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		acls = append(acls, a)
+	}
+	return acls, nil
+}
+
+// DeleteACL removes an ACL entry.
+func (db *DB) DeleteACL(ctx context.Context, orgID, aclID string) error {
+	_, err := db.pool.Exec(ctx,
+		`DELETE FROM root_acls WHERE id = $1 AND org_id = $2`, aclID, orgID,
+	)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Sync Jobs
+// ---------------------------------------------------------------------------
+
+// CreateSyncJob creates a new sync job record.
+func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, totalFiles int) (*models.SyncJob, error) {
+	job := &models.SyncJob{
+		ID:         uuid.New().String(),
+		OrgID:      orgID,
+		RootID:     rootID,
+		UserID:     userID,
+		Status:     "pending",
+		TotalFiles: totalFiles,
+		Processed:  0,
+		StartedAt:  time.Now(),
+	}
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO sync_jobs (id, org_id, root_id, user_id, status, total_files, processed, started_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		job.ID, job.OrgID, job.RootID, job.UserID, job.Status, job.TotalFiles, job.Processed, job.StartedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// UpdateSyncJobStatus updates the status and progress of a sync job.
+func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string, processed int) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_jobs SET status = $1, processed = $2 WHERE id = $3`,
+		status, processed, jobID,
+	)
+	return err
+}
+
+// CompleteSyncJob marks a sync job as completed or failed.
+func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors []map[string]string) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_jobs SET status = $1, finished_at = NOW(), errors = $2 WHERE id = $3`,
+		status, errors, jobID,
+	)
+	return err
+}
+
+// GetSyncJob retrieves a sync job by ID.
+func (db *DB) GetSyncJob(ctx context.Context, orgID, jobID string) (*models.SyncJob, error) {
+	job := &models.SyncJob{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		 FROM sync_jobs WHERE id = $1 AND org_id = $2`, jobID, orgID,
+	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
+		&job.Processed, &job.Errors, &job.StartedAt, &job.FinishedAt)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// ListSyncJobs lists recent sync jobs for a root.
+func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int) ([]models.SyncJob, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
+		 ORDER BY started_at DESC LIMIT $3`,
+		orgID, rootID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []models.SyncJob
+	for rows.Next() {
+		var j models.SyncJob
+		if err := rows.Scan(&j.ID, &j.OrgID, &j.RootID, &j.UserID, &j.Status, &j.TotalFiles,
+			&j.Processed, &j.Errors, &j.StartedAt, &j.FinishedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// GetLatestSyncJob gets the most recent sync job for a root.
+func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*models.SyncJob, error) {
+	job := &models.SyncJob{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
+		 ORDER BY started_at DESC LIMIT 1`,
+		orgID, rootID,
+	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
+		&job.Processed, &job.Errors, &job.StartedAt, &job.FinishedAt)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+// Ping checks the database connection.
+func (db *DB) Ping(ctx context.Context) error {
+	return db.pool.Ping(ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
+
 func encodeEmbedding(emb []float64) []byte {
 	buf := make([]byte, len(emb)*8)
 	for i, v := range emb {
@@ -228,7 +770,6 @@ func encodeEmbedding(emb []float64) []byte {
 	return buf
 }
 
-// decodeEmbedding converts bytes back to a float64 slice.
 func decodeEmbedding(buf []byte) ([]float64, error) {
 	if len(buf)%8 != 0 {
 		return nil, fmt.Errorf("invalid embedding bytes length: %d", len(buf))
