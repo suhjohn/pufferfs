@@ -34,6 +34,7 @@ embedding_image = (
     .pip_install(
         "sentence-transformers>=3.0.0",
         "torch>=2.0.0",
+        "einops>=0.7.0",
         "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py")
@@ -150,25 +151,25 @@ def file_to_chunks(
 # chunks_to_embeddings: embed a batch of chunks
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
+EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 EMBEDDING_DIM = 768
 
 
 @app.cls(
     image=embedding_image,
-    gpu="T4",
+    cpu=2,
     timeout=600,
     memory=4096,
     scaledown_window=300,
 )
 class Embedder:
-    """Persistent embedding model container."""
+    """Persistent embedding model container (CPU-only, Nomic Embed v1.5)."""
 
     @modal.enter()
     def load_model(self):
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        self.model = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True)
 
     @modal.method()
     def embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
@@ -176,7 +177,7 @@ class Embedder:
         if not chunk_dicts:
             return []
 
-        texts = [c["content"] for c in chunk_dicts]
+        texts = [f"search_document: {c['content']}" for c in chunk_dicts]
         embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
         results: list[dict] = []
@@ -192,7 +193,8 @@ class Embedder:
         """Embed a list of raw text strings. Used for query embedding."""
         if not texts:
             return []
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        prefixed = [f"search_query: {t}" for t in texts]
+        embeddings = self.model.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
         return [emb.tolist() for emb in embeddings]
 
 
@@ -222,7 +224,7 @@ def chunk_file_endpoint(item: dict) -> dict:
 
 @app.function(
     image=embedding_image,
-    gpu="T4",
+    cpu=2,
     timeout=600,
     memory=4096,
 )
@@ -236,7 +238,7 @@ def embed_chunks_endpoint(item: dict) -> dict:
 
 @app.function(
     image=embedding_image,
-    gpu="T4",
+    cpu=2,
     timeout=600,
     memory=4096,
 )
