@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
-import io
+import random
 import re
-from typing import TYPE_CHECKING
 
 from models import Chunk
 
-if TYPE_CHECKING:
-    pass
+# ---------------------------------------------------------------------------
+# Gemini vision: image → text
+# ---------------------------------------------------------------------------
+
+GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+
+
+def image_to_text(image_bytes: bytes, gemini_api_key: str, mime_type: str = "image/jpeg") -> str:
+    """Call Gemini vision to extract text / describe an image."""
+    from google import genai
+    from google.genai.types import Part
+
+    client = genai.Client(api_key=gemini_api_key)
+    model = random.choice(GEMINI_MODELS)
+
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            "Extract all text from this image. If it contains a document page, "
+            "return the full text content preserving structure. If it is a photo "
+            "or diagram, describe what you see in detail. Return only the extracted "
+            "text or description, no preamble.",
+        ],
+    )
+    return response.text or ""
+
 
 # ---------------------------------------------------------------------------
 # Code chunking (line-based)
@@ -126,27 +150,59 @@ def _split_large(text: str, max_chars: int, overlap: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# PDF chunking (page → image → text)
+# Document chunking: PDF / DOCX / PPTX → PDF pages → images → Gemini text
 # ---------------------------------------------------------------------------
 
 
-def chunk_pdf(
+def _convert_to_pdf(file_bytes: bytes, file_type: str) -> bytes:
+    """Convert DOCX or PPTX to PDF via LibreOffice headless."""
+    import os
+    import subprocess
+    import tempfile
+
+    ext = {"docx": ".docx", "pptx": ".pptx"}[file_type]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        in_path = os.path.join(tmpdir, f"input{ext}")
+        with open(in_path, "wb") as f:
+            f.write(file_bytes)
+
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, in_path],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+
+        pdf_path = os.path.join(tmpdir, "input.pdf")
+        with open(pdf_path, "rb") as f:
+            return f.read()
+
+
+def chunk_document_via_images(
     file_bytes: bytes,
     root_id: str,
     file_path: str,
+    file_type: str,
     s3_client,
     bucket: str,
+    gemini_api_key: str,
 ) -> list[Chunk]:
-    """Extract pages from PDF as images, convert to text."""
+    """Unified pipeline: PDF/DOCX/PPTX → PDF pages → JPEG images → Gemini → text chunks."""
     import fitz  # pymupdf
 
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    # Convert DOCX/PPTX to PDF first
+    if file_type in ("docx", "pptx"):
+        pdf_bytes = _convert_to_pdf(file_bytes, file_type)
+    else:
+        pdf_bytes = file_bytes
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     chunks: list[Chunk] = []
 
     for page_num in range(len(doc)):
         page = doc[page_num]
 
-        # Render page to image (JPEG for smaller size)
+        # Render page to JPEG
         pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("jpeg")
 
@@ -159,8 +215,13 @@ def chunk_pdf(
             ContentType="image/jpeg",
         )
 
-        # Extract text from the page
-        text = page.get_text("text")
+        # Extract text via Gemini vision
+        if gemini_api_key:
+            text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
+        else:
+            # Fallback: PyMuPDF text extraction
+            text = page.get_text("text")
+
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
@@ -171,7 +232,7 @@ def chunk_pdf(
             chunk_index=page_num,
             content=text,
             content_hash=Chunk.hash_content(text),
-            file_type="pdf",
+            file_type=file_type,
             page_number=page_num,
             image_path=image_key,
         )
@@ -182,63 +243,7 @@ def chunk_pdf(
 
 
 # ---------------------------------------------------------------------------
-# DOCX chunking
-# ---------------------------------------------------------------------------
-
-
-def chunk_docx(
-    file_bytes: bytes,
-    root_id: str,
-    file_path: str,
-) -> list[Chunk]:
-    """Extract text from DOCX, chunk by paragraphs."""
-    from docx import Document
-
-    doc = Document(io.BytesIO(file_bytes))
-    full_text = "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    return chunk_markdown(full_text, root_id, file_path, file_type="docx")
-
-
-# ---------------------------------------------------------------------------
-# PPTX chunking
-# ---------------------------------------------------------------------------
-
-
-def chunk_pptx(
-    file_bytes: bytes,
-    root_id: str,
-    file_path: str,
-) -> list[Chunk]:
-    """Extract text from PPTX slides, one chunk per slide."""
-    from pptx import Presentation
-
-    prs = Presentation(io.BytesIO(file_bytes))
-    chunks: list[Chunk] = []
-
-    for slide_num, slide in enumerate(prs.slides):
-        texts: list[str] = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                texts.append(shape.text_frame.text)
-        content = "\n".join(texts)
-        if content.strip():
-            chunk = Chunk(
-                id=Chunk.make_id(root_id, file_path, slide_num),
-                root_id=root_id,
-                file_path=file_path,
-                chunk_index=slide_num,
-                content=content,
-                content_hash=Chunk.hash_content(content),
-                file_type="pptx",
-                page_number=slide_num,
-            )
-            chunks.append(chunk)
-
-    return chunks
-
-
-# ---------------------------------------------------------------------------
-# Image chunking (caption placeholder)
+# Standalone image chunking: image → Gemini → text
 # ---------------------------------------------------------------------------
 
 
@@ -248,22 +253,28 @@ def chunk_image(
     file_path: str,
     s3_client,
     bucket: str,
+    gemini_api_key: str,
 ) -> list[Chunk]:
-    """For images, create a single chunk with filename as placeholder content.
-
-    In production, this would call an LLM for captioning.
-    """
+    """For images: upload to S3, call Gemini for text extraction/captioning."""
     # Upload original image to S3
     image_key = f"chunks/{root_id}/{file_path}"
+    content_type = _guess_image_content_type(file_path)
     s3_client.put_object(
         Bucket=bucket,
         Key=image_key,
         Body=file_bytes,
-        ContentType=_guess_image_content_type(file_path),
+        ContentType=content_type,
     )
 
-    # For now, use filename as content. In production, call LLM for caption.
-    content = f"[Image: {file_path}]"
+    # Call Gemini for text extraction / captioning
+    if gemini_api_key:
+        content = image_to_text(file_bytes, gemini_api_key, mime_type=content_type)
+    else:
+        content = f"[Image: {file_path}]"
+
+    if not content.strip():
+        content = f"[Image: {file_path}]"
+
     chunk = Chunk(
         id=Chunk.make_id(root_id, file_path, 0),
         root_id=root_id,

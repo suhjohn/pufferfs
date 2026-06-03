@@ -17,12 +17,12 @@ app = modal.App("pufferfs")
 
 chunking_image = (
     modal.Image.debian_slim(python_version="3.12")
+    .apt_install("libreoffice-core", "libreoffice-writer", "libreoffice-impress")
     .pip_install(
         "boto3>=1.34.0",
         "pymupdf>=1.24.0",
-        "python-docx>=1.1.0",
-        "python-pptx>=0.6.23",
         "Pillow>=10.0.0",
+        "google-genai>=1.0.0",
         "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py")
@@ -53,6 +53,11 @@ s3_secret = modal.Secret.from_name(
     ],
 )
 
+gemini_secret = modal.Secret.from_name(
+    "pufferfs-gemini",
+    required_keys=["GEMINI_API_KEY"],
+)
+
 # ---------------------------------------------------------------------------
 # file_to_chunks: convert a file to a list of Chunk dicts
 # ---------------------------------------------------------------------------
@@ -60,7 +65,7 @@ s3_secret = modal.Secret.from_name(
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret],
+    secrets=[s3_secret, gemini_secret],
     timeout=600,
     memory=2048,
 )
@@ -78,11 +83,9 @@ def file_to_chunks(
     from chunkers import (
         CODE_EXTENSIONS,
         chunk_code,
-        chunk_docx,
+        chunk_document_via_images,
         chunk_image,
         chunk_markdown,
-        chunk_pdf,
-        chunk_pptx,
         detect_file_type,
     )
 
@@ -105,32 +108,29 @@ def file_to_chunks(
         resp = s3.get_object(Bucket=bucket, Key=s3_key)
         file_bytes = resp["Body"].read()
 
+    def _ensure_s3():
+        nonlocal s3, bucket
+        if not s3:
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
+                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+            )
+            bucket = os.environ["AWS_BUCKET_NAME"]
+        return s3, bucket
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
     chunks: list[Chunk] = []
 
-    if file_type == "pdf":
-        if not s3:
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
-                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            )
-            bucket = os.environ["AWS_BUCKET_NAME"]
-        chunks = chunk_pdf(file_bytes, root_id, file_path, s3, bucket)
-    elif file_type == "docx":
-        chunks = chunk_docx(file_bytes, root_id, file_path)
-    elif file_type == "pptx":
-        chunks = chunk_pptx(file_bytes, root_id, file_path)
+    if file_type in ("pdf", "docx", "pptx"):
+        s3c, bkt = _ensure_s3()
+        chunks = chunk_document_via_images(
+            file_bytes, root_id, file_path, file_type, s3c, bkt, gemini_key,
+        )
     elif file_type == "image":
-        if not s3:
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
-                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            )
-            bucket = os.environ["AWS_BUCKET_NAME"]
-        chunks = chunk_image(file_bytes, root_id, file_path, s3, bucket)
+        s3c, bkt = _ensure_s3()
+        chunks = chunk_image(file_bytes, root_id, file_path, s3c, bkt, gemini_key)
     elif file_type in CODE_EXTENSIONS:
         text = file_bytes.decode("utf-8", errors="replace")
         chunks = chunk_code(text, root_id, file_path, file_type)
@@ -198,7 +198,7 @@ class Embedder:
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret],
+    secrets=[s3_secret, gemini_secret],
     timeout=600,
     memory=2048,
 )
