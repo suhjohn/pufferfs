@@ -13,10 +13,10 @@ import (
 
 // ModalClient calls Modal web endpoints for chunking and embedding.
 type ModalClient struct {
-	chunkURL     string
-	embedURL     string
+	chunkURL      string
+	embedURL      string
 	queryEmbedURL string
-	httpClient   *http.Client
+	httpClient    *http.Client
 }
 
 // NewModalClient creates a client for calling Modal endpoints.
@@ -25,7 +25,7 @@ func NewModalClient() *ModalClient {
 		chunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		embedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		queryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
-		httpClient:    &http.Client{Timeout: 300 * time.Second},
+		httpClient:    &http.Client{Timeout: 900 * time.Second},
 	}
 }
 

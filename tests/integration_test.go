@@ -16,7 +16,9 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,6 +44,8 @@ const (
 	e2eMinioBucket = "pufferfs-e2e-test"
 
 	e2eJWTSecret = "e2e-integration-test-jwt-secret!"
+
+	llmWikiURL = "https://gist.githubusercontent.com/karpathy/442a6bf555914893e9891c11519de94f/raw/ac46de1ad27f92b28ac95459c782c07f6b8c964a/llm-wiki.md"
 )
 
 var (
@@ -85,20 +89,25 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 		assertNestedRowsIndexed(t, services, namespace, fixtures)
 		assertPDFPageRows(t, services, namespace, fixtures.pdfs)
+		assertOfficeDocumentPageRows(t, services, namespace, fixtures.officeDocs)
+		assertLargeMarkdownRows(t, services, namespace, fixtures.largeMarkdownPath, 2)
 		assertCLIQuery(t, homeDir, env, "roadmap retention metrics", env.rootName, "hybrid", "", "docs/product/strategy/roadmap.md")
 		assertCLIQuery(t, homeDir, env, "rollback procedure", env.rootName, "fts", "", "ops/runbooks/deploy/rollback.txt")
+		if fixtures.largeMarkdownPath != "" {
+			assertCLIQuery(t, homeDir, env, "persistent compounding artifact wiki", env.rootName, "hybrid", "", fixtures.largeMarkdownPath)
+		}
 		if hasIndexedPDF(fixtures.pdfs) {
-			assertCLIQuery(t, homeDir, env, "business model", env.rootName, "vector", "", "")
+			assertCLIQuery(t, homeDir, env, "PDF example", env.rootName, "vector", "", "")
 		}
 
-		roadmapPath := "docs/product/strategy/roadmap.md"
-		rollbackPath := "ops/runbooks/deploy/rollback.txt"
-		businessPDFPath := "docs/product/business-model-and-kpis.pdf"
-		roadmapBefore := rowsDigest(queryTPRowsForPath(t, services, namespace, roadmapPath))
-		rollbackBefore := rowsDigest(queryTPRowsForPath(t, services, namespace, rollbackPath))
-		businessPDFBefore := rowsDigest(queryTPRowsForPath(t, services, namespace, businessPDFPath))
+		modifyPath := fixtures.modifyPath
+		stableBefore := make(map[string]rowDigest)
+		for _, relPath := range fixtures.stablePaths {
+			stableBefore[relPath] = rowsDigest(queryTPRowsForPath(t, services, namespace, relPath))
+		}
+		modifyBefore := rowsDigest(queryTPRowsForPath(t, services, namespace, modifyPath))
 
-		writeFile(t, projectDir, roadmapPath, "# Product Roadmap\n\nQ1: launch usage-based billing.\nQ2: add enterprise audit exports.\nQ3: tighten retention controls.\n")
+		appendFile(t, projectDir, modifyPath, "\n\nRuntime update: add enterprise audit exports and tighten retention controls.\n")
 		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
 		if err != nil {
 			t.Fatalf("modify sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
@@ -106,21 +115,19 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Merkle diff found 1 changed files")
 		requireOutputContains(t, stdout, "Syncing 1 changes")
 
-		roadmapAfter := rowsDigest(queryTPRowsForPath(t, services, namespace, roadmapPath))
-		rollbackAfter := rowsDigest(queryTPRowsForPath(t, services, namespace, rollbackPath))
-		businessPDFAfter := rowsDigest(queryTPRowsForPath(t, services, namespace, businessPDFPath))
-		if roadmapBefore.equal(roadmapAfter) {
-			t.Fatalf("modified %s kept identical indexed row digest: %#v", roadmapPath, roadmapAfter)
+		modifyAfter := rowsDigest(queryTPRowsForPath(t, services, namespace, modifyPath))
+		if modifyBefore.equal(modifyAfter) {
+			t.Fatalf("modified %s kept identical indexed row digest: %#v", modifyPath, modifyAfter)
 		}
-		if !rollbackBefore.equal(rollbackAfter) {
-			t.Fatalf("unchanged %s was reindexed: before %#v after %#v", rollbackPath, rollbackBefore, rollbackAfter)
-		}
-		if !businessPDFBefore.equal(businessPDFAfter) {
-			t.Fatalf("unchanged %s was reindexed: before %#v after %#v", businessPDFPath, businessPDFBefore, businessPDFAfter)
+		for relPath, before := range stableBefore {
+			after := rowsDigest(queryTPRowsForPath(t, services, namespace, relPath))
+			if !before.equal(after) {
+				t.Fatalf("unchanged %s was reindexed: before %#v after %#v", relPath, before, after)
+			}
 		}
 
-		oldMovePath := "src/services/billing/reconciliation.md"
-		newMovePath := "src/services/payments/settlement-reconciliation.md"
+		oldMovePath := fixtures.movePath
+		newMovePath := fixtures.moveTargetPath
 		mkdirAll(t, filepath.Join(projectDir, filepath.Dir(newMovePath)))
 		if err := os.Rename(filepath.Join(projectDir, filepath.FromSlash(oldMovePath)), filepath.Join(projectDir, filepath.FromSlash(newMovePath))); err != nil {
 			t.Fatalf("moving nested markdown file: %v", err)
@@ -133,7 +140,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertNoTPRows(t, services, namespace, oldMovePath)
 		assertHasTPRows(t, services, namespace, newMovePath)
 
-		removedPath := "docs/finance/bank/notes.txt"
+		removedPath := fixtures.removePath
 		if err := os.Remove(filepath.Join(projectDir, filepath.FromSlash(removedPath))); err != nil {
 			t.Fatalf("removing nested txt file: %v", err)
 		}
@@ -144,11 +151,11 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Sync complete")
 		assertNoTPRows(t, services, namespace, removedPath)
 
-		watchPath := rollbackPath
+		watchPath := fixtures.watchPath
 		beforeWatch := rowsDigest(queryTPRowsForPath(t, services, namespace, watchPath))
 		watch := startPufferfsWatch(t, homeDir, env, projectDir, env.rootName, 300*time.Millisecond)
 		watch.waitForOutput(t, "Watching", 30*time.Second)
-		writeFile(t, projectDir, watchPath, "Rollback runbook\n\n1. Freeze deploys.\n2. Restore the previous artifact.\n3. Verify invoice webhooks and search indexing.\n")
+		appendFile(t, projectDir, watchPath, "\n3. Verify invoice webhooks and search indexing.\n")
 		waitForRowDigestChange(t, services, namespace, watchPath, beforeWatch, 90*time.Second)
 		watch.stop(t)
 	})
@@ -537,14 +544,28 @@ func initPufferFS(t *testing.T, env *e2eEnv, homeDir string) {
 }
 
 type fixtureSet struct {
-	textPaths []string
-	mdPaths   []string
-	pdfs      []pdfFixture
+	textPaths         []string
+	mdPaths           []string
+	largeMarkdownPath string
+	pdfs              []pdfFixture
+	officeDocs        []officeDocumentFixture
+	modifyPath        string
+	watchPath         string
+	movePath          string
+	moveTargetPath    string
+	removePath        string
+	stablePaths       []string
 }
 
 type pdfFixture struct {
 	source         string
 	relPath        string
+	expectedChunks int
+}
+
+type officeDocumentFixture struct {
+	relPath        string
+	fileType       string
 	expectedChunks int
 }
 
@@ -559,8 +580,18 @@ func createNestedProject(t *testing.T, projectDir string) fixtureSet {
 		mdPaths: []string{
 			"README.md",
 			"docs/product/strategy/roadmap.md",
+			"docs/research/wiki/llm-wiki.md",
 			"src/services/billing/reconciliation.md",
 		},
+		largeMarkdownPath: "docs/research/wiki/llm-wiki.md",
+		officeDocs:        []officeDocumentFixture{
+			// R2/user-provided DOCX/PPTX fixtures are appended dynamically from the manifest.
+		},
+		modifyPath:     "docs/product/strategy/roadmap.md",
+		watchPath:      "ops/runbooks/deploy/rollback.txt",
+		movePath:       "src/services/billing/reconciliation.md",
+		moveTargetPath: "src/services/payments/settlement-reconciliation.md",
+		removePath:     "docs/finance/bank/notes.txt",
 	}
 
 	writeFile(t, projectDir, "README.md", "# Workspace\n\nThis workspace combines product, finance, research, source, and operations notes.\n")
@@ -568,8 +599,12 @@ func createNestedProject(t *testing.T, projectDir string) fixtureSet {
 	writeFile(t, projectDir, "docs/finance/bank/notes.txt", "Chase bank transaction notes for reconciliation and refund review.\n")
 	writeFile(t, projectDir, "src/services/billing/reconciliation.md", "# Billing Reconciliation\n\nMatch bank deposits to invoices and subscription renewals.\n")
 	writeFile(t, projectDir, "ops/runbooks/deploy/rollback.txt", "Rollback runbook\n\n1. Freeze deploys.\n2. Restore the previous artifact.\n")
+	writeDownloadedTextFixture(t, projectDir, fixtures.largeMarkdownPath, llmWikiURL)
 
 	fixtures.pdfs = copyPDFFixtures(t, projectDir)
+	applyExternalFixtureManifest(t, projectDir, &fixtures)
+	applyDiscoveredWorkspaceFixtures(t, projectDir, &fixtures)
+	fixtures.stablePaths = stableFixturePaths(fixtures)
 	return fixtures
 }
 
@@ -700,11 +735,385 @@ func writeFile(t *testing.T, root, relPath, content string) {
 	}
 }
 
+func appendFile(t *testing.T, root, relPath, content string) {
+	t.Helper()
+
+	fullPath := filepath.Join(root, filepath.FromSlash(relPath))
+	f, err := os.OpenFile(fullPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("opening %s for append: %v", relPath, err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		t.Fatalf("appending to %s: %v", relPath, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("closing %s after append: %v", relPath, err)
+	}
+}
+
 func mkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		t.Fatalf("creating %s: %v", path, err)
 	}
+}
+
+func writeDownloadedTextFixture(t *testing.T, root, relPath, sourceURL string) {
+	t.Helper()
+
+	body := downloadFixtureBytes(t, sourceURL)
+	fullPath := filepath.Join(root, filepath.FromSlash(relPath))
+	mkdirAll(t, filepath.Dir(fullPath))
+	if err := os.WriteFile(fullPath, body, 0o644); err != nil {
+		t.Fatalf("writing downloaded fixture %s: %v", relPath, err)
+	}
+}
+
+type fixtureManifest struct {
+	Files []manifestFile `json:"files"`
+}
+
+type manifestFile struct {
+	URL            string   `json:"url"`
+	Path           string   `json:"path"`
+	SHA256         string   `json:"sha256,omitempty"`
+	FileType       string   `json:"file_type,omitempty"`
+	ExpectedChunks *int     `json:"expected_chunks,omitempty"`
+	MinChunks      int      `json:"min_chunks,omitempty"`
+	Roles          []string `json:"roles,omitempty"`
+	MoveTargetPath string   `json:"move_target_path,omitempty"`
+}
+
+func applyExternalFixtureManifest(t *testing.T, projectDir string, fixtures *fixtureSet) {
+	t.Helper()
+
+	manifest := loadFixtureManifest(t)
+	if manifest == nil {
+		return
+	}
+	for _, file := range manifest.Files {
+		relPath := cleanFixturePath(t, file.Path)
+		body := downloadFixtureBytes(t, file.URL)
+		if file.SHA256 != "" {
+			sum := sha256.Sum256(body)
+			got := hex.EncodeToString(sum[:])
+			if !strings.EqualFold(got, file.SHA256) {
+				t.Fatalf("fixture %s sha256 mismatch: got %s want %s", relPath, got, file.SHA256)
+			}
+		}
+		fullPath := filepath.Join(projectDir, filepath.FromSlash(relPath))
+		mkdirAll(t, filepath.Dir(fullPath))
+		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
+			t.Fatalf("writing external fixture %s: %v", relPath, err)
+		}
+		registerManifestFixture(t, fixtures, file, relPath)
+	}
+}
+
+func applyDiscoveredWorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixtureSet) {
+	t.Helper()
+
+	seedURL := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_WORKSPACE_URL"))
+	if seedURL == "" {
+		return
+	}
+	seed, err := url.Parse(seedURL)
+	if err != nil {
+		t.Fatalf("parsing PUFFERFS_E2E_WORKSPACE_URL: %v", err)
+	}
+	rootPath := path.Dir(seed.Path) + "/"
+	seen := make(map[string]bool)
+	queue := []*url.URL{seed}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		relPath := discoveredRelPath(t, current, rootPath)
+		if seen[relPath] {
+			continue
+		}
+		seen[relPath] = true
+
+		body := downloadFixtureBytes(t, current.String())
+		fullPath := filepath.Join(projectDir, filepath.FromSlash(relPath))
+		mkdirAll(t, filepath.Dir(fullPath))
+		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
+			t.Fatalf("writing discovered fixture %s: %v", relPath, err)
+		}
+		registerManifestFixture(t, fixtures, manifestFile{
+			URL:      current.String(),
+			Path:     relPath,
+			FileType: fixtureFileType(relPath),
+		}, relPath)
+
+		if fixtureFileType(relPath) != "markdown" {
+			continue
+		}
+		for _, href := range discoverWorkspaceLinks(string(body)) {
+			parsed, err := url.Parse(href)
+			if err != nil {
+				t.Fatalf("parsing discovered link %q in %s: %v", href, relPath, err)
+			}
+			next := current.ResolveReference(parsed)
+			if next.Scheme != seed.Scheme || next.Host != seed.Host || !strings.HasPrefix(next.Path, rootPath) {
+				continue
+			}
+			nextRelPath := discoveredRelPath(t, next, rootPath)
+			if !seen[nextRelPath] && publicFixtureExists(next.String()) {
+				queue = append(queue, next)
+			}
+		}
+	}
+}
+
+func publicFixtureExists(sourceURL string) bool {
+	req, err := http.NewRequest(http.MethodHead, sourceURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "pufferfs-e2e-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+func discoveredRelPath(t *testing.T, u *url.URL, rootPath string) string {
+	t.Helper()
+
+	decodedPath, err := url.PathUnescape(u.Path)
+	if err != nil {
+		t.Fatalf("unescaping discovered URL path %s: %v", u.Path, err)
+	}
+	decodedRoot, err := url.PathUnescape(rootPath)
+	if err != nil {
+		t.Fatalf("unescaping workspace root path %s: %v", rootPath, err)
+	}
+	if !strings.HasPrefix(decodedPath, decodedRoot) {
+		t.Fatalf("discovered URL %s is outside workspace root %s", u.String(), decodedRoot)
+	}
+	return cleanFixturePath(t, strings.TrimPrefix(decodedPath, decodedRoot))
+}
+
+func discoverWorkspaceLinks(markdown string) []string {
+	seen := make(map[string]bool)
+	var links []string
+	add := func(raw string) {
+		raw = strings.TrimSpace(strings.Trim(raw, "<>"))
+		if raw == "" || strings.HasPrefix(raw, "#") || strings.Contains(raw, "://") || strings.HasPrefix(raw, "mailto:") {
+			return
+		}
+		raw = strings.Split(raw, "#")[0]
+		raw = strings.Split(raw, "?")[0]
+		if raw == "" || strings.HasPrefix(raw, "/") || seen[raw] || fixtureFileType(raw) == "text" && filepath.Ext(raw) == "" {
+			return
+		}
+		seen[raw] = true
+		links = append(links, raw)
+	}
+
+	for _, match := range markdownLinkRE.FindAllStringSubmatch(markdown, -1) {
+		add(match[1])
+	}
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		line = strings.TrimSpace(strings.Trim(line, "`"))
+		if looksLikeFixtureFile(line) {
+			add(url.PathEscape(line))
+		}
+	}
+	return links
+}
+
+var markdownLinkRE = regexp.MustCompile(`\[[^\]]+\]\(([^)]+)\)`)
+
+func looksLikeFixtureFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".md", ".txt":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadFixtureManifest(t *testing.T) *fixtureManifest {
+	t.Helper()
+
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_FIXTURE_MANIFEST"))
+	manifestURL := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_FIXTURE_MANIFEST_URL"))
+	switch {
+	case raw != "":
+		if data, err := os.ReadFile(raw); err == nil {
+			raw = string(data)
+		}
+	case manifestURL != "":
+		raw = string(downloadFixtureBytes(t, manifestURL))
+	default:
+		return nil
+	}
+
+	var manifest fixtureManifest
+	if err := json.Unmarshal([]byte(raw), &manifest); err != nil {
+		t.Fatalf("decoding fixture manifest: %v", err)
+	}
+	return &manifest
+}
+
+func registerManifestFixture(t *testing.T, fixtures *fixtureSet, file manifestFile, relPath string) {
+	t.Helper()
+
+	fileType := strings.TrimSpace(file.FileType)
+	if fileType == "" {
+		fileType = fixtureFileType(relPath)
+	}
+	switch fileType {
+	case "pdf":
+		expected := -1
+		if file.ExpectedChunks != nil {
+			expected = *file.ExpectedChunks
+		}
+		fixtures.pdfs = append(fixtures.pdfs, pdfFixture{source: file.URL, relPath: relPath, expectedChunks: expected})
+	case "docx", "pptx":
+		expected := -1
+		if file.ExpectedChunks != nil {
+			expected = *file.ExpectedChunks
+		}
+		fixtures.officeDocs = append(fixtures.officeDocs, officeDocumentFixture{relPath: relPath, fileType: fileType, expectedChunks: expected})
+	case "markdown":
+		fixtures.mdPaths = append(fixtures.mdPaths, relPath)
+	case "text":
+		fixtures.textPaths = append(fixtures.textPaths, relPath)
+	default:
+		if strings.HasPrefix(fileType, "text") {
+			fixtures.textPaths = append(fixtures.textPaths, relPath)
+		}
+	}
+
+	for _, role := range file.Roles {
+		switch strings.ToLower(strings.TrimSpace(role)) {
+		case "modify":
+			fixtures.modifyPath = relPath
+		case "watch":
+			fixtures.watchPath = relPath
+		case "move":
+			fixtures.movePath = relPath
+			if file.MoveTargetPath != "" {
+				fixtures.moveTargetPath = cleanFixturePath(t, file.MoveTargetPath)
+			} else {
+				fixtures.moveTargetPath = filepath.ToSlash(filepath.Join("moved", filepath.Base(relPath)))
+			}
+		case "remove":
+			fixtures.removePath = relPath
+		case "large_markdown":
+			fixtures.largeMarkdownPath = relPath
+		case "stable":
+			fixtures.stablePaths = append(fixtures.stablePaths, relPath)
+		}
+	}
+	if file.MinChunks > 0 && fileType == "markdown" {
+		fixtures.largeMarkdownPath = relPath
+	}
+}
+
+func cleanFixturePath(t *testing.T, relPath string) string {
+	t.Helper()
+
+	relPath = filepath.ToSlash(strings.TrimSpace(relPath))
+	if relPath == "" || strings.HasPrefix(relPath, "/") || strings.Contains(relPath, "\x00") {
+		t.Fatalf("invalid fixture path %q", relPath)
+	}
+	cleaned := path.Clean(relPath)
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		t.Fatalf("invalid fixture path %q", relPath)
+	}
+	return cleaned
+}
+
+func fixtureFileType(relPath string) string {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".pdf":
+		return "pdf"
+	case ".docx", ".doc":
+		return "docx"
+	case ".pptx", ".ppt":
+		return "pptx"
+	case ".md", ".markdown", ".rst":
+		return "markdown"
+	case ".txt":
+		return "text"
+	default:
+		return "text"
+	}
+}
+
+func downloadFixtureBytes(t *testing.T, sourceURL string) []byte {
+	t.Helper()
+
+	if strings.HasPrefix(sourceURL, "file://") {
+		body, err := os.ReadFile(strings.TrimPrefix(sourceURL, "file://"))
+		if err != nil {
+			t.Fatalf("reading local fixture %s: %v", sourceURL, err)
+		}
+		return body
+	}
+
+	req, err := http.NewRequest(http.MethodGet, sourceURL, nil)
+	if err != nil {
+		t.Fatalf("creating fixture download request for %s: %v", sourceURL, err)
+	}
+	req.Header.Set("User-Agent", "pufferfs-e2e-test")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("downloading fixture %s: %v", sourceURL, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", sourceURL, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("downloading fixture %s: HTTP %d: %s", sourceURL, resp.StatusCode, string(body))
+	}
+	return body
+}
+
+func stableFixturePaths(fixtures fixtureSet) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	add := func(relPath string) {
+		if relPath == "" || seen[relPath] {
+			return
+		}
+		if relPath == fixtures.modifyPath || relPath == fixtures.movePath || relPath == fixtures.removePath || relPath == fixtures.watchPath {
+			return
+		}
+		seen[relPath] = true
+		paths = append(paths, relPath)
+	}
+	for _, relPath := range fixtures.stablePaths {
+		add(relPath)
+	}
+	for _, relPath := range fixtures.textPaths {
+		add(relPath)
+	}
+	for _, relPath := range fixtures.mdPaths {
+		add(relPath)
+	}
+	for _, pdf := range fixtures.pdfs {
+		if pdf.expectedChunks != 0 {
+			add(pdf.relPath)
+		}
+	}
+	for _, doc := range fixtures.officeDocs {
+		if doc.expectedChunks != 0 {
+			add(doc.relPath)
+		}
+	}
+	return paths
 }
 
 func assertNestedRowsIndexed(t *testing.T, services realServices, namespace string, fixtures fixtureSet) {
@@ -720,6 +1129,13 @@ func assertNestedRowsIndexed(t *testing.T, services realServices, namespace stri
 		}
 		assertHasTPRows(t, services, namespace, pdf.relPath)
 	}
+	for _, doc := range fixtures.officeDocs {
+		if doc.expectedChunks == 0 {
+			assertNoTPRows(t, services, namespace, doc.relPath)
+			continue
+		}
+		assertHasTPRows(t, services, namespace, doc.relPath)
+	}
 }
 
 func assertPDFPageRows(t *testing.T, services realServices, namespace string, pdfs []pdfFixture) {
@@ -732,8 +1148,11 @@ func assertPDFPageRows(t *testing.T, services realServices, namespace string, pd
 
 	for _, pdf := range pdfs {
 		rows := queryTPRowsForPath(t, services, namespace, pdf.relPath)
-		if len(rows) != pdf.expectedChunks {
+		if pdf.expectedChunks >= 0 && len(rows) != pdf.expectedChunks {
 			t.Fatalf("expected %d Turbopuffer rows for %s, got %d: %#v", pdf.expectedChunks, pdf.relPath, len(rows), rows)
+		}
+		if pdf.expectedChunks < 0 && len(rows) == 0 {
+			t.Fatalf("expected Turbopuffer rows for %s, got none", pdf.relPath)
 		}
 		seenIndexes := make(map[int]bool)
 		for _, row := range rows {
@@ -756,17 +1175,63 @@ func assertPDFPageRows(t *testing.T, services realServices, namespace string, pd
 			}
 			seenIndexes[index] = true
 		}
-		for i := 0; i < pdf.expectedChunks; i++ {
-			if !seenIndexes[i] {
-				t.Fatalf("expected %s to contain chunk/page index %d, got indexes %#v", pdf.relPath, i, seenIndexes)
+		if pdf.expectedChunks >= 0 {
+			for i := 0; i < pdf.expectedChunks; i++ {
+				if !seenIndexes[i] {
+					t.Fatalf("expected %s to contain chunk/page index %d, got indexes %#v", pdf.relPath, i, seenIndexes)
+				}
 			}
+		}
+	}
+}
+
+func assertOfficeDocumentPageRows(t *testing.T, services realServices, namespace string, docs []officeDocumentFixture) {
+	t.Helper()
+
+	for _, doc := range docs {
+		rows := queryTPRowsForPath(t, services, namespace, doc.relPath)
+		if doc.expectedChunks >= 0 && len(rows) != doc.expectedChunks {
+			t.Fatalf("expected %d Turbopuffer rows for %s, got %d: %#v", doc.expectedChunks, doc.relPath, len(rows), rows)
+		}
+		if doc.expectedChunks < 0 && len(rows) == 0 {
+			t.Fatalf("expected Turbopuffer rows for %s, got none", doc.relPath)
+		}
+		for _, row := range rows {
+			if row["file_path"] != doc.relPath {
+				t.Fatalf("expected file_path %s, got %#v", doc.relPath, row["file_path"])
+			}
+			if row["file_type"] != doc.fileType {
+				t.Fatalf("expected file_type %s for %s, got %#v", doc.fileType, doc.relPath, row["file_type"])
+			}
+			if _, ok := numericAttr(row["page_number"]); !ok {
+				t.Fatalf("expected page_number for %s after Office→PDF→image chunking, got %#v", doc.relPath, row["page_number"])
+			}
+			if strings.TrimSpace(fmt.Sprint(row["image_path"])) == "" {
+				t.Fatalf("expected image_path for %s after Office→PDF→image chunking, got %#v", doc.relPath, row["image_path"])
+			}
+		}
+	}
+}
+
+func assertLargeMarkdownRows(t *testing.T, services realServices, namespace, relPath string, minRows int) {
+	t.Helper()
+	if relPath == "" {
+		return
+	}
+	rows := queryTPRowsForPath(t, services, namespace, relPath)
+	if len(rows) < minRows {
+		t.Fatalf("expected at least %d Turbopuffer rows for large markdown %s, got %d: %#v", minRows, relPath, len(rows), rows)
+	}
+	for _, row := range rows {
+		if row["file_type"] != "markdown" {
+			t.Fatalf("expected file_type markdown for %s, got %#v", relPath, row["file_type"])
 		}
 	}
 }
 
 func hasIndexedPDF(pdfs []pdfFixture) bool {
 	for _, pdf := range pdfs {
-		if pdf.expectedChunks > 0 {
+		if pdf.expectedChunks != 0 {
 			return true
 		}
 	}

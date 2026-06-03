@@ -22,7 +22,7 @@ func newAPIClient(cfg *appconfig.Config) *apiClient {
 	return &apiClient{
 		baseURL:    cfg.Server.URL,
 		apiKey:     cfg.Server.APIKey,
-		httpClient: &http.Client{Timeout: 300 * time.Second},
+		httpClient: &http.Client{Timeout: 900 * time.Second},
 	}
 }
 
