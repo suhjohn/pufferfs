@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -44,7 +45,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots", s.handleCreateRoot)
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
+	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
+	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
 	s.mux.HandleFunc("POST /query", s.handleQuery)
 }
 
@@ -92,6 +95,39 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, root)
+}
+
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	rootID := r.PathValue("id")
+	filePath := r.URL.Query().Get("path")
+	if filePath == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path query param required"})
+		return
+	}
+
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reading body: " + err.Error()})
+		return
+	}
+
+	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
+	if err := s.s3.Upload(r.Context(), s3Key, data, "application/octet-stream"); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
+}
+
+func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
+	rootID := r.PathValue("id")
+	state, err := s.db.LoadState(r.Context(), rootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +200,14 @@ func (s *Server) processSync(ctx context.Context, req *models.SyncRequest) (*mod
 }
 
 func (s *Server) processFileAdd(ctx context.Context, rootID string, change models.FileChange) error {
+	// For MODIFIED files, delete old chunks first
+	if change.Status == models.StatusModified {
+		filter := []any{"file_path", "Eq", change.Path}
+		if err := s.tp.DeleteByFilter(rootID, filter); err != nil {
+			log.Printf("warning: failed to delete old chunks for %s: %v", change.Path, err)
+		}
+	}
+
 	// The CLI uploads the file to S3 before calling sync
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 
@@ -182,34 +226,95 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 		return nil
 	}
 
-	// Call Modal to embed the chunks
-	embedResp, err := s.modal.EmbedChunks(chunkResp.Chunks)
-	if err != nil {
-		return fmt.Errorf("embedding: %w", err)
+	// Check embedding cache — skip re-embedding for unchanged chunks
+	var contentHashes []string
+	for _, c := range chunkResp.Chunks {
+		if h, ok := c["content_hash"].(string); ok {
+			contentHashes = append(contentHashes, h)
+		}
 	}
 
-	// Upsert to Turbopuffer
-	rows := make([]map[string]any, len(embedResp.Results))
-	for i, r := range embedResp.Results {
-		chunk, _ := r["chunk"].(map[string]any)
-		embedding, _ := r["embedding"].([]any)
+	cached, err := s.db.GetCachedEmbeddings(ctx, contentHashes)
+	if err != nil {
+		log.Printf("warning: embedding cache lookup failed: %v", err)
+		cached = make(map[string][]float64)
+	}
 
-		rows[i] = map[string]any{
-			"id":           chunk["id"],
-			"vector":       embedding,
-			"content":      chunk["content"],
-			"file_path":    chunk["file_path"],
-			"chunk_index":  chunk["chunk_index"],
-			"content_hash": chunk["content_hash"],
-			"file_type":    chunk["file_type"],
+	// Split chunks into cached (have embedding) and uncached (need embedding)
+	var uncachedChunks []map[string]any
+	cachedRows := make(map[int][]float64)
+
+	for i, c := range chunkResp.Chunks {
+		hash, _ := c["content_hash"].(string)
+		if emb, ok := cached[hash]; ok {
+			cachedRows[i] = emb
+		} else {
+			uncachedChunks = append(uncachedChunks, c)
+		}
+	}
+
+	log.Printf("file %s: %d chunks total, %d cached, %d to embed",
+		change.Path, len(chunkResp.Chunks), len(cachedRows), len(uncachedChunks))
+
+	// Embed only uncached chunks via Modal
+	var embedResults []map[string]any
+	if len(uncachedChunks) > 0 {
+		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
+		if err != nil {
+			return fmt.Errorf("embedding: %w", err)
+		}
+		embedResults = embedResp.Results
+
+		// Save new embeddings to cache
+		newCacheEntries := make(map[string][]float64)
+		for j, r := range embedResults {
+			chunk, _ := r["chunk"].(map[string]any)
+			hash, _ := chunk["content_hash"].(string)
+			if emb, ok := r["embedding"].([]any); ok && hash != "" {
+				embFloat := make([]float64, len(emb))
+				for k, v := range emb {
+					if f, ok := v.(float64); ok {
+						embFloat[k] = f
+					}
+				}
+				newCacheEntries[hash] = embFloat
+			}
+			_ = j
+		}
+		if err := s.db.SaveCachedEmbeddings(ctx, newCacheEntries); err != nil {
+			log.Printf("warning: failed to save embedding cache: %v", err)
+		}
+	}
+
+	// Build Turbopuffer rows: merge cached + freshly embedded
+	rows := make([]map[string]any, len(chunkResp.Chunks))
+	embedIdx := 0
+	for i, c := range chunkResp.Chunks {
+		row := map[string]any{
+			"id":           c["id"],
+			"content":      c["content"],
+			"file_path":    c["file_path"],
+			"chunk_index":  c["chunk_index"],
+			"content_hash": c["content_hash"],
+			"file_type":    c["file_type"],
 			"root_id":      rootID,
 		}
-		if pn, ok := chunk["page_number"]; ok && pn != nil {
-			rows[i]["page_number"] = pn
+		if pn, ok := c["page_number"]; ok && pn != nil {
+			row["page_number"] = pn
 		}
-		if ip, ok := chunk["image_path"]; ok && ip != nil {
-			rows[i]["image_path"] = ip
+		if ip, ok := c["image_path"]; ok && ip != nil {
+			row["image_path"] = ip
 		}
+
+		if emb, ok := cachedRows[i]; ok {
+			row["vector"] = emb
+		} else if embedIdx < len(embedResults) {
+			r := embedResults[embedIdx]
+			row["vector"], _ = r["embedding"].([]any)
+			embedIdx++
+		}
+
+		rows[i] = row
 	}
 
 	return s.tp.UpsertRows(rootID, rows, "cosine_distance")
@@ -329,13 +434,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "page_number", "image_path"}
 
+	// Build glob filter if specified
+	var filters any
+	if req.Glob != "" {
+		filters = []any{"file_path", "Glob", req.Glob}
+	}
+
 	var rows []map[string]any
 	var err error
 
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, nil, includeAttrs)
+		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, filters, includeAttrs)
 
 	case "vector":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -344,7 +455,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, nil, includeAttrs)
+		rows, err = s.tp.Query(req.RootID, rankBy, req.TopK, filters, includeAttrs)
 
 	case "hybrid":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)

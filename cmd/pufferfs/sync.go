@@ -64,10 +64,15 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		return fmt.Errorf("scanning directory: %w", err)
 	}
 
-	// Load previous state
+	// Load previous state — try local first, then fall back to server
 	previousState, err := loadLocalState(rootID)
 	if err != nil {
-		previousState = make(map[string]models.FileState)
+		if rootID != "" && !dryRun && cfg.Server.URL != "" {
+			previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
+		}
+		if previousState == nil {
+			previousState = make(map[string]models.FileState)
+		}
 	}
 
 	// Compute diff
@@ -185,9 +190,21 @@ func uploadFile(client *apiClient, rootID, relPath, localPath string) error {
 	if err != nil {
 		return err
 	}
-	key := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, relPath)
-	_, err = client.post(key, data)
+	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, relPath)
+	_, err = client.postRaw(url, data, "application/octet-stream")
 	return err
+}
+
+func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileState, error) {
+	respBody, err := client.get(fmt.Sprintf("/roots/%s/state", rootID))
+	if err != nil {
+		return nil, err
+	}
+	var state map[string]models.FileState
+	if err := json.Unmarshal(respBody, &state); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
 func loadLocalState(rootID string) (map[string]models.FileState, error) {

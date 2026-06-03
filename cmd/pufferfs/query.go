@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
@@ -101,6 +103,36 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK 
 }
 
 func detectRootFromCwd() (string, error) {
-	// TODO: walk ~/.tpfs/roots/ and match source_path against cwd
-	return "", fmt.Errorf("auto-detect not yet implemented")
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	rootsDir := filepath.Join(appconfig.DefaultConfigDir(), "roots")
+	entries, err := os.ReadDir(rootsDir)
+	if err != nil {
+		return "", fmt.Errorf("no roots found in %s", rootsDir)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		metaPath := filepath.Join(rootsDir, entry.Name(), "meta.json")
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			ID         string `json:"id"`
+			SourcePath string `json:"source_path"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if strings.HasPrefix(cwd, meta.SourcePath) {
+			return meta.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no root matches cwd %s", cwd)
 }

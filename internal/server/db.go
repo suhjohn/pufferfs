@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -50,6 +51,12 @@ func (db *DB) migrate() error {
 			root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
 			state      JSONB NOT NULL DEFAULT '{}',
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS embedding_cache (
+			content_hash TEXT PRIMARY KEY,
+			embedding    BYTEA NOT NULL,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 	`)
 	return err
@@ -150,4 +157,94 @@ func (db *DB) UpdateRootTimestamp(ctx context.Context, rootID string) error {
 		`UPDATE roots SET updated_at = NOW() WHERE id = $1`, rootID,
 	)
 	return err
+}
+
+// GetCachedEmbeddings looks up cached embeddings by content hash.
+// Returns a map from content_hash -> embedding (as float64 slice).
+func (db *DB) GetCachedEmbeddings(ctx context.Context, hashes []string) (map[string][]float64, error) {
+	result := make(map[string][]float64)
+	if len(hashes) == 0 {
+		return result, nil
+	}
+
+	rows, err := db.pool.Query(ctx,
+		`SELECT content_hash, embedding FROM embedding_cache WHERE content_hash = ANY($1)`,
+		hashes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var hash string
+		var embBytes []byte
+		if err := rows.Scan(&hash, &embBytes); err != nil {
+			return nil, err
+		}
+		emb, err := decodeEmbedding(embBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decoding embedding for %s: %w", hash, err)
+		}
+		result[hash] = emb
+	}
+	return result, nil
+}
+
+// SaveCachedEmbeddings stores embeddings in the cache.
+func (db *DB) SaveCachedEmbeddings(ctx context.Context, entries map[string][]float64) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	for hash, emb := range entries {
+		embBytes := encodeEmbedding(emb)
+		_, err := db.pool.Exec(ctx,
+			`INSERT INTO embedding_cache (content_hash, embedding, created_at)
+			 VALUES ($1, $2, NOW())
+			 ON CONFLICT (content_hash) DO NOTHING`,
+			hash, embBytes,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// encodeEmbedding converts a float64 slice to bytes (little-endian float64s).
+func encodeEmbedding(emb []float64) []byte {
+	buf := make([]byte, len(emb)*8)
+	for i, v := range emb {
+		bits := math.Float64bits(v)
+		buf[i*8] = byte(bits)
+		buf[i*8+1] = byte(bits >> 8)
+		buf[i*8+2] = byte(bits >> 16)
+		buf[i*8+3] = byte(bits >> 24)
+		buf[i*8+4] = byte(bits >> 32)
+		buf[i*8+5] = byte(bits >> 40)
+		buf[i*8+6] = byte(bits >> 48)
+		buf[i*8+7] = byte(bits >> 56)
+	}
+	return buf
+}
+
+// decodeEmbedding converts bytes back to a float64 slice.
+func decodeEmbedding(buf []byte) ([]float64, error) {
+	if len(buf)%8 != 0 {
+		return nil, fmt.Errorf("invalid embedding bytes length: %d", len(buf))
+	}
+	emb := make([]float64, len(buf)/8)
+	for i := range emb {
+		bits := uint64(buf[i*8]) |
+			uint64(buf[i*8+1])<<8 |
+			uint64(buf[i*8+2])<<16 |
+			uint64(buf[i*8+3])<<24 |
+			uint64(buf[i*8+4])<<32 |
+			uint64(buf[i*8+5])<<40 |
+			uint64(buf[i*8+6])<<48 |
+			uint64(buf[i*8+7])<<56
+		emb[i] = math.Float64frombits(bits)
+	}
+	return emb, nil
 }

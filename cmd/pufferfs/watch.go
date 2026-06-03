@@ -104,6 +104,15 @@ func runWatch(cfg *appconfig.Config, dir, name, rootID string, debounce time.Dur
 				continue
 			}
 
+			// If a new directory was created, add it to the watcher
+			if event.Has(fsnotify.Create) {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					if !matcher.ShouldIgnore(relPath, true) {
+						_ = watcher.Add(event.Name)
+					}
+				}
+			}
+
 			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) ||
 				event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 				if !pending {
