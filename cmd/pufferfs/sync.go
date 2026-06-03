@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
 	"github.com/pufferfs/pufferfs/internal/diff"
 	"github.com/pufferfs/pufferfs/internal/ignore"
+	"github.com/pufferfs/pufferfs/internal/merkle"
 	"github.com/pufferfs/pufferfs/pkg/models"
 	"github.com/spf13/cobra"
 )
@@ -58,26 +60,58 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		name = filepath.Base(dir)
 	}
 
-	// Scan directory
+	// Build Merkle tree (parallel file hashing)
 	matcher := ignore.NewMatcher(dir)
-	currentState, err := diff.Scan(dir, matcher)
+	fmt.Printf("Building Merkle tree for %s...\n", dir)
+	start := time.Now()
+	currentTree, err := merkle.BuildTree(dir, matcher)
 	if err != nil {
-		return fmt.Errorf("scanning directory: %w", err)
+		return fmt.Errorf("building Merkle tree: %w", err)
+	}
+	fmt.Printf("Merkle tree built in %s (root hash: %s)\n", time.Since(start).Round(time.Millisecond), currentTree.Root.Hash[:20]+"...")
+
+	// Extract flat state for backward compatibility with server
+	currentState := currentTree.ToFileStateMap()
+
+	// Load previous tree — try local first, then fall back to flat state
+	var prevTree *merkle.Tree
+	prevTree, err = loadLocalTree(rootID)
+	if err != nil {
+		// Fall back to flat state for backward compatibility
+		var previousState map[string]models.FileState
+		previousState, err = loadLocalState(rootID)
+		if err != nil {
+			if rootID != "" && !dryRun && cfg.Server.URL != "" {
+				previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
+			}
+		}
+		if previousState != nil {
+			// Use flat diff as fallback
+			result := diff.Compute(previousState, currentState)
+			return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree)
+		}
+		// No previous state at all — everything is new
+		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
 	}
 
-	// Load previous state — try local first, then fall back to server
-	previousState, err := loadLocalState(rootID)
-	if err != nil {
-		if rootID != "" && !dryRun && cfg.Server.URL != "" {
-			previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
-		}
-		if previousState == nil {
-			previousState = make(map[string]models.FileState)
-		}
+	// Merkle tree-based diff — only walks changed branches
+	if prevTree.Root.Hash == currentTree.Root.Hash {
+		fmt.Println("No changes detected (Merkle root hash matches).")
+		return nil
 	}
 
-	// Compute diff
-	result := diff.Compute(previousState, currentState)
+	treeChanges := merkle.Diff(prevTree, currentTree)
+	fmt.Printf("Merkle diff found %d changed files (skipped unchanged subtrees)\n", len(treeChanges))
+
+	// Convert Merkle changes to DiffResult for compatibility
+	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
+
+	return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree)
+}
+
+// runSyncWithResult executes the sync with a pre-computed DiffResult.
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree) error {
+	var err error
 
 	// Detect secrets
 	secrets := diff.DetectSecrets(currentState)
@@ -103,7 +137,8 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 	}
 
 	// Upload changed files to S3 via the server
-	fmt.Printf("Syncing %d changes to root %s...\n", countChanges(result), rootID)
+	changeCount := countChanges(result)
+	fmt.Printf("Syncing %d changes to root %s...\n", changeCount, rootID)
 
 	// Upload files that are ADDED or MODIFIED
 	for _, change := range result.Changes {
@@ -115,11 +150,21 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		}
 	}
 
-	// Send sync request
+	// Build content proof from Merkle tree
+	proof := currentTree.BuildContentProof()
+	contentProof := &models.ContentProofData{
+		FileHashes: proof.FileHashes,
+		DirHashes:  proof.DirHashes,
+		RootHash:   proof.RootHash,
+	}
+
+	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
-		RootID:  rootID,
-		Changes: filterChanges(result),
-		State:   currentState,
+		RootID:       rootID,
+		Changes:      filterChanges(result),
+		State:        currentState,
+		SimHash:      currentTree.SimHashHex(),
+		ContentProof: contentProof,
 	}
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync", rootID), syncReq)
@@ -132,7 +177,12 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		return fmt.Errorf("parsing sync response: %w", err)
 	}
 
-	// Save state locally
+	// Save Merkle tree locally (replaces flat state)
+	if err := saveLocalTree(rootID, currentTree); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to save Merkle tree: %v\n", err)
+	}
+
+	// Also save flat state for backward compatibility
 	if err := saveLocalState(rootID, currentState); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to save local state: %v\n", err)
 	}
@@ -146,6 +196,82 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
 
 	return nil
+}
+
+// merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.
+// Includes move detection by matching removed→added files with the same content hash.
+func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.Tree) models.DiffResult {
+	result := models.DiffResult{}
+
+	// Separate added and removed for move detection
+	var added, removed []merkle.DiffChange
+	for _, c := range changes {
+		switch c.Type {
+		case "added":
+			added = append(added, c)
+		case "removed":
+			removed = append(removed, c)
+		case "modified":
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        c.Path,
+				Status:      models.StatusModified,
+				ContentHash: c.ContentHash,
+				Size:        c.Size,
+			})
+			result.Stats.Modified++
+		}
+	}
+
+	// Move detection: match removed→added by content hash
+	usedRemoved := make(map[int]bool)
+	usedAdded := make(map[int]bool)
+
+	for ai, a := range added {
+		for ri, r := range removed {
+			if usedRemoved[ri] || usedAdded[ai] {
+				continue
+			}
+			if a.ContentHash == r.ContentHash {
+				result.Changes = append(result.Changes, models.FileChange{
+					Path:        a.Path,
+					Status:      models.StatusMoved,
+					OldPath:     r.Path,
+					ContentHash: a.ContentHash,
+					Size:        a.Size,
+				})
+				result.Stats.Moved++
+				usedRemoved[ri] = true
+				usedAdded[ai] = true
+				break
+			}
+		}
+	}
+
+	for ri, r := range removed {
+		if !usedRemoved[ri] {
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        r.Path,
+				Status:      models.StatusRemoved,
+				ContentHash: r.ContentHash,
+				Size:        r.Size,
+			})
+			result.Stats.Removed++
+		}
+	}
+
+	for ai, a := range added {
+		if !usedAdded[ai] {
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        a.Path,
+				Status:      models.StatusAdded,
+				ContentHash: a.ContentHash,
+				Size:        a.Size,
+			})
+			result.Stats.Added++
+		}
+	}
+
+	return result
 }
 
 func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (string, error) {
@@ -206,6 +332,31 @@ func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileSt
 		return nil, err
 	}
 	return state, nil
+}
+
+func loadLocalTree(rootID string) (*merkle.Tree, error) {
+	if rootID == "" {
+		return nil, fmt.Errorf("no root ID")
+	}
+	path := filepath.Join(appconfig.RootDir(rootID), "tree.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var tree merkle.Tree
+	return &tree, json.Unmarshal(data, &tree)
+}
+
+func saveLocalTree(rootID string, tree *merkle.Tree) error {
+	dir := appconfig.RootDir(rootID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(tree)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "tree.json"), data, 0o600)
 }
 
 func loadLocalState(rootID string) (map[string]models.FileState, error) {

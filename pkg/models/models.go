@@ -79,6 +79,14 @@ type RootMetadata struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
+// RootWithSimHash is a root with its SimHash for similarity matching.
+type RootWithSimHash struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	SourcePath string `json:"source_path"`
+	SimHash    string `json:"simhash"`
+}
+
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {
 	Size        int64  `json:"size"`
@@ -155,9 +163,18 @@ type ChunkWithEmbedding struct {
 
 // SyncRequest is sent from CLI to server to trigger a sync.
 type SyncRequest struct {
-	RootID  string                  `json:"root_id"`
-	Changes []FileChange            `json:"changes"`
-	State   map[string]FileState    `json:"state"`
+	RootID       string               `json:"root_id"`
+	Changes      []FileChange         `json:"changes"`
+	State        map[string]FileState `json:"state"`
+	SimHash      string               `json:"simhash,omitempty"`
+	ContentProof *ContentProofData    `json:"content_proof,omitempty"`
+}
+
+// ContentProofData is the serialized content proof sent with sync/query requests.
+type ContentProofData struct {
+	FileHashes map[string]string `json:"file_hashes"`
+	DirHashes  map[string]string `json:"dir_hashes"`
+	RootHash   string            `json:"root_hash"`
 }
 
 // SyncResponse is returned from server after sync completes.

@@ -67,6 +67,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
 	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
+	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
 	s.mux.HandleFunc("GET /roots/{id}/sync/status", s.handleSyncStatus)
 	s.mux.HandleFunc("GET /roots/{id}/sync/jobs", s.handleListSyncJobs)
@@ -375,6 +376,79 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
+// handleSyncInit checks for similar indexes in the org before a full sync.
+// Returns similarity info so the CLI can decide whether to do a full or delta sync.
+func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+		return
+	}
+
+	rootID := r.PathValue("id")
+	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
+	var req struct {
+		SimHash string `json:"simhash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	type initResponse struct {
+		SimilarRoot *models.RootWithSimHash `json:"similar_root,omitempty"`
+		Similarity  float64                 `json:"similarity"`
+		CanReuse    bool                    `json:"can_reuse"`
+	}
+
+	if req.SimHash == "" {
+		writeJSON(w, http.StatusOK, initResponse{})
+		return
+	}
+
+	similar, err := s.db.FindSimilarRoots(r.Context(), id.OrgID, rootID, req.SimHash)
+	if err != nil || len(similar) == 0 {
+		writeJSON(w, http.StatusOK, initResponse{})
+		return
+	}
+
+	targetBytes, err := hexToSimHash(req.SimHash)
+	if err != nil {
+		writeJSON(w, http.StatusOK, initResponse{})
+		return
+	}
+
+	var bestRoot *models.RootWithSimHash
+	bestDist := 257
+	for i, r := range similar {
+		candidateBytes, err := hexToSimHash(r.SimHash)
+		if err != nil {
+			continue
+		}
+		dist := hammingDistance(targetBytes, candidateBytes)
+		if dist < bestDist {
+			bestDist = dist
+			bestRoot = &similar[i]
+		}
+	}
+
+	if bestRoot == nil || bestDist > 51 {
+		writeJSON(w, http.StatusOK, initResponse{})
+		return
+	}
+
+	similarity := 1.0 - float64(bestDist)/256.0
+	writeJSON(w, http.StatusOK, initResponse{
+		SimilarRoot: bestRoot,
+		Similarity:  similarity,
+		CanReuse:    true,
+	})
+}
+
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
@@ -396,6 +470,24 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RootID = rootID
+
+	// Store SimHash for future index reuse
+	if req.SimHash != "" {
+		if err := s.db.UpdateRootSimHash(r.Context(), id.OrgID, rootID, req.SimHash); err != nil {
+			log.Printf("warning: failed to update simhash: %v", err)
+		}
+
+		// Try index reuse: find similar roots and clone their data
+		s.tryIndexReuse(r.Context(), id.OrgID, rootID, req.SimHash, &req)
+	}
+
+	// Store content proof if provided
+	if req.ContentProof != nil {
+		proofBytes, _ := json.Marshal(req.ContentProof)
+		if err := s.db.UpsertContentProof(r.Context(), id.OrgID, id.UserID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
+			log.Printf("warning: failed to store content proof: %v", err)
+		}
+	}
 
 	// Count actionable files
 	actionableFiles := 0
@@ -601,6 +693,220 @@ func checkPermission(acls []models.RootACL, filePath, requiredPermission string)
 		}
 	}
 	return true // No matching ACL → allow
+}
+
+// ---------------------------------------------------------------------------
+// Index reuse (Phase 2)
+// ---------------------------------------------------------------------------
+
+// tryIndexReuse finds a similar root in the same org and clones its Turbopuffer
+// namespace + embedding cache to bootstrap the new root's index.
+// This allows the second (and subsequent) team member syncing the same codebase
+// to skip most of the expensive chunking+embedding work.
+func (s *Server) tryIndexReuse(ctx context.Context, orgID, rootID, simhash string, req *models.SyncRequest) {
+	similar, err := s.db.FindSimilarRoots(ctx, orgID, rootID, simhash)
+	if err != nil || len(similar) == 0 {
+		return
+	}
+
+	// Find the best match by computing Hamming distance
+	targetBytes, err := hexToSimHash(simhash)
+	if err != nil {
+		return
+	}
+
+	var bestRoot *models.RootWithSimHash
+	bestDist := 257 // worse than max
+	for i, r := range similar {
+		candidateBytes, err := hexToSimHash(r.SimHash)
+		if err != nil {
+			continue
+		}
+		dist := hammingDistance(targetBytes, candidateBytes)
+		if dist < bestDist {
+			bestDist = dist
+			bestRoot = &similar[i]
+		}
+	}
+
+	// Threshold: similarity must be > 80% (Hamming distance < 51 out of 256 bits)
+	if bestRoot == nil || bestDist > 51 {
+		return
+	}
+
+	similarity := 1.0 - float64(bestDist)/256.0
+	log.Printf("index reuse: found similar root %s (%.1f%% similar), cloning namespace", bestRoot.ID, similarity*100)
+
+	// Clone Turbopuffer namespace: copy all vectors from source to target
+	srcNS := tpNamespace(orgID, bestRoot.ID)
+	dstNS := tpNamespace(orgID, rootID)
+	if err := s.cloneTurbopufferNamespace(ctx, srcNS, dstNS); err != nil {
+		log.Printf("warning: failed to clone turbopuffer namespace: %v", err)
+		return
+	}
+
+	// Copy embedding cache entries
+	var contentHashes []string
+	for _, fs := range req.State {
+		contentHashes = append(contentHashes, fs.ContentHash)
+	}
+	copied, err := s.db.CopyEmbeddingCache(ctx, orgID, orgID, contentHashes)
+	if err != nil {
+		log.Printf("warning: failed to copy embedding cache: %v", err)
+	} else if copied > 0 {
+		log.Printf("index reuse: copied %d embedding cache entries", copied)
+	}
+
+	// Remove changes for files that already exist in the cloned namespace
+	// by checking content_hash matches from the source state
+	if len(req.Changes) > 0 {
+		sourceState, err := s.db.LoadState(ctx, bestRoot.ID)
+		if err == nil && sourceState != nil {
+			sourceByHash := make(map[string]bool)
+			for _, fs := range sourceState {
+				sourceByHash[fs.ContentHash] = true
+			}
+
+			var remaining []models.FileChange
+			skipped := 0
+			for _, c := range req.Changes {
+				if (c.Status == models.StatusAdded || c.Status == models.StatusModified) && sourceByHash[c.ContentHash] {
+					skipped++
+					continue
+				}
+				remaining = append(remaining, c)
+			}
+			if skipped > 0 {
+				log.Printf("index reuse: skipped %d files already in cloned index", skipped)
+				req.Changes = remaining
+			}
+		}
+	}
+}
+
+// cloneTurbopufferNamespace copies all vectors from source to destination namespace.
+func (s *Server) cloneTurbopufferNamespace(ctx context.Context, srcNS, dstNS string) error {
+	// Query all vectors from source (in batches)
+	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "content_hash", "page_number", "image_path", "root_id"}
+	offset := 0
+	batchSize := 500
+	totalCopied := 0
+
+	for {
+		// Use BM25 search with wildcard to get all documents
+		rows, err := s.tp.Query(srcNS, []any{"content", "BM25", "*"}, batchSize, nil, includeAttrs)
+		if err != nil {
+			if totalCopied > 0 {
+				return nil // partial clone is OK
+			}
+			return err
+		}
+
+		if len(rows) == 0 {
+			break
+		}
+
+		// Upsert to destination namespace
+		if err := s.tp.UpsertRows(dstNS, rows, "cosine_distance"); err != nil {
+			return fmt.Errorf("upserting to %s: %w", dstNS, err)
+		}
+
+		totalCopied += len(rows)
+		if len(rows) < batchSize {
+			break
+		}
+		offset += batchSize
+	}
+
+	log.Printf("index reuse: cloned %d vectors from %s to %s", totalCopied, srcNS, dstNS)
+	return nil
+}
+
+func hexToSimHash(hex string) ([32]byte, error) {
+	var result [32]byte
+	if len(hex) != 64 {
+		return result, fmt.Errorf("invalid simhash length: %d", len(hex))
+	}
+	for i := 0; i < 32; i++ {
+		b, err := hexByte(hex[i*2], hex[i*2+1])
+		if err != nil {
+			return result, err
+		}
+		result[i] = b
+	}
+	return result, nil
+}
+
+func hexByte(hi, lo byte) (byte, error) {
+	h, err := hexDigit(hi)
+	if err != nil {
+		return 0, err
+	}
+	l, err := hexDigit(lo)
+	if err != nil {
+		return 0, err
+	}
+	return h<<4 | l, nil
+}
+
+func hexDigit(c byte) (byte, error) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', nil
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, nil
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, nil
+	default:
+		return 0, fmt.Errorf("invalid hex digit: %c", c)
+	}
+}
+
+func hammingDistance(a, b [32]byte) int {
+	dist := 0
+	for i := 0; i < 32; i++ {
+		xor := a[i] ^ b[i]
+		for xor != 0 {
+			dist += int(xor & 1)
+			xor >>= 1
+		}
+	}
+	return dist
+}
+
+// ---------------------------------------------------------------------------
+// Content proof filtering (Phase 3)
+// ---------------------------------------------------------------------------
+
+// filterByContentProof removes query results for files the user doesn't have locally.
+// This provides zero-trust search: even with a shared/cloned index, users only see
+// results for files they can prove they possess (via Merkle tree hashes).
+func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID string, rows []map[string]any) []map[string]any {
+	proofBytes, _, err := s.db.GetContentProof(ctx, orgID, userID, rootID)
+	if err != nil {
+		return rows // No proof stored → no filtering (backward compatible)
+	}
+
+	var proof models.ContentProofData
+	if err := json.Unmarshal(proofBytes, &proof); err != nil {
+		return rows
+	}
+
+	var filtered []map[string]any
+	for _, row := range rows {
+		fp := strVal(row, "file_path")
+		ch := strVal(row, "content_hash")
+		if fp == "" {
+			continue
+		}
+		// Check: does the client's proof contain this file with matching hash?
+		if proofHash, ok := proof.FileHashes[fp]; ok {
+			if ch == "" || proofHash == ch {
+				filtered = append(filtered, row)
+			}
+		}
+	}
+	return filtered
 }
 
 // ---------------------------------------------------------------------------
@@ -957,7 +1263,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Filter out denied paths
+	// Filter out denied paths (ACL enforcement)
 	var filteredRows []map[string]any
 	for _, row := range rows {
 		fp := strVal(row, "file_path")
@@ -972,6 +1278,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			filteredRows = append(filteredRows, row)
 		}
 	}
+
+	// Content proof filtering: only return results for files the user can prove they have
+	filteredRows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, req.RootID, filteredRows)
 
 	results := make([]models.QueryResult, len(filteredRows))
 	for i, row := range filteredRows {

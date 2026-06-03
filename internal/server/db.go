@@ -759,6 +759,97 @@ func (db *DB) Ping(ctx context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
+// SimHash / Index Reuse
+// ---------------------------------------------------------------------------
+
+// UpdateRootSimHash stores the SimHash for a root.
+func (db *DB) UpdateRootSimHash(ctx context.Context, orgID, rootID, simhash string) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE roots SET simhash = $1 WHERE id = $2 AND org_id = $3`,
+		simhash, rootID, orgID,
+	)
+	return err
+}
+
+// FindSimilarRoots finds roots in the same org with similar SimHashes.
+// Returns roots ordered by SimHash similarity (exact text match first, then all others).
+// The caller computes actual Hamming distance client-side.
+func (db *DB) FindSimilarRoots(ctx context.Context, orgID, excludeRootID, simhash string) ([]models.RootWithSimHash, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, name, source_path, simhash FROM roots
+		 WHERE org_id = $1 AND id != $2 AND simhash != ''
+		 ORDER BY (simhash = $3) DESC, updated_at DESC
+		 LIMIT 10`,
+		orgID, excludeRootID, simhash,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []models.RootWithSimHash
+	for rows.Next() {
+		var r models.RootWithSimHash
+		if err := rows.Scan(&r.ID, &r.Name, &r.SourcePath, &r.SimHash); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// CopyEmbeddingCache copies embedding cache entries from one org-scoped key space to another.
+// Used when cloning an index for a similar root.
+func (db *DB) CopyEmbeddingCache(ctx context.Context, srcOrgID, dstOrgID string, contentHashes []string) (int64, error) {
+	if len(contentHashes) == 0 {
+		return 0, nil
+	}
+	tag, err := db.pool.Exec(ctx,
+		`INSERT INTO embedding_cache (org_id, content_hash, embedding, created_at)
+		 SELECT $1, content_hash, embedding, NOW()
+		 FROM embedding_cache
+		 WHERE org_id = $2 AND content_hash = ANY($3)
+		 ON CONFLICT (org_id, content_hash) DO NOTHING`,
+		dstOrgID, srcOrgID, contentHashes,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Content Proofs
+// ---------------------------------------------------------------------------
+
+// UpsertContentProof stores or updates a content proof for a user+root pair.
+func (db *DB) UpsertContentProof(ctx context.Context, orgID, userID, rootID, rootHash string, proof []byte) error {
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO content_proofs (org_id, user_id, root_id, root_hash, proof, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, NOW())
+		 ON CONFLICT (org_id, user_id, root_id)
+		 DO UPDATE SET root_hash = EXCLUDED.root_hash, proof = EXCLUDED.proof, updated_at = NOW()`,
+		orgID, userID, rootID, rootHash, proof,
+	)
+	return err
+}
+
+// GetContentProof retrieves the content proof for a user+root pair.
+func (db *DB) GetContentProof(ctx context.Context, orgID, userID, rootID string) ([]byte, string, error) {
+	var proof []byte
+	var rootHash string
+	err := db.pool.QueryRow(ctx,
+		`SELECT proof, root_hash FROM content_proofs
+		 WHERE org_id = $1 AND user_id = $2 AND root_id = $3`,
+		orgID, userID, rootID,
+	).Scan(&proof, &rootHash)
+	if err != nil {
+		return nil, "", err
+	}
+	return proof, rootHash, nil
+}
+
+// ---------------------------------------------------------------------------
 // Encoding helpers
 // ---------------------------------------------------------------------------
 
