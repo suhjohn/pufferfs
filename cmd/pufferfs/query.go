@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
 	"github.com/pufferfs/pufferfs/pkg/models"
 	"github.com/spf13/cobra"
@@ -139,7 +140,7 @@ func detectRootFromCwd() (string, error) {
 		if err := json.Unmarshal(data, &meta); err != nil {
 			continue
 		}
-		if strings.HasPrefix(cwd, meta.SourcePath) {
+		if cwd == meta.SourcePath || strings.HasPrefix(cwd, meta.SourcePath+string(filepath.Separator)) {
 			return meta.ID, nil
 		}
 	}
@@ -164,15 +165,6 @@ func resolveRootName(client *apiClient, name string) (string, error) {
 }
 
 func isUUID(s string) bool {
-	if len(s) != 36 {
-		return false
-	}
-	for i, c := range s {
-		if i == 8 || i == 13 || i == 18 || i == 23 {
-			if c != '-' {
-				return false
-			}
-		}
-	}
-	return true
+	_, err := uuid.Parse(s)
+	return err == nil
 }

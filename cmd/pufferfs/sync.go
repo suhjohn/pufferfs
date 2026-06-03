@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -190,7 +191,7 @@ func uploadFile(client *apiClient, rootID, relPath, localPath string) error {
 	if err != nil {
 		return err
 	}
-	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, relPath)
+	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, url.QueryEscape(relPath))
 	_, err = client.postRaw(url, data, "application/octet-stream")
 	return err
 }
