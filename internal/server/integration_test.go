@@ -37,11 +37,11 @@ const (
 	testDBName = "pufferfs_test"
 	testDBPort = "15432"
 
-	testMinioPort      = "19000"
-	testMinioUser      = "minioadmin"
-	testMinioPass      = "minioadmin"
-	testMinioBucket    = "pufferfs-test"
-	testJWTSecret      = "integration-test-secret-32chars!"
+	testMinioPort   = "19000"
+	testMinioUser   = "minioadmin"
+	testMinioPass   = "minioadmin"
+	testMinioBucket = "pufferfs-test"
+	testJWTSecret   = "integration-test-secret-32chars!"
 )
 
 var (
@@ -193,7 +193,7 @@ func waitForPort(t *testing.T, port string, timeout time.Duration) {
 // ---------------------------------------------------------------------------
 
 type mockModal struct {
-	srv *httptest.Server
+	srv    *httptest.Server
 	client *server.ModalClient
 }
 
@@ -873,17 +873,16 @@ func TestIntegration_SyncWithModifiedAndRemoved(t *testing.T) {
 	}
 }
 
-func TestIntegration_SimHashAndIndexReuse(t *testing.T) {
+func TestIntegration_SimHashStored(t *testing.T) {
 	env := setupTestEnv(t)
 
-	// Create root A (first user syncs repo)
+	// Create root A and sync with a SimHash
 	_, result := env.doRequest(t, "POST", "/roots", map[string]any{
 		"name":        "repo-alpha",
 		"source_path": "/home/alice/repo",
 	})
 	rootA := result["id"].(string)
 
-	// Upload and sync root A
 	env.doRequestRaw(t, "POST", fmt.Sprintf("/roots/%s/upload?path=src/app.go", rootA),
 		[]byte("package main"), "application/octet-stream")
 
@@ -902,34 +901,29 @@ func TestIntegration_SimHashAndIndexReuse(t *testing.T) {
 		t.Fatalf("sync A: expected 200, got %d", status)
 	}
 
-	// Verify simhash was stored
 	nsA := fmt.Sprintf("org-%s-root-%s", env.orgID, rootA)
 	if env.tp.docCount(nsA) == 0 {
 		t.Error("root A should have documents in TP")
 	}
 
-	// Create root B (second user syncs same repo — same simhash)
+	// sync/init is disabled (no namespace cloning): should return can_reuse=false
 	_, result = env.doRequest(t, "POST", "/roots", map[string]any{
 		"name":        "repo-beta",
 		"source_path": "/home/bob/repo",
 	})
 	rootB := result["id"].(string)
 
-	// Sync init: check for similar indexes
 	status, initResult := env.doRequest(t, "POST", "/roots/"+rootB+"/sync/init", map[string]any{
 		"simhash": "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
 	})
 	if !isSuccess(status) {
 		t.Fatalf("sync init: expected 200, got %d", status)
 	}
-	if initResult["can_reuse"] != true {
-		t.Errorf("expected can_reuse=true, got %v", initResult["can_reuse"])
-	}
-	if initResult["similarity"] == nil || initResult["similarity"].(float64) < 0.99 {
-		t.Errorf("expected high similarity for identical simhash, got %v", initResult["similarity"])
+	if initResult["can_reuse"] != false {
+		t.Errorf("expected can_reuse=false (index reuse disabled), got %v", initResult["can_reuse"])
 	}
 
-	// Sync root B with same simhash (should trigger index reuse)
+	// Root B syncs independently (no cloning, full index)
 	env.doRequestRaw(t, "POST", fmt.Sprintf("/roots/%s/upload?path=src/app.go", rootB),
 		[]byte("package main"), "application/octet-stream")
 
@@ -948,10 +942,9 @@ func TestIntegration_SimHashAndIndexReuse(t *testing.T) {
 		t.Fatalf("sync B: expected 200, got %d", status)
 	}
 
-	// Root B's namespace should have documents (from clone + any new processing)
 	nsB := fmt.Sprintf("org-%s-root-%s", env.orgID, rootB)
 	if env.tp.docCount(nsB) == 0 {
-		t.Error("root B should have documents after index reuse")
+		t.Error("root B should have documents after independent sync")
 	}
 }
 

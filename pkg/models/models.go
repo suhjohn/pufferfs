@@ -79,14 +79,6 @@ type RootMetadata struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// RootWithSimHash is a root with its SimHash for similarity matching.
-type RootWithSimHash struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	SourcePath string `json:"source_path"`
-	SimHash    string `json:"simhash"`
-}
-
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {
 	Size        int64  `json:"size"`
@@ -239,14 +231,14 @@ type RootACL struct {
 
 // SyncJob tracks the lifecycle of a sync operation.
 type SyncJob struct {
-	ID         string              `json:"id"`
-	OrgID      string              `json:"org_id"`
-	RootID     string              `json:"root_id"`
-	UserID     string              `json:"user_id"`
-	Status     string              `json:"status"`
-	TotalFiles int                 `json:"total_files"`
-	Processed  int                 `json:"processed"`
-	Errors     json.RawMessage     `json:"errors"`
-	StartedAt  time.Time           `json:"started_at"`
-	FinishedAt *time.Time          `json:"finished_at,omitempty"`
+	ID         string          `json:"id"`
+	OrgID      string          `json:"org_id"`
+	RootID     string          `json:"root_id"`
+	UserID     string          `json:"user_id"`
+	Status     string          `json:"status"`
+	TotalFiles int             `json:"total_files"`
+	Processed  int             `json:"processed"`
+	Errors     json.RawMessage `json:"errors"`
+	StartedAt  time.Time       `json:"started_at"`
+	FinishedAt *time.Time      `json:"finished_at,omitempty"`
 }

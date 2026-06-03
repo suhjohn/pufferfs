@@ -55,7 +55,7 @@ func namespaceName(rootID string) string {
 // UpsertRows writes documents to a namespace.
 func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric string) error {
 	body := map[string]any{
-		"upsert_rows":    rows,
+		"upsert_rows":     rows,
 		"distance_metric": distanceMetric,
 		"schema": map[string]any{
 			"content": map[string]any{
@@ -65,6 +65,7 @@ func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric s
 			"file_path":    map[string]any{"type": "string"},
 			"chunk_index":  map[string]any{"type": "uint"},
 			"content_hash": map[string]any{"type": "string"},
+			"file_hash":    map[string]any{"type": "string"},
 			"file_type":    map[string]any{"type": "string"},
 			"page_number":  map[string]any{"type": "uint"},
 			"image_path":   map[string]any{"type": "string"},
@@ -177,7 +178,7 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
 func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, globFilter string) ([]map[string]any, error) {
-	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "page_number", "image_path"}
+	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"}
 
 	queries := []map[string]any{
 		{
@@ -241,4 +242,3 @@ func reciprocalRankFusion(resultSets [][]map[string]any, k int) []map[string]any
 	}
 	return results
 }
-

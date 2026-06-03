@@ -598,12 +598,6 @@ func (db *DB) GetACLsForUser(ctx context.Context, orgID, rootID, userID string, 
 		userID,
 		"role:" + string(role),
 	}
-	// Also include lower roles (e.g., admin gets editor+viewer grants)
-	for _, r := range []auth.Role{auth.RoleViewer, auth.RoleEditor, auth.RoleAdmin, auth.RoleOwner} {
-		if auth.Role(r) != role {
-			grantTargets = append(grantTargets, "role:"+string(r))
-		}
-	}
 
 	rows, err := db.pool.Query(ctx,
 		`SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at
@@ -785,53 +779,6 @@ func (db *DB) UpdateRootSimHash(ctx context.Context, orgID, rootID, simhash stri
 		simhash, rootID, orgID,
 	)
 	return err
-}
-
-// FindSimilarRoots finds roots in the same org with similar SimHashes.
-// Returns roots ordered by SimHash similarity (exact text match first, then all others).
-// The caller computes actual Hamming distance client-side.
-func (db *DB) FindSimilarRoots(ctx context.Context, orgID, excludeRootID, simhash string) ([]models.RootWithSimHash, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT id, name, source_path, simhash FROM roots
-		 WHERE org_id = $1 AND id != $2 AND simhash != ''
-		 ORDER BY (simhash = $3) DESC, updated_at DESC
-		 LIMIT 10`,
-		orgID, excludeRootID, simhash,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []models.RootWithSimHash
-	for rows.Next() {
-		var r models.RootWithSimHash
-		if err := rows.Scan(&r.ID, &r.Name, &r.SourcePath, &r.SimHash); err != nil {
-			return nil, err
-		}
-		results = append(results, r)
-	}
-	return results, rows.Err()
-}
-
-// CopyEmbeddingCache copies embedding cache entries from one org-scoped key space to another.
-// Used when cloning an index for a similar root.
-func (db *DB) CopyEmbeddingCache(ctx context.Context, srcOrgID, dstOrgID string, contentHashes []string) (int64, error) {
-	if len(contentHashes) == 0 {
-		return 0, nil
-	}
-	tag, err := db.pool.Exec(ctx,
-		`INSERT INTO embedding_cache (org_id, content_hash, embedding, created_at)
-		 SELECT $1, content_hash, embedding, NOW()
-		 FROM embedding_cache
-		 WHERE org_id = $2 AND content_hash = ANY($3)
-		 ON CONFLICT (org_id, content_hash) DO NOTHING`,
-		dstOrgID, srcOrgID, contentHashes,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
 }
 
 // ---------------------------------------------------------------------------

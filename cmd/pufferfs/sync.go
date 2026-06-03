@@ -60,6 +60,18 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		name = filepath.Base(dir)
 	}
 
+	if rootID == "" {
+		if localRootID, err := findLocalRootID(name, dir); err == nil {
+			rootID = localRootID
+		} else if !dryRun {
+			resolvedRootID, err := resolveOrCreateRoot(newAPIClient(cfg), name, dir)
+			if err != nil {
+				return err
+			}
+			rootID = resolvedRootID
+		}
+	}
+
 	// Build Merkle tree (parallel file hashing)
 	matcher := ignore.NewMatcher(dir)
 	fmt.Printf("Building Merkle tree for %s...\n", dir)
@@ -310,6 +322,37 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (string, er
 
 	fmt.Printf("Created root: %s (%s)\n", root.Name, root.ID)
 	return root.ID, nil
+}
+
+func findLocalRootID(name, sourcePath string) (string, error) {
+	rootsDir := filepath.Join(appconfig.DefaultConfigDir(), "roots")
+	entries, err := os.ReadDir(rootsDir)
+	if err != nil {
+		return "", err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(rootsDir, entry.Name(), "meta.json"))
+		if err != nil {
+			continue
+		}
+		var meta struct {
+			ID         string `json:"id"`
+			Name       string `json:"name"`
+			SourcePath string `json:"source_path"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			continue
+		}
+		if meta.Name == name && meta.SourcePath == sourcePath {
+			return meta.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("local root metadata not found")
 }
 
 func uploadFile(client *apiClient, rootID, relPath, localPath string) error {
