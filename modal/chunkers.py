@@ -146,9 +146,9 @@ def chunk_pdf(
     for page_num in range(len(doc)):
         page = doc[page_num]
 
-        # Render page to image
+        # Render page to image (JPEG for smaller size)
         pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("png")
+        img_bytes = pix.tobytes("jpeg")
 
         # Upload page image to S3
         image_key = _page_image_key(root_id, file_path, page_num)
@@ -156,7 +156,7 @@ def chunk_pdf(
             Bucket=bucket,
             Key=image_key,
             Body=img_bytes,
-            ContentType="image/png",
+            ContentType="image/jpeg",
         )
 
         # Extract text from the page
@@ -315,7 +315,7 @@ def detect_file_type(file_path: str) -> str:
 
 
 def _page_image_key(root_id: str, file_path: str, page_num: int) -> str:
-    return f"chunks/{root_id}/{file_path}.{page_num}.png"
+    return f"chunks/{root_id}/{file_path}.{page_num}.jpg"
 
 
 def _guess_image_content_type(file_path: str) -> str:
