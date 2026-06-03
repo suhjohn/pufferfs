@@ -422,6 +422,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RootID = rootID
+	if err := normalizeSyncRequest(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// Store SimHash for future index reuse
 	if req.SimHash != "" {

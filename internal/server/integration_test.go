@@ -807,6 +807,34 @@ func TestIntegration_SyncFlow(t *testing.T) {
 	}
 }
 
+func TestIntegration_SyncRejectsInvalidPaths(t *testing.T) {
+	env := setupTestEnv(t)
+
+	_, result := env.doRequest(t, "POST", "/roots", map[string]any{
+		"name":        "invalid-path-test",
+		"source_path": "/home/user/project-invalid",
+	})
+	rootID := result["id"].(string)
+
+	syncReq := models.SyncRequest{
+		RootID: rootID,
+		Changes: []models.FileChange{
+			{Path: "../evil.txt", Status: models.StatusAdded, ContentHash: "sha256:evil", Size: 4},
+		},
+		State: map[string]models.FileState{
+			"../evil.txt": {Size: 4, ContentHash: "sha256:evil"},
+		},
+	}
+
+	status, result := env.doRequest(t, "POST", "/roots/"+rootID+"/sync", syncReq)
+	if status != http.StatusBadRequest {
+		t.Fatalf("sync with path traversal: expected 400, got %d: %v", status, result)
+	}
+	if !strings.Contains(fmt.Sprint(result["error"]), "invalid change path") {
+		t.Fatalf("expected invalid change path error, got %v", result)
+	}
+}
+
 func TestIntegration_SyncWithModifiedAndRemoved(t *testing.T) {
 	env := setupTestEnv(t)
 
