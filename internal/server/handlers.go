@@ -711,10 +711,24 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 	processed := 0
 	workers := syncWorkerCount()
 	sem := make(chan struct{}, workers)
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	mutations := make(chan syncMutation, workers)
+	streamResult := make(chan syncMutation, 1)
+	streamErr := make(chan error, 1)
+
+	go func() {
+		deferred, err := s.streamSyncMutations(streamCtx, orgID, req.RootID, mutations)
+		if err != nil {
+			cancel()
+		}
+		streamResult <- deferred
+		streamErr <- err
+	}()
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
-	var mutations []syncMutation
 
 	for _, change := range req.Changes {
 		change := change
@@ -729,32 +743,49 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, mutation, err := s.processSyncChange(ctx, orgID, req.RootID, change)
+			result, mutation, err := s.processSyncChange(streamCtx, orgID, req.RootID, change)
 
 			mu.Lock()
-			defer mu.Unlock()
 			if err != nil && firstErr == nil {
 				firstErr = err
+				cancel()
 			}
 			if err == nil {
 				resp.ChunksAdded += result.chunksAdded
 				resp.ChunksRemoved += result.chunksRemoved
 				resp.ChunksMoved += result.chunksMoved
 				resp.FilesProcessed += result.filesProcessed
-				mutations = append(mutations, mutation)
 			}
 			processed++
 			if job != nil && processed%5 == 0 {
 				_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "embedding", processed)
 			}
+			mu.Unlock()
+
+			if err == nil {
+				select {
+				case mutations <- mutation:
+				case <-streamCtx.Done():
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = streamCtx.Err()
+					}
+					mu.Unlock()
+				}
+			}
 		}()
 	}
 	wg.Wait()
+	close(mutations)
+	deferredMutation := <-streamResult
+	if err := <-streamErr; err != nil && firstErr == nil {
+		firstErr = err
+	}
 
 	if firstErr != nil {
 		return nil, firstErr
 	}
-	if err := s.applySyncMutations(ctx, orgID, req.RootID, mutations); err != nil {
+	if err := s.applyDeferredSyncMutations(ctx, orgID, req.RootID, deferredMutation); err != nil {
 		return nil, err
 	}
 
@@ -825,34 +856,72 @@ func syncWorkerCount() int {
 	return workers
 }
 
-func (s *Server) applySyncMutations(ctx context.Context, orgID, rootID string, mutations []syncMutation) error {
+func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID string, mutations <-chan syncMutation) (syncMutation, error) {
 	ns := tpNamespace(orgID, rootID)
+	flushRows := syncMutationFlushRows()
+	flushEvery := syncMutationFlushInterval()
+	ticker := time.NewTicker(flushEvery)
+	defer ticker.Stop()
+
 	var upsertRows []map[string]any
 	var pendingEmbeddings []pendingEmbedding
-	var deleteIDs []string
-	var s3DeleteKeys []string
-	for _, mutation := range mutations {
-		upsertRows = append(upsertRows, mutation.upsertRows...)
-		pendingEmbeddings = append(pendingEmbeddings, mutation.pendingEmbeddings...)
-		deleteIDs = append(deleteIDs, mutation.deleteIDs...)
-		s3DeleteKeys = append(s3DeleteKeys, mutation.s3DeleteKeys...)
-	}
-	if len(pendingEmbeddings) > 0 {
-		if err := s.resolvePendingEmbeddings(ctx, orgID, pendingEmbeddings); err != nil {
-			return err
+	var deferred syncMutation
+
+	flush := func(reason string) error {
+		if len(upsertRows) == 0 {
+			return nil
 		}
-	}
-	if len(upsertRows) > 0 {
+		flushStart := time.Now()
+		if len(pendingEmbeddings) > 0 {
+			if err := s.resolvePendingEmbeddings(ctx, orgID, pendingEmbeddings); err != nil {
+				return err
+			}
+		}
 		if err := s.upsertRowsInBatches(ns, upsertRows); err != nil {
 			return err
 		}
+		log.Printf("timing stage=sync_mutation_flush reason=%s rows=%d pending_embeddings=%d elapsed=%s", reason, len(upsertRows), len(pendingEmbeddings), time.Since(flushStart))
+		upsertRows = nil
+		pendingEmbeddings = nil
+		return nil
 	}
-	if len(deleteIDs) > 0 {
-		if err := s.deleteIDsInBatches(ns, deleteIDs); err != nil {
+
+	for {
+		select {
+		case mutation, ok := <-mutations:
+			if !ok {
+				if err := flush("final"); err != nil {
+					return syncMutation{}, err
+				}
+				return deferred, nil
+			}
+			upsertRows = append(upsertRows, mutation.upsertRows...)
+			pendingEmbeddings = append(pendingEmbeddings, mutation.pendingEmbeddings...)
+			deferred.deleteIDs = append(deferred.deleteIDs, mutation.deleteIDs...)
+			deferred.s3DeleteKeys = append(deferred.s3DeleteKeys, mutation.s3DeleteKeys...)
+			if len(upsertRows) >= flushRows {
+				if err := flush("rows"); err != nil {
+					return syncMutation{}, err
+				}
+			}
+		case <-ticker.C:
+			if err := flush("interval"); err != nil {
+				return syncMutation{}, err
+			}
+		case <-ctx.Done():
+			return syncMutation{}, ctx.Err()
+		}
+	}
+}
+
+func (s *Server) applyDeferredSyncMutations(ctx context.Context, orgID, rootID string, mutation syncMutation) error {
+	ns := tpNamespace(orgID, rootID)
+	if len(mutation.deleteIDs) > 0 {
+		if err := s.deleteIDsInBatches(ns, mutation.deleteIDs); err != nil {
 			return err
 		}
 	}
-	for _, key := range s3DeleteKeys {
+	for _, key := range mutation.s3DeleteKeys {
 		if err := s.s3.Delete(ctx, key); err != nil {
 			return fmt.Errorf("deleting %s from S3: %w", key, err)
 		}
@@ -953,6 +1022,38 @@ func tpWriteBatchSize() int {
 		return 5000
 	}
 	return rows
+}
+
+func syncMutationFlushRows() int {
+	const defaultRows = 10000
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_FLUSH_ROWS"))
+	if raw == "" {
+		return defaultRows
+	}
+	rows, err := strconv.Atoi(raw)
+	if err != nil || rows < 1 {
+		return defaultRows
+	}
+	if rows > 100000 {
+		return 100000
+	}
+	return rows
+}
+
+func syncMutationFlushInterval() time.Duration {
+	const defaultInterval = 3 * time.Second
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_FLUSH_INTERVAL"))
+	if raw == "" {
+		return defaultInterval
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil || interval <= 0 {
+		return defaultInterval
+	}
+	if interval > time.Minute {
+		return time.Minute
+	}
+	return interval
 }
 
 // tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
