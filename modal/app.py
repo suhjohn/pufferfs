@@ -157,28 +157,43 @@ EMBEDDING_DIM = 768
 
 @app.cls(
     image=embedding_image,
-    cpu=2,
+    gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
+    cpu=4,
     timeout=600,
-    memory=4096,
-    scaledown_window=300,
+    memory=8192,
+    min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "1")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "8")),
+    scaledown_window=900,
 )
 class Embedder:
-    """Persistent embedding model container (CPU-only, Nomic Embed v1.5)."""
+    """Persistent embedding model container (GPU-backed, Nomic Embed v1.5)."""
 
     @modal.enter()
     def load_model(self):
+        import torch
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.encode_batch_size = int(os.getenv("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", "64"))
+        self.model = SentenceTransformer(
+            EMBEDDING_MODEL,
+            trust_remote_code=True,
+            device=self.device,
+        )
 
-    @modal.method()
-    def embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
+    def _embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
         """Embed a batch of Chunk dicts, return ChunkWithEmbedding dicts."""
         if not chunk_dicts:
             return []
 
         texts = [f"search_document: {c['content']}" for c in chunk_dicts]
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        embeddings = self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.encode_batch_size,
+            device=self.device,
+        )
 
         results: list[dict] = []
         for chunk_dict, emb in zip(chunk_dicts, embeddings):
@@ -188,14 +203,31 @@ class Embedder:
 
         return results
 
-    @modal.method()
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of raw text strings. Used for query embedding."""
         if not texts:
             return []
         prefixed = [f"search_query: {t}" for t in texts]
-        embeddings = self.model.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
+        embeddings = self.model.encode(
+            prefixed,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.encode_batch_size,
+            device=self.device,
+        )
         return [emb.tolist() for emb in embeddings]
+
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-chunks-endpoint")
+    def embed_chunks_endpoint(self, item: dict) -> dict:
+        """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
+        results = self._embed_chunks(item["chunks"])
+        return {"results": results, "count": len(results)}
+
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-query-endpoint")
+    def embed_query_endpoint(self, item: dict) -> dict:
+        """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
+        embeddings = self._embed_texts(item["texts"])
+        return {"embeddings": embeddings}
 
 
 # ---------------------------------------------------------------------------
@@ -220,31 +252,3 @@ def chunk_file_endpoint(item: dict) -> dict:
         content_b64=item.get("content_b64"),
     )
     return {"chunks": chunks, "count": len(chunks)}
-
-
-@app.function(
-    image=embedding_image,
-    cpu=2,
-    timeout=600,
-    memory=4096,
-)
-@modal.fastapi_endpoint(method="POST")
-def embed_chunks_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
-    embedder = Embedder()
-    results = embedder.embed_chunks.local(item["chunks"])
-    return {"results": results, "count": len(results)}
-
-
-@app.function(
-    image=embedding_image,
-    cpu=2,
-    timeout=600,
-    memory=4096,
-)
-@modal.fastapi_endpoint(method="POST")
-def embed_query_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
-    embedder = Embedder()
-    embeddings = embedder.embed_texts.local(item["texts"])
-    return {"embeddings": embeddings}

@@ -762,9 +762,16 @@ func (s *Server) processSync(ctx context.Context, orgID string, req *models.Sync
 }
 
 type syncMutation struct {
-	upsertRows   []map[string]any
-	deleteIDs    []string
-	s3DeleteKeys []string
+	upsertRows        []map[string]any
+	pendingEmbeddings []pendingEmbedding
+	deleteIDs         []string
+	s3DeleteKeys      []string
+}
+
+type pendingEmbedding struct {
+	chunk       map[string]any
+	row         map[string]any
+	contentHash string
 }
 
 type syncChangeResult struct {
@@ -821,12 +828,19 @@ func syncWorkerCount() int {
 func (s *Server) applySyncMutations(ctx context.Context, orgID, rootID string, mutations []syncMutation) error {
 	ns := tpNamespace(orgID, rootID)
 	var upsertRows []map[string]any
+	var pendingEmbeddings []pendingEmbedding
 	var deleteIDs []string
 	var s3DeleteKeys []string
 	for _, mutation := range mutations {
 		upsertRows = append(upsertRows, mutation.upsertRows...)
+		pendingEmbeddings = append(pendingEmbeddings, mutation.pendingEmbeddings...)
 		deleteIDs = append(deleteIDs, mutation.deleteIDs...)
 		s3DeleteKeys = append(s3DeleteKeys, mutation.s3DeleteKeys...)
+	}
+	if len(pendingEmbeddings) > 0 {
+		if err := s.resolvePendingEmbeddings(ctx, orgID, pendingEmbeddings); err != nil {
+			return err
+		}
 	}
 	if len(upsertRows) > 0 {
 		if err := s.upsertRowsInBatches(ns, upsertRows); err != nil {
@@ -843,6 +857,53 @@ func (s *Server) applySyncMutations(ctx context.Context, orgID, rootID string, m
 			return fmt.Errorf("deleting %s from S3: %w", key, err)
 		}
 	}
+	return nil
+}
+
+func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pending []pendingEmbedding) error {
+	chunks := make([]map[string]any, len(pending))
+	for i, item := range pending {
+		chunks[i] = item.chunk
+	}
+	embedStart := time.Now()
+	embedResults, err := s.embedChunksInBatches(chunks)
+	if err != nil {
+		return fmt.Errorf("embedding sync chunks: %w", err)
+	}
+	log.Printf("timing stage=modal_embed_global chunks=%d elapsed=%s", len(chunks), time.Since(embedStart))
+
+	cacheEntries := make(map[string][]float64)
+	for i, result := range embedResults {
+		if i >= len(pending) {
+			break
+		}
+		embedding, ok := result["embedding"].([]any)
+		if !ok {
+			continue
+		}
+		pending[i].row["vector"] = embedding
+		hash := pending[i].contentHash
+		if hash == "" {
+			chunk, _ := result["chunk"].(map[string]any)
+			hash, _ = chunk["content_hash"].(string)
+		}
+		if hash == "" {
+			continue
+		}
+		embFloat := make([]float64, len(embedding))
+		for j, value := range embedding {
+			if f, ok := value.(float64); ok {
+				embFloat[j] = f
+			}
+		}
+		cacheEntries[hash] = embFloat
+	}
+
+	cacheSaveStart := time.Now()
+	if err := s.db.SaveCachedEmbeddings(ctx, orgID, cacheEntries); err != nil {
+		log.Printf("warning: failed to save embedding cache: %v", err)
+	}
+	log.Printf("timing stage=embedding_cache_save_global entries=%d elapsed=%s", len(cacheEntries), time.Since(cacheSaveStart))
 	return nil
 }
 
@@ -965,70 +1026,44 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 	}
 	log.Printf("timing file=%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
 
-	var uncachedChunks []map[string]any
 	cachedRows := make(map[int][]float64)
+	uncachedCount := 0
 
 	for i, c := range chunkResp.Chunks {
 		hash, _ := c["content_hash"].(string)
 		if emb, ok := cached[hash]; ok {
 			cachedRows[i] = emb
 		} else {
-			uncachedChunks = append(uncachedChunks, c)
+			uncachedCount++
 		}
 	}
 
 	log.Printf("file %s: %d chunks total, %d cached, %d to embed",
-		change.Path, len(chunkResp.Chunks), len(cachedRows), len(uncachedChunks))
-
-	var embedResults []map[string]any
-	if len(uncachedChunks) > 0 {
-		embedStart := time.Now()
-		embedResults, err = s.embedChunksInBatches(uncachedChunks)
-		if err != nil {
-			return syncMutation{}, fmt.Errorf("embedding: %w", err)
-		}
-		log.Printf("timing file=%s stage=modal_embed chunks=%d elapsed=%s", change.Path, len(uncachedChunks), time.Since(embedStart))
-
-		newCacheEntries := make(map[string][]float64)
-		for _, r := range embedResults {
-			chunk, _ := r["chunk"].(map[string]any)
-			hash, _ := chunk["content_hash"].(string)
-			if emb, ok := r["embedding"].([]any); ok && hash != "" {
-				embFloat := make([]float64, len(emb))
-				for k, v := range emb {
-					if f, ok := v.(float64); ok {
-						embFloat[k] = f
-					}
-				}
-				newCacheEntries[hash] = embFloat
-			}
-		}
-		cacheSaveStart := time.Now()
-		if err := s.db.SaveCachedEmbeddings(ctx, orgID, newCacheEntries); err != nil {
-			log.Printf("warning: failed to save embedding cache: %v", err)
-		}
-		log.Printf("timing file=%s stage=embedding_cache_save entries=%d elapsed=%s", change.Path, len(newCacheEntries), time.Since(cacheSaveStart))
-	}
+		change.Path, len(chunkResp.Chunks), len(cachedRows), uncachedCount)
 
 	rows := make([]map[string]any, len(chunkResp.Chunks))
-	embedIdx := 0
+	pending := make([]pendingEmbedding, 0, uncachedCount)
 	for i, c := range chunkResp.Chunks {
 		row := indexedChunkFromModal(rootID, change.ContentHash, c)
+		rowMap := row.mapRow()
 
 		if emb, ok := cachedRows[i]; ok {
-			row.Vector = emb
-		} else if embedIdx < len(embedResults) {
-			r := embedResults[embedIdx]
-			row.Vector, _ = r["embedding"].([]any)
-			embedIdx++
+			rowMap["vector"] = emb
+		} else {
+			hash, _ := c["content_hash"].(string)
+			pending = append(pending, pendingEmbedding{
+				chunk:       c,
+				row:         rowMap,
+				contentHash: hash,
+			})
 		}
 
-		rows[i] = row.mapRow()
+		rows[i] = rowMap
 	}
 
 	staleIDs := staleChunkIDs(oldIDs, rows)
 	log.Printf("timing file=%s stage=process_file_total chunks=%d elapsed=%s", change.Path, len(rows), time.Since(totalStart))
-	return syncMutation{upsertRows: rows, deleteIDs: staleIDs}, nil
+	return syncMutation{upsertRows: rows, pendingEmbeddings: pending, deleteIDs: staleIDs}, nil
 }
 
 func (s *Server) processFileRemove(ctx context.Context, orgID, rootID string, change models.FileChange) (syncMutation, error) {
@@ -1141,7 +1176,7 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 	}
 	log.Printf("timing move=%s->%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.OldPath, change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
 
-	var uncachedChunks []map[string]any
+	var pending []pendingEmbedding
 	newRows := make([]map[string]any, len(rows))
 	for i, row := range rows {
 		chunkIdx := 0
@@ -1158,51 +1193,100 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 		if emb, ok := cached[hash]; ok {
 			newRows[i]["vector"] = emb
 		} else {
-			uncachedChunks = append(uncachedChunks, modalChunkPayload(newRows[i]))
+			pending = append(pending, pendingEmbedding{
+				chunk:       modalChunkPayload(newRows[i]),
+				row:         newRows[i],
+				contentHash: hash,
+			})
 		}
 	}
 
-	if len(uncachedChunks) > 0 {
-		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(uncachedChunks), len(rows))
-		embedStart := time.Now()
-		embedResults, err := s.embedChunksInBatches(uncachedChunks)
-		if err != nil {
-			return syncMutation{}, fmt.Errorf("re-embedding moved chunks: %w", err)
-		}
-		log.Printf("timing move=%s->%s stage=modal_embed chunks=%d elapsed=%s", change.OldPath, change.Path, len(uncachedChunks), time.Since(embedStart))
-		embedIdx := 0
-		for i := range newRows {
-			if _, hasVec := newRows[i]["vector"]; !hasVec && embedIdx < len(embedResults) {
-				newRows[i]["vector"], _ = embedResults[embedIdx]["embedding"].([]any)
-				embedIdx++
-			}
-		}
+	if len(pending) > 0 {
+		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(pending), len(rows))
 	}
 
 	log.Printf("timing move=%s->%s stage=process_move_total rows=%d elapsed=%s", change.OldPath, change.Path, len(newRows), time.Since(totalStart))
-	return syncMutation{upsertRows: newRows, deleteIDs: oldIDs}, nil
+	return syncMutation{upsertRows: newRows, pendingEmbeddings: pending, deleteIDs: oldIDs}, nil
 }
 
 func (s *Server) embedChunksInBatches(chunks []map[string]any) ([]map[string]any, error) {
-	const batchSize = 4
-
+	batchSize := embedBatchSize()
+	batchCount := (len(chunks) + batchSize - 1) / batchSize
+	concurrency := embedBatchConcurrency()
+	if concurrency > batchCount {
+		concurrency = batchCount
+	}
 	totalStart := time.Now()
-	results := make([]map[string]any, 0, len(chunks))
+	batchResults := make([][]map[string]any, batchCount)
+	errs := make([]error, batchCount)
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
 	for start := 0; start < len(chunks); start += batchSize {
 		end := start + batchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
-		batchStart := time.Now()
-		resp, err := s.modal.EmbedChunks(chunks[start:end])
-		if err != nil {
-			return nil, err
-		}
-		log.Printf("timing stage=modal_embed_batch batch=%d/%d chunks=%d elapsed=%s", start/batchSize+1, (len(chunks)+batchSize-1)/batchSize, end-start, time.Since(batchStart))
-		results = append(results, resp.Results...)
+		batchIndex := start / batchSize
+		wg.Add(1)
+		go func(batchIndex, start, end int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			batchStart := time.Now()
+			resp, err := s.modal.EmbedChunks(chunks[start:end])
+			if err != nil {
+				errs[batchIndex] = err
+				return
+			}
+			log.Printf("timing stage=modal_embed_batch batch=%d/%d chunks=%d elapsed=%s", batchIndex+1, batchCount, end-start, time.Since(batchStart))
+			batchResults[batchIndex] = resp.Results
+		}(batchIndex, start, end)
 	}
-	log.Printf("timing stage=modal_embed_batches_total chunks=%d batches=%d elapsed=%s", len(chunks), (len(chunks)+batchSize-1)/batchSize, time.Since(totalStart))
+	wg.Wait()
+
+	results := make([]map[string]any, 0, len(chunks))
+	for batchIndex, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("embedding batch %d/%d: %w", batchIndex+1, batchCount, err)
+		}
+		results = append(results, batchResults[batchIndex]...)
+	}
+	log.Printf("timing stage=modal_embed_batches_total chunks=%d batches=%d batch_size=%d concurrency=%d elapsed=%s", len(chunks), batchCount, batchSize, concurrency, time.Since(totalStart))
 	return results, nil
+}
+
+func embedBatchSize() int {
+	const defaultSize = 16
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBED_BATCH_SIZE"))
+	if raw == "" {
+		return defaultSize
+	}
+	size, err := strconv.Atoi(raw)
+	if err != nil || size < 1 {
+		return defaultSize
+	}
+	if size > 128 {
+		return 128
+	}
+	return size
+}
+
+func embedBatchConcurrency() int {
+	const defaultConcurrency = 4
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBED_BATCH_CONCURRENCY"))
+	if raw == "" {
+		return defaultConcurrency
+	}
+	concurrency, err := strconv.Atoi(raw)
+	if err != nil || concurrency < 1 {
+		return defaultConcurrency
+	}
+	if concurrency > 16 {
+		return 16
+	}
+	return concurrency
 }
 
 // ---------------------------------------------------------------------------
