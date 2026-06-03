@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/internal/storage"
@@ -751,10 +752,12 @@ func tpNamespace(orgID, rootID string) string {
 }
 
 func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, change models.FileChange) error {
+	totalStart := time.Now()
 	ns := tpNamespace(orgID, rootID)
 
 	var oldIDs []string
 	if change.Status == models.StatusModified {
+		oldRowsStart := time.Now()
 		oldRows, err := s.tp.Query(ns,
 			[]any{"file_path", "asc"},
 			10000,
@@ -764,6 +767,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 		if err != nil {
 			return fmt.Errorf("querying old chunks for %s: %w", change.Path, err)
 		}
+		log.Printf("timing file=%s stage=tp_query_old_chunks rows=%d elapsed=%s", change.Path, len(oldRows), time.Since(oldRowsStart))
 		for _, row := range oldRows {
 			if id := fmt.Sprintf("%v", row["id"]); id != "" && id != "<nil>" {
 				oldIDs = append(oldIDs, id)
@@ -773,11 +777,14 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 
+	downloadStart := time.Now()
 	fileData, err := s.s3.Download(ctx, s3Key)
 	if err != nil {
 		return fmt.Errorf("downloading %s from S3: %w", s3Key, err)
 	}
+	log.Printf("timing file=%s stage=s3_download bytes=%d elapsed=%s", change.Path, len(fileData), time.Since(downloadStart))
 
+	chunkStart := time.Now()
 	chunkResp, err := s.modal.ChunkFile(ChunkFileRequest{
 		S3Key:      s3Key,
 		FilePath:   change.Path,
@@ -788,13 +795,17 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 	if err != nil {
 		return fmt.Errorf("chunking: %w", err)
 	}
+	log.Printf("timing file=%s stage=modal_chunk chunks=%d elapsed=%s", change.Path, len(chunkResp.Chunks), time.Since(chunkStart))
 
 	if len(chunkResp.Chunks) == 0 {
 		if len(oldIDs) > 0 {
+			deleteStart := time.Now()
 			if err := s.tp.DeleteIDs(ns, oldIDs); err != nil {
 				return fmt.Errorf("deleting stale chunks for %s: %w", change.Path, err)
 			}
+			log.Printf("timing file=%s stage=tp_delete_stale ids=%d elapsed=%s", change.Path, len(oldIDs), time.Since(deleteStart))
 		}
+		log.Printf("timing file=%s stage=process_file_total chunks=0 elapsed=%s", change.Path, time.Since(totalStart))
 		return nil
 	}
 
@@ -805,11 +816,13 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 		}
 	}
 
+	cacheLookupStart := time.Now()
 	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup failed: %v", err)
 		cached = make(map[string][]float64)
 	}
+	log.Printf("timing file=%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
 
 	var uncachedChunks []map[string]any
 	cachedRows := make(map[int][]float64)
@@ -828,10 +841,12 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 
 	var embedResults []map[string]any
 	if len(uncachedChunks) > 0 {
+		embedStart := time.Now()
 		embedResults, err = s.embedChunksInBatches(uncachedChunks)
 		if err != nil {
 			return fmt.Errorf("embedding: %w", err)
 		}
+		log.Printf("timing file=%s stage=modal_embed chunks=%d elapsed=%s", change.Path, len(uncachedChunks), time.Since(embedStart))
 
 		newCacheEntries := make(map[string][]float64)
 		for _, r := range embedResults {
@@ -847,9 +862,11 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 				newCacheEntries[hash] = embFloat
 			}
 		}
+		cacheSaveStart := time.Now()
 		if err := s.db.SaveCachedEmbeddings(ctx, orgID, newCacheEntries); err != nil {
 			log.Printf("warning: failed to save embedding cache: %v", err)
 		}
+		log.Printf("timing file=%s stage=embedding_cache_save entries=%d elapsed=%s", change.Path, len(newCacheEntries), time.Since(cacheSaveStart))
 	}
 
 	rows := make([]map[string]any, len(chunkResp.Chunks))
@@ -868,16 +885,21 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 		rows[i] = row.mapRow()
 	}
 
+	upsertStart := time.Now()
 	if err := s.tp.UpsertRows(ns, rows, "cosine_distance"); err != nil {
 		return err
 	}
+	log.Printf("timing file=%s stage=tp_upsert rows=%d elapsed=%s", change.Path, len(rows), time.Since(upsertStart))
 
 	staleIDs := staleChunkIDs(oldIDs, rows)
 	if len(staleIDs) > 0 {
+		deleteStart := time.Now()
 		if err := s.tp.DeleteIDs(ns, staleIDs); err != nil {
 			return fmt.Errorf("deleting stale chunks for %s: %w", change.Path, err)
 		}
+		log.Printf("timing file=%s stage=tp_delete_stale ids=%d elapsed=%s", change.Path, len(staleIDs), time.Since(deleteStart))
 	}
+	log.Printf("timing file=%s stage=process_file_total chunks=%d elapsed=%s", change.Path, len(rows), time.Since(totalStart))
 	return nil
 }
 
@@ -927,13 +949,17 @@ func modalChunkPayload(row map[string]any) map[string]any {
 }
 
 func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, change models.FileChange) error {
+	totalStart := time.Now()
 	oldFileKey := fmt.Sprintf("files/%s/%s", rootID, change.OldPath)
 	newFileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
+	s3RenameStart := time.Now()
 	if err := s.s3.Rename(ctx, oldFileKey, newFileKey); err != nil {
 		return fmt.Errorf("renaming %s to %s in S3: %w", change.OldPath, change.Path, err)
 	}
+	log.Printf("timing move=%s->%s stage=s3_rename elapsed=%s", change.OldPath, change.Path, time.Since(s3RenameStart))
 
 	ns := tpNamespace(orgID, rootID)
+	queryStart := time.Now()
 	rows, err := s.tp.Query(ns,
 		[]any{"file_path", "asc"},
 		10000,
@@ -943,8 +969,10 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 	if err != nil {
 		return fmt.Errorf("querying old chunks: %w", err)
 	}
+	log.Printf("timing move=%s->%s stage=tp_query_old_rows rows=%d elapsed=%s", change.OldPath, change.Path, len(rows), time.Since(queryStart))
 
 	if len(rows) == 0 {
+		log.Printf("timing move=%s->%s stage=process_move_total rows=0 elapsed=%s", change.OldPath, change.Path, time.Since(totalStart))
 		return nil
 	}
 
@@ -961,11 +989,13 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 		}
 	}
 
+	cacheLookupStart := time.Now()
 	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup for move failed: %v", err)
 		cached = make(map[string][]float64)
 	}
+	log.Printf("timing move=%s->%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.OldPath, change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
 
 	var uncachedChunks []map[string]any
 	newRows := make([]map[string]any, len(rows))
@@ -990,10 +1020,12 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 
 	if len(uncachedChunks) > 0 {
 		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(uncachedChunks), len(rows))
+		embedStart := time.Now()
 		embedResults, err := s.embedChunksInBatches(uncachedChunks)
 		if err != nil {
 			return fmt.Errorf("re-embedding moved chunks: %w", err)
 		}
+		log.Printf("timing move=%s->%s stage=modal_embed chunks=%d elapsed=%s", change.OldPath, change.Path, len(uncachedChunks), time.Since(embedStart))
 		embedIdx := 0
 		for i := range newRows {
 			if _, hasVec := newRows[i]["vector"]; !hasVec && embedIdx < len(embedResults) {
@@ -1003,27 +1035,39 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 		}
 	}
 
+	upsertStart := time.Now()
 	if err := s.tp.UpsertRows(ns, newRows, "cosine_distance"); err != nil {
 		return err
 	}
-	return s.tp.DeleteIDs(ns, oldIDs)
+	log.Printf("timing move=%s->%s stage=tp_upsert rows=%d elapsed=%s", change.OldPath, change.Path, len(newRows), time.Since(upsertStart))
+	deleteStart := time.Now()
+	if err := s.tp.DeleteIDs(ns, oldIDs); err != nil {
+		return err
+	}
+	log.Printf("timing move=%s->%s stage=tp_delete_old ids=%d elapsed=%s", change.OldPath, change.Path, len(oldIDs), time.Since(deleteStart))
+	log.Printf("timing move=%s->%s stage=process_move_total rows=%d elapsed=%s", change.OldPath, change.Path, len(newRows), time.Since(totalStart))
+	return nil
 }
 
 func (s *Server) embedChunksInBatches(chunks []map[string]any) ([]map[string]any, error) {
 	const batchSize = 4
 
+	totalStart := time.Now()
 	results := make([]map[string]any, 0, len(chunks))
 	for start := 0; start < len(chunks); start += batchSize {
 		end := start + batchSize
 		if end > len(chunks) {
 			end = len(chunks)
 		}
+		batchStart := time.Now()
 		resp, err := s.modal.EmbedChunks(chunks[start:end])
 		if err != nil {
 			return nil, err
 		}
+		log.Printf("timing stage=modal_embed_batch batch=%d/%d chunks=%d elapsed=%s", start/batchSize+1, (len(chunks)+batchSize-1)/batchSize, end-start, time.Since(batchStart))
 		results = append(results, resp.Results...)
 	}
+	log.Printf("timing stage=modal_embed_batches_total chunks=%d batches=%d elapsed=%s", len(chunks), (len(chunks)+batchSize-1)/batchSize, time.Since(totalStart))
 	return results, nil
 }
 

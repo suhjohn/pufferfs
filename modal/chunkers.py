@@ -191,13 +191,23 @@ def chunk_document_via_images(
     import concurrent.futures
     import fitz  # pymupdf
     import os
+    import time
+
+    total_start = time.perf_counter()
 
     # Convert DOCX/PPTX to PDF first
     if file_type in ("docx", "pptx"):
+        convert_start = time.perf_counter()
         pdf_bytes = _convert_to_pdf(file_bytes, file_type)
+        print(
+            f"timing file={file_path} stage=office_to_pdf file_type={file_type} "
+            f"bytes_in={len(file_bytes)} bytes_out={len(pdf_bytes)} elapsed={time.perf_counter() - convert_start:.3f}s",
+            flush=True,
+        )
     else:
         pdf_bytes = file_bytes
 
+    render_start = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: list[tuple[int, bytes, str]] = []
     for page_num in range(len(doc)):
@@ -207,27 +217,44 @@ def chunk_document_via_images(
         fallback_text = page.get_text("text")
         pages.append((page_num, img_bytes, fallback_text))
     doc.close()
+    print(
+        f"timing file={file_path} stage=pdf_render pages={len(pages)} elapsed={time.perf_counter() - render_start:.3f}s",
+        flush=True,
+    )
 
     def page_to_chunk(page_data: tuple[int, bytes, str]) -> Chunk:
+        page_start = time.perf_counter()
         page_num, img_bytes, fallback_text = page_data
         image_key = _page_image_key(root_id, file_path, page_num)
         if s3_client and bucket:
+            upload_start = time.perf_counter()
             s3_client.put_object(
                 Bucket=bucket,
                 Key=image_key,
                 Body=img_bytes,
                 ContentType="image/jpeg",
             )
+            print(
+                f"timing file={file_path} page={page_num} stage=page_image_upload "
+                f"bytes={len(img_bytes)} elapsed={time.perf_counter() - upload_start:.3f}s",
+                flush=True,
+            )
 
+        text_start = time.perf_counter()
         if gemini_api_key:
             text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
         else:
             text = fallback_text
+        print(
+            f"timing file={file_path} page={page_num} stage=image_to_text "
+            f"chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
+            flush=True,
+        )
 
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
-        return Chunk(
+        chunk = Chunk(
             id=Chunk.make_id(root_id, file_path, page_num),
             root_id=root_id,
             file_path=file_path,
@@ -238,15 +265,33 @@ def chunk_document_via_images(
             page_number=page_num,
             image_path=image_key,
         )
+        print(
+            f"timing file={file_path} page={page_num} stage=page_total elapsed={time.perf_counter() - page_start:.3f}s",
+            flush=True,
+        )
+        return chunk
 
     if not pages:
+        print(
+            f"timing file={file_path} stage=document_chunk_total pages=0 chunks=0 elapsed={time.perf_counter() - total_start:.3f}s",
+            flush=True,
+        )
         return []
 
     max_workers = max(1, int(os.getenv("PUFFERFS_PAGE_TEXT_WORKERS", "8")))
     max_workers = min(max_workers, len(pages))
+    text_start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         chunks = list(executor.map(page_to_chunk, pages))
+    print(
+        f"timing file={file_path} stage=parallel_image_to_text pages={len(pages)} workers={max_workers} elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
     chunks.sort(key=lambda chunk: chunk.chunk_index)
+    print(
+        f"timing file={file_path} stage=document_chunk_total pages={len(pages)} chunks={len(chunks)} elapsed={time.perf_counter() - total_start:.3f}s",
+        flush=True,
+    )
     return chunks
 
 

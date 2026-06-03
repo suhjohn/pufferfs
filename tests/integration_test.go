@@ -796,6 +796,7 @@ func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixture
 		Prefix: aws.String(cfg.prefix),
 	})
 
+	listStart := time.Now()
 	var objects []r2FixtureObject
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
@@ -813,6 +814,7 @@ func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixture
 			objects = append(objects, r2FixtureObject{key: *object.Key, size: size})
 		}
 	}
+	t.Logf("timing stage=r2_list bucket=%s prefix=%s objects=%d elapsed=%s", cfg.bucket, cfg.prefix, len(objects), time.Since(listStart))
 	sort.Slice(objects, func(i, j int) bool {
 		return objects[i].key < objects[j].key
 	})
@@ -820,9 +822,11 @@ func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixture
 		t.Fatalf("no R2 fixtures found in s3://%s/%s", cfg.bucket, cfg.prefix)
 	}
 	objects = selectR2FixtureObjects(objects)
+	t.Logf("timing stage=r2_select objects=%d full_corpus=%t", len(objects), strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_FULL_CORPUS")), "1"))
 
 	for _, object := range objects {
 		relPath := r2FixtureRelPath(t, cfg.prefix, object.key)
+		downloadStart := time.Now()
 		resp, err := client.GetObject(ctx, &s3sdk.GetObjectInput{
 			Bucket: aws.String(cfg.bucket),
 			Key:    aws.String(object.key),
@@ -840,6 +844,7 @@ func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixture
 		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
 			t.Fatalf("writing R2 fixture %s: %v", relPath, err)
 		}
+		t.Logf("timing stage=r2_download key=%s bytes=%d elapsed=%s", object.key, len(body), time.Since(downloadStart))
 		registerFixtureSource(t, fixtures, r2FixtureSource(cfg, object.key, relPath), relPath)
 	}
 }
