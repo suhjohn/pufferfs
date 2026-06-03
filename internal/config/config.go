@@ -58,7 +58,9 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Config{}, nil
+			cfg := &Config{}
+			cfg.applyEnvOverrides()
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}

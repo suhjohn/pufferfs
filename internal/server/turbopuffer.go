@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 )
@@ -19,15 +20,20 @@ type TPClient struct {
 }
 
 // NewTPClient creates a Turbopuffer client.
+// If TURBOPUFFER_API_URL is set, it overrides the default API URL.
 func NewTPClient(apiKey, region string) *TPClient {
 	if region == "" {
 		region = "gcp-us-central1"
 	}
-	return &TPClient{
+	c := &TPClient{
 		apiKey:     apiKey,
 		region:     region,
 		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
+	if u := os.Getenv("TURBOPUFFER_API_URL"); u != "" {
+		c.baseOverride = u
+	}
+	return c
 }
 
 // NewTPClientWithURL creates a TP client with a custom base URL (for testing).
