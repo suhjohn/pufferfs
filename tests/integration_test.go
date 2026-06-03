@@ -602,6 +602,7 @@ func createNestedProject(t *testing.T, projectDir string) fixtureSet {
 	writeDownloadedTextFixture(t, projectDir, fixtures.largeMarkdownPath, llmWikiURL)
 
 	fixtures.pdfs = copyPDFFixtures(t, projectDir)
+	applyR2WorkspaceFixtures(t, projectDir, &fixtures)
 	applyExternalFixtureManifest(t, projectDir, &fixtures)
 	applyDiscoveredWorkspaceFixtures(t, projectDir, &fixtures)
 	fixtures.stablePaths = stableFixturePaths(fixtures)
@@ -785,6 +786,204 @@ type manifestFile struct {
 	MoveTargetPath string   `json:"move_target_path,omitempty"`
 }
 
+func applyR2WorkspaceFixtures(t *testing.T, projectDir string, fixtures *fixtureSet) {
+	t.Helper()
+
+	cfg := r2FixtureConfigFromEnv()
+	if cfg == nil {
+		return
+	}
+
+	ctx := context.Background()
+	client := newR2S3Client(t, *cfg)
+	paginator := s3sdk.NewListObjectsV2Paginator(client, &s3sdk.ListObjectsV2Input{
+		Bucket: aws.String(cfg.bucket),
+		Prefix: aws.String(cfg.prefix),
+	})
+
+	var objects []r2FixtureObject
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			t.Fatalf("listing R2 fixtures in s3://%s/%s: %v", cfg.bucket, cfg.prefix, err)
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil || strings.HasSuffix(*object.Key, "/") {
+				continue
+			}
+			var size int64
+			if object.Size != nil {
+				size = *object.Size
+			}
+			objects = append(objects, r2FixtureObject{key: *object.Key, size: size})
+		}
+	}
+	sort.Slice(objects, func(i, j int) bool {
+		return objects[i].key < objects[j].key
+	})
+	if len(objects) == 0 {
+		t.Fatalf("no R2 fixtures found in s3://%s/%s", cfg.bucket, cfg.prefix)
+	}
+	objects = selectR2FixtureObjects(objects)
+
+	for _, object := range objects {
+		relPath := r2FixtureRelPath(t, cfg.prefix, object.key)
+		resp, err := client.GetObject(ctx, &s3sdk.GetObjectInput{
+			Bucket: aws.String(cfg.bucket),
+			Key:    aws.String(object.key),
+		})
+		if err != nil {
+			t.Fatalf("downloading R2 fixture s3://%s/%s: %v", cfg.bucket, object.key, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading R2 fixture s3://%s/%s: %v", cfg.bucket, object.key, err)
+		}
+		fullPath := filepath.Join(projectDir, filepath.FromSlash(relPath))
+		mkdirAll(t, filepath.Dir(fullPath))
+		if err := os.WriteFile(fullPath, body, 0o644); err != nil {
+			t.Fatalf("writing R2 fixture %s: %v", relPath, err)
+		}
+		registerManifestFixture(t, fixtures, r2FixtureManifestFile(cfg, object.key, relPath), relPath)
+	}
+}
+
+type r2FixtureObject struct {
+	key  string
+	size int64
+}
+
+type r2FixtureConfig struct {
+	accountID string
+	bucket    string
+	prefix    string
+	publicURL string
+	accessKey string
+	secretKey string
+}
+
+func r2FixtureConfigFromEnv() *r2FixtureConfig {
+	accountID := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_ACCOUNT_ID"))
+	bucket := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_BUCKET"))
+	prefix := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_PREFIX"))
+	accessKey := strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID"))
+	secretKey := strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY"))
+	if accountID == "" || bucket == "" || accessKey == "" || secretKey == "" {
+		return nil
+	}
+	if prefix == "" {
+		prefix = "workspace/"
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return &r2FixtureConfig{
+		accountID: accountID,
+		bucket:    bucket,
+		prefix:    prefix,
+		publicURL: strings.TrimRight(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_PUBLIC_BASE_URL")), "/"),
+		accessKey: accessKey,
+		secretKey: secretKey,
+	}
+}
+
+func newR2S3Client(t *testing.T, cfg r2FixtureConfig) *s3sdk.Client {
+	t.Helper()
+
+	endpoint := fmt.Sprintf("https://%s.r2.cloudflarestorage.com", cfg.accountID)
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
+		awsconfig.WithRegion("auto"),
+		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(cfg.accessKey, cfg.secretKey, "")),
+	)
+	if err != nil {
+		t.Fatalf("loading R2 AWS config: %v", err)
+	}
+	return s3sdk.NewFromConfig(awsCfg, func(o *s3sdk.Options) {
+		o.BaseEndpoint = aws.String(endpoint)
+	})
+}
+
+func r2FixtureRelPath(t *testing.T, prefix, key string) string {
+	t.Helper()
+	if !strings.HasPrefix(key, prefix) {
+		t.Fatalf("R2 fixture key %q is outside prefix %q", key, prefix)
+	}
+	return cleanFixturePath(t, strings.TrimPrefix(key, prefix))
+}
+
+func r2FixtureManifestFile(cfg *r2FixtureConfig, key, relPath string) manifestFile {
+	file := manifestFile{
+		Path:     relPath,
+		FileType: fixtureFileType(relPath),
+	}
+	if cfg.publicURL != "" {
+		file.URL = cfg.publicURL + "/" + strings.TrimPrefix(key, cfg.prefix)
+	} else {
+		file.URL = "s3://" + cfg.bucket + "/" + key
+	}
+	if file.FileType == "pdf" {
+		if expected, ok := defaultExpectedPDFChunks(filepath.Base(relPath)); ok {
+			file.ExpectedChunks = &expected
+		}
+	}
+	if file.FileType == "markdown" && strings.EqualFold(filepath.Base(relPath), "llm-wiki.md") {
+		file.Roles = append(file.Roles, "large_markdown", "stable")
+		file.MinChunks = 2
+	}
+	return file
+}
+
+func selectR2FixtureObjects(objects []r2FixtureObject) []r2FixtureObject {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_R2_FULL_CORPUS")), "1") {
+		return objects
+	}
+
+	selected := make(map[string]r2FixtureObject)
+	bestByType := make(map[string]r2FixtureObject)
+	for _, object := range objects {
+		rel := object.key
+		fileType := fixtureFileType(rel)
+		if fileType == "pptx" && object.size > r2SmokeMaxBytes("PUFFERFS_E2E_R2_SMOKE_MAX_PPTX_BYTES", 250_000) {
+			continue
+		}
+		base := strings.ToLower(filepath.Base(rel))
+		if base == "readme.md" || base == "llm-wiki.md" {
+			selected[object.key] = object
+			continue
+		}
+		if _, ok := bestByType[fileType]; !ok || object.size < bestByType[fileType].size {
+			bestByType[fileType] = object
+		}
+	}
+	for _, fileType := range []string{"pdf", "docx", "pptx", "markdown", "text"} {
+		if object, ok := bestByType[fileType]; ok {
+			selected[object.key] = object
+		}
+	}
+
+	var subset []r2FixtureObject
+	for _, object := range selected {
+		subset = append(subset, object)
+	}
+	sort.Slice(subset, func(i, j int) bool {
+		return subset[i].key < subset[j].key
+	})
+	return subset
+}
+
+func r2SmokeMaxBytes(envName string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(envName))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
+}
+
 func applyExternalFixtureManifest(t *testing.T, projectDir string, fixtures *fixtureSet) {
 	t.Helper()
 
@@ -943,18 +1142,11 @@ func looksLikeFixtureFile(name string) bool {
 func loadFixtureManifest(t *testing.T) *fixtureManifest {
 	t.Helper()
 
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_FIXTURE_MANIFEST"))
 	manifestURL := strings.TrimSpace(os.Getenv("PUFFERFS_E2E_FIXTURE_MANIFEST_URL"))
-	switch {
-	case raw != "":
-		if data, err := os.ReadFile(raw); err == nil {
-			raw = string(data)
-		}
-	case manifestURL != "":
-		raw = string(downloadFixtureBytes(t, manifestURL))
-	default:
+	if manifestURL == "" {
 		return nil
 	}
+	raw := string(downloadFixtureBytes(t, manifestURL))
 
 	var manifest fixtureManifest
 	if err := json.Unmarshal([]byte(raw), &manifest); err != nil {

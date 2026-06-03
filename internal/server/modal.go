@@ -103,20 +103,32 @@ func (m *ModalClient) post(url string, body any, out any) error {
 		return err
 	}
 
-	resp, err := m.httpClient.Post(url, "application/json", bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := m.httpClient.Post(url, "application/json", bytes.NewReader(data))
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+		respBody, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			return json.Unmarshal(respBody, out)
+		}
+		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode < 500 || attempt == 2 {
+			return lastErr
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return json.Unmarshal(respBody, out)
+	return lastErr
 }

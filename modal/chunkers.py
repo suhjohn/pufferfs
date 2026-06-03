@@ -188,7 +188,9 @@ def chunk_document_via_images(
     gemini_api_key: str,
 ) -> list[Chunk]:
     """Unified pipeline: PDF/DOCX/PPTX → PDF pages → JPEG images → Gemini → text chunks."""
+    import concurrent.futures
     import fitz  # pymupdf
+    import os
 
     # Convert DOCX/PPTX to PDF first
     if file_type in ("docx", "pptx"):
@@ -197,16 +199,17 @@ def chunk_document_via_images(
         pdf_bytes = file_bytes
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    chunks: list[Chunk] = []
-
+    pages: list[tuple[int, bytes, str]] = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-
-        # Render page to JPEG
         pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("jpeg")
+        fallback_text = page.get_text("text")
+        pages.append((page_num, img_bytes, fallback_text))
+    doc.close()
 
-        # Upload page image to S3 (skipped when s3_client is None, e.g. inline content)
+    def page_to_chunk(page_data: tuple[int, bytes, str]) -> Chunk:
+        page_num, img_bytes, fallback_text = page_data
         image_key = _page_image_key(root_id, file_path, page_num)
         if s3_client and bucket:
             s3_client.put_object(
@@ -216,17 +219,15 @@ def chunk_document_via_images(
                 ContentType="image/jpeg",
             )
 
-        # Extract text via Gemini vision
         if gemini_api_key:
             text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
         else:
-            # Fallback: PyMuPDF text extraction
-            text = page.get_text("text")
+            text = fallback_text
 
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
-        chunk = Chunk(
+        return Chunk(
             id=Chunk.make_id(root_id, file_path, page_num),
             root_id=root_id,
             file_path=file_path,
@@ -237,9 +238,15 @@ def chunk_document_via_images(
             page_number=page_num,
             image_path=image_key,
         )
-        chunks.append(chunk)
 
-    doc.close()
+    if not pages:
+        return []
+
+    max_workers = max(1, int(os.getenv("PUFFERFS_PAGE_TEXT_WORKERS", "8")))
+    max_workers = min(max_workers, len(pages))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        chunks = list(executor.map(page_to_chunk, pages))
+    chunks.sort(key=lambda chunk: chunk.chunk_index)
     return chunks
 
 

@@ -828,11 +828,10 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, rootID string, chang
 
 	var embedResults []map[string]any
 	if len(uncachedChunks) > 0 {
-		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
+		embedResults, err = s.embedChunksInBatches(uncachedChunks)
 		if err != nil {
 			return fmt.Errorf("embedding: %w", err)
 		}
-		embedResults = embedResp.Results
 
 		newCacheEntries := make(map[string][]float64)
 		for _, r := range embedResults {
@@ -991,14 +990,14 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 
 	if len(uncachedChunks) > 0 {
 		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(uncachedChunks), len(rows))
-		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
+		embedResults, err := s.embedChunksInBatches(uncachedChunks)
 		if err != nil {
 			return fmt.Errorf("re-embedding moved chunks: %w", err)
 		}
 		embedIdx := 0
 		for i := range newRows {
-			if _, hasVec := newRows[i]["vector"]; !hasVec && embedIdx < len(embedResp.Results) {
-				newRows[i]["vector"], _ = embedResp.Results[embedIdx]["embedding"].([]any)
+			if _, hasVec := newRows[i]["vector"]; !hasVec && embedIdx < len(embedResults) {
+				newRows[i]["vector"], _ = embedResults[embedIdx]["embedding"].([]any)
 				embedIdx++
 			}
 		}
@@ -1008,6 +1007,24 @@ func (s *Server) processFileMove(ctx context.Context, orgID, rootID string, chan
 		return err
 	}
 	return s.tp.DeleteIDs(ns, oldIDs)
+}
+
+func (s *Server) embedChunksInBatches(chunks []map[string]any) ([]map[string]any, error) {
+	const batchSize = 4
+
+	results := make([]map[string]any, 0, len(chunks))
+	for start := 0; start < len(chunks); start += batchSize {
+		end := start + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		resp, err := s.modal.EmbedChunks(chunks[start:end])
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, resp.Results...)
+	}
+	return results, nil
 }
 
 // ---------------------------------------------------------------------------
