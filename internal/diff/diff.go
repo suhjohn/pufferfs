@@ -57,7 +57,7 @@ func Scan(rootDir string, matcher *ignore.Matcher) (map[string]models.FileState,
 		state[relPath] = models.FileState{
 			Size:        info.Size(),
 			ContentHash: hash,
-			Mtime:       float64(info.ModTime().UnixNano()) / 1e9,
+			Mtime:       info.ModTime().UnixNano(),
 		}
 		return nil
 	})
@@ -182,9 +182,6 @@ func Compute(prev, curr map[string]models.FileState) models.DiffResult {
 		}
 	}
 
-	// Pass 3: directory move detection
-	result = detectDirectoryMoves(result)
-
 	return result
 }
 
@@ -199,33 +196,6 @@ func classifyMove(oldPath, newPath string) models.FileChangeStatus {
 		return models.StatusRenamed
 	}
 	return models.StatusMoved
-}
-
-// detectDirectoryMoves collapses many per-file MOVEDs sharing
-// the same (oldDir→newDir) mapping into a conceptual directory move.
-// For now this annotates them but keeps individual entries.
-func detectDirectoryMoves(result models.DiffResult) models.DiffResult {
-	type dirPair struct {
-		oldDir, newDir string
-	}
-
-	counts := make(map[dirPair]int)
-	for _, c := range result.Changes {
-		if c.Status == models.StatusMoved && c.OldPath != "" {
-			pair := dirPair{
-				oldDir: filepath.Dir(c.OldPath),
-				newDir: filepath.Dir(c.Path),
-			}
-			counts[pair]++
-		}
-	}
-
-	// If ≥80% of removed files from a directory moved to the same new directory,
-	// keep them as MOVED (the directory move is implicit).
-	// This is informational — the sync pipeline handles them the same way.
-	_ = counts
-
-	return result
 }
 
 // hashFile computes the SHA-256 hex digest of a file.

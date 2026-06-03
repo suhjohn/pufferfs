@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -191,40 +193,37 @@ func (db *DB) GetCachedEmbeddings(ctx context.Context, hashes []string) (map[str
 	return result, nil
 }
 
-// SaveCachedEmbeddings stores embeddings in the cache.
+// SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value INSERT.
 func (db *DB) SaveCachedEmbeddings(ctx context.Context, entries map[string][]float64) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
+	// Build a multi-value INSERT: INSERT INTO ... VALUES ($1,$2,$3), ($4,$5,$6), ...
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO embedding_cache (content_hash, embedding, created_at) VALUES `)
+	args := make([]any, 0, len(entries)*2)
+	i := 0
 	for hash, emb := range entries {
-		embBytes := encodeEmbedding(emb)
-		_, err := db.pool.Exec(ctx,
-			`INSERT INTO embedding_cache (content_hash, embedding, created_at)
-			 VALUES ($1, $2, NOW())
-			 ON CONFLICT (content_hash) DO NOTHING`,
-			hash, embBytes,
-		)
-		if err != nil {
-			return err
+		if i > 0 {
+			sb.WriteString(", ")
 		}
+		p := i*2 + 1
+		fmt.Fprintf(&sb, "($%d, $%d, NOW())", p, p+1)
+		args = append(args, hash, encodeEmbedding(emb))
+		i++
 	}
-	return nil
+	sb.WriteString(` ON CONFLICT (content_hash) DO NOTHING`)
+
+	_, err := db.pool.Exec(ctx, sb.String(), args...)
+	return err
 }
 
 // encodeEmbedding converts a float64 slice to bytes (little-endian float64s).
 func encodeEmbedding(emb []float64) []byte {
 	buf := make([]byte, len(emb)*8)
 	for i, v := range emb {
-		bits := math.Float64bits(v)
-		buf[i*8] = byte(bits)
-		buf[i*8+1] = byte(bits >> 8)
-		buf[i*8+2] = byte(bits >> 16)
-		buf[i*8+3] = byte(bits >> 24)
-		buf[i*8+4] = byte(bits >> 32)
-		buf[i*8+5] = byte(bits >> 40)
-		buf[i*8+6] = byte(bits >> 48)
-		buf[i*8+7] = byte(bits >> 56)
+		binary.LittleEndian.PutUint64(buf[i*8:], math.Float64bits(v))
 	}
 	return buf
 }
@@ -236,15 +235,7 @@ func decodeEmbedding(buf []byte) ([]float64, error) {
 	}
 	emb := make([]float64, len(buf)/8)
 	for i := range emb {
-		bits := uint64(buf[i*8]) |
-			uint64(buf[i*8+1])<<8 |
-			uint64(buf[i*8+2])<<16 |
-			uint64(buf[i*8+3])<<24 |
-			uint64(buf[i*8+4])<<32 |
-			uint64(buf[i*8+5])<<40 |
-			uint64(buf[i*8+6])<<48 |
-			uint64(buf[i*8+7])<<56
-		emb[i] = math.Float64frombits(bits)
+		emb[i] = math.Float64frombits(binary.LittleEndian.Uint64(buf[i*8:]))
 	}
 	return emb, nil
 }

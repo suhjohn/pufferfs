@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"sort"
+	"time"
 )
 
 // TPClient talks to the Turbopuffer API.
@@ -24,7 +25,7 @@ func NewTPClient(apiKey, region string) *TPClient {
 	return &TPClient{
 		apiKey:     apiKey,
 		region:     region,
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
@@ -215,20 +216,16 @@ func reciprocalRankFusion(resultSets [][]map[string]any, k int) []map[string]any
 		id    string
 		score float64
 	}
-	var sorted []scored
+	ranked := make([]scored, 0, len(scores))
 	for id, score := range scores {
-		sorted = append(sorted, scored{id, score})
+		ranked = append(ranked, scored{id, score})
 	}
-	for i := 0; i < len(sorted); i++ {
-		for j := i + 1; j < len(sorted); j++ {
-			if sorted[j].score > sorted[i].score {
-				sorted[i], sorted[j] = sorted[j], sorted[i]
-			}
-		}
-	}
+	sort.Slice(ranked, func(i, j int) bool {
+		return ranked[i].score > ranked[j].score
+	})
 
 	var results []map[string]any
-	for _, s := range sorted {
+	for _, s := range ranked {
 		doc := docs[s.id]
 		doc["$dist"] = s.score
 		results = append(results, doc)
@@ -236,7 +233,3 @@ func reciprocalRankFusion(resultSets [][]map[string]any, k int) []map[string]any
 	return results
 }
 
-func init() {
-	// Ensure we have the env vars
-	_ = os.Getenv("TURBOPUFFER_API_KEY")
-}

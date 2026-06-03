@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
 )
@@ -21,7 +22,7 @@ func newAPIClient(cfg *appconfig.Config) *apiClient {
 	return &apiClient{
 		baseURL:    cfg.Server.URL,
 		apiKey:     cfg.Server.APIKey,
-		httpClient: &http.Client{},
+		httpClient: &http.Client{Timeout: 300 * time.Second},
 	}
 }
 

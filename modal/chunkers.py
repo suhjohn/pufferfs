@@ -333,13 +333,7 @@ def _page_image_key(root_id: str, file_path: str, page_num: int) -> str:
 
 
 def _guess_image_content_type(file_path: str) -> str:
-    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-    return {
-        "png": "image/png",
-        "jpg": "image/jpeg",
-        "jpeg": "image/jpeg",
-        "gif": "image/gif",
-        "svg": "image/svg+xml",
-        "webp": "image/webp",
-        "bmp": "image/bmp",
-    }.get(ext, "application/octet-stream")
+    import mimetypes
+
+    mime, _ = mimetypes.guess_type(file_path)
+    return mime or "application/octet-stream"

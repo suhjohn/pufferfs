@@ -110,5 +110,8 @@ func (c *Client) Rename(ctx context.Context, oldKey, newKey string) error {
 	if err != nil {
 		return fmt.Errorf("copy %s -> %s: %w", oldKey, newKey, err)
 	}
-	return c.Delete(ctx, oldKey)
+	if err := c.Delete(ctx, oldKey); err != nil {
+		return fmt.Errorf("rename delete %s after copy to %s: %w", oldKey, newKey, err)
+	}
+	return nil
 }

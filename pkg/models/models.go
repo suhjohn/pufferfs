@@ -28,7 +28,7 @@ type RootMetadata struct {
 type FileState struct {
 	Size        int64   `json:"size"`
 	ContentHash string  `json:"content_hash"`
-	Mtime       float64 `json:"mtime"`
+	Mtime       int64   `json:"mtime"`
 }
 
 // FileChangeStatus enumerates possible diff outcomes.

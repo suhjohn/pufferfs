@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
 
 // ModalClient calls Modal web endpoints for chunking and embedding.
@@ -24,7 +25,7 @@ func NewModalClient() *ModalClient {
 		chunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		embedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		queryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
-		httpClient:    &http.Client{},
+		httpClient:    &http.Client{Timeout: 300 * time.Second},
 	}
 }
 

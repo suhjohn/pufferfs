@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
@@ -106,6 +107,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Limit upload size to 512 MB
+	const maxUploadSize = 512 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reading body: " + err.Error()})
@@ -275,7 +279,7 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 
 		// Save new embeddings to cache
 		newCacheEntries := make(map[string][]float64)
-		for j, r := range embedResults {
+		for _, r := range embedResults {
 			chunk, _ := r["chunk"].(map[string]any)
 			hash, _ := chunk["content_hash"].(string)
 			if emb, ok := r["embedding"].([]any); ok && hash != "" {
@@ -287,7 +291,6 @@ func (s *Server) processFileAdd(ctx context.Context, rootID string, change model
 				}
 				newCacheEntries[hash] = embFloat
 			}
-			_ = j
 		}
 		if err := s.db.SaveCachedEmbeddings(ctx, newCacheEntries); err != nil {
 			log.Printf("warning: failed to save embedding cache: %v", err)
@@ -366,12 +369,23 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 		return fmt.Errorf("deleting old chunks: %w", err)
 	}
 
-	// 4. Re-embed with new file path (need the vector data)
-	// Since we can't get vectors back from tp queries easily,
-	// and content is identical, we re-embed via Modal.
-	// This is a tradeoff: move operations do re-embed.
-	// TODO: optimize by caching embeddings in S3.
-	chunkDicts := make([]map[string]any, len(rows))
+	// 4. Re-upsert with new file path using cached embeddings (no re-embedding)
+	var contentHashes []string
+	for _, row := range rows {
+		if h, ok := row["content_hash"].(string); ok {
+			contentHashes = append(contentHashes, h)
+		}
+	}
+
+	cached, err := s.db.GetCachedEmbeddings(ctx, contentHashes)
+	if err != nil {
+		log.Printf("warning: embedding cache lookup for move failed: %v", err)
+		cached = make(map[string][]float64)
+	}
+
+	// Build new rows; fall back to re-embedding only for chunks missing from cache
+	var uncachedChunks []map[string]any
+	newRows := make([]map[string]any, len(rows))
 	for i, row := range rows {
 		chunkIdx := 0
 		if ci, ok := row["chunk_index"]; ok {
@@ -379,39 +393,39 @@ func (s *Server) processFileMove(ctx context.Context, rootID string, change mode
 				chunkIdx = int(f)
 			}
 		}
-		chunkDicts[i] = map[string]any{
+		newRows[i] = map[string]any{
 			"id":           models.MakeChunkID(rootID, change.Path, chunkIdx),
-			"root_id":      rootID,
+			"content":      row["content"],
 			"file_path":    change.Path,
 			"chunk_index":  chunkIdx,
-			"content":      row["content"],
 			"content_hash": row["content_hash"],
 			"file_type":    row["file_type"],
+			"root_id":      rootID,
 			"page_number":  row["page_number"],
 			"image_path":   row["image_path"],
 		}
+
+		hash, _ := row["content_hash"].(string)
+		if emb, ok := cached[hash]; ok {
+			newRows[i]["vector"] = emb
+		} else {
+			uncachedChunks = append(uncachedChunks, newRows[i])
+		}
 	}
 
-	embedResp, err := s.modal.EmbedChunks(chunkDicts)
-	if err != nil {
-		return fmt.Errorf("re-embedding moved chunks: %w", err)
-	}
-
-	newRows := make([]map[string]any, len(embedResp.Results))
-	for i, r := range embedResp.Results {
-		chunk, _ := r["chunk"].(map[string]any)
-		embedding, _ := r["embedding"].([]any)
-		newRows[i] = map[string]any{
-			"id":           chunk["id"],
-			"vector":       embedding,
-			"content":      chunk["content"],
-			"file_path":    chunk["file_path"],
-			"chunk_index":  chunk["chunk_index"],
-			"content_hash": chunk["content_hash"],
-			"file_type":    chunk["file_type"],
-			"root_id":      rootID,
-			"page_number":  chunk["page_number"],
-			"image_path":   chunk["image_path"],
+	// Only call Modal for chunks not in cache
+	if len(uncachedChunks) > 0 {
+		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(uncachedChunks), len(rows))
+		embedResp, err := s.modal.EmbedChunks(uncachedChunks)
+		if err != nil {
+			return fmt.Errorf("re-embedding moved chunks: %w", err)
+		}
+		embedIdx := 0
+		for i := range newRows {
+			if _, hasVec := newRows[i]["vector"]; !hasVec && embedIdx < len(embedResp.Results) {
+				newRows[i]["vector"], _ = embedResp.Results[embedIdx]["embedding"].([]any)
+				embedIdx++
+			}
 		}
 	}
 
@@ -517,7 +531,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func detectFileType(path string) string {
-	ext := filepath.Ext(path)
+	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".pdf":
 		return "pdf"
