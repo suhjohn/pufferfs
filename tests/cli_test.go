@@ -11,10 +11,11 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -146,194 +147,46 @@ func cliCreateMinioBucket(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Mock Modal + Turbopuffer
+// Real Modal + Turbopuffer services
 // ---------------------------------------------------------------------------
 
-func cliStartMockModal(t *testing.T) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			FilePath string `json:"file_path"`
-			FileType string `json:"file_type"`
-			RootID   string `json:"root_id"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-
-		resp := map[string]any{
-			"count": 2,
-			"chunks": []map[string]any{
-				{
-					"id":           fmt.Sprintf("chunk-%s-0", req.FilePath),
-					"content":      fmt.Sprintf("Chunk 0 of %s: content here", req.FilePath),
-					"file_path":    req.FilePath,
-					"chunk_index":  0,
-					"content_hash": fmt.Sprintf("sha256:hash0_%s", req.FilePath),
-					"file_type":    req.FileType,
-					"root_id":      req.RootID,
-				},
-				{
-					"id":           fmt.Sprintf("chunk-%s-1", req.FilePath),
-					"content":      fmt.Sprintf("Chunk 1 of %s: more content", req.FilePath),
-					"file_path":    req.FilePath,
-					"chunk_index":  1,
-					"content_hash": fmt.Sprintf("sha256:hash1_%s", req.FilePath),
-					"file_type":    req.FileType,
-					"root_id":      req.RootID,
-				},
-			},
-		}
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	mux.HandleFunc("/embed", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Chunks []map[string]any `json:"chunks"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-
-		results := make([]map[string]any, len(req.Chunks))
-		for i, chunk := range req.Chunks {
-			emb := make([]any, 768)
-			for j := range emb {
-				emb[j] = float64(i*768+j) * 0.001
-			}
-			results[i] = map[string]any{"chunk": chunk, "embedding": emb}
-		}
-		json.NewEncoder(w).Encode(map[string]any{"results": results, "count": len(results)})
-	})
-
-	mux.HandleFunc("/embed-query", func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Texts []string `json:"texts"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-
-		embeddings := make([][]float64, len(req.Texts))
-		for i := range req.Texts {
-			emb := make([]float64, 768)
-			for j := range emb {
-				emb[j] = float64(j) * 0.001
-			}
-			embeddings[i] = emb
-		}
-		json.NewEncoder(w).Encode(map[string]any{"embeddings": embeddings})
-	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+type cliRealServices struct {
+	modalChunkURL      string
+	modalEmbedURL      string
+	modalQueryEmbedURL string
+	turbopufferAPIKey  string
+	turbopufferAPIURL  string
 }
 
-func cliStartMockTP(t *testing.T) *httptest.Server {
+func cliRequireRealServices(t *testing.T) cliRealServices {
 	t.Helper()
 
-	var mu sync.Mutex
-	namespaces := make(map[string][]map[string]any)
+	cfg := cliRealServices{
+		modalChunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
+		modalEmbedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
+		modalQueryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
+		turbopufferAPIKey:  os.Getenv("TURBOPUFFER_API_KEY"),
+		turbopufferAPIURL:  os.Getenv("TURBOPUFFER_API_URL"),
+	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v2/namespaces/", func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v2/namespaces/"), "/")
-		ns := parts[0]
-		isQuery := len(parts) > 1 && parts[1] == "query"
+	var missing []string
+	if cfg.modalChunkURL == "" {
+		missing = append(missing, "MODAL_CHUNK_ENDPOINT")
+	}
+	if cfg.modalEmbedURL == "" {
+		missing = append(missing, "MODAL_EMBED_ENDPOINT")
+	}
+	if cfg.modalQueryEmbedURL == "" {
+		missing = append(missing, "MODAL_QUERY_EMBED_ENDPOINT")
+	}
+	if cfg.turbopufferAPIKey == "" {
+		missing = append(missing, "TURBOPUFFER_API_KEY")
+	}
+	if len(missing) > 0 {
+		t.Skipf("real Modal/Turbopuffer integration requires env vars: %s", strings.Join(missing, ", "))
+	}
 
-		body, _ := io.ReadAll(r.Body)
-		var req map[string]any
-		json.Unmarshal(body, &req)
-
-		mu.Lock()
-		defer mu.Unlock()
-
-		if isQuery {
-			docs := namespaces[ns]
-			limit := 10
-			if l, ok := req["limit"].(float64); ok {
-				limit = int(l)
-			}
-			var rows []map[string]any
-			for i, doc := range docs {
-				if i >= limit {
-					break
-				}
-				row := make(map[string]any)
-				for k, v := range doc {
-					if k != "vector" {
-						row[k] = v
-					}
-				}
-				row["$dist"] = float64(i) * 0.1
-				rows = append(rows, row)
-			}
-			if _, ok := req["queries"]; ok {
-				json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{{"rows": rows}, {"rows": rows}}})
-			} else {
-				json.NewEncoder(w).Encode(map[string]any{"rows": rows})
-			}
-			return
-		}
-
-		if upsertRows, ok := req["upsert_rows"]; ok {
-			rowSlice, _ := upsertRows.([]any)
-			for _, r := range rowSlice {
-				row, _ := r.(map[string]any)
-				if id, ok := row["id"]; ok {
-					docs := namespaces[ns]
-					for i, d := range docs {
-						if d["id"] == id {
-							namespaces[ns] = append(docs[:i], docs[i+1:]...)
-							break
-						}
-					}
-				}
-				namespaces[ns] = append(namespaces[ns], row)
-			}
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-
-		if deleteFilter, ok := req["delete_by_filter"]; ok {
-			filterArr, _ := deleteFilter.([]any)
-			if len(filterArr) >= 3 {
-				field, _ := filterArr[0].(string)
-				value := filterArr[2]
-				var remaining []map[string]any
-				for _, doc := range namespaces[ns] {
-					if doc[field] != value {
-						remaining = append(remaining, doc)
-					}
-				}
-				namespaces[ns] = remaining
-			}
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-
-		if deletes, ok := req["deletes"]; ok {
-			idSlice, _ := deletes.([]any)
-			idSet := make(map[string]bool)
-			for _, id := range idSlice {
-				if s, ok := id.(string); ok {
-					idSet[s] = true
-				}
-			}
-			var remaining []map[string]any
-			for _, doc := range namespaces[ns] {
-				if !idSet[fmt.Sprintf("%v", doc["id"])] {
-					remaining = append(remaining, doc)
-				}
-			}
-			namespaces[ns] = remaining
-			json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-			return
-		}
-
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	})
-
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+	return cfg
 }
 
 // ---------------------------------------------------------------------------
@@ -345,7 +198,7 @@ type cliServerProcess struct {
 	addr string
 }
 
-func cliStartServer(t *testing.T, modalURL, tpURL string) *cliServerProcess {
+func cliStartServer(t *testing.T, services cliRealServices) *cliServerProcess {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -367,11 +220,11 @@ func cliStartServer(t *testing.T, modalURL, tpURL string) *cliServerProcess {
 		"LISTEN_ADDR="+addr,
 		"JWT_SECRET="+cliTestJWTSecret,
 		"MIGRATIONS_DIR="+filepath.Join(repoRoot, "migrations"),
-		"MODAL_CHUNK_ENDPOINT="+modalURL+"/chunk",
-		"MODAL_EMBED_ENDPOINT="+modalURL+"/embed",
-		"MODAL_QUERY_EMBED_ENDPOINT="+modalURL+"/embed-query",
-		"TURBOPUFFER_API_KEY=test-key",
-		"TURBOPUFFER_API_URL="+tpURL,
+		"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
+		"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
+		"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
+		"TURBOPUFFER_API_KEY="+services.turbopufferAPIKey,
+		"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
 		"AWS_ENDPOINT_URL="+fmt.Sprintf("http://localhost:%s", cliTestMinioPort),
 		"AWS_BUCKET_NAME="+cliTestMinioBucket,
 		"AWS_ACCESS_KEY_ID="+cliTestMinioUser,
@@ -424,6 +277,162 @@ func runPufferfs(t *testing.T, homeDir, serverURL, apiKey string, args ...string
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func cliExpectedPDFChunks(t *testing.T) map[string]int {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_CLI_PDF_EXPECTED_CHUNKS"))
+	if raw == "" {
+		return nil
+	}
+
+	expected := make(map[string]int)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			t.Fatalf("invalid PUFFERFS_CLI_PDF_EXPECTED_CHUNKS item %q, want path=count", item)
+		}
+		count, err := strconv.Atoi(parts[1])
+		if err != nil || count < 0 {
+			t.Fatalf("invalid expected chunk count %q in %q", parts[1], item)
+		}
+		expected[filepath.ToSlash(parts[0])] = count
+	}
+	return expected
+}
+
+func cliResolveRootID(t *testing.T, serverURL, apiKey, name string) string {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, serverURL+"/roots", nil)
+	if err != nil {
+		t.Fatalf("creating roots request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("listing roots: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading roots response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("listing roots: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var roots []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &roots); err != nil {
+		t.Fatalf("decoding roots response: %v", err)
+	}
+	for _, root := range roots {
+		if root.Name == name {
+			return root.ID
+		}
+	}
+	t.Fatalf("root %q not found in %s", name, string(body))
+	return ""
+}
+
+func cliTPBaseURL(services cliRealServices) string {
+	if services.turbopufferAPIURL != "" {
+		return strings.TrimRight(services.turbopufferAPIURL, "/")
+	}
+	return "https://api.turbopuffer.com"
+}
+
+func cliQueryTPRowsForPath(t *testing.T, services cliRealServices, namespace, relPath string) []map[string]any {
+	t.Helper()
+
+	body := map[string]any{
+		"rank_by":            []any{"id", "asc"},
+		"limit":              1000,
+		"filters":            []any{"file_path", "Eq", relPath},
+		"include_attributes": []string{"file_path", "chunk_index", "file_hash", "file_type", "page_number", "image_path"},
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("encoding TP query: %v", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/v2/namespaces/%s/query", cliTPBaseURL(services), url.PathEscape(namespace))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("creating TP query: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+services.turbopufferAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("querying TP rows for %s: %v", relPath, err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading TP response: %v", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("querying TP rows for %s: HTTP %d: %s", relPath, resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Rows []map[string]any `json:"rows"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		t.Fatalf("decoding TP rows: %v", err)
+	}
+	return result.Rows
+}
+
+func cliDeleteTPNamespace(t *testing.T, services cliRealServices, namespace string) {
+	t.Helper()
+
+	endpoint := fmt.Sprintf("%s/v2/namespaces/%s", cliTPBaseURL(services), url.PathEscape(namespace))
+	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+	if err != nil {
+		t.Logf("creating TP cleanup request for %s: %v", namespace, err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+services.turbopufferAPIKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Logf("cleaning TP namespace %s: %v", namespace, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("cleaning TP namespace %s: HTTP %d: %s", namespace, resp.StatusCode, string(body))
+	}
+}
+
+func numericAttr(value any) (int, bool) {
+	switch v := value.(type) {
+	case float64:
+		return int(v), v == float64(int(v))
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case json.Number:
+		i, err := v.Int64()
+		return int(i), err == nil
+	default:
+		return 0, false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +558,8 @@ func cliCopyPDFFixtures(t *testing.T, projectDir string) []string {
 // ---------------------------------------------------------------------------
 
 func TestCLI_FullUserJourney(t *testing.T) {
+	services := cliRequireRealServices(t)
+
 	cliSetupOnce.Do(func() {
 		cliBuildBinaries(t)
 		cliStartPostgres(t)
@@ -570,9 +581,7 @@ func TestCLI_FullUserJourney(t *testing.T) {
 		cliCreateMinioBucket(t)
 	})
 
-	modalSrv := cliStartMockModal(t)
-	tpSrv := cliStartMockTP(t)
-	srv := cliStartServer(t, modalSrv.URL, tpSrv.URL)
+	srv := cliStartServer(t, services)
 	serverURL := fmt.Sprintf("http://%s", srv.addr)
 	apiKey := cliCreateUser(t)
 	homeDir := t.TempDir()
@@ -603,6 +612,10 @@ func TestCLI_FullUserJourney(t *testing.T) {
 		[]byte("package main\n\nfunc add(a, b int) int { return a + b }\n"), 0o644)
 
 	pdfFixtures := cliCopyPDFFixtures(t, projectDir)
+	expectedPDFChunks := cliExpectedPDFChunks(t)
+	if len(pdfFixtures) > 0 && len(expectedPDFChunks) == 0 {
+		t.Fatalf("PUFFERFS_CLI_PDF_EXPECTED_CHUNKS is required when PUFFERFS_CLI_PDF_FIXTURES is set")
+	}
 
 	// ---- Scenario 2: First sync ----
 	t.Run("first_sync", func(t *testing.T) {
@@ -614,6 +627,56 @@ func TestCLI_FullUserJourney(t *testing.T) {
 			t.Errorf("expected 'Sync complete', got: %s", stdout)
 		}
 	})
+
+	if len(expectedPDFChunks) > 0 {
+		parentT := t
+		t.Run("pdf_chunks_match_page_counts", func(t *testing.T) {
+			rootID := cliResolveRootID(t, serverURL, apiKey, "my-project")
+			namespace := fmt.Sprintf("org-%s-root-%s", "cli-test-org-1", rootID)
+			parentT.Cleanup(func() {
+				cliDeleteTPNamespace(parentT, services, namespace)
+			})
+
+			for _, relPath := range pdfFixtures {
+				expected, ok := expectedPDFChunks[relPath]
+				if !ok {
+					t.Fatalf("missing expected chunk count for %s", relPath)
+				}
+
+				rows := cliQueryTPRowsForPath(t, services, namespace, relPath)
+				if len(rows) != expected {
+					t.Fatalf("expected %d Turbopuffer rows for %s, got %d: %#v", expected, relPath, len(rows), rows)
+				}
+
+				seenIndexes := make(map[int]bool)
+				for _, row := range rows {
+					if row["file_path"] != relPath {
+						t.Fatalf("expected file_path %s, got %#v", relPath, row["file_path"])
+					}
+					if row["file_type"] != "pdf" {
+						t.Fatalf("expected file_type pdf for %s, got %#v", relPath, row["file_type"])
+					}
+					index, ok := numericAttr(row["chunk_index"])
+					if !ok {
+						t.Fatalf("expected numeric chunk_index for %s, got %#v", relPath, row["chunk_index"])
+					}
+					page, ok := numericAttr(row["page_number"])
+					if !ok {
+						t.Fatalf("expected numeric page_number for %s, got %#v", relPath, row["page_number"])
+					}
+					if index != page {
+						t.Fatalf("expected chunk_index == page_number for %s, got %d and %d", relPath, index, page)
+					}
+					seenIndexes[index] = true
+				}
+				for i := 0; i < expected; i++ {
+					if !seenIndexes[i] {
+						t.Fatalf("expected %s to contain chunk/page index %d, got indexes %#v", relPath, i, seenIndexes)
+					}
+				}
+			}
+		})
+	}
 
 	// ---- Scenario 3: Query (fts, vector, hybrid) ----
 	t.Run("query_fts", func(t *testing.T) {
@@ -648,17 +711,24 @@ func TestCLI_FullUserJourney(t *testing.T) {
 
 	if len(pdfFixtures) > 0 {
 		t.Run("query_pdf_fixtures", func(t *testing.T) {
-			stdout, stderr, err := runPufferfs(t, homeDir, serverURL, apiKey, "query", "pdf", "--root", "my-project", "--mode", "fts", "--glob", "*.pdf", "--top-k", "50")
+			stdout, stderr, err := runPufferfs(t, homeDir, serverURL, apiKey, "query", "business", "--root", "my-project", "--mode", "hybrid", "--glob", "*.pdf", "--top-k", "50")
 			if err != nil {
 				t.Fatalf("query PDF fixtures failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 			}
 			if strings.Contains(stdout, "No results found") {
 				t.Fatalf("expected PDF fixture results, got none")
 			}
+			matched := 0
 			for _, relPath := range pdfFixtures {
-				if !strings.Contains(stdout, relPath) {
-					t.Fatalf("expected PDF result for %s, got: %s", relPath, stdout)
+				if expectedPDFChunks[relPath] == 0 {
+					continue
 				}
+				if strings.Contains(stdout, relPath) {
+					matched++
+				}
+			}
+			if matched == 0 {
+				t.Fatalf("expected at least one indexed PDF result, got: %s", stdout)
 			}
 		})
 	}
