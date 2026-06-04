@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -65,8 +66,14 @@ func main() {
 		log.Println("WARNING: Using default JWT secret. Set JWT_SECRET in production.")
 	}
 
-	// Auth middleware: supports both JWT and API key
-	handler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
+	// Auth middleware: supports both JWT and tenant API key for normal routes.
+	appHandler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
+	adminHandler := auth.AdminMiddleware(adminKeyHash())(srv.Handler())
+
+	topMux := http.NewServeMux()
+	topMux.Handle("/admin/", adminHandler)
+	topMux.Handle("/", appHandler)
+	handler := http.Handler(topMux)
 
 	// OAuth2 handler (Google)
 	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
@@ -84,12 +91,8 @@ func main() {
 			JWTSecret:          jwtSecret,
 		}, db.UpsertUser)
 
-		// Register OAuth routes on a separate mux that wraps the auth-protected one
-		topMux := http.NewServeMux()
 		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)
 		topMux.HandleFunc("GET /auth/callback", oauthHandler.HandleCallback)
-		topMux.Handle("/", handler)
-		handler = topMux
 
 		log.Println("Google OAuth2 enabled")
 	} else {
@@ -130,4 +133,16 @@ func main() {
 		log.Printf("shutdown error: %v", err)
 	}
 	log.Println("Server stopped")
+}
+
+func adminKeyHash() string {
+	if rawHash := strings.TrimSpace(os.Getenv("PUFFERFS_ADMIN_KEY_HASH")); rawHash != "" {
+		log.Println("PufferFS admin API key enabled")
+		return rawHash
+	}
+	if rawKey := strings.TrimSpace(os.Getenv("PUFFERFS_ADMIN_KEY")); rawKey != "" {
+		log.Println("PufferFS admin API key enabled")
+		return auth.HashAPIKey(rawKey)
+	}
+	return ""
 }

@@ -27,6 +27,7 @@ func syncCmd() *cobra.Command {
 		dryRun  bool
 		name    string
 		rootID  string
+		scope   string
 		follow  bool
 		options followOptions
 	)
@@ -59,7 +60,7 @@ func syncCmd() *cobra.Command {
 				}
 				return runFollow(cfg, absDir, name, rootID, options)
 			}
-			return runSync(cfg, absDir, name, rootID, dryRun)
+			return runSync(cfg, absDir, name, rootID, scope, dryRun)
 		},
 	}
 
@@ -67,12 +68,13 @@ func syncCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Continuously sync when files change")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
+	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
 	addFollowFlags(cmd, &options)
 
 	return cmd
 }
 
-func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error {
+func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool) error {
 	// Default name to directory basename
 	if name == "" {
 		name = filepath.Base(dir)
@@ -89,7 +91,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 			localMeta = meta
 		} else if !dryRun {
 			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, dir)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope)
 			if err != nil {
 				return err
 			}
@@ -136,7 +138,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 			fmt.Println("No changes detected (remote state matches local filesystem).")
 			return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -154,7 +156,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -172,11 +174,11 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
 	var err error
 
 	// Detect secrets
@@ -196,7 +198,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 	// Get or create root
 	if rootID == "" {
-		resolvedRoot, err := resolveOrCreateRoot(client, name, dir)
+		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope)
 		if err != nil {
 			return err
 		}
@@ -293,8 +295,8 @@ func syncConflictFromError(err error) (*syncConflictError, bool) {
 	return &syncConflictError{SyncConflictResponse: resp}, true
 }
 
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
-	err := runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
+	err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return err
@@ -314,7 +316,7 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID string, d
 		fmt.Println("No changes detected (remote state matches local filesystem).")
 		return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
 	}
-	return runSyncWithResult(cfg, dir, name, rootID, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
+	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
 }
 
 func pollSyncJob(client *apiClient, rootID, jobID string) error {
@@ -446,7 +448,7 @@ func moveReuseMaxBytes() int64 {
 	return value
 }
 
-func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (*models.RootMetadata, error) {
+func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string) (*models.RootMetadata, error) {
 	// Try to find existing root by name
 	respBody, err := client.get("/roots")
 	if err != nil {
@@ -469,6 +471,7 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (*models.Ro
 	createReq := map[string]string{
 		"name":        name,
 		"source_path": sourcePath,
+		"scope":       rootScope,
 	}
 	respBody, err = client.post("/roots", createReq)
 	if err != nil {

@@ -156,7 +156,11 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			cleanupKeys = append(cleanupKeys, msg.PayloadRef)
 		}
 		if d.server.modal.HasChunkShardEndpoint() {
-			resp, err := d.server.modal.ChunkShard(modalJob(msg))
+			modalPayload, err := d.modalJob(ctx, msg)
+			if err != nil {
+				return err
+			}
+			resp, err := d.server.modal.ChunkShard(modalPayload)
 			if err != nil {
 				return err
 			}
@@ -181,7 +185,11 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			cleanupKeys = append(cleanupKeys, msg.PayloadRef)
 		}
 		if d.server.modal.HasEmbedShardEndpoint() {
-			resp, err := d.server.modal.EmbedShard(modalJob(msg))
+			modalPayload, err := d.modalJob(ctx, msg)
+			if err != nil {
+				return err
+			}
+			resp, err := d.server.modal.EmbedShard(modalPayload)
 			if err != nil {
 				return err
 			}
@@ -201,7 +209,11 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing", 0)
 		}
 		if d.server.modal.HasIndexShardEndpoint() {
-			if _, err := d.server.modal.IndexShard(modalJob(msg)); err != nil {
+			modalPayload, err := d.modalJob(ctx, msg)
+			if err != nil {
+				return err
+			}
+			if _, err := d.server.modal.IndexShard(modalPayload); err != nil {
 				return err
 			}
 		} else {
@@ -242,13 +254,15 @@ func (d *SyncDispatcher) pipelineFor(msg queue.JobMessage) *syncPipeline {
 		BaseGenerationSeq: msg.BaseGenerationSeq,
 	}
 	return &syncPipeline{
-		server:     d.server,
-		orgID:      msg.OrgID,
-		rootID:     msg.RootID,
-		generation: generation,
-		job:        job,
-		userID:     msg.UserID,
-		req:        &models.SyncRequest{RootID: msg.RootID},
+		server:                d.server,
+		orgID:                 msg.OrgID,
+		rootID:                msg.RootID,
+		generation:            generation,
+		job:                   job,
+		userID:                msg.UserID,
+		req:                   &models.SyncRequest{RootID: msg.RootID},
+		indexNamespaces:       modelIndexNamespaces(msg.IndexNamespaces, msg.OrgID, msg.RootID),
+		indexNamespacesLoaded: len(msg.IndexNamespaces) > 0,
 		resp: &models.SyncResponse{
 			RootID:        msg.RootID,
 			SyncJobID:     msg.SyncJobID,
@@ -298,6 +312,25 @@ func objectQueueJobFromMessage(msg queue.JobMessage) objectQueueJob {
 	}
 }
 
+func (d *SyncDispatcher) modalJob(ctx context.Context, msg queue.JobMessage) (map[string]any, error) {
+	if len(msg.IndexNamespaces) == 0 {
+		if d == nil || d.server == nil || d.server.db == nil {
+			msg.IndexNamespaces = []queue.IndexNamespace{{
+				Namespace:  tpNamespace(msg.OrgID, msg.RootID),
+				ShardIndex: 0,
+				ShardCount: 1,
+			}}
+			return modalJob(msg), nil
+		}
+		namespaces, err := d.server.db.ListRootIndexNamespaces(ctx, msg.OrgID, msg.RootID)
+		if err != nil {
+			return nil, err
+		}
+		msg.IndexNamespaces = queueIndexNamespaces(namespaces)
+	}
+	return modalJob(msg), nil
+}
+
 func modalJob(msg queue.JobMessage) map[string]any {
 	return map[string]any{
 		"job_id":              msg.JobID,
@@ -311,6 +344,7 @@ func modalJob(msg queue.JobMessage) map[string]any {
 		"base_generation_seq": msg.BaseGenerationSeq,
 		"stage":               msg.Stage,
 		"payload_ref":         msg.PayloadRef,
+		"index_namespaces":    msg.IndexNamespaces,
 		"shard_index":         msg.ShardIndex,
 		"total_shards":        msg.TotalShards,
 		"priority":            msg.Priority,

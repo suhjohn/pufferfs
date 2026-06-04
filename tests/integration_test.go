@@ -31,6 +31,8 @@ import (
 	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	natsserver "github.com/nats-io/nats-server/v2/server"
+
+	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 const (
@@ -44,7 +46,9 @@ const (
 	e2eMinioPass   = "minioadmin"
 	e2eMinioBucket = "pufferfs-e2e-test"
 
-	e2eJWTSecret = "e2e-integration-test-jwt-secret!"
+	e2eJWTSecret         = "e2e-integration-test-jwt-secret!"
+	e2eAdminKey          = "pfs_e2e_platform_admin_key"
+	e2eTPNamespaceShards = "2"
 
 	llmWikiURL = "https://gist.githubusercontent.com/karpathy/442a6bf555914893e9891c11519de94f/raw/ac46de1ad27f92b28ac95459c782c07f6b8c964a/llm-wiki.md"
 )
@@ -69,6 +73,134 @@ func TestPufferFSEndToEnd(t *testing.T) {
 	services := requireRealServices(t)
 	setupE2EInfra(t)
 
+	t.Run("admin provisioning creates member-scoped tenant access", func(t *testing.T) {
+		suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+		srv := startServer(t, services, "")
+		serverURL := fmt.Sprintf("http://%s", srv.addr)
+		cleanupDone := false
+
+		org := adminProvisionOrg(t, serverURL, map[string]any{
+			"name":        "Integration Tenant " + suffix,
+			"slug":        "integration-tenant-" + suffix,
+			"external_id": "tenant-" + suffix,
+		})
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, serverURL, "/admin/orgs/"+url.PathEscape(org.ID))
+			}
+		})
+
+		adminUser := adminProvisionUser(t, serverURL, map[string]any{
+			"email":       "tenant-admin-" + suffix + "@example.com",
+			"name":        "Tenant Admin",
+			"external_id": "tenant-admin-" + suffix,
+		})
+		memberA := adminProvisionUser(t, serverURL, map[string]any{
+			"email":       "member-a-" + suffix + "@example.com",
+			"name":        "Member A",
+			"external_id": "member-a-" + suffix,
+		})
+		memberB := adminProvisionUser(t, serverURL, map[string]any{
+			"email":       "member-b-" + suffix + "@example.com",
+			"name":        "Member B",
+			"external_id": "member-b-" + suffix,
+		})
+
+		adminUpsertMember(t, serverURL, org.ID, adminUser.ID, "admin")
+		adminUpsertMember(t, serverURL, org.ID, memberA.ID, "viewer")
+		adminUpsertMember(t, serverURL, org.ID, memberB.ID, "viewer")
+
+		adminMemberKey := adminCreateMemberAPIKey(t, serverURL, org.ID, adminUser.ID, []string{"query", "root:delete"})
+		memberAKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query"})
+		memberASyncKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query", "sync"})
+		memberBKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberB.ID, []string{"query"})
+
+		orgRoot := adminCreateRoot(t, serverURL, org.ID, map[string]any{
+			"name":        "shared-root-" + suffix,
+			"source_path": "/tenant/shared",
+			"scope":       "org",
+		})
+		memberARoot := adminCreateRoot(t, serverURL, org.ID, map[string]any{
+			"name":          "member-a-root-" + suffix,
+			"source_path":   "/tenant/member-a",
+			"scope":         "user",
+			"owner_user_id": memberA.ID,
+		})
+		memberBRoot := adminCreateRoot(t, serverURL, org.ID, map[string]any{
+			"name":          "member-b-root-" + suffix,
+			"source_path":   "/tenant/member-b",
+			"scope":         "user",
+			"owner_user_id": memberB.ID,
+		})
+
+		assertVisibleRoots(t, serverURL, memberAKey,
+			[]string{orgRoot.Name, memberARoot.Name},
+			[]string{memberBRoot.Name},
+		)
+		assertVisibleRoots(t, serverURL, memberBKey,
+			[]string{orgRoot.Name, memberBRoot.Name},
+			[]string{memberARoot.Name},
+		)
+		assertVisibleRoots(t, serverURL, adminMemberKey,
+			[]string{orgRoot.Name, memberARoot.Name, memberBRoot.Name},
+			nil,
+		)
+		assertRootStatus(t, serverURL, memberAKey, memberBRoot.ID, http.StatusNotFound)
+		assertRootStatus(t, serverURL, adminMemberKey, memberBRoot.ID, http.StatusOK)
+
+		var memberCreatedRoot models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, serverURL+"/roots", memberASyncKey, map[string]any{
+			"name":        "member-a-created-" + suffix,
+			"source_path": "/tenant/member-a-created",
+			"scope":       "user",
+		}, &memberCreatedRoot)
+		if status != http.StatusCreated {
+			t.Fatalf("member user-root create: HTTP %d: %s", status, string(body))
+		}
+		if memberCreatedRoot.Scope != "user" || memberCreatedRoot.OwnerUserID != memberA.ID {
+			t.Fatalf("unexpected member-created root: %#v", memberCreatedRoot)
+		}
+		status, body = jsonRequest(t, http.MethodPost, serverURL+"/roots", memberASyncKey, map[string]any{
+			"name":        "member-a-org-root-" + suffix,
+			"source_path": "/tenant/member-a-org",
+			"scope":       "org",
+		}, nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("member org-root create: HTTP %d, want 403: %s", status, string(body))
+		}
+
+		homeDir := t.TempDir()
+		stdout, stderr, err := runPufferfs(t, homeDir, serverURL, memberAKey, "root", "delete", orgRoot.ID, "--yes")
+		if err == nil {
+			t.Fatalf("query-only member key unexpectedly deleted root\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		requireOutputContains(t, stdout+stderr, "root delete scope required")
+
+		projectDir := filepath.Join(homeDir, "member-workspace")
+		writeFile(t, projectDir, "notes.txt", "query-only member keys cannot create or sync roots\n")
+		stdout, stderr, err = runPufferfs(t, homeDir, serverURL, memberAKey, "sync", projectDir, "--name", "member-created-"+suffix, "--scope", "user")
+		if err == nil {
+			t.Fatalf("query-only member key unexpectedly synced root\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		requireOutputContains(t, stdout+stderr, "sync scope required")
+
+		stdout, stderr, err = runPufferfs(t, t.TempDir(), serverURL, adminMemberKey, "root", "delete", memberBRoot.ID, "--yes")
+		if err != nil {
+			t.Fatalf("admin member key failed to delete user root: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Deleted root")
+		assertVisibleRoots(t, serverURL, memberBKey,
+			[]string{orgRoot.Name},
+			[]string{memberBRoot.Name},
+		)
+
+		deleteCreatedDataAndAssertGone(t, serverURL, org.ID,
+			[]string{adminUser.ID, memberA.ID, memberB.ID},
+			[]string{orgRoot.ID, memberARoot.ID, memberBRoot.ID, memberCreatedRoot.ID},
+		)
+		cleanupDone = true
+	})
+
 	t.Run("cli sync query modify move remove and watch with nested project", func(t *testing.T) {
 		env := newE2EEnv(t, services, "")
 		homeDir := t.TempDir()
@@ -84,17 +216,22 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Sync complete")
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
-		namespace := tpNamespace(env.orgID, rootID)
+		namespaces := rootIndexNamespaces(t, rootID)
+		assertRootIndexNamespaceCount(t, namespaces, 2)
+		cleanupDone := false
 		t.Cleanup(func() {
-			deleteTPNamespace(t, services, namespace)
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
 		})
 		assertMinioHasPrefix(t, fmt.Sprintf("bundles/%s/", rootID))
 		assertMinioHasPrefix(t, "syncs/")
 
-		assertNestedRowsIndexed(t, services, namespace, fixtures)
-		assertPDFPageRows(t, services, namespace, fixtures.pdfs)
-		assertOfficeDocumentPageRows(t, services, namespace, fixtures.officeDocs)
-		assertLargeMarkdownRows(t, services, namespace, fixtures.largeMarkdownPath, 2)
+		assertNestedRowsIndexed(t, services, namespaces, fixtures)
+		assertPDFPageRows(t, services, namespaces, fixtures.pdfs)
+		assertOfficeDocumentPageRows(t, services, namespaces, fixtures.officeDocs)
+		assertLargeMarkdownRows(t, services, namespaces, fixtures.largeMarkdownPath, 2)
 		assertCLIQuery(t, homeDir, env, "roadmap retention metrics", env.rootName, "hybrid", "", "docs/product/strategy/roadmap.md")
 		assertCLIQuery(t, homeDir, env, "rollback procedure", env.rootName, "fts", "", "ops/runbooks/deploy/rollback.txt")
 		if fixtures.largeMarkdownPath != "" {
@@ -107,9 +244,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		modifyPath := fixtures.modifyPath
 		stableBefore := make(map[string]rowDigest)
 		for _, relPath := range fixtures.stablePaths {
-			stableBefore[relPath] = rowsDigest(queryTPRowsForPath(t, services, namespace, relPath))
+			stableBefore[relPath] = rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
 		}
-		modifyBefore := rowsDigest(queryTPRowsForPath(t, services, namespace, modifyPath))
+		modifyBefore := rowsDigest(queryTPRowsForPath(t, services, namespaces, modifyPath))
 
 		appendFile(t, projectDir, modifyPath, "\n\nRuntime update: add enterprise audit exports and tighten retention controls.\n")
 		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
@@ -119,12 +256,12 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Merkle diff found 1 changed files")
 		requireOutputContains(t, stdout, "Syncing 1 changes")
 
-		modifyAfter := rowsDigest(queryTPRowsForPath(t, services, namespace, modifyPath))
+		modifyAfter := rowsDigest(queryTPRowsForPath(t, services, namespaces, modifyPath))
 		if modifyBefore.equal(modifyAfter) {
 			t.Fatalf("modified %s kept identical indexed row digest: %#v", modifyPath, modifyAfter)
 		}
 		for relPath, before := range stableBefore {
-			after := rowsDigest(queryTPRowsForPath(t, services, namespace, relPath))
+			after := rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
 			if !before.equal(after) {
 				t.Fatalf("unchanged %s was reindexed: before %#v after %#v", relPath, before, after)
 			}
@@ -141,9 +278,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("move sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
 		requireOutputContains(t, stdout, "Sync complete")
-		assertNoTPRows(t, services, namespace, oldMovePath)
-		assertClosedTPRows(t, services, namespace, oldMovePath)
-		assertHasTPRows(t, services, namespace, newMovePath)
+		assertNoTPRows(t, services, namespaces, oldMovePath)
+		assertClosedTPRows(t, services, namespaces, oldMovePath)
+		assertHasTPRows(t, services, namespaces, newMovePath)
 
 		removedPath := fixtures.removePath
 		if err := os.Remove(filepath.Join(projectDir, filepath.FromSlash(removedPath))); err != nil {
@@ -154,16 +291,19 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("remove sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
 		requireOutputContains(t, stdout, "Sync complete")
-		assertNoTPRows(t, services, namespace, removedPath)
-		assertClosedTPRows(t, services, namespace, removedPath)
+		assertNoTPRows(t, services, namespaces, removedPath)
+		assertClosedTPRows(t, services, namespaces, removedPath)
 
 		watchPath := fixtures.watchPath
-		beforeWatch := rowsDigest(queryTPRowsForPath(t, services, namespace, watchPath))
+		beforeWatch := rowsDigest(queryTPRowsForPath(t, services, namespaces, watchPath))
 		watch := startPufferfsWatch(t, homeDir, env, projectDir, env.rootName, 300*time.Millisecond)
-		watch.waitForOutput(t, "Watching", 30*time.Second)
+		watch.waitForOutput(t, "Following", 30*time.Second)
 		appendFile(t, projectDir, watchPath, "\n3. Verify invoice webhooks and search indexing.\n")
-		waitForRowDigestChange(t, services, namespace, watchPath, beforeWatch, 90*time.Second)
+		waitForRowDigestChange(t, services, namespaces, watchPath, beforeWatch, 90*time.Second)
 		watch.stop(t)
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
 	})
 
 	t.Run("failed indexing does not save local state and clean retry indexes incrementally from scratch", func(t *testing.T) {
@@ -201,13 +341,21 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("retry did not save local Merkle tree: %v", err)
 		}
 
-		namespace := tpNamespace(env.orgID, rootID)
+		namespaces := rootIndexNamespaces(t, rootID)
+		assertRootIndexNamespaceCount(t, namespaces, 2)
+		cleanupDone := false
 		t.Cleanup(func() {
-			deleteTPNamespace(t, services, namespace)
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
 		})
-		assertHasTPRows(t, services, namespace, "docs/deep/retry/incident.md")
-		assertHasTPRows(t, services, namespace, "docs/deep/retry/evidence.txt")
+		assertHasTPRows(t, services, namespaces, "docs/deep/retry/incident.md")
+		assertHasTPRows(t, services, namespaces, "docs/deep/retry/evidence.txt")
 		assertCLIQuery(t, homeDir, env, "failed indexing retry", env.rootName, "hybrid", "", "docs/deep/retry/incident.md")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
 	})
 
 	t.Run("queued NATS dispatcher sync flow indexes and queries", func(t *testing.T) {
@@ -233,14 +381,22 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
 		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
-		namespace := tpNamespace(env.orgID, rootID)
+		namespaces := rootIndexNamespaces(t, rootID)
+		assertRootIndexNamespaceCount(t, namespaces, 2)
+		cleanupDone := false
 		t.Cleanup(func() {
-			deleteTPNamespace(t, services, namespace)
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
 		})
 		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/done/", generationID))
-		assertHasTPRows(t, services, namespace, "queued/architecture.md")
-		assertHasTPRows(t, services, namespace, "queued/document.pdf")
+		assertHasTPRows(t, services, namespaces, "queued/architecture.md")
+		assertHasTPRows(t, services, namespaces, "queued/document.pdf")
 		assertCLIQuery(t, homeDir, env, "JetStream dispatchers Modal compute", env.rootName, "hybrid", "", "queued/architecture.md")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
 	})
 
 	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
@@ -265,12 +421,20 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Sync complete")
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
-		namespace := tpNamespace(env.orgID, rootID)
+		namespaces := rootIndexNamespaces(t, rootID)
+		assertRootIndexNamespaceCount(t, namespaces, 2)
+		cleanupDone := false
 		t.Cleanup(func() {
-			deleteTPNamespace(t, services, namespace)
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
 		})
-		assertHasTPRows(t, services, namespace, "docs/readme.md")
+		assertHasTPRows(t, services, namespaces, "docs/readme.md")
 		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
 	})
 }
 
@@ -522,6 +686,27 @@ func assertMinioHasPrefix(t *testing.T, prefix string) {
 	}
 }
 
+func assertStoragePrefixEmpty(t *testing.T, prefix string) {
+	t.Helper()
+
+	client := newMinioClient(t)
+	bucket := e2eMinioBucket
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		bucket = os.Getenv("AWS_BUCKET_NAME")
+	}
+	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
+		Bucket:  aws.String(bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		t.Fatalf("listing storage prefix %s: %v", prefix, err)
+	}
+	if len(resp.Contents) != 0 {
+		t.Fatalf("expected no objects with prefix %s after delete", prefix)
+	}
+}
+
 type e2eEnv struct {
 	server    *serverProcess
 	serverURL string
@@ -615,6 +800,8 @@ func startServerWithExtraEnv(t *testing.T, services realServices, turbopufferKey
 		"DATABASE_URL="+dbURL,
 		"LISTEN_ADDR="+addr,
 		"JWT_SECRET="+e2eJWTSecret,
+		"PUFFERFS_ADMIN_KEY="+e2eAdminKey,
+		"PUFFERFS_TP_NAMESPACE_SHARDS="+e2eTPNamespaceShards,
 		"MIGRATIONS_DIR="+filepath.Join(repoRoot(t), "migrations"),
 		"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
 		"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
@@ -707,6 +894,7 @@ func startStageWorkers(t *testing.T, services realServices, natsURL string, stag
 			"MODAL_INDEX_SHARD_ENDPOINT="+services.modalIndexShardURL,
 			"TURBOPUFFER_API_KEY="+services.turbopufferAPIKey,
 			"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
+			"PUFFERFS_TP_NAMESPACE_SHARDS="+e2eTPNamespaceShards,
 		)
 		cmd.Env = append(cmd.Env, services.storageEnv...)
 		cmd.Dir = repoRoot(t)
@@ -730,6 +918,283 @@ func stopWorkerProcesses(t *testing.T, workers []*exec.Cmd) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}
+}
+
+func adminProvisionOrg(t *testing.T, serverURL string, payload map[string]any) models.Organization {
+	t.Helper()
+	var org models.Organization
+	adminJSON(t, http.MethodPost, serverURL, "/admin/orgs", payload, http.StatusOK, &org)
+	return org
+}
+
+func adminProvisionUser(t *testing.T, serverURL string, payload map[string]any) models.User {
+	t.Helper()
+	var user models.User
+	adminJSON(t, http.MethodPost, serverURL, "/admin/users", payload, http.StatusOK, &user)
+	return user
+}
+
+func adminUpsertMember(t *testing.T, serverURL, orgID, userID, role string) {
+	t.Helper()
+	var member models.OrgMember
+	adminJSON(t, http.MethodPut, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/members/"+url.PathEscape(userID), map[string]any{
+		"role": role,
+	}, http.StatusOK, &member)
+	if member.UserID != userID || member.Role != role {
+		t.Fatalf("unexpected member response: %#v", member)
+	}
+}
+
+func adminCreateMemberAPIKey(t *testing.T, serverURL, orgID, userID string, scopes []string) string {
+	t.Helper()
+	var resp struct {
+		Key string `json:"key"`
+	}
+	adminJSON(t, http.MethodPost, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/users/"+url.PathEscape(userID)+"/api-keys", map[string]any{
+		"name":   "member-key",
+		"scopes": scopes,
+	}, http.StatusCreated, &resp)
+	if resp.Key == "" {
+		t.Fatal("admin API key creation returned empty key")
+	}
+	return resp.Key
+}
+
+func adminCreateRoot(t *testing.T, serverURL, orgID string, payload map[string]any) models.RootMetadata {
+	t.Helper()
+	var root models.RootMetadata
+	adminJSON(t, http.MethodPost, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/roots", payload, http.StatusCreated, &root)
+	if root.ID == "" {
+		t.Fatalf("admin root creation returned empty root: %#v", root)
+	}
+	return root
+}
+
+func adminJSON(t *testing.T, method, serverURL, requestPath string, payload any, expectedStatus int, out any) {
+	t.Helper()
+	status, body := jsonRequest(t, method, serverURL+requestPath, e2eAdminKey, payload, out)
+	if status != expectedStatus {
+		t.Fatalf("%s %s: HTTP %d, want %d: %s", method, requestPath, status, expectedStatus, string(body))
+	}
+}
+
+func adminDelete(t *testing.T, serverURL, requestPath string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, serverURL+requestPath, nil)
+	if err != nil {
+		t.Logf("cleanup request error: %v", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+e2eAdminKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Logf("cleanup delete %s failed: %v", requestPath, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Logf("cleanup delete %s: HTTP %d: %s", requestPath, resp.StatusCode, string(body))
+	}
+}
+
+func deleteCreatedDataAndAssertGone(t *testing.T, serverURL, orgID string, userIDs, rootIDs []string) {
+	t.Helper()
+
+	waitForNoActiveSyncs(t, rootIDs)
+	generationIDs := syncGenerationIDsForRoots(t, rootIDs)
+	for _, userID := range userIDs {
+		status, body := jsonRequest(t, http.MethodDelete, serverURL+"/admin/users/"+url.PathEscape(userID), e2eAdminKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("deleting user %s: HTTP %d: %s", userID, status, string(body))
+		}
+	}
+	status, body := jsonRequest(t, http.MethodDelete, serverURL+"/admin/orgs/"+url.PathEscape(orgID), e2eAdminKey, nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("deleting org %s: HTTP %d: %s", orgID, status, string(body))
+	}
+
+	assertDBCountZero(t, "organization", `SELECT COUNT(*) FROM organizations WHERE id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org roots", `SELECT COUNT(*) FROM roots WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org members", `SELECT COUNT(*) FROM org_members WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org API keys", `SELECT COUNT(*) FROM api_keys WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org ACLs", `SELECT COUNT(*) FROM root_acls WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org sync jobs", `SELECT COUNT(*) FROM sync_jobs WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org sync generations", `SELECT COUNT(*) FROM sync_generations WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org content proofs", `SELECT COUNT(*) FROM content_proofs WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org embedding cache", `SELECT COUNT(*) FROM embedding_cache WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org root index namespaces", `SELECT COUNT(*) FROM root_index_namespaces WHERE org_id = `+sqlQuote(orgID))
+	if len(userIDs) > 0 {
+		assertDBCountZero(t, "created users", `SELECT COUNT(*) FROM users WHERE id IN `+sqlStringList(userIDs))
+	}
+	if len(rootIDs) > 0 {
+		assertDBCountZero(t, "root states", `SELECT COUNT(*) FROM root_states WHERE root_id IN `+sqlStringList(rootIDs))
+	}
+
+	for _, rootID := range rootIDs {
+		assertStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID))
+		assertStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID))
+		assertStoragePrefixEmpty(t, fmt.Sprintf("states/%s/", rootID))
+		assertStoragePrefixEmpty(t, fmt.Sprintf("chunks/%s/", rootID))
+	}
+	for _, generationID := range generationIDs {
+		assertStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID))
+	}
+}
+
+func waitForNoActiveSyncs(t *testing.T, rootIDs []string) {
+	t.Helper()
+	if len(rootIDs) == 0 {
+		return
+	}
+
+	activeSQL := `SELECT (
+		(SELECT COUNT(*) FROM sync_generations WHERE root_id IN ` + sqlStringList(rootIDs) + ` AND status = 'building') +
+		(SELECT COUNT(*) FROM sync_jobs WHERE root_id IN ` + sqlStringList(rootIDs) + ` AND status NOT IN ('completed', 'failed'))
+	)`
+	deadline := time.Now().Add(90 * time.Second)
+	for {
+		raw := strings.TrimSpace(psqlOutput(t, activeSQL))
+		active, err := strconv.Atoi(raw)
+		if err != nil {
+			t.Fatalf("parsing active sync count %q: %v", raw, err)
+		}
+		if active == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			detail := psqlOutput(t, `
+				SELECT 'generation', id, root_id, status FROM sync_generations
+				 WHERE root_id IN `+sqlStringList(rootIDs)+` AND status = 'building'
+				UNION ALL
+				SELECT 'job', id, root_id, status FROM sync_jobs
+				 WHERE root_id IN `+sqlStringList(rootIDs)+` AND status NOT IN ('completed', 'failed')
+				ORDER BY 1, 2`)
+			t.Fatalf("timed out waiting for active syncs to finish before delete; active=%d\n%s", active, detail)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func syncGenerationIDsForRoots(t *testing.T, rootIDs []string) []string {
+	t.Helper()
+	if len(rootIDs) == 0 {
+		return nil
+	}
+	out := psqlOutput(t, `SELECT id FROM sync_generations WHERE root_id IN `+sqlStringList(rootIDs)+` ORDER BY id`)
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			ids = append(ids, line)
+		}
+	}
+	return ids
+}
+
+func assertDBCountZero(t *testing.T, label, sql string) {
+	t.Helper()
+	raw := strings.TrimSpace(psqlOutput(t, sql))
+	count, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("parsing %s count %q: %v", label, raw, err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no %s rows after delete, got %d", label, count)
+	}
+}
+
+func psqlOutput(t *testing.T, sql string) string {
+	t.Helper()
+	cmd := exec.Command("docker", "exec", "-i", e2ePgContainer, "psql", "-U", e2eDBUser, "-d", e2eDBName, "-At", "-c", sql)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running psql %q: %v\n%s", sql, err, out)
+	}
+	return string(out)
+}
+
+func sqlStringList(values []string) string {
+	if len(values) == 0 {
+		return "(NULL)"
+	}
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, sqlQuote(value))
+	}
+	return "(" + strings.Join(quoted, ",") + ")"
+}
+
+func sqlQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func assertVisibleRoots(t *testing.T, serverURL, apiKey string, expected, absent []string) {
+	t.Helper()
+	var roots []models.RootMetadata
+	status, body := jsonRequest(t, http.MethodGet, serverURL+"/roots", apiKey, nil, &roots)
+	if status != http.StatusOK {
+		t.Fatalf("listing roots: HTTP %d: %s", status, string(body))
+	}
+	names := make(map[string]bool, len(roots))
+	for _, root := range roots {
+		names[root.Name] = true
+	}
+	for _, name := range expected {
+		if !names[name] {
+			t.Fatalf("expected visible root %q in %#v", name, names)
+		}
+	}
+	for _, name := range absent {
+		if names[name] {
+			t.Fatalf("root %q should not be visible in %#v", name, names)
+		}
+	}
+}
+
+func assertRootStatus(t *testing.T, serverURL, apiKey, rootID string, expectedStatus int) {
+	t.Helper()
+	status, body := jsonRequest(t, http.MethodGet, serverURL+"/roots/"+url.PathEscape(rootID), apiKey, nil, nil)
+	if status != expectedStatus {
+		t.Fatalf("GET root %s: HTTP %d, want %d: %s", rootID, status, expectedStatus, string(body))
+	}
+}
+
+func jsonRequest(t *testing.T, method, requestURL, bearer string, payload any, out any) (int, []byte) {
+	t.Helper()
+	var body io.Reader
+	if payload != nil {
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshaling request payload: %v", err)
+		}
+		body = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, requestURL, body)
+	if err != nil {
+		t.Fatalf("creating request: %v", err)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, requestURL, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if out != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			t.Fatalf("decoding response %s: %v", string(respBody), err)
+		}
+	}
+	return resp.StatusCode, respBody
 }
 
 func createUserAndAPIKey(t *testing.T, orgID, userID, rawKey string) {
@@ -1552,29 +2017,29 @@ func stableFixturePaths(fixtures fixtureSet) []string {
 	return paths
 }
 
-func assertNestedRowsIndexed(t *testing.T, services realServices, namespace string, fixtures fixtureSet) {
+func assertNestedRowsIndexed(t *testing.T, services realServices, namespaces []string, fixtures fixtureSet) {
 	t.Helper()
 
 	for _, relPath := range append(append([]string{}, fixtures.textPaths...), fixtures.mdPaths...) {
-		assertHasTPRows(t, services, namespace, relPath)
+		assertHasTPRows(t, services, namespaces, relPath)
 	}
 	for _, pdf := range fixtures.pdfs {
 		if pdf.expectedChunks == 0 {
-			assertNoTPRows(t, services, namespace, pdf.relPath)
+			assertNoTPRows(t, services, namespaces, pdf.relPath)
 			continue
 		}
-		assertHasTPRows(t, services, namespace, pdf.relPath)
+		assertHasTPRows(t, services, namespaces, pdf.relPath)
 	}
 	for _, doc := range fixtures.officeDocs {
 		if doc.expectedChunks == 0 {
-			assertNoTPRows(t, services, namespace, doc.relPath)
+			assertNoTPRows(t, services, namespaces, doc.relPath)
 			continue
 		}
-		assertHasTPRows(t, services, namespace, doc.relPath)
+		assertHasTPRows(t, services, namespaces, doc.relPath)
 	}
 }
 
-func assertPDFPageRows(t *testing.T, services realServices, namespace string, pdfs []pdfFixture) {
+func assertPDFPageRows(t *testing.T, services realServices, namespaces []string, pdfs []pdfFixture) {
 	t.Helper()
 
 	if len(pdfs) == 0 {
@@ -1583,7 +2048,7 @@ func assertPDFPageRows(t *testing.T, services realServices, namespace string, pd
 	}
 
 	for _, pdf := range pdfs {
-		rows := queryTPRowsForPath(t, services, namespace, pdf.relPath)
+		rows := queryTPRowsForPath(t, services, namespaces, pdf.relPath)
 		if pdf.expectedChunks >= 0 && len(rows) != pdf.expectedChunks {
 			t.Fatalf("expected %d Turbopuffer rows for %s, got %d: %#v", pdf.expectedChunks, pdf.relPath, len(rows), rows)
 		}
@@ -1621,11 +2086,11 @@ func assertPDFPageRows(t *testing.T, services realServices, namespace string, pd
 	}
 }
 
-func assertOfficeDocumentPageRows(t *testing.T, services realServices, namespace string, docs []officeDocumentFixture) {
+func assertOfficeDocumentPageRows(t *testing.T, services realServices, namespaces []string, docs []officeDocumentFixture) {
 	t.Helper()
 
 	for _, doc := range docs {
-		rows := queryTPRowsForPath(t, services, namespace, doc.relPath)
+		rows := queryTPRowsForPath(t, services, namespaces, doc.relPath)
 		if doc.expectedChunks >= 0 && len(rows) != doc.expectedChunks {
 			t.Fatalf("expected %d Turbopuffer rows for %s, got %d: %#v", doc.expectedChunks, doc.relPath, len(rows), rows)
 		}
@@ -1649,12 +2114,12 @@ func assertOfficeDocumentPageRows(t *testing.T, services realServices, namespace
 	}
 }
 
-func assertLargeMarkdownRows(t *testing.T, services realServices, namespace, relPath string, minRows int) {
+func assertLargeMarkdownRows(t *testing.T, services realServices, namespaces []string, relPath string, minRows int) {
 	t.Helper()
 	if relPath == "" {
 		return
 	}
-	rows := queryTPRowsForPath(t, services, namespace, relPath)
+	rows := queryTPRowsForPath(t, services, namespaces, relPath)
 	if len(rows) < minRows {
 		t.Fatalf("expected at least %d Turbopuffer rows for large markdown %s, got %d: %#v", minRows, relPath, len(rows), rows)
 	}
@@ -1761,8 +2226,28 @@ func visibleGenerationID(t *testing.T, serverURL, apiKey, rootID string) string 
 	return root.VisibleGenerationID
 }
 
-func tpNamespace(orgID, rootID string) string {
-	return fmt.Sprintf("org-%s-root-%s", orgID, rootID)
+func rootIndexNamespaces(t *testing.T, rootID string) []string {
+	t.Helper()
+
+	out := psqlOutput(t, `SELECT namespace FROM root_index_namespaces WHERE root_id = `+sqlQuote(rootID)+` AND retired_at IS NULL ORDER BY shard_index`)
+	var namespaces []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			namespaces = append(namespaces, line)
+		}
+	}
+	if len(namespaces) == 0 {
+		t.Fatalf("root %s has no root_index_namespaces rows", rootID)
+	}
+	return namespaces
+}
+
+func assertRootIndexNamespaceCount(t *testing.T, namespaces []string, want int) {
+	t.Helper()
+	if len(namespaces) != want {
+		t.Fatalf("root index namespaces = %#v, want %d namespaces", namespaces, want)
+	}
 }
 
 func tpBaseURL(services realServices) string {
@@ -1772,20 +2257,30 @@ func tpBaseURL(services realServices) string {
 	return "https://api.turbopuffer.com"
 }
 
-func queryTPRowsForPath(t *testing.T, services realServices, namespace, relPath string) []map[string]any {
+func queryTPRowsForPath(t *testing.T, services realServices, namespaces []string, relPath string) []map[string]any {
 	t.Helper()
-	return queryTPRowsForPathWithFilter(t, services, namespace, []any{"And", []any{
+	return queryTPRowsForPathWithFilter(t, services, namespaces, []any{"And", []any{
 		[]any{"file_path", "Eq", relPath},
 		[]any{"valid_to_generation_seq", "Eq", 0},
 	}})
 }
 
-func queryTPAllRowsForPath(t *testing.T, services realServices, namespace, relPath string) []map[string]any {
+func queryTPAllRowsForPath(t *testing.T, services realServices, namespaces []string, relPath string) []map[string]any {
 	t.Helper()
-	return queryTPRowsForPathWithFilter(t, services, namespace, []any{"file_path", "Eq", relPath})
+	return queryTPRowsForPathWithFilter(t, services, namespaces, []any{"file_path", "Eq", relPath})
 }
 
-func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespace string, filter any) []map[string]any {
+func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespaces []string, filter any) []map[string]any {
+	t.Helper()
+
+	var allRows []map[string]any
+	for _, namespace := range namespaces {
+		allRows = append(allRows, queryTPNamespaceRowsWithFilter(t, services, namespace, filter)...)
+	}
+	return allRows
+}
+
+func queryTPNamespaceRowsWithFilter(t *testing.T, services realServices, namespace string, filter any) []map[string]any {
 	t.Helper()
 
 	body := map[string]any{
@@ -1819,6 +2314,9 @@ func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespace
 		t.Fatalf("reading TP response: %v", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusNotFound {
+			return nil
+		}
 		t.Fatalf("querying TP rows: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -1829,6 +2327,13 @@ func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespace
 		t.Fatalf("decoding TP rows: %v", err)
 	}
 	return result.Rows
+}
+
+func deleteTPNamespaces(t *testing.T, services realServices, namespaces []string) {
+	t.Helper()
+	for _, namespace := range namespaces {
+		deleteTPNamespace(t, services, namespace)
+	}
 }
 
 func deleteTPNamespace(t *testing.T, services realServices, namespace string) {
@@ -1853,25 +2358,25 @@ func deleteTPNamespace(t *testing.T, services realServices, namespace string) {
 	}
 }
 
-func assertHasTPRows(t *testing.T, services realServices, namespace, relPath string) {
+func assertHasTPRows(t *testing.T, services realServices, namespaces []string, relPath string) {
 	t.Helper()
-	rows := queryTPRowsForPath(t, services, namespace, relPath)
+	rows := queryTPRowsForPath(t, services, namespaces, relPath)
 	if len(rows) == 0 {
 		t.Fatalf("expected TP rows for %s", relPath)
 	}
 }
 
-func assertNoTPRows(t *testing.T, services realServices, namespace, relPath string) {
+func assertNoTPRows(t *testing.T, services realServices, namespaces []string, relPath string) {
 	t.Helper()
-	rows := queryTPRowsForPath(t, services, namespace, relPath)
+	rows := queryTPRowsForPath(t, services, namespaces, relPath)
 	if len(rows) != 0 {
 		t.Fatalf("expected no TP rows for %s, got %#v", relPath, rows)
 	}
 }
 
-func assertClosedTPRows(t *testing.T, services realServices, namespace, relPath string) {
+func assertClosedTPRows(t *testing.T, services realServices, namespaces []string, relPath string) {
 	t.Helper()
-	rows := queryTPAllRowsForPath(t, services, namespace, relPath)
+	rows := queryTPAllRowsForPath(t, services, namespaces, relPath)
 	if len(rows) == 0 {
 		t.Fatalf("expected inactive TP rows for %s", relPath)
 	}
@@ -1916,12 +2421,12 @@ func (d rowDigest) equal(other rowDigest) bool {
 	return true
 }
 
-func waitForRowDigestChange(t *testing.T, services realServices, namespace, relPath string, before rowDigest, timeout time.Duration) {
+func waitForRowDigestChange(t *testing.T, services realServices, namespaces []string, relPath string, before rowDigest, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		after := rowsDigest(queryTPRowsForPath(t, services, namespace, relPath))
+		after := rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
 		if !before.equal(after) {
 			return
 		}

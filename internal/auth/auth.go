@@ -4,6 +4,7 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"net/http"
 	"strings"
@@ -28,11 +29,13 @@ type Identity struct {
 	OrgID  string
 	Role   Role
 	Email  string
+	Scopes []string
 }
 
 type contextKey string
 
 const identityKey contextKey = "identity"
+const adminKey contextKey = "admin"
 
 // IdentityFromContext extracts the authenticated identity from the request context.
 func IdentityFromContext(ctx context.Context) *Identity {
@@ -43,6 +46,40 @@ func IdentityFromContext(ctx context.Context) *Identity {
 // WithIdentity attaches an Identity to the context.
 func WithIdentity(ctx context.Context, id *Identity) context.Context {
 	return context.WithValue(ctx, identityKey, id)
+}
+
+func IsAdmin(ctx context.Context) bool {
+	ok, _ := ctx.Value(adminKey).(bool)
+	return ok
+}
+
+func WithAdmin(ctx context.Context) context.Context {
+	return context.WithValue(ctx, adminKey, true)
+}
+
+// HasScope reports whether an identity is allowed to perform an API-key scoped
+// action. JWT identities and legacy keys with no scopes are treated as
+// unrestricted; scoped API keys must include the exact scope, an alias, or "*".
+func HasScope(id *Identity, required string, aliases ...string) bool {
+	if id == nil {
+		return false
+	}
+	if len(id.Scopes) == 0 {
+		return true
+	}
+	allowed := map[string]struct{}{
+		required: {},
+		"*":      {},
+	}
+	for _, alias := range aliases {
+		allowed[alias] = struct{}{}
+	}
+	for _, scope := range id.Scopes {
+		if _, ok := allowed[scope]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // JWTClaims are the custom claims in a PufferFs JWT.
@@ -147,6 +184,32 @@ func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handle
 			}
 			ctx := WithIdentity(r.Context(), id)
 			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func AdminMiddleware(adminKeyHash string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.TrimSpace(adminKeyHash) == "" {
+				http.Error(w, `{"error":"admin API key is not configured"}`, http.StatusForbidden)
+				return
+			}
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, `{"error":"missing Authorization header"}`, http.StatusUnauthorized)
+				return
+			}
+			token := strings.TrimPrefix(authHeader, "Bearer ")
+			if token == authHeader {
+				http.Error(w, `{"error":"invalid Authorization format, expected Bearer token"}`, http.StatusUnauthorized)
+				return
+			}
+			if subtle.ConstantTimeCompare([]byte(HashAPIKey(token)), []byte(adminKeyHash)) != 1 {
+				http.Error(w, `{"error":"invalid admin API key"}`, http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(WithAdmin(r.Context())))
 		})
 	}
 }

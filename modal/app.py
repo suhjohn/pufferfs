@@ -109,6 +109,7 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     import time
 
     import fitz
+    from chunkers import _page_text_coverage, extracted_text_is_usable
 
     render_start = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -116,11 +117,15 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     for page_num in range(len(doc)):
         page = doc[page_num]
         pix = page.get_pixmap(dpi=200)
+        extracted_text = page.get_text("text")
+        text_coverage = _page_text_coverage(page)
         pages.append(
             {
                 "page_num": page_num,
                 "image_bytes": pix.tobytes("jpeg"),
-                "fallback_text": page.get_text("text"),
+                "extracted_text": extracted_text,
+                "text_coverage": text_coverage,
+                "text_is_usable": extracted_text_is_usable(extracted_text, text_coverage),
             }
         )
     doc.close()
@@ -141,7 +146,7 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     scaledown_window=900,
 )
 def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallback_text: str) -> str:
-    """Extract text from one rendered page image."""
+    """Extract text from one rendered page image, falling back to native text without Gemini."""
     import time
 
     from chunkers import image_to_text
@@ -150,11 +155,13 @@ def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallba
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
         text = image_to_text(image_bytes, gemini_key, mime_type="image/jpeg")
+        source = "gemini"
     else:
         text = fallback_text
+        source = "native_fallback"
     print(
         f"timing file={file_path} page={page_num} stage=image_to_text "
-        f"chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
+        f"source={source} chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
         flush=True,
     )
     return text
@@ -193,7 +200,8 @@ def chunk_document_with_stage_functions(
         page_start = time.perf_counter()
         page_num = int(page_data["page_num"])
         img_bytes = page_data["image_bytes"]
-        fallback_text = page_data["fallback_text"]
+        extracted_text = page_data.get("extracted_text") or page_data.get("fallback_text") or ""
+        text_is_usable = bool(page_data.get("text_is_usable"))
         image_key = _page_image_key(root_id, file_path, page_num)
         if s3_client and bucket:
             upload_start = time.perf_counter()
@@ -209,7 +217,15 @@ def chunk_document_with_stage_functions(
                 flush=True,
             )
 
-        text = page_image_to_text.remote(file_path, page_num, img_bytes, fallback_text)
+        if text_is_usable:
+            text = extracted_text
+            print(
+                f"timing file={file_path} page={page_num} stage=image_to_text "
+                f"source=native_text chars={len(text)} elapsed=0.000s",
+                flush=True,
+            )
+        else:
+            text = page_image_to_text.remote(file_path, page_num, img_bytes, extracted_text)
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
@@ -305,10 +321,10 @@ def file_to_chunks(
             bucket = os.environ["AWS_BUCKET_NAME"]
         return s3, bucket
 
-    # When content is inline, S3 is managed by the Go server — skip S3 ops in Modal
+    # Source bytes can be inline, but generated images still need persisted S3 keys.
     s3c = None
     bkt = None
-    if not content_b64:
+    if not content_b64 or file_type in ("pdf", "docx", "pptx", "image"):
         s3c, bkt = _ensure_s3()
 
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
@@ -380,8 +396,46 @@ def _generation_chunk_id(root_id: str, generation_id: str, file_path: str, chunk
     return f"{path_hash}:{chunk_index}"
 
 
-def _namespace(org_id: str, root_id: str) -> str:
+def _legacy_namespace(org_id: str, root_id: str) -> str:
     return f"org-{org_id}-root-{root_id}"
+
+
+def _job_index_namespaces(job: dict) -> list[dict]:
+    namespaces = job.get("index_namespaces") or []
+    if not namespaces:
+        return [
+            {
+                "namespace": _legacy_namespace(job["org_id"], job["root_id"]),
+                "shard_index": 0,
+                "shard_count": 1,
+            }
+        ]
+    return sorted(namespaces, key=lambda ns: int(ns.get("shard_index") or 0))
+
+
+def _path_shard_index(file_path: str, shard_count: int) -> int:
+    if shard_count <= 1:
+        return 0
+    digest = hashlib.sha256(file_path.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % shard_count
+
+
+def _namespace_for_path(job: dict, file_path: str) -> str:
+    namespaces = _job_index_namespaces(job)
+    shard_count = int(namespaces[0].get("shard_count") or len(namespaces))
+    by_shard = {}
+    for ns in namespaces:
+        if int(ns.get("shard_count") or shard_count) != shard_count:
+            raise RuntimeError("root index namespace shard count mismatch")
+        shard_index = int(ns.get("shard_index") or 0)
+        by_shard[shard_index] = ns["namespace"]
+    if len(by_shard) != shard_count:
+        raise RuntimeError(f"root has {len(by_shard)} index namespaces, expected {shard_count}")
+    shard_index = _path_shard_index(file_path, shard_count)
+    namespace = by_shard.get(shard_index)
+    if not namespace:
+        raise RuntimeError(f"root missing index namespace shard {shard_index}")
+    return namespace
 
 
 def _tp_base_url() -> str:
@@ -412,6 +466,10 @@ def _tp_request(method: str, path: str, body: dict) -> dict:
     raise RuntimeError(f"turbopuffer request failed: {last_error}") from last_error
 
 
+def _is_tp_not_found(exc: Exception) -> bool:
+    return "turbopuffer HTTP 404:" in str(exc)
+
+
 def _active_generation_filter(seq: int) -> list:
     return [
         "And",
@@ -434,8 +492,13 @@ def _query_active_rows(job: dict, file_path: str, attrs: list[str]) -> list[dict
         "filters": ["And", filters],
         "include_attributes": attrs,
     }
-    ns = urllib.parse.quote(_namespace(job["org_id"], job["root_id"]), safe="")
-    rows = _tp_request("POST", f"/v2/namespaces/{ns}/query", body).get("rows", [])
+    ns = urllib.parse.quote(_namespace_for_path(job, file_path), safe="")
+    try:
+        rows = _tp_request("POST", f"/v2/namespaces/{ns}/query", body).get("rows", [])
+    except RuntimeError as exc:
+        if _is_tp_not_found(exc):
+            return []
+        raise
     if len(rows) >= limit:
         raise RuntimeError(f"{file_path} has at least {limit} active chunks; refusing partial metadata copy")
     return rows
@@ -450,17 +513,22 @@ def _close_rows_for_path(job: dict, file_path: str) -> int:
         "valid_to_generation": job["generation_id"],
         "valid_to_generation_seq": job["generation_seq"],
     }
-    ns = urllib.parse.quote(_namespace(job["org_id"], job["root_id"]), safe="")
+    ns = urllib.parse.quote(_namespace_for_path(job, file_path), safe="")
     closed = 0
     for _ in range(100):
-        result = _tp_request(
-            "POST",
-            f"/v2/namespaces/{ns}",
-            {
-                "patch_by_filter": {"filters": ["And", filters], "patch": patch},
-                "patch_by_filter_allow_partial": True,
-            },
-        )
+        try:
+            result = _tp_request(
+                "POST",
+                f"/v2/namespaces/{ns}",
+                {
+                    "patch_by_filter": {"filters": ["And", filters], "patch": patch},
+                    "patch_by_filter_allow_partial": True,
+                },
+            )
+        except RuntimeError as exc:
+            if _is_tp_not_found(exc):
+                return closed
+            raise
         closed += int(result.get("rows_affected") or result.get("rows_patched") or result.get("count") or 0)
         if not result.get("rows_remaining"):
             return closed
@@ -773,8 +841,13 @@ def index_shard_endpoint(item: dict) -> dict:
             upserts.append(record["row"])
         elif record.get("op") == "close" and record.get("close_path"):
             close_paths.add(record["close_path"])
-    namespace = _namespace(job["org_id"], job["root_id"])
-    _tp_upsert_rows(namespace, upserts)
+    upserts_by_namespace: dict[str, list[dict]] = {}
+    for row in upserts:
+        file_path = row.get("file_path", "")
+        namespace = _namespace_for_path(job, file_path)
+        upserts_by_namespace.setdefault(namespace, []).append(row)
+    for namespace, rows in upserts_by_namespace.items():
+        _tp_upsert_rows(namespace, rows)
     closed = 0
     for path in close_paths:
         closed += _close_rows_for_path(job, path)

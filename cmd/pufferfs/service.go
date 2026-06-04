@@ -23,9 +23,11 @@ func serviceCmd() *cobra.Command {
 	}
 	cmd.AddCommand(serviceInstallCmd())
 	cmd.AddCommand(serviceStartCmd())
+	cmd.AddCommand(serviceRestartCmd())
 	cmd.AddCommand(serviceStopCmd())
 	cmd.AddCommand(serviceStatusCmd())
 	cmd.AddCommand(serviceLogsCmd())
+	cmd.AddCommand(serviceUninstallCmd())
 	return cmd
 }
 
@@ -102,6 +104,10 @@ func serviceStartCmd() *cobra.Command {
 	return serviceActionCmd("start", "Start an installed sync service", startService)
 }
 
+func serviceRestartCmd() *cobra.Command {
+	return serviceActionCmd("restart", "Restart an installed sync service", restartService)
+}
+
 func serviceStopCmd() *cobra.Command {
 	return serviceActionCmd("stop", "Stop an installed sync service", stopService)
 }
@@ -112,6 +118,10 @@ func serviceStatusCmd() *cobra.Command {
 
 func serviceLogsCmd() *cobra.Command {
 	return serviceActionCmd("logs", "Follow sync service logs", logsService)
+}
+
+func serviceUninstallCmd() *cobra.Command {
+	return serviceActionCmd("uninstall", "Uninstall a sync service", uninstallService)
 }
 
 func serviceActionCmd(use, short string, action func(string) error) *cobra.Command {
@@ -230,6 +240,17 @@ func stopService(name string) error {
 	}
 }
 
+func restartService(name string) error {
+	switch runtime.GOOS {
+	case "linux":
+		return runServiceCommand("systemctl", "--user", "restart", systemdUnitName(name))
+	case "darwin":
+		return runServiceCommand("launchctl", "kickstart", "-k", launchdDomain()+"/ai.pufferfs."+name)
+	default:
+		return fmt.Errorf("service restart is not supported on %s", runtime.GOOS)
+	}
+}
+
 func statusService(name string) error {
 	switch runtime.GOOS {
 	case "linux":
@@ -252,6 +273,17 @@ func logsService(name string) error {
 	}
 }
 
+func uninstallService(name string) error {
+	switch runtime.GOOS {
+	case "linux":
+		return uninstallSystemdUserService(name)
+	case "darwin":
+		return uninstallLaunchdService(name)
+	default:
+		return fmt.Errorf("service uninstall is not supported on %s", runtime.GOOS)
+	}
+}
+
 func installSystemdUserService(spec serviceSpec) (string, error) {
 	path := systemdUserServicePath(spec.Name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -270,6 +302,31 @@ func installSystemdUserService(spec serviceSpec) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func uninstallSystemdUserService(name string) error {
+	path := systemdUserServicePath(name)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("service %q is not installed at %s", name, path)
+		}
+		return err
+	}
+
+	unit := systemdUnitName(name)
+	_ = runServiceCommandSilent("systemctl", "--user", "stop", unit)
+	if err := runServiceCommand("systemctl", "--user", "disable", unit); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := runServiceCommand("systemctl", "--user", "daemon-reload"); err != nil {
+		return err
+	}
+	_ = runServiceCommandSilent("systemctl", "--user", "reset-failed", unit)
+	fmt.Printf("Uninstalled systemd user service %q from %s\n", name, path)
+	return nil
 }
 
 func renderSystemdUserService(spec serviceSpec) string {
@@ -313,6 +370,23 @@ func installLaunchdService(spec serviceSpec) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func uninstallLaunchdService(name string) error {
+	path := launchdPlistPath(name)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("service %q is not installed at %s", name, path)
+		}
+		return err
+	}
+
+	_ = runServiceCommandSilent("launchctl", "bootout", launchdDomain(), path)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	fmt.Printf("Uninstalled launchd user service %q from %s\n", name, path)
+	return nil
 }
 
 func renderLaunchdPlist(spec serviceSpec) ([]byte, error) {
@@ -454,6 +528,11 @@ func runServiceCommand(name string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
+func runServiceCommandSilent(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
 	return cmd.Run()
 }
 

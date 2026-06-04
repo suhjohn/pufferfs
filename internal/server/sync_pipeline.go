@@ -41,6 +41,9 @@ type syncPipeline struct {
 	req        *models.SyncRequest
 	broker     *objectQueueBroker
 	resp       *models.SyncResponse
+
+	indexNamespaces       []models.RootIndexNamespace
+	indexNamespacesLoaded bool
 }
 
 type syncChunkArtifact struct {
@@ -138,6 +141,9 @@ func (p *syncPipeline) writeRequest(ctx context.Context) error {
 }
 
 func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage, error) {
+	if _, err := p.loadIndexNamespaces(ctx); err != nil {
+		return nil, err
+	}
 	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
 	msgs := make([]queue.JobMessage, 0, len(shards))
 	for i, shard := range shards {
@@ -168,10 +174,26 @@ func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, t
 		BaseGenerationSeq: p.generation.BaseGenerationSeq,
 		Stage:             stage,
 		PayloadRef:        payloadRef,
+		IndexNamespaces:   queueIndexNamespaces(p.indexNamespaces),
 		ShardIndex:        shardIndex,
 		TotalShards:       totalShards,
 		EnqueuedAt:        time.Now().UTC(),
 	}
+}
+
+func (p *syncPipeline) loadIndexNamespaces(ctx context.Context) ([]models.RootIndexNamespace, error) {
+	if p.indexNamespacesLoaded {
+		return p.indexNamespaces, nil
+	}
+	if len(p.indexNamespaces) == 0 {
+		namespaces, err := p.server.db.ListRootIndexNamespaces(ctx, p.orgID, p.rootID)
+		if err != nil {
+			return nil, err
+		}
+		p.indexNamespaces = namespaces
+	}
+	p.indexNamespacesLoaded = true
+	return p.indexNamespaces, nil
 }
 
 func shardChanges(changes []models.FileChange, maxFiles int, maxBytes int64) [][]models.FileChange {
@@ -545,13 +567,27 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) 
 			}
 		}
 	}
-	ns := tpNamespace(p.orgID, p.rootID)
+	indexNamespaces, err := p.loadIndexNamespaces(ctx)
+	if err != nil {
+		return err
+	}
 	if len(upserts) > 0 {
 		if err := p.server.writeIndexRowsArtifact(ctx, p.generation.ID, "index-stage", upserts); err != nil {
 			return err
 		}
-		if err := p.server.upsertRowsInBatches(ns, upserts); err != nil {
-			return err
+		upsertsByNamespace := make(map[string][]map[string]any)
+		for _, row := range upserts {
+			filePath := strVal(row, "file_path")
+			ns, err := rootIndexNamespaceForPath(indexNamespaces, filePath)
+			if err != nil {
+				return fmt.Errorf("routing index row for %s: %w", filePath, err)
+			}
+			upsertsByNamespace[ns.Namespace] = append(upsertsByNamespace[ns.Namespace], row)
+		}
+		for namespace, rows := range upsertsByNamespace {
+			if err := p.server.upsertRowsInBatches(namespace, rows); err != nil {
+				return err
+			}
 		}
 		p.resp.ChunksAdded += len(upserts)
 	}
@@ -581,8 +617,16 @@ func (p *syncPipeline) closeRowsForPath(ctx context.Context, path string) (int, 
 		"valid_to_generation_seq": p.generation.Seq,
 	}
 	total := 0
+	indexNamespaces, err := p.loadIndexNamespaces(ctx)
+	if err != nil {
+		return total, err
+	}
+	ns, err := rootIndexNamespaceForPath(indexNamespaces, path)
+	if err != nil {
+		return total, fmt.Errorf("routing close for %s: %w", path, err)
+	}
 	for pass := 0; pass < 100; pass++ {
-		rowsRemaining, affected, err := p.server.tp.PatchByFilter(tpNamespace(p.orgID, p.rootID), tpAndFilter(filters), patch, true)
+		rowsRemaining, affected, err := p.server.tp.PatchByFilter(ns.Namespace, tpAndFilter(filters), patch, true)
 		if err != nil {
 			return total, err
 		}
@@ -601,7 +645,15 @@ func (p *syncPipeline) queryActiveRows(ctx context.Context, path string, attrs [
 	if p.generation.BaseGenerationSeq > 0 {
 		filters = append(filters, activeGenerationFilter(p.generation.BaseGenerationSeq))
 	}
-	return p.server.tp.Query(tpNamespace(p.orgID, p.rootID), []any{"file_path", "asc"}, activeRowsQueryLimit, tpAndFilter(filters), attrs)
+	indexNamespaces, err := p.loadIndexNamespaces(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ns, err := rootIndexNamespaceForPath(indexNamespaces, path)
+	if err != nil {
+		return nil, fmt.Errorf("routing active row query for %s: %w", path, err)
+	}
+	return p.server.tp.Query(ns.Namespace, []any{"file_path", "asc"}, activeRowsQueryLimit, tpAndFilter(filters), attrs)
 }
 
 func (p *syncPipeline) ensureStageComplete(ctx context.Context, stage string) error {
