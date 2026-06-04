@@ -63,11 +63,12 @@ func embeddingModelVersion() string {
 
 // ChunkFileRequest is the payload sent to the Modal chunk endpoint.
 type ChunkFileRequest struct {
-	S3Key      string `json:"s3_key"`
-	FilePath   string `json:"file_path"`
-	FileType   string `json:"file_type"`
-	RootID     string `json:"root_id"`
-	ContentB64 string `json:"content_b64,omitempty"`
+	S3Key        string `json:"s3_key"`
+	FilePath     string `json:"file_path"`
+	AbsolutePath string `json:"absolute_path,omitempty"`
+	FileType     string `json:"file_type"`
+	RootID       string `json:"root_id"`
+	ContentB64   string `json:"content_b64,omitempty"`
 }
 
 // ChunkFileResponse is returned from Modal.

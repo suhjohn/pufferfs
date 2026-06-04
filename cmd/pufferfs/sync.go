@@ -208,7 +208,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 	changeCount := countChanges(result)
 	fmt.Printf("Syncing %d changes to root %s...\n", changeCount, rootID)
 
-	changes := filterChanges(result)
+	changes := withAbsolutePaths(dir, filterChanges(result))
 	manifestRef, err := uploadChangedFiles(client, rootID, dir, changes)
 	if err != nil {
 		return err
@@ -846,6 +846,15 @@ func filterChanges(result models.DiffResult) []models.FileChange {
 		}
 	}
 	return changes
+}
+
+func withAbsolutePaths(rootDir string, changes []models.FileChange) []models.FileChange {
+	out := make([]models.FileChange, len(changes))
+	for i, change := range changes {
+		out[i] = change
+		out[i].AbsolutePath = filepath.Join(rootDir, filepath.FromSlash(change.Path))
+	}
+	return out
 }
 
 func countChanges(result models.DiffResult) int {

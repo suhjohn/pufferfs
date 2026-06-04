@@ -94,7 +94,11 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK 
 
 	for i, r := range resp.Results {
 		fmt.Printf("\n--- Result %d (score: %.4f) ---\n", i+1, r.Score)
-		fmt.Printf("File: %s", r.FilePath)
+		displayPath := r.FilePath
+		if r.AbsolutePath != "" {
+			displayPath = r.AbsolutePath
+		}
+		fmt.Printf("File: %s", displayPath)
 		if r.PageNumber != nil {
 			fmt.Printf(" (page %d)", *r.PageNumber)
 		}

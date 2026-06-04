@@ -258,6 +258,7 @@ def file_to_chunks(
     file_path: str,
     file_type: str,
     root_id: str,
+    absolute_path: str = "",
     content_b64: str | None = None,
 ) -> list[dict]:
     """Chunk a file. If content_b64 is provided, uses it directly; otherwise downloads from S3."""
@@ -324,6 +325,8 @@ def file_to_chunks(
         text = file_bytes.decode("utf-8", errors="replace")
         chunks = chunk_markdown(text, root_id, file_path, file_type)
 
+    for chunk in chunks:
+        chunk.absolute_path = absolute_path
     return [asdict(c) for c in chunks]
 
 
@@ -456,6 +459,8 @@ def _row_from_chunk(job: dict, file_hash: str, chunk: dict) -> dict:
         "valid_to_generation": "",
         "valid_to_generation_seq": 0,
     }
+    if chunk.get("absolute_path"):
+        row["absolute_path"] = chunk["absolute_path"]
     if chunk.get("page_number") is not None:
         row["page_number"] = chunk["page_number"]
     if chunk.get("image_path") is not None:
@@ -463,7 +468,7 @@ def _row_from_chunk(job: dict, file_hash: str, chunk: dict) -> dict:
     return row
 
 
-def _row_from_existing(job: dict, file_path: str, file_hash: str, row: dict, fallback_index: int) -> dict:
+def _row_from_existing(job: dict, file_path: str, absolute_path: str, file_hash: str, row: dict, fallback_index: int) -> dict:
     chunk_index = int(row.get("chunk_index") or fallback_index)
     out = {
         "id": _generation_chunk_id(job["root_id"], job["generation_id"], file_path, chunk_index),
@@ -480,6 +485,8 @@ def _row_from_existing(job: dict, file_path: str, file_hash: str, row: dict, fal
         "valid_to_generation": "",
         "valid_to_generation_seq": 0,
     }
+    if absolute_path:
+        out["absolute_path"] = absolute_path
     if row.get("page_number") is not None:
         out["page_number"] = row["page_number"]
     if row.get("image_path") is not None:
@@ -512,6 +519,7 @@ def chunk_shard_endpoint(item: dict) -> dict:
             chunks = file_to_chunks.remote(
                 s3_key=s3_key,
                 file_path=change["path"],
+                absolute_path=change.get("absolute_path", ""),
                 file_type=detect_file_type(change["path"]),
                 root_id=job["root_id"],
                 content_b64=base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
@@ -525,14 +533,14 @@ def chunk_shard_endpoint(item: dict) -> dict:
             rows = _query_active_rows(
                 job,
                 old_path,
-                ["content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"],
+                ["content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"],
             )
             for idx, existing in enumerate(rows):
                 artifacts.append(
                     {
                         "op": "row",
                         "change": change,
-                        "row": _row_from_existing(job, change["path"], change.get("content_hash", ""), existing, idx),
+                        "row": _row_from_existing(job, change["path"], change.get("absolute_path", ""), change.get("content_hash", ""), existing, idx),
                     }
                 )
     if not artifacts:
@@ -661,6 +669,7 @@ def _tp_upsert_rows(namespace: str, rows: list[dict]) -> None:
         "schema": {
             "content": {"type": "string", "full_text_search": True},
             "file_path": {"type": "string"},
+            "absolute_path": {"type": "string"},
             "chunk_index": {"type": "uint"},
             "content_hash": {"type": "string"},
             "file_hash": {"type": "string"},
@@ -732,6 +741,7 @@ def chunk_file_endpoint(item: dict) -> dict:
     chunks = file_to_chunks.local(
         s3_key=item.get("s3_key", ""),
         file_path=item["file_path"],
+        absolute_path=item.get("absolute_path", ""),
         file_type=item.get("file_type", "auto"),
         root_id=item["root_id"],
         content_b64=item.get("content_b64"),

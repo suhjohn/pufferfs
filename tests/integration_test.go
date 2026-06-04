@@ -1793,7 +1793,7 @@ func queryTPRowsForPathWithFilter(t *testing.T, services realServices, namespace
 		"limit":   1000,
 		"filters": filter,
 		"include_attributes": []string{
-			"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq",
+			"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq",
 		},
 	}
 	data, err := json.Marshal(body)

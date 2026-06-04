@@ -27,6 +27,7 @@ class Chunk:
     content: str
     content_hash: str  # sha256 of content
     file_type: str
+    absolute_path: str = ""
     page_number: int | None = None
     image_path: str | None = None  # S3 key for rendered page image
 

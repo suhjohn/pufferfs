@@ -303,17 +303,19 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 			chunks = chunkLocally(fileData, p.rootID, change.Path)
 		} else {
 			chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
-				S3Key:      s3Key,
-				FilePath:   change.Path,
-				FileType:   detectFileType(change.Path),
-				RootID:     p.rootID,
-				ContentB64: base64.StdEncoding.EncodeToString(fileData),
+				S3Key:        s3Key,
+				FilePath:     change.Path,
+				AbsolutePath: change.AbsolutePath,
+				FileType:     detectFileType(change.Path),
+				RootID:       p.rootID,
+				ContentB64:   base64.StdEncoding.EncodeToString(fileData),
 			})
 			if err != nil {
 				return nil, err
 			}
 			chunks = chunkResp.Chunks
 		}
+		attachAbsolutePath(chunks, change.AbsolutePath)
 		rows := make([]syncChunkArtifact, 0, len(chunks)+1)
 		if change.Status == models.StatusModified {
 			rows = append(rows, syncChunkArtifact{Op: "close", Change: change})
@@ -325,18 +327,27 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 	case models.StatusRemoved:
 		return []syncChunkArtifact{{Op: "close", Change: change}}, nil
 	case models.StatusMoved, models.StatusRenamed:
-		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"})
+		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"})
 		if err != nil {
 			return nil, err
 		}
 		out := []syncChunkArtifact{{Op: "close", Change: models.FileChange{Path: change.OldPath, Status: models.StatusRemoved}}}
 		for i, row := range rows {
-			chunk := indexedChunkFromExisting(p.rootID, p.generation.ID, p.generation.Seq, change.Path, change.ContentHash, intFromAny(row["chunk_index"], i), row)
+			chunk := indexedChunkFromExisting(p.rootID, p.generation.ID, p.generation.Seq, change.Path, change.AbsolutePath, change.ContentHash, intFromAny(row["chunk_index"], i), row)
 			out = append(out, syncChunkArtifact{Op: "row", Change: change, Row: chunk.mapRow()})
 		}
 		return out, nil
 	default:
 		return nil, nil
+	}
+}
+
+func attachAbsolutePath(chunks []map[string]any, absolutePath string) {
+	if absolutePath == "" {
+		return
+	}
+	for _, chunk := range chunks {
+		chunk["absolute_path"] = absolutePath
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 )
 
 func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
+	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "true")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -45,6 +46,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if err := q.Enqueue(ctx, queue.StageChunk, initial); err != nil {
 		t.Fatalf("enqueue chunk: %v", err)
 	}
+	if err := store.Upload(ctx, initial.PayloadRef, []byte("input\n"), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload input artifact: %v", err)
+	}
 
 	chunkDispatcher := NewSyncDispatcher(srv, q, queue.StageChunk, 1)
 	chunkMsg := pullOne(t, ctx, q, queue.StageChunk)
@@ -59,6 +63,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if embedMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl" {
 		t.Fatalf("embed payload ref = %q", embedMsg.Job.PayloadRef)
 	}
+	if err := store.Upload(ctx, embedMsg.Job.PayloadRef, []byte("chunks\n"), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload chunk artifact: %v", err)
+	}
 	embedDispatcher := NewSyncDispatcher(srv, q, queue.StageEmbed, 1)
 	if err := embedDispatcher.Process(ctx, embedMsg.Job); err != nil {
 		t.Fatalf("process embed: %v", err)
@@ -69,6 +76,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if indexMsg.Job.PayloadRef != "syncs/gen-1/index_rows/chunk-job-embed.jsonl" {
 		t.Fatalf("index payload ref = %q", indexMsg.Job.PayloadRef)
 	}
+	if err := store.Upload(ctx, indexMsg.Job.PayloadRef, []byte("index\n"), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload index artifact: %v", err)
+	}
 	indexDispatcher := NewSyncDispatcher(srv, q, queue.StageIndex, 1)
 	if err := indexDispatcher.Process(ctx, indexMsg.Job); err != nil {
 		t.Fatalf("process index: %v", err)
@@ -78,9 +88,56 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if _, err := store.Download(ctx, syncShardDoneKey("gen-1", 0)); err != nil {
 		t.Fatalf("done marker not written: %v", err)
 	}
+	cleanupMsg := pullOne(t, ctx, q, queue.StageCleanup)
+	if got := cleanupMsg.Job.CleanupKeys; len(got) != 3 {
+		t.Fatalf("cleanup keys = %#v, want input/chunk/index artifacts", got)
+	}
+	cleanupDispatcher := NewSyncDispatcher(srv, q, queue.StageCleanup, 1)
+	if err := cleanupDispatcher.Process(ctx, cleanupMsg.Job); err != nil {
+		t.Fatalf("process cleanup: %v", err)
+	}
+	_ = q.Ack(cleanupMsg)
+	for _, key := range []string{initial.PayloadRef, embedMsg.Job.PayloadRef, indexMsg.Job.PayloadRef} {
+		if store.Has(key) {
+			t.Fatalf("cleanup left artifact %s", key)
+		}
+	}
 	commitMsg := pullOne(t, ctx, q, queue.StageCommit)
 	if commitMsg.Job.Stage != queue.StageCommit || commitMsg.Job.TotalShards != 1 {
 		t.Fatalf("unexpected commit job: %#v", commitMsg.Job)
+	}
+}
+
+func TestCleanupDispatcherPreservesIndexedImageArtifacts(t *testing.T) {
+	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "true")
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	imageKey := "chunks/root-1/document.pdf.0.jpg"
+	syncKey := "syncs/gen-1/chunks/job.jsonl"
+	if err := store.Upload(ctx, imageKey, []byte("image"), "image/jpeg"); err != nil {
+		t.Fatalf("upload image: %v", err)
+	}
+	if err := store.Upload(ctx, syncKey, []byte("artifact"), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload artifact: %v", err)
+	}
+	srv := NewWithStore(nil, store, &ModalClient{}, nil)
+	dispatcher := NewSyncDispatcher(srv, nil, queue.StageCleanup, 1)
+	err := dispatcher.Process(ctx, queue.JobMessage{
+		JobID:        "cleanup",
+		OrgID:        "org-1",
+		RootID:       "root-1",
+		GenerationID: "gen-1",
+		Stage:        queue.StageCleanup,
+		CleanupKeys:  []string{imageKey, syncKey},
+	})
+	if err != nil {
+		t.Fatalf("process cleanup: %v", err)
+	}
+	if !store.Has(imageKey) {
+		t.Fatalf("cleanup deleted indexed image artifact %s", imageKey)
+	}
+	if store.Has(syncKey) {
+		t.Fatalf("cleanup left sync artifact %s", syncKey)
 	}
 }
 
@@ -222,4 +279,20 @@ func (s *memoryObjectStore) DownloadRange(ctx context.Context, key string, offse
 		return nil, fmt.Errorf("range %d-%d outside object %s length %d", offset, end, key, len(data))
 	}
 	return append([]byte(nil), data[offset:end]...), nil
+}
+
+func (s *memoryObjectStore) DeleteMany(_ context.Context, keys []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range keys {
+		delete(s.objects, key)
+	}
+	return nil
+}
+
+func (s *memoryObjectStore) Has(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.objects[key]
+	return ok
 }

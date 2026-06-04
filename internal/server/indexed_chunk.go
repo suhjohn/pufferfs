@@ -6,6 +6,7 @@ type indexedChunk struct {
 	ID                   string
 	Content              string
 	FilePath             string
+	AbsolutePath         string
 	ChunkIndex           any
 	ContentHash          string
 	FileHash             string
@@ -27,6 +28,7 @@ func indexedChunkFromModal(rootID, generationID string, generationSeq int64, fil
 		ID:            models.MakeGenerationChunkID(rootID, generationID, filePath, chunkIndex),
 		Content:       strVal(chunk, "content"),
 		FilePath:      filePath,
+		AbsolutePath:  strVal(chunk, "absolute_path"),
 		ChunkIndex:    chunk["chunk_index"],
 		ContentHash:   strVal(chunk, "content_hash"),
 		FileHash:      fileHash,
@@ -39,11 +41,12 @@ func indexedChunkFromModal(rootID, generationID string, generationSeq int64, fil
 	}
 }
 
-func indexedChunkFromExisting(rootID, generationID string, generationSeq int64, filePath, fileHash string, chunkIndex int, row map[string]any) indexedChunk {
+func indexedChunkFromExisting(rootID, generationID string, generationSeq int64, filePath, absolutePath, fileHash string, chunkIndex int, row map[string]any) indexedChunk {
 	return indexedChunk{
 		ID:            models.MakeGenerationChunkID(rootID, generationID, filePath, chunkIndex),
 		Content:       strVal(row, "content"),
 		FilePath:      filePath,
+		AbsolutePath:  absolutePath,
 		ChunkIndex:    chunkIndex,
 		ContentHash:   strVal(row, "content_hash"),
 		FileHash:      fileHash,
@@ -71,6 +74,9 @@ func (c indexedChunk) mapRow() map[string]any {
 		"valid_from_generation_seq": c.GenerationSeq,
 		"valid_to_generation":       c.ValidToGeneration,
 		"valid_to_generation_seq":   c.ValidToGenerationSeq,
+	}
+	if c.AbsolutePath != "" {
+		row["absolute_path"] = c.AbsolutePath
 	}
 	if c.PageNumber != nil {
 		row["page_number"] = c.PageNumber
