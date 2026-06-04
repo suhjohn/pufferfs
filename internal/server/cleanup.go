@@ -17,10 +17,10 @@ const syncStageCleanup = queue.StageCleanup
 
 func cleanupSyncArtifactsEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return true
 	}
 }
 
@@ -141,6 +141,58 @@ func (d *SyncDispatcher) processCleanup(ctx context.Context, msg queue.JobMessag
 			return fmt.Errorf("deleting cleanup batch: %w", err)
 		}
 		log.Printf("cleanup deleted %d sync artifact objects generation_id=%s", end-start, msg.GenerationID)
+	}
+	return nil
+}
+
+func (s *Server) cleanupFailedGenerationRows(ctx context.Context, orgID, rootID, generationID string) error {
+	if s == nil || s.tp == nil || orgID == "" || rootID == "" || generationID == "" {
+		return nil
+	}
+	ns := tpNamespace(orgID, rootID)
+	closeFilter := []any{"valid_to_generation", "Eq", generationID}
+	reopenPatch := map[string]any{
+		"valid_to_generation":     "",
+		"valid_to_generation_seq": 0,
+	}
+	for pass := 0; pass < 100; pass++ {
+		rowsRemaining, err := s.tp.PatchByFilter(ns, closeFilter, reopenPatch, true)
+		if err != nil {
+			return fmt.Errorf("reopening rows closed by failed generation %s: %w", generationID, err)
+		}
+		if !rowsRemaining {
+			break
+		}
+		if pass == 99 {
+			return fmt.Errorf("reopening rows closed by failed generation %s: rows remain after repeated patch passes", generationID)
+		}
+	}
+
+	orphanFilter := []any{"generation_id", "Eq", generationID}
+	for pass := 0; pass < 100; pass++ {
+		rowsRemaining, err := s.tp.DeleteByFilter(ns, orphanFilter, true)
+		if err != nil {
+			return fmt.Errorf("deleting failed generation rows %s: %w", generationID, err)
+		}
+		if !rowsRemaining {
+			return nil
+		}
+	}
+	return fmt.Errorf("deleting failed generation rows %s: rows remain after repeated delete passes", generationID)
+}
+
+func (s *Server) cleanupFailedGenerationRowsForRoot(ctx context.Context, orgID, rootID string) error {
+	if s == nil || s.db == nil || s.tp == nil {
+		return nil
+	}
+	generations, err := s.db.ListFailedSyncGenerations(ctx, orgID, rootID, 100)
+	if err != nil {
+		return err
+	}
+	for _, generation := range generations {
+		if err := s.cleanupFailedGenerationRows(ctx, generation.OrgID, generation.RootID, generation.ID); err != nil {
+			return err
+		}
 	}
 	return nil
 }

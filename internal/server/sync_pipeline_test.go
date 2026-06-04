@@ -97,18 +97,56 @@ func TestEnqueueCleanupBatchesHonorsFlag(t *testing.T) {
 
 	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "")
 	if err := enqueueCleanupBatches(ctx, q, base, []string{"syncs/gen-1/chunks/job.jsonl"}); err != nil {
+		t.Fatalf("default enqueue: %v", err)
+	}
+	if len(q.jobs) != 1 || q.stage != queue.StageCleanup {
+		t.Fatalf("default cleanup stage=%q jobs=%#v", q.stage, q.jobs)
+	}
+
+	q = &recordingQueue{}
+	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "false")
+	if err := enqueueCleanupBatches(ctx, q, base, []string{"syncs/gen-1/chunks/job.jsonl"}); err != nil {
 		t.Fatalf("disabled enqueue: %v", err)
 	}
 	if len(q.jobs) != 0 {
 		t.Fatalf("disabled cleanup enqueued jobs: %#v", q.jobs)
 	}
+}
 
-	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "true")
-	if err := enqueueCleanupBatches(ctx, q, base, []string{"syncs/gen-1/chunks/job.jsonl"}); err != nil {
-		t.Fatalf("enabled enqueue: %v", err)
+func TestChunkShardBackpressureMessages(t *testing.T) {
+	t.Setenv("PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS", "2")
+	msgs := []queue.JobMessage{
+		{GenerationID: "gen-1", ShardIndex: 0, TotalShards: 5},
+		{GenerationID: "gen-1", ShardIndex: 1, TotalShards: 5},
+		{GenerationID: "gen-1", ShardIndex: 2, TotalShards: 5},
+		{GenerationID: "gen-1", ShardIndex: 3, TotalShards: 5},
+		{GenerationID: "gen-1", ShardIndex: 4, TotalShards: 5},
 	}
-	if len(q.jobs) != 1 || q.stage != queue.StageCleanup {
-		t.Fatalf("enabled cleanup stage=%q jobs=%#v", q.stage, q.jobs)
+	if initial := initialChunkShardMessages(msgs); len(initial) != 2 {
+		t.Fatalf("initial messages = %d, want 2", len(initial))
+	}
+	next, ok := nextChunkShardMessage(queue.JobMessage{
+		OrgID:             "org-1",
+		RootID:            "root-1",
+		GenerationID:      "gen-1",
+		GenerationSeq:     7,
+		BaseGenerationID:  "gen-0",
+		BaseGenerationSeq: 6,
+		ShardIndex:        1,
+		TotalShards:       5,
+		CleanupKeys:       []string{"syncs/gen-1/index_rows/job.jsonl"},
+	})
+	if !ok {
+		t.Fatal("expected next shard")
+	}
+	if next.ShardIndex != 3 || next.Stage != syncStageChunk || next.PayloadRef != "syncs/gen-1/inputs/shard-000003.jsonl" {
+		t.Fatalf("next shard = %#v", next)
+	}
+	if len(next.CleanupKeys) != 0 {
+		t.Fatalf("next cleanup keys = %#v, want none", next.CleanupKeys)
+	}
+	if _, ok := nextChunkShardMessage(queue.JobMessage{GenerationID: "gen-1", ShardIndex: 3, TotalShards: 5}); ok {
+		t.Fatal("unexpected next shard past total")
 	}
 }
 

@@ -576,6 +576,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
 		return
 	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := s.cleanupFailedGenerationRowsForRoot(ctx, id.OrgID, rootID); err != nil {
+			log.Printf("warning: failed generation row cleanup for root %s: %v", rootID, err)
+		}
+	}()
 	if r.URL.Query().Get("async") == "true" {
 		go func(req models.SyncRequest, generation *SyncGeneration, job *models.SyncJob) {
 			ctx, cancel := context.WithTimeout(context.Background(), syncJobTimeout())
@@ -611,6 +618,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+		}
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
@@ -624,6 +634,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		proofBytes, _ := json.Marshal(req.ContentProof)
 		if err := s.db.UpsertContentProof(ctx, orgID, userID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
 			_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+			if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+				log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+			}
 			if job != nil {
 				_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 			}
@@ -633,6 +646,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 
 	if err := s.db.CommitSyncGeneration(ctx, generation, req.State); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+		}
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}

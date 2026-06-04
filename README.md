@@ -75,7 +75,6 @@ export MODAL_QUERY_EMBED_ENDPOINT="https://..."
 export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
 export MODAL_EMBED_SHARD_ENDPOINT="https://..."
 export MODAL_INDEX_SHARD_ENDPOINT="https://..."
-export PUFFERFS_CLEANUP_SYNC_ARTIFACTS="true"
 
 go run ./cmd/server
 ```
@@ -101,10 +100,18 @@ go run ./cmd/worker --stage=cleanup --concurrency=4
 `go test ./internal/queue` starts an embedded JetStream server locally and
 verifies enqueue, pull, ack, and delayed redelivery semantics.
 
-When `PUFFERFS_CLEANUP_SYNC_ARTIFACTS=true`, index and commit workers enqueue
-cleanup jobs that batch-delete transient sync/raw-source transport artifacts
-after they are no longer needed. OCR page images are preserved because indexed
-chunks keep their exact `image_path` object keys.
+Cleanup jobs are enabled by default and batch-delete transient sync/raw-source
+transport artifacts after they are no longer needed. Set
+`PUFFERFS_CLEANUP_SYNC_ARTIFACTS=false` to disable them. OCR page images are
+preserved because indexed chunks keep their exact `image_path` object keys.
+
+Queued syncs enqueue chunk shards in bounded waves. The default maximum is 32
+in-flight shards per root; override it with `PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS`
+when tuning large syncs.
+
+Embedding-cache lookups are batched at 500 hashes with up to 4 concurrent
+queries by default. Tune with `PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE` and
+`PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY`.
 
 ## Modal Functions
 

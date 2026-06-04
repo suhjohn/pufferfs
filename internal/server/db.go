@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +32,7 @@ type DB struct {
 
 type SyncGeneration struct {
 	ID                string
+	OrgID             string
 	RootID            string
 	BaseGenerationID  string
 	Seq               int64
@@ -654,6 +657,7 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 	}
 	return &SyncGeneration{
 		ID:                generationID,
+		OrgID:             orgID,
 		RootID:            rootID,
 		BaseGenerationID:  baseGenerationID,
 		Seq:               seq,
@@ -755,6 +759,34 @@ func (db *DB) GetSyncGenerationStatus(ctx context.Context, generationID string) 
 	return status, err
 }
 
+func (db *DB) ListFailedSyncGenerations(ctx context.Context, orgID, rootID string, limit int) ([]SyncGeneration, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, root_id, base_generation_id, seq, base_generation_seq
+		 FROM sync_generations
+		 WHERE org_id = $1 AND root_id = $2 AND status = 'failed'
+		 ORDER BY created_at ASC
+		 LIMIT $3`,
+		orgID, rootID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var generations []SyncGeneration
+	for rows.Next() {
+		var generation SyncGeneration
+		if err := rows.Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq); err != nil {
+			return nil, err
+		}
+		generations = append(generations, generation)
+	}
+	return generations, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // Embedding Cache
 // ---------------------------------------------------------------------------
@@ -767,7 +799,70 @@ func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID, modelVersion strin
 	if len(hashes) == 0 {
 		return result, nil
 	}
+	hashes = uniqueStrings(hashes)
+	if len(hashes) == 0 {
+		return result, nil
+	}
+	batchSize := embeddingCacheQueryBatchSize()
+	if len(hashes) <= batchSize {
+		return db.getCachedEmbeddingsBatch(ctx, orgID, modelVersion, hashes)
+	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+	)
+	batches := make(chan []string)
+	workers := embeddingCacheQueryConcurrency()
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for batch := range batches {
+				cached, err := db.getCachedEmbeddingsBatch(ctx, orgID, modelVersion, batch)
+				mu.Lock()
+				if err != nil && firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				for hash, embedding := range cached {
+					result[hash] = embedding
+				}
+				mu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+sendBatches:
+	for start := 0; start < len(hashes); start += batchSize {
+		end := start + batchSize
+		if end > len(hashes) {
+			end = len(hashes)
+		}
+		select {
+		case batches <- hashes[start:end]:
+		case <-ctx.Done():
+			break sendBatches
+		}
+	}
+	close(batches)
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return result, nil
+}
+
+func (db *DB) getCachedEmbeddingsBatch(ctx context.Context, orgID, modelVersion string, hashes []string) (map[string][]float64, error) {
+	result := make(map[string][]float64)
 	rows, err := db.pool.Query(ctx,
 		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND model_version = $2 AND content_hash = ANY($3)`,
 		orgID, modelVersion, hashes,
@@ -789,7 +884,52 @@ func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID, modelVersion strin
 		}
 		result[hash] = emb
 	}
-	return result, nil
+	return result, rows.Err()
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func embeddingCacheQueryBatchSize() int {
+	const defaultBatchSize = 500
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE"))
+	if raw == "" {
+		return defaultBatchSize
+	}
+	size, err := strconv.Atoi(raw)
+	if err != nil || size < 1 {
+		return defaultBatchSize
+	}
+	if size > 5000 {
+		return 5000
+	}
+	return size
+}
+
+func embeddingCacheQueryConcurrency() int {
+	const defaultConcurrency = 4
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY"))
+	if raw == "" {
+		return defaultConcurrency
+	}
+	concurrency, err := strconv.Atoi(raw)
+	if err != nil || concurrency < 1 {
+		return defaultConcurrency
+	}
+	if concurrency > 16 {
+		return 16
+	}
+	return concurrency
 }
 
 // SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value

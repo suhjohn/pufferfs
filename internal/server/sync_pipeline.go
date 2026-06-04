@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +25,9 @@ const (
 	syncStageIndex  = "index"
 	syncStageCommit = "commit"
 
-	defaultSyncShardMaxFiles = 5000
-	defaultSyncShardMaxBytes = 256 * 1024 * 1024
+	defaultSyncShardMaxFiles     = 5000
+	defaultSyncShardMaxBytes     = 256 * 1024 * 1024
+	defaultSyncMaxInFlightShards = 32
 )
 
 type syncPipeline struct {
@@ -116,7 +119,7 @@ func (s *Server) enqueueSync(ctx context.Context, orgID, userID string, generati
 		}
 		return p.resp, nil
 	}
-	if err := s.queue.Enqueue(ctx, syncStageChunk, msgs...); err != nil {
+	if err := s.queue.Enqueue(ctx, syncStageChunk, initialChunkShardMessages(msgs)...); err != nil {
 		return nil, err
 	}
 	if job != nil {
@@ -141,7 +144,7 @@ func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage
 		if err != nil {
 			return nil, err
 		}
-		msgs = append(msgs, p.jobMessage(syncStageChunk, uuid.NewString(), ref, i, len(shards)))
+		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(shards)))
 	}
 	return msgs, nil
 }
@@ -198,6 +201,52 @@ func shardChanges(changes []models.FileChange, maxFiles int, maxBytes int64) [][
 
 func syncRequestKey(generationID string) string {
 	return fmt.Sprintf("syncs/%s/request.json", generationID)
+}
+
+func syncInputShardKey(generationID string, shardIndex int) string {
+	return fmt.Sprintf("syncs/%s/inputs/shard-%06d.jsonl", generationID, shardIndex)
+}
+
+func chunkShardJobID(generationID string, shardIndex int) string {
+	return fmt.Sprintf("%s-chunk-%06d", generationID, shardIndex)
+}
+
+func syncMaxInFlightShards() int {
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS"))
+	if raw == "" {
+		return defaultSyncMaxInFlightShards
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return defaultSyncMaxInFlightShards
+	}
+	if n > 1024 {
+		return 1024
+	}
+	return n
+}
+
+func initialChunkShardMessages(msgs []queue.JobMessage) []queue.JobMessage {
+	limit := syncMaxInFlightShards()
+	if len(msgs) <= limit {
+		return msgs
+	}
+	return msgs[:limit]
+}
+
+func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
+	nextIndex := msg.ShardIndex + syncMaxInFlightShards()
+	if msg.TotalShards <= 0 || nextIndex >= msg.TotalShards {
+		return queue.JobMessage{}, false
+	}
+	next := msg
+	next.JobID = chunkShardJobID(msg.GenerationID, nextIndex)
+	next.Stage = syncStageChunk
+	next.PayloadRef = syncInputShardKey(msg.GenerationID, nextIndex)
+	next.CleanupKeys = nil
+	next.ShardIndex = nextIndex
+	next.EnqueuedAt = time.Now().UTC()
+	return next, true
 }
 
 func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
