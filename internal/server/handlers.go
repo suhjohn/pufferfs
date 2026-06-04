@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -913,111 +912,10 @@ func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID
 // Sync processing
 // ---------------------------------------------------------------------------
 
-func (s *Server) legacyProcessSync(ctx context.Context, orgID, generationID string, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	resp := &models.SyncResponse{RootID: req.RootID}
-	processed := 0
-	workers := syncWorkerCount()
-	sem := make(chan struct{}, workers)
-	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	mutations := make(chan syncMutation, workers)
-	streamResult := make(chan syncMutation, 1)
-	streamErr := make(chan error, 1)
-	sourceCache := newSyncSourceCache(s.s3)
-
-	go func() {
-		deferred, err := s.streamSyncMutations(streamCtx, orgID, req.RootID, generationID, mutations)
-		if err != nil {
-			cancel()
-		}
-		streamResult <- deferred
-		streamErr <- err
-	}()
-
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var firstErr error
-
-	for _, change := range req.Changes {
-		change := change
-		if change.Status == models.StatusUnchanged {
-			processed++
-			continue
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			result, mutation, err := s.processSyncChange(streamCtx, orgID, generationID, req.RootID, change, sourceCache)
-
-			mu.Lock()
-			if err != nil && firstErr == nil {
-				firstErr = err
-				cancel()
-			}
-			if err == nil {
-				resp.ChunksAdded += result.chunksAdded
-				resp.ChunksRemoved += result.chunksRemoved
-				resp.ChunksMoved += result.chunksMoved
-				resp.FilesProcessed += result.filesProcessed
-			}
-			processed++
-			if job != nil && processed%5 == 0 {
-				_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "embedding", processed)
-			}
-			mu.Unlock()
-
-			if err == nil {
-				select {
-				case mutations <- mutation:
-				case <-streamCtx.Done():
-					mu.Lock()
-					if firstErr == nil {
-						firstErr = streamCtx.Err()
-					}
-					mu.Unlock()
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	close(mutations)
-	deferredMutation := <-streamResult
-	if err := <-streamErr; err != nil && firstErr == nil {
-		firstErr = err
-	}
-
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	if err := s.applyDeferredSyncMutations(ctx, orgID, req.RootID, deferredMutation); err != nil {
-		return nil, err
-	}
-
-	return resp, nil
-}
-
-type syncMutation struct {
-	upsertRows        []map[string]any
-	pendingEmbeddings []pendingEmbedding
-	deleteIDs         []string
-	s3DeleteKeys      []string
-}
-
 type pendingEmbedding struct {
 	chunk       map[string]any
 	row         map[string]any
 	contentHash string
-}
-
-type syncChangeResult struct {
-	chunksAdded    int
-	chunksRemoved  int
-	chunksMoved    int
-	filesProcessed int
 }
 
 type syncSourceCache struct {
@@ -1061,34 +959,6 @@ func (c *syncSourceCache) read(ctx context.Context, key string, offset, length i
 	return out, nil
 }
 
-func (s *Server) processSyncChange(ctx context.Context, orgID, generationID, rootID string, change models.FileChange, sourceCache *syncSourceCache) (syncChangeResult, syncMutation, error) {
-	switch change.Status {
-	case models.StatusAdded, models.StatusModified:
-		mutation, err := s.processFileAdd(ctx, orgID, generationID, rootID, change, sourceCache)
-		if err != nil {
-			return syncChangeResult{}, syncMutation{}, fmt.Errorf("processing %s (%s): %w", change.Path, change.Status, err)
-		}
-		return syncChangeResult{chunksAdded: 1, filesProcessed: 1}, mutation, nil
-
-	case models.StatusRemoved:
-		mutation, err := s.processFileRemove(ctx, orgID, rootID, change)
-		if err != nil {
-			return syncChangeResult{}, syncMutation{}, fmt.Errorf("removing %s: %w", change.Path, err)
-		}
-		return syncChangeResult{chunksRemoved: 1, filesProcessed: 1}, mutation, nil
-
-	case models.StatusMoved, models.StatusRenamed:
-		mutation, err := s.processFileMove(ctx, orgID, generationID, rootID, change)
-		if err != nil {
-			return syncChangeResult{}, syncMutation{}, fmt.Errorf("moving %s -> %s: %w", change.OldPath, change.Path, err)
-		}
-		return syncChangeResult{chunksMoved: 1, filesProcessed: 1}, mutation, nil
-
-	default:
-		return syncChangeResult{}, syncMutation{}, nil
-	}
-}
-
 func syncWorkerCount() int {
 	const defaultWorkers = 64
 	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_WORKERS"))
@@ -1105,67 +975,6 @@ func syncWorkerCount() int {
 	return workers
 }
 
-func (s *Server) streamSyncMutations(ctx context.Context, orgID, rootID, generationID string, mutations <-chan syncMutation) (syncMutation, error) {
-	ns := tpNamespace(orgID, rootID)
-	flushRows := syncMutationFlushRows()
-	flushEvery := syncMutationFlushInterval()
-	ticker := time.NewTicker(flushEvery)
-	defer ticker.Stop()
-
-	var upsertRows []map[string]any
-	var pendingEmbeddings []pendingEmbedding
-	var deferred syncMutation
-
-	flush := func(reason string) error {
-		if len(upsertRows) == 0 {
-			return nil
-		}
-		flushStart := time.Now()
-		if len(pendingEmbeddings) > 0 {
-			if err := s.resolvePendingEmbeddings(ctx, orgID, pendingEmbeddings); err != nil {
-				return err
-			}
-		}
-		if err := s.writeIndexRowsArtifact(ctx, generationID, reason, upsertRows); err != nil {
-			return err
-		}
-		if err := s.upsertRowsInBatches(ns, upsertRows); err != nil {
-			return err
-		}
-		log.Printf("timing stage=sync_mutation_flush reason=%s rows=%d pending_embeddings=%d elapsed=%s", reason, len(upsertRows), len(pendingEmbeddings), time.Since(flushStart))
-		upsertRows = nil
-		pendingEmbeddings = nil
-		return nil
-	}
-
-	for {
-		select {
-		case mutation, ok := <-mutations:
-			if !ok {
-				if err := flush("final"); err != nil {
-					return syncMutation{}, err
-				}
-				return deferred, nil
-			}
-			upsertRows = append(upsertRows, mutation.upsertRows...)
-			pendingEmbeddings = append(pendingEmbeddings, mutation.pendingEmbeddings...)
-			deferred.deleteIDs = append(deferred.deleteIDs, mutation.deleteIDs...)
-			deferred.s3DeleteKeys = append(deferred.s3DeleteKeys, mutation.s3DeleteKeys...)
-			if len(upsertRows) >= flushRows {
-				if err := flush("rows"); err != nil {
-					return syncMutation{}, err
-				}
-			}
-		case <-ticker.C:
-			if err := flush("interval"); err != nil {
-				return syncMutation{}, err
-			}
-		case <-ctx.Done():
-			return syncMutation{}, ctx.Err()
-		}
-	}
-}
-
 func (s *Server) writeIndexRowsArtifact(ctx context.Context, generationID, reason string, rows []map[string]any) error {
 	if generationID == "" || len(rows) == 0 {
 		return nil
@@ -1180,49 +989,6 @@ func (s *Server) writeIndexRowsArtifact(ctx context.Context, generationID, reaso
 	key := fmt.Sprintf("syncs/%s/index_rows/%d-%s.jsonl", generationID, time.Now().UnixNano(), safeObjectName(reason))
 	if err := s.s3.Upload(ctx, key, buf.Bytes(), "application/x-ndjson"); err != nil {
 		return fmt.Errorf("uploading index row artifact %s: %w", key, err)
-	}
-	return nil
-}
-
-func (s *Server) writeQueueStateArtifact(ctx context.Context, generationID, stage, payloadRef string) error {
-	if generationID == "" || payloadRef == "" {
-		return nil
-	}
-	queue := map[string]any{
-		"generation_id": generationID,
-		"stage":         stage,
-		"jobs": []map[string]any{
-			{
-				"job_id":      generationID + "-" + stage + "-000001",
-				"stage":       stage,
-				"payload_ref": payloadRef,
-				"status":      "queued",
-				"attempts":    0,
-			},
-		},
-	}
-	data, err := json.Marshal(queue)
-	if err != nil {
-		return err
-	}
-	key := fmt.Sprintf("syncs/%s/queues/%s.queue.json", generationID, safeObjectName(stage))
-	if err := s.s3.Upload(ctx, key, data, "application/json"); err != nil {
-		return fmt.Errorf("uploading queue state artifact %s: %w", key, err)
-	}
-	return nil
-}
-
-func (s *Server) applyDeferredSyncMutations(ctx context.Context, orgID, rootID string, mutation syncMutation) error {
-	ns := tpNamespace(orgID, rootID)
-	if len(mutation.deleteIDs) > 0 {
-		if err := s.deleteIDsInBatches(ns, mutation.deleteIDs); err != nil {
-			return err
-		}
-	}
-	for _, key := range mutation.s3DeleteKeys {
-		if err := s.s3.Delete(ctx, key); err != nil {
-			return fmt.Errorf("deleting %s from S3: %w", key, err)
-		}
 	}
 	return nil
 }
@@ -1290,22 +1056,6 @@ func (s *Server) upsertRowsInBatches(ns string, rows []map[string]any) error {
 	return nil
 }
 
-func (s *Server) deleteIDsInBatches(ns string, ids []string) error {
-	batchSize := tpWriteBatchSize()
-	for start := 0; start < len(ids); start += batchSize {
-		end := start + batchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		deleteStart := time.Now()
-		if err := s.tp.DeleteIDs(ns, ids[start:end]); err != nil {
-			return err
-		}
-		log.Printf("timing stage=tp_delete_batch batch=%d/%d ids=%d elapsed=%s", start/batchSize+1, (len(ids)+batchSize-1)/batchSize, end-start, time.Since(deleteStart))
-	}
-	return nil
-}
-
 func (s *Server) patchRowsInBatches(ns string, rows []map[string]any) error {
 	batchSize := tpWriteBatchSize()
 	for start := 0; start < len(rows); start += batchSize {
@@ -1338,191 +1088,9 @@ func tpWriteBatchSize() int {
 	return rows
 }
 
-func syncMutationFlushRows() int {
-	const defaultRows = 10000
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_FLUSH_ROWS"))
-	if raw == "" {
-		return defaultRows
-	}
-	rows, err := strconv.Atoi(raw)
-	if err != nil || rows < 1 {
-		return defaultRows
-	}
-	if rows > 100000 {
-		return 100000
-	}
-	return rows
-}
-
-func syncMutationFlushInterval() time.Duration {
-	const defaultInterval = 3 * time.Second
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_FLUSH_INTERVAL"))
-	if raw == "" {
-		return defaultInterval
-	}
-	interval, err := time.ParseDuration(raw)
-	if err != nil || interval <= 0 {
-		return defaultInterval
-	}
-	if interval > time.Minute {
-		return time.Minute
-	}
-	return interval
-}
-
 // tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
 func tpNamespace(orgID, rootID string) string {
 	return fmt.Sprintf("org-%s-root-%s", orgID, rootID)
-}
-
-func (s *Server) processFileAdd(ctx context.Context, orgID, generationID, rootID string, change models.FileChange, sourceCache *syncSourceCache) (syncMutation, error) {
-	totalStart := time.Now()
-	ns := tpNamespace(orgID, rootID)
-
-	var oldIDs []string
-	if change.Status == models.StatusModified {
-		oldRowsStart := time.Now()
-		oldRows, err := s.tp.Query(ns,
-			[]any{"file_path", "asc"},
-			10000,
-			[]any{"file_path", "Eq", change.Path},
-			[]string{"file_path"},
-		)
-		if err != nil {
-			return syncMutation{}, fmt.Errorf("querying old chunks for %s: %w", change.Path, err)
-		}
-		log.Printf("timing file=%s stage=tp_query_old_chunks rows=%d elapsed=%s", change.Path, len(oldRows), time.Since(oldRowsStart))
-		for _, row := range oldRows {
-			if id := fmt.Sprintf("%v", row["id"]); id != "" && id != "<nil>" {
-				oldIDs = append(oldIDs, id)
-			}
-		}
-	}
-
-	s3Key := change.SourceKey
-	if s3Key == "" {
-		s3Key = fmt.Sprintf("files/%s/%s", rootID, change.Path)
-	}
-
-	downloadStart := time.Now()
-	fileData, err := sourceCache.read(ctx, s3Key, change.SourceOffset, change.SourceLength)
-	if err != nil {
-		return syncMutation{}, fmt.Errorf("downloading %s from S3: %w", s3Key, err)
-	}
-	log.Printf("timing file=%s stage=s3_download bytes=%d elapsed=%s", change.Path, len(fileData), time.Since(downloadStart))
-
-	chunkStart := time.Now()
-	chunkResp, err := s.modal.ChunkFile(ChunkFileRequest{
-		S3Key:      s3Key,
-		FilePath:   change.Path,
-		FileType:   detectFileType(change.Path),
-		RootID:     rootID,
-		ContentB64: base64.StdEncoding.EncodeToString(fileData),
-	})
-	if err != nil {
-		return syncMutation{}, fmt.Errorf("chunking: %w", err)
-	}
-	log.Printf("timing file=%s stage=modal_chunk chunks=%d elapsed=%s", change.Path, len(chunkResp.Chunks), time.Since(chunkStart))
-
-	if len(chunkResp.Chunks) == 0 {
-		log.Printf("timing file=%s stage=process_file_total chunks=0 elapsed=%s", change.Path, time.Since(totalStart))
-		return syncMutation{deleteIDs: oldIDs}, nil
-	}
-
-	var contentHashes []string
-	for _, c := range chunkResp.Chunks {
-		if h, ok := c["content_hash"].(string); ok {
-			contentHashes = append(contentHashes, h)
-		}
-	}
-
-	cacheLookupStart := time.Now()
-	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), contentHashes)
-	if err != nil {
-		log.Printf("warning: embedding cache lookup failed: %v", err)
-		cached = make(map[string][]float64)
-	}
-	log.Printf("timing file=%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
-
-	cachedRows := make(map[int][]float64)
-	uncachedCount := 0
-
-	for i, c := range chunkResp.Chunks {
-		hash, _ := c["content_hash"].(string)
-		if emb, ok := cached[hash]; ok {
-			cachedRows[i] = emb
-		} else {
-			uncachedCount++
-		}
-	}
-
-	log.Printf("file %s: %d chunks total, %d cached, %d to embed",
-		change.Path, len(chunkResp.Chunks), len(cachedRows), uncachedCount)
-
-	rows := make([]map[string]any, len(chunkResp.Chunks))
-	pending := make([]pendingEmbedding, 0, uncachedCount)
-	for i, c := range chunkResp.Chunks {
-		row := indexedChunkFromModal(rootID, generationID, 0, change.ContentHash, c)
-		rowMap := row.mapRow()
-
-		if emb, ok := cachedRows[i]; ok {
-			rowMap["vector"] = emb
-		} else {
-			hash, _ := c["content_hash"].(string)
-			pending = append(pending, pendingEmbedding{
-				chunk:       c,
-				row:         rowMap,
-				contentHash: hash,
-			})
-		}
-
-		rows[i] = rowMap
-	}
-
-	staleIDs := staleChunkIDs(oldIDs, rows)
-	log.Printf("timing file=%s stage=process_file_total chunks=%d elapsed=%s", change.Path, len(rows), time.Since(totalStart))
-	return syncMutation{upsertRows: rows, pendingEmbeddings: pending, deleteIDs: staleIDs}, nil
-}
-
-func (s *Server) processFileRemove(ctx context.Context, orgID, rootID string, change models.FileChange) (syncMutation, error) {
-	ns := tpNamespace(orgID, rootID)
-	queryStart := time.Now()
-	rows, err := s.tp.Query(ns,
-		[]any{"file_path", "asc"},
-		10000,
-		[]any{"file_path", "Eq", change.Path},
-		[]string{"file_path"},
-	)
-	if err != nil {
-		return syncMutation{}, err
-	}
-	log.Printf("timing file=%s stage=tp_query_remove_rows rows=%d elapsed=%s", change.Path, len(rows), time.Since(queryStart))
-	var deleteIDs []string
-	for _, row := range rows {
-		if id := fmt.Sprintf("%v", row["id"]); id != "" && id != "<nil>" {
-			deleteIDs = append(deleteIDs, id)
-		}
-	}
-	return syncMutation{
-		deleteIDs: deleteIDs,
-	}, nil
-}
-
-func staleChunkIDs(oldIDs []string, newRows []map[string]any) []string {
-	newIDs := make(map[string]bool, len(newRows))
-	for _, row := range newRows {
-		if id := fmt.Sprintf("%v", row["id"]); id != "" && id != "<nil>" {
-			newIDs[id] = true
-		}
-	}
-
-	var stale []string
-	for _, id := range oldIDs {
-		if !newIDs[id] {
-			stale = append(stale, id)
-		}
-	}
-	return stale
 }
 
 func modalChunkPayload(row map[string]any) map[string]any {
@@ -1542,79 +1110,6 @@ func modalChunkPayload(row map[string]any) map[string]any {
 		chunk["image_path"] = imagePath
 	}
 	return chunk
-}
-
-func (s *Server) processFileMove(ctx context.Context, orgID, generationID, rootID string, change models.FileChange) (syncMutation, error) {
-	totalStart := time.Now()
-	ns := tpNamespace(orgID, rootID)
-	queryStart := time.Now()
-	rows, err := s.tp.Query(ns,
-		[]any{"file_path", "asc"},
-		10000,
-		[]any{"file_path", "Eq", change.OldPath},
-		[]string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"},
-	)
-	if err != nil {
-		return syncMutation{}, fmt.Errorf("querying old chunks: %w", err)
-	}
-	log.Printf("timing move=%s->%s stage=tp_query_old_rows rows=%d elapsed=%s", change.OldPath, change.Path, len(rows), time.Since(queryStart))
-
-	if len(rows) == 0 {
-		log.Printf("timing move=%s->%s stage=process_move_total rows=0 elapsed=%s", change.OldPath, change.Path, time.Since(totalStart))
-		return syncMutation{}, nil
-	}
-
-	var oldIDs []string
-	for _, row := range rows {
-		if id := fmt.Sprintf("%v", row["id"]); id != "" && id != "<nil>" {
-			oldIDs = append(oldIDs, id)
-		}
-	}
-	var contentHashes []string
-	for _, row := range rows {
-		if h, ok := row["content_hash"].(string); ok {
-			contentHashes = append(contentHashes, h)
-		}
-	}
-
-	cacheLookupStart := time.Now()
-	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), contentHashes)
-	if err != nil {
-		log.Printf("warning: embedding cache lookup for move failed: %v", err)
-		cached = make(map[string][]float64)
-	}
-	log.Printf("timing move=%s->%s stage=embedding_cache_lookup hashes=%d hits=%d elapsed=%s", change.OldPath, change.Path, len(contentHashes), len(cached), time.Since(cacheLookupStart))
-
-	var pending []pendingEmbedding
-	newRows := make([]map[string]any, len(rows))
-	for i, row := range rows {
-		chunkIdx := 0
-		if ci, ok := row["chunk_index"]; ok {
-			if f, ok := ci.(float64); ok {
-				chunkIdx = int(f)
-			}
-		}
-		chunk := indexedChunkFromExisting(rootID, generationID, 0, change.Path, change.ContentHash, chunkIdx, row)
-		newRows[i] = chunk.mapRow()
-
-		hash, _ := row["content_hash"].(string)
-		if emb, ok := cached[hash]; ok {
-			newRows[i]["vector"] = emb
-		} else {
-			pending = append(pending, pendingEmbedding{
-				chunk:       modalChunkPayload(newRows[i]),
-				row:         newRows[i],
-				contentHash: hash,
-			})
-		}
-	}
-
-	if len(pending) > 0 {
-		log.Printf("move %s: %d/%d chunks need re-embedding (cache miss)", change.Path, len(pending), len(rows))
-	}
-
-	log.Printf("timing move=%s->%s stage=process_move_total rows=%d elapsed=%s", change.OldPath, change.Path, len(newRows), time.Since(totalStart))
-	return syncMutation{upsertRows: newRows, pendingEmbeddings: pending, deleteIDs: oldIDs}, nil
 }
 
 func (s *Server) embedChunksInBatches(chunks []map[string]any) ([]map[string]any, error) {
