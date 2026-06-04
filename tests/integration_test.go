@@ -221,6 +221,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		projectDir := filepath.Join(homeDir, "queued-workspace")
 		writeFile(t, projectDir, "queued/architecture.md", "# Queued Architecture\n\nNATS JetStream dispatchers invoke Modal compute and commit generations.\n")
 		writeFile(t, projectDir, "queued/search.txt", "Dispatcher integration test document for semantic retrieval.\n")
+		writePDF(t, projectDir, "queued/document.pdf", "Queued PDF document chunking through Modal and JetStream.")
 
 		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
 		if err != nil {
@@ -236,6 +237,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		})
 		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/done/", generationID))
 		assertHasTPRows(t, services, namespace, "queued/architecture.md")
+		assertHasTPRows(t, services, namespace, "queued/document.pdf")
 		assertCLIQuery(t, homeDir, env, "JetStream dispatchers Modal compute", env.rootName, "hybrid", "", "queued/architecture.md")
 	})
 }
@@ -907,6 +909,40 @@ func writeFile(t *testing.T, root, relPath, content string) {
 	mkdirAll(t, filepath.Dir(fullPath))
 	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
 		t.Fatalf("writing %s: %v", relPath, err)
+	}
+}
+
+func writePDF(t *testing.T, root, relPath, text string) {
+	t.Helper()
+
+	escaped := strings.NewReplacer(`\`, `\\`, `(`, `\(`, `)`, `\)`).Replace(text)
+	stream := fmt.Sprintf("BT /F1 18 Tf 72 720 Td (%s) Tj ET", escaped)
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream),
+	}
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objects)+1)
+	for i, obj := range objects {
+		objectNumber := i + 1
+		offsets[objectNumber] = pdf.Len()
+		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", objectNumber, obj)
+	}
+	xrefOffset := pdf.Len()
+	fmt.Fprintf(&pdf, "xref\n0 %d\n0000000000 65535 f \n", len(objects)+1)
+	for i := 1; i <= len(objects); i++ {
+		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[i])
+	}
+	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xrefOffset)
+
+	fullPath := filepath.Join(root, filepath.FromSlash(relPath))
+	mkdirAll(t, filepath.Dir(fullPath))
+	if err := os.WriteFile(fullPath, pdf.Bytes(), 0o644); err != nil {
+		t.Fatalf("writing PDF %s: %v", relPath, err)
 	}
 }
 
