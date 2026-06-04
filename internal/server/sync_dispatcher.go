@@ -56,11 +56,21 @@ func (d *SyncDispatcher) Run(ctx context.Context) error {
 }
 
 func (d *SyncDispatcher) processReceived(ctx context.Context, msg queue.ReceivedMessage) {
+	skip, err := d.shouldSkipMessage(ctx, msg.Job)
+	if err != nil {
+		log.Printf("checking sync job stage=%s job_id=%s generation_id=%s: %v", d.stage, msg.Job.JobID, msg.Job.GenerationID, err)
+	} else if skip {
+		if ackErr := d.queue.Ack(msg); ackErr != nil {
+			log.Printf("acking skipped %s job %s: %v", d.stage, msg.Job.JobID, ackErr)
+		}
+		return
+	}
+
 	stopHeartbeat := d.startHeartbeat(ctx, msg)
 	defer stopHeartbeat()
 
 	start := time.Now()
-	err := d.Process(ctx, msg.Job)
+	err = d.Process(ctx, msg.Job)
 	elapsed := time.Since(start)
 	if err == nil {
 		log.Printf("processed sync job stage=%s job_id=%s generation_id=%s shard=%d/%d elapsed=%s", d.stage, msg.Job.JobID, msg.Job.GenerationID, msg.Job.ShardIndex+1, msg.Job.TotalShards, elapsed)
@@ -168,6 +178,9 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err := d.writeShardDone(ctx, msg); err != nil {
 			return err
 		}
+		if err := d.enqueueNextChunkShard(ctx, msg); err != nil {
+			return err
+		}
 		if err := enqueueCleanupBatches(ctx, d.queue, msg, cleanupShardKeys(msg)); err != nil {
 			return err
 		}
@@ -188,6 +201,7 @@ func (d *SyncDispatcher) pipelineFor(msg queue.JobMessage) *syncPipeline {
 	}
 	generation := &SyncGeneration{
 		ID:                msg.GenerationID,
+		OrgID:             msg.OrgID,
 		RootID:            msg.RootID,
 		BaseGenerationID:  msg.BaseGenerationID,
 		Seq:               msg.GenerationSeq,
@@ -208,6 +222,32 @@ func (d *SyncDispatcher) pipelineFor(msg queue.JobMessage) *syncPipeline {
 			GenerationSeq: msg.GenerationSeq,
 		},
 	}
+}
+
+func (d *SyncDispatcher) shouldSkipMessage(ctx context.Context, msg queue.JobMessage) (bool, error) {
+	if d == nil || d.server == nil || d.server.db == nil || msg.GenerationID == "" || msg.Stage == syncStageCleanup {
+		return false, nil
+	}
+	status, err := d.server.db.GetSyncGenerationStatus(ctx, msg.GenerationID)
+	if err != nil {
+		return false, err
+	}
+	if status != "failed" {
+		return false, nil
+	}
+	if err := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); err != nil {
+		log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, err)
+	}
+	log.Printf("skipping sync job stage=%s job_id=%s generation_id=%s status=failed", msg.Stage, msg.JobID, msg.GenerationID)
+	return true, nil
+}
+
+func (d *SyncDispatcher) enqueueNextChunkShard(ctx context.Context, msg queue.JobMessage) error {
+	next, ok := nextChunkShardMessage(msg)
+	if !ok {
+		return nil
+	}
+	return d.queue.Enqueue(ctx, syncStageChunk, next)
 }
 
 func objectQueueJobFromMessage(msg queue.JobMessage) objectQueueJob {
@@ -281,6 +321,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		proofBytes, _ := json.Marshal(req.ContentProof)
 		if err := d.server.db.UpsertContentProof(ctx, msg.OrgID, msg.UserID, msg.RootID, req.ContentProof.RootHash, proofBytes); err != nil {
 			_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+			if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+				log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+			}
 			if msg.SyncJobID != "" {
 				_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
 			}
@@ -289,6 +332,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 	}
 	if err := d.server.db.CommitSyncGeneration(ctx, generation, req.State); err != nil {
 		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
 		if msg.SyncJobID != "" {
 			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
 		}

@@ -96,6 +96,51 @@ func (t *TPClient) PatchRows(ns string, rows []map[string]any) error {
 	return err
 }
 
+// DeleteByFilter deletes documents that match a Turbopuffer filter.
+func (t *TPClient) DeleteByFilter(ns string, filters any, allowPartial bool) (bool, error) {
+	body := map[string]any{
+		"delete_by_filter": filters,
+	}
+	if allowPartial {
+		body["delete_by_filter_allow_partial"] = true
+	}
+	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		RowsRemaining bool `json:"rows_remaining"`
+	}
+	if len(resp) > 0 {
+		_ = json.Unmarshal(resp, &result)
+	}
+	return result.RowsRemaining, nil
+}
+
+// PatchByFilter updates attributes on documents that match a Turbopuffer filter.
+func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, allowPartial bool) (bool, error) {
+	body := map[string]any{
+		"patch_by_filter": map[string]any{
+			"filters": filters,
+			"patch":   patch,
+		},
+	}
+	if allowPartial {
+		body["patch_by_filter_allow_partial"] = true
+	}
+	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		RowsRemaining bool `json:"rows_remaining"`
+	}
+	if len(resp) > 0 {
+		_ = json.Unmarshal(resp, &result)
+	}
+	return result.RowsRemaining, nil
+}
+
 // Query performs a search query.
 func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeAttrs []string) ([]map[string]any, error) {
 	body := map[string]any{
