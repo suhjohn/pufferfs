@@ -242,6 +242,36 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertHasTPRows(t, services, namespace, "queued/document.pdf")
 		assertCLIQuery(t, homeDir, env, "JetStream dispatchers Modal compute", env.rootName, "hybrid", "", "queued/architecture.md")
 	})
+
+	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
+		nats := startE2ENATS(t)
+		env := newQueuedE2EEnv(t, services, nats.ClientURL())
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+		workers := startStageWorkers(t, services, nats.ClientURL(), queueStages()...)
+		defer stopWorkerProcesses(t, workers)
+
+		projectDir := filepath.Join(homeDir, "text-workspace")
+		writeFile(t, projectDir, "docs/readme.md", "# Local Chunking\n\nThis file is chunked entirely in Go without calling Modal.\n")
+		writeFile(t, projectDir, "docs/notes.txt", "Plain text file chunked locally by the Go worker.\n")
+		writeFile(t, projectDir, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n")
+
+		syncStart := time.Now()
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		t.Logf("text-only queued CLI sync command elapsed=%s", time.Since(syncStart))
+		if err != nil {
+			t.Fatalf("text-only queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		namespace := tpNamespace(env.orgID, rootID)
+		t.Cleanup(func() {
+			deleteTPNamespace(t, services, namespace)
+		})
+		assertHasTPRows(t, services, namespace, "docs/readme.md")
+		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
+	})
 }
 
 type realServices struct {

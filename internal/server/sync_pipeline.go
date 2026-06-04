@@ -298,21 +298,27 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 		if err != nil {
 			return nil, fmt.Errorf("downloading %s: %w", s3Key, err)
 		}
-		chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
-			S3Key:      s3Key,
-			FilePath:   change.Path,
-			FileType:   detectFileType(change.Path),
-			RootID:     p.rootID,
-			ContentB64: base64.StdEncoding.EncodeToString(fileData),
-		})
-		if err != nil {
-			return nil, err
+		var chunks []map[string]any
+		if localChunkable(change.Path) {
+			chunks = chunkLocally(fileData, p.rootID, change.Path)
+		} else {
+			chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
+				S3Key:      s3Key,
+				FilePath:   change.Path,
+				FileType:   detectFileType(change.Path),
+				RootID:     p.rootID,
+				ContentB64: base64.StdEncoding.EncodeToString(fileData),
+			})
+			if err != nil {
+				return nil, err
+			}
+			chunks = chunkResp.Chunks
 		}
-		rows := make([]syncChunkArtifact, 0, len(chunkResp.Chunks)+1)
+		rows := make([]syncChunkArtifact, 0, len(chunks)+1)
 		if change.Status == models.StatusModified {
 			rows = append(rows, syncChunkArtifact{Op: "close", Change: change})
 		}
-		for _, chunk := range chunkResp.Chunks {
+		for _, chunk := range chunks {
 			rows = append(rows, syncChunkArtifact{Op: "chunk", Change: change, Chunk: chunk})
 		}
 		return rows, nil
