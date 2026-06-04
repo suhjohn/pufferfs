@@ -12,6 +12,7 @@ import (
 
 	"github.com/pufferfs/pufferfs/internal/auth"
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/server"
 	"github.com/pufferfs/pufferfs/internal/storage"
 )
@@ -47,6 +48,15 @@ func main() {
 
 	// Server
 	srv := server.New(db, s3Client, modalClient, tpClient)
+	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
+		q, err := queue.NewNATSQueue(natsURL)
+		if err != nil {
+			log.Fatalf("connecting to NATS JetStream: %v", err)
+		}
+		defer q.Close()
+		srv.SetQueue(q)
+		log.Printf("NATS JetStream sync queue enabled: %s", natsURL)
+	}
 
 	// JWT secret
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))

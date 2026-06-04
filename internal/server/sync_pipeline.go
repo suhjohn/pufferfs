@@ -12,13 +12,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 const (
-	syncStageChunk = "chunk"
-	syncStageEmbed = "embed"
-	syncStageIndex = "index"
+	syncStageChunk  = "chunk"
+	syncStageEmbed  = "embed"
+	syncStageIndex  = "index"
+	syncStageCommit = "commit"
+
+	defaultSyncShardMaxFiles = 5000
+	defaultSyncShardMaxBytes = 256 * 1024 * 1024
 )
 
 type syncPipeline struct {
@@ -27,6 +33,7 @@ type syncPipeline struct {
 	rootID     string
 	generation *SyncGeneration
 	job        *models.SyncJob
+	userID     string
 	req        *models.SyncRequest
 	broker     *objectQueueBroker
 	resp       *models.SyncResponse
@@ -78,6 +85,119 @@ func (p *syncPipeline) run(ctx context.Context) (*models.SyncResponse, error) {
 		return nil, err
 	}
 	return p.resp, nil
+}
+
+func (s *Server) enqueueSync(ctx context.Context, orgID, userID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+	p := &syncPipeline{
+		server:     s,
+		orgID:      orgID,
+		rootID:     req.RootID,
+		generation: generation,
+		job:        job,
+		userID:     userID,
+		req:        req,
+		resp: &models.SyncResponse{
+			RootID:        req.RootID,
+			SyncJobID:     syncJobIdentifier(job),
+			GenerationID:  generation.ID,
+			GenerationSeq: generation.Seq,
+		},
+	}
+	if err := p.writeRequest(ctx); err != nil {
+		return nil, err
+	}
+	msgs, err := p.prepareQueueJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(msgs) == 0 {
+		if err := p.enqueueCommit(ctx, 0); err != nil {
+			return nil, err
+		}
+		return p.resp, nil
+	}
+	if err := s.queue.Enqueue(ctx, syncStageChunk, msgs...); err != nil {
+		return nil, err
+	}
+	if job != nil {
+		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "queued", 0)
+	}
+	return p.resp, nil
+}
+
+func (p *syncPipeline) writeRequest(ctx context.Context) error {
+	data, err := json.Marshal(p.req)
+	if err != nil {
+		return err
+	}
+	return p.server.s3.Upload(ctx, syncRequestKey(p.generation.ID), data, "application/json")
+}
+
+func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage, error) {
+	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
+	msgs := make([]queue.JobMessage, 0, len(shards))
+	for i, shard := range shards {
+		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, p.jobMessage(syncStageChunk, uuid.NewString(), ref, i, len(shards)))
+	}
+	return msgs, nil
+}
+
+func (p *syncPipeline) enqueueCommit(ctx context.Context, totalShards int) error {
+	msg := p.jobMessage(syncStageCommit, uuid.NewString(), syncRequestKey(p.generation.ID), 0, totalShards)
+	return p.server.queue.Enqueue(ctx, syncStageCommit, msg)
+}
+
+func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, totalShards int) queue.JobMessage {
+	return queue.JobMessage{
+		JobID:             jobID,
+		SyncJobID:         syncJobIdentifier(p.job),
+		UserID:            p.userID,
+		OrgID:             p.orgID,
+		RootID:            p.rootID,
+		GenerationID:      p.generation.ID,
+		GenerationSeq:     p.generation.Seq,
+		BaseGenerationID:  p.generation.BaseGenerationID,
+		BaseGenerationSeq: p.generation.BaseGenerationSeq,
+		Stage:             stage,
+		PayloadRef:        payloadRef,
+		ShardIndex:        shardIndex,
+		TotalShards:       totalShards,
+		EnqueuedAt:        time.Now().UTC(),
+	}
+}
+
+func shardChanges(changes []models.FileChange, maxFiles int, maxBytes int64) [][]models.FileChange {
+	var shards [][]models.FileChange
+	var current []models.FileChange
+	var currentBytes int64
+	for _, change := range changes {
+		if change.Status == models.StatusUnchanged {
+			continue
+		}
+		size := change.SourceLength
+		if size <= 0 {
+			size = change.Size
+		}
+		if len(current) > 0 && (len(current) >= maxFiles || currentBytes+size > maxBytes) {
+			shards = append(shards, current)
+			current = nil
+			currentBytes = 0
+		}
+		current = append(current, change)
+		currentBytes += size
+	}
+	if len(current) > 0 {
+		shards = append(shards, current)
+	}
+	return shards
+}
+
+func syncRequestKey(generationID string) string {
+	return fmt.Sprintf("syncs/%s/request.json", generationID)
 }
 
 func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
@@ -178,21 +298,27 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 		if err != nil {
 			return nil, fmt.Errorf("downloading %s: %w", s3Key, err)
 		}
-		chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
-			S3Key:      s3Key,
-			FilePath:   change.Path,
-			FileType:   detectFileType(change.Path),
-			RootID:     p.rootID,
-			ContentB64: base64.StdEncoding.EncodeToString(fileData),
-		})
-		if err != nil {
-			return nil, err
+		var chunks []map[string]any
+		if localChunkable(change.Path) {
+			chunks = chunkLocally(fileData, p.rootID, change.Path)
+		} else {
+			chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
+				S3Key:      s3Key,
+				FilePath:   change.Path,
+				FileType:   detectFileType(change.Path),
+				RootID:     p.rootID,
+				ContentB64: base64.StdEncoding.EncodeToString(fileData),
+			})
+			if err != nil {
+				return nil, err
+			}
+			chunks = chunkResp.Chunks
 		}
-		rows := make([]syncChunkArtifact, 0, len(chunkResp.Chunks)+1)
+		rows := make([]syncChunkArtifact, 0, len(chunks)+1)
 		if change.Status == models.StatusModified {
 			rows = append(rows, syncChunkArtifact{Op: "close", Change: change})
 		}
-		for _, chunk := range chunkResp.Chunks {
+		for _, chunk := range chunks {
 			rows = append(rows, syncChunkArtifact{Op: "chunk", Change: change, Chunk: chunk})
 		}
 		return rows, nil

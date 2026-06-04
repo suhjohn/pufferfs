@@ -30,6 +30,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	awscreds "github.com/aws/aws-sdk-go-v2/credentials"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 )
 
 const (
@@ -52,6 +53,7 @@ var (
 	e2eSetupOnce      sync.Once
 	e2eCLIBinPath     string
 	e2eServerBinPath  string
+	e2eWorkerBinPath  string
 	e2ePgContainer    = "pufferfs-e2e-test-pg"
 	e2eMinioContainer = "pufferfs-e2e-test-minio"
 )
@@ -207,25 +209,99 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertHasTPRows(t, services, namespace, "docs/deep/retry/evidence.txt")
 		assertCLIQuery(t, homeDir, env, "failed indexing retry", env.rootName, "hybrid", "", "docs/deep/retry/incident.md")
 	})
+
+	t.Run("queued NATS dispatcher sync flow indexes and queries", func(t *testing.T) {
+		nats := startE2ENATS(t)
+		env := newQueuedE2EEnv(t, services, nats.ClientURL())
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+		workers := startStageWorkers(t, services, nats.ClientURL(), queueStages()...)
+		defer stopWorkerProcesses(t, workers)
+
+		projectDir := filepath.Join(homeDir, "queued-workspace")
+		writeFile(t, projectDir, "queued/architecture.md", "# Queued Architecture\n\nNATS JetStream dispatchers invoke Modal compute and commit generations.\n")
+		writeFile(t, projectDir, "queued/search.txt", "Dispatcher integration test document for semantic retrieval.\n")
+		writePDF(t, projectDir, "queued/document.pdf", "Queued PDF document chunking through Modal and JetStream.")
+
+		syncStart := time.Now()
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		t.Logf("queued CLI sync command elapsed=%s", time.Since(syncStart))
+		if err != nil {
+			t.Fatalf("queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		namespace := tpNamespace(env.orgID, rootID)
+		t.Cleanup(func() {
+			deleteTPNamespace(t, services, namespace)
+		})
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/done/", generationID))
+		assertHasTPRows(t, services, namespace, "queued/architecture.md")
+		assertHasTPRows(t, services, namespace, "queued/document.pdf")
+		assertCLIQuery(t, homeDir, env, "JetStream dispatchers Modal compute", env.rootName, "hybrid", "", "queued/architecture.md")
+	})
+
+	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
+		nats := startE2ENATS(t)
+		env := newQueuedE2EEnv(t, services, nats.ClientURL())
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+		workers := startStageWorkers(t, services, nats.ClientURL(), queueStages()...)
+		defer stopWorkerProcesses(t, workers)
+
+		projectDir := filepath.Join(homeDir, "text-workspace")
+		writeFile(t, projectDir, "docs/readme.md", "# Local Chunking\n\nThis file is chunked entirely in Go without calling Modal.\n")
+		writeFile(t, projectDir, "docs/notes.txt", "Plain text file chunked locally by the Go worker.\n")
+		writeFile(t, projectDir, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n")
+
+		syncStart := time.Now()
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		t.Logf("text-only queued CLI sync command elapsed=%s", time.Since(syncStart))
+		if err != nil {
+			t.Fatalf("text-only queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		namespace := tpNamespace(env.orgID, rootID)
+		t.Cleanup(func() {
+			deleteTPNamespace(t, services, namespace)
+		})
+		assertHasTPRows(t, services, namespace, "docs/readme.md")
+		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
+	})
 }
 
 type realServices struct {
 	modalChunkURL      string
 	modalEmbedURL      string
 	modalQueryEmbedURL string
+	modalChunkShardURL string
+	modalEmbedShardURL string
+	modalIndexShardURL string
 	turbopufferAPIKey  string
 	turbopufferAPIURL  string
+	storageEnv         []string
 }
 
 func requireRealServices(t *testing.T) realServices {
 	t.Helper()
 
+	useRealS3 := os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1"
 	cfg := realServices{
 		modalChunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		modalEmbedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		modalQueryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
 		turbopufferAPIKey:  os.Getenv("TURBOPUFFER_API_KEY"),
 		turbopufferAPIURL:  os.Getenv("TURBOPUFFER_API_URL"),
+		storageEnv:         e2eStorageEnv(),
+	}
+	if useRealS3 {
+		cfg.modalChunkShardURL = os.Getenv("MODAL_CHUNK_SHARD_ENDPOINT")
+		cfg.modalEmbedShardURL = os.Getenv("MODAL_EMBED_SHARD_ENDPOINT")
+		cfg.modalIndexShardURL = os.Getenv("MODAL_INDEX_SHARD_ENDPOINT")
 	}
 
 	var missing []string
@@ -241,10 +317,34 @@ func requireRealServices(t *testing.T) realServices {
 	if cfg.turbopufferAPIKey == "" {
 		missing = append(missing, "TURBOPUFFER_API_KEY")
 	}
+	if useRealS3 {
+		for _, name := range []string{"AWS_ENDPOINT_URL", "AWS_BUCKET_NAME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+			if os.Getenv(name) == "" {
+				missing = append(missing, name)
+			}
+		}
+	}
 	if len(missing) > 0 {
 		t.Skipf("real Modal/Turbopuffer integration requires env vars: %s", strings.Join(missing, ", "))
 	}
 	return cfg
+}
+
+func e2eStorageEnv() []string {
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		return []string{
+			"AWS_ENDPOINT_URL=" + os.Getenv("AWS_ENDPOINT_URL"),
+			"AWS_BUCKET_NAME=" + os.Getenv("AWS_BUCKET_NAME"),
+			"AWS_ACCESS_KEY_ID=" + os.Getenv("AWS_ACCESS_KEY_ID"),
+			"AWS_SECRET_ACCESS_KEY=" + os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		}
+	}
+	return []string{
+		"AWS_ENDPOINT_URL=" + fmt.Sprintf("http://localhost:%s", e2eMinioPort),
+		"AWS_BUCKET_NAME=" + e2eMinioBucket,
+		"AWS_ACCESS_KEY_ID=" + e2eMinioUser,
+		"AWS_SECRET_ACCESS_KEY=" + e2eMinioPass,
+	}
 }
 
 func setupE2EInfra(t *testing.T) {
@@ -279,6 +379,13 @@ func buildBinaries(t *testing.T) {
 	cmd.Dir = repoRoot
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building server: %v\n%s", err, out)
+	}
+
+	e2eWorkerBinPath = filepath.Join(tmpDir, "pufferfs-worker")
+	cmd = exec.Command("go", "build", "-o", e2eWorkerBinPath, "./cmd/worker")
+	cmd.Dir = repoRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building worker: %v\n%s", err, out)
 	}
 }
 
@@ -346,6 +453,9 @@ func waitForPostgres(t *testing.T, timeout time.Duration) {
 
 func createMinioBucket(t *testing.T) {
 	t.Helper()
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		return
+	}
 
 	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
@@ -371,9 +481,16 @@ func newMinioClient(t *testing.T) *s3sdk.Client {
 	t.Helper()
 
 	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
+	accessKey := e2eMinioUser
+	secretKey := e2eMinioPass
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		endpoint = os.Getenv("AWS_ENDPOINT_URL")
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),
-		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(e2eMinioUser, e2eMinioPass, "")),
+		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 	)
 	if err != nil {
 		t.Fatalf("loading AWS config: %v", err)
@@ -388,8 +505,12 @@ func assertMinioHasPrefix(t *testing.T, prefix string) {
 	t.Helper()
 
 	client := newMinioClient(t)
+	bucket := e2eMinioBucket
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		bucket = os.Getenv("AWS_BUCKET_NAME")
+	}
 	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
-		Bucket:  aws.String(e2eMinioBucket),
+		Bucket:  aws.String(bucket),
 		Prefix:  aws.String(prefix),
 		MaxKeys: aws.Int32(1),
 	})
@@ -436,6 +557,26 @@ func newE2EEnvWithIdentity(t *testing.T, services realServices, turbopufferKeyOv
 	}
 }
 
+func newQueuedE2EEnv(t *testing.T, services realServices, natsURL string) *e2eEnv {
+	t.Helper()
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	orgID := "e2e-org-queued-" + suffix
+	userID := "e2e-user-queued-" + suffix
+	apiKey := "pfs_e2e_queued_" + suffix
+	rootName := "queued-workspace-" + suffix
+	srv := startServerWithExtraEnv(t, services, "", []string{"NATS_URL=" + natsURL})
+	createUserAndAPIKey(t, orgID, userID, apiKey)
+	return &e2eEnv{
+		server:    srv,
+		serverURL: fmt.Sprintf("http://%s", srv.addr),
+		apiKey:    apiKey,
+		orgID:     orgID,
+		userID:    userID,
+		rootName:  rootName,
+	}
+}
+
 func (e *e2eEnv) stop(t *testing.T) {
 	t.Helper()
 	e.server.stop(t)
@@ -447,6 +588,12 @@ type serverProcess struct {
 }
 
 func startServer(t *testing.T, services realServices, turbopufferKeyOverride string) *serverProcess {
+	t.Helper()
+
+	return startServerWithExtraEnv(t, services, turbopufferKeyOverride, nil)
+}
+
+func startServerWithExtraEnv(t *testing.T, services realServices, turbopufferKeyOverride string, extraEnv []string) *serverProcess {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -474,11 +621,9 @@ func startServer(t *testing.T, services realServices, turbopufferKeyOverride str
 		"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
 		"TURBOPUFFER_API_KEY="+tpKey,
 		"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
-		"AWS_ENDPOINT_URL="+fmt.Sprintf("http://localhost:%s", e2eMinioPort),
-		"AWS_BUCKET_NAME="+e2eMinioBucket,
-		"AWS_ACCESS_KEY_ID="+e2eMinioUser,
-		"AWS_SECRET_ACCESS_KEY="+e2eMinioPass,
 	)
+	cmd.Env = append(cmd.Env, services.storageEnv...)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Dir = repoRoot(t)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -516,6 +661,75 @@ func (p *serverProcess) stop(t *testing.T) {
 	_ = p.cmd.Process.Kill()
 	_ = p.cmd.Wait()
 	p.cmd = nil
+}
+
+func startE2ENATS(t *testing.T) *natsserver.Server {
+	t.Helper()
+	ns, err := natsserver.NewServer(&natsserver.Options{
+		Host:      "127.0.0.1",
+		Port:      -1,
+		JetStream: true,
+		StoreDir:  t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("creating embedded NATS: %v", err)
+	}
+	go ns.Start()
+	if !ns.ReadyForConnections(10 * time.Second) {
+		ns.Shutdown()
+		t.Fatal("embedded NATS did not become ready")
+	}
+	t.Cleanup(func() {
+		ns.Shutdown()
+		ns.WaitForShutdown()
+	})
+	return ns
+}
+
+func queueStages() []string {
+	return []string{"chunk", "embed", "index", "commit"}
+}
+
+func startStageWorkers(t *testing.T, services realServices, natsURL string, stages ...string) []*exec.Cmd {
+	t.Helper()
+	workers := make([]*exec.Cmd, 0, len(stages))
+	for _, stage := range stages {
+		cmd := exec.Command(e2eWorkerBinPath, "--stage="+stage, "--concurrency=2")
+		cmd.Env = append(os.Environ(),
+			"DATABASE_URL="+fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", e2eDBUser, e2eDBPass, e2eDBPort, e2eDBName),
+			"NATS_URL="+natsURL,
+			"JWT_SECRET="+e2eJWTSecret,
+			"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
+			"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
+			"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
+			"MODAL_CHUNK_SHARD_ENDPOINT="+services.modalChunkShardURL,
+			"MODAL_EMBED_SHARD_ENDPOINT="+services.modalEmbedShardURL,
+			"MODAL_INDEX_SHARD_ENDPOINT="+services.modalIndexShardURL,
+			"TURBOPUFFER_API_KEY="+services.turbopufferAPIKey,
+			"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
+		)
+		cmd.Env = append(cmd.Env, services.storageEnv...)
+		cmd.Dir = repoRoot(t)
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			stopWorkerProcesses(t, workers)
+			t.Fatalf("starting %s worker: %v", stage, err)
+		}
+		workers = append(workers, cmd)
+	}
+	return workers
+}
+
+func stopWorkerProcesses(t *testing.T, workers []*exec.Cmd) {
+	t.Helper()
+	for _, cmd := range workers {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
 }
 
 func createUserAndAPIKey(t *testing.T, orgID, userID, rawKey string) {
@@ -770,6 +984,40 @@ func writeFile(t *testing.T, root, relPath, content string) {
 	mkdirAll(t, filepath.Dir(fullPath))
 	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
 		t.Fatalf("writing %s: %v", relPath, err)
+	}
+}
+
+func writePDF(t *testing.T, root, relPath, text string) {
+	t.Helper()
+
+	escaped := strings.NewReplacer(`\`, `\\`, `(`, `\(`, `)`, `\)`).Replace(text)
+	stream := fmt.Sprintf("BT /F1 18 Tf 72 720 Td (%s) Tj ET", escaped)
+	objects := []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+		fmt.Sprintf("<< /Length %d >>\nstream\n%s\nendstream", len(stream), stream),
+	}
+	var pdf bytes.Buffer
+	pdf.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objects)+1)
+	for i, obj := range objects {
+		objectNumber := i + 1
+		offsets[objectNumber] = pdf.Len()
+		fmt.Fprintf(&pdf, "%d 0 obj\n%s\nendobj\n", objectNumber, obj)
+	}
+	xrefOffset := pdf.Len()
+	fmt.Fprintf(&pdf, "xref\n0 %d\n0000000000 65535 f \n", len(objects)+1)
+	for i := 1; i <= len(objects); i++ {
+		fmt.Fprintf(&pdf, "%010d 00000 n \n", offsets[i])
+	}
+	fmt.Fprintf(&pdf, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xrefOffset)
+
+	fullPath := filepath.Join(root, filepath.FromSlash(relPath))
+	mkdirAll(t, filepath.Dir(fullPath))
+	if err := os.WriteFile(fullPath, pdf.Bytes(), 0o644); err != nil {
+		t.Fatalf("writing PDF %s: %v", relPath, err)
 	}
 }
 
@@ -1479,6 +1727,38 @@ func resolveRootID(t *testing.T, serverURL, apiKey, name string) string {
 	}
 	t.Fatalf("root %q not found in %s", name, string(body))
 	return ""
+}
+
+func visibleGenerationID(t *testing.T, serverURL, apiKey, rootID string) string {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, serverURL+"/roots/"+url.PathEscape(rootID), nil)
+	if err != nil {
+		t.Fatalf("creating root request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("getting root: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading root response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("getting root: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var root struct {
+		VisibleGenerationID string `json:"visible_generation_id"`
+	}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("decoding root response: %v", err)
+	}
+	if root.VisibleGenerationID == "" {
+		t.Fatalf("root has empty visible generation: %s", string(body))
+	}
+	return root.VisibleGenerationID
 }
 
 func tpNamespace(orgID, rootID string) string {

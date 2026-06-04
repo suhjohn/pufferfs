@@ -20,6 +20,7 @@ func main() {
 	root.AddCommand(syncCmd())
 	root.AddCommand(queryCmd())
 	root.AddCommand(watchCmd())
+	root.AddCommand(serviceCmd())
 	root.AddCommand(initCmd())
 
 	if err := root.Execute(); err != nil {

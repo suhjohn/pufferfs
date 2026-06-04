@@ -72,9 +72,32 @@ export AWS_BUCKET_NAME="pufferfs"
 export MODAL_CHUNK_ENDPOINT="https://..."
 export MODAL_EMBED_ENDPOINT="https://..."
 export MODAL_QUERY_EMBED_ENDPOINT="https://..."
+export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
+export MODAL_EMBED_SHARD_ENDPOINT="https://..."
+export MODAL_INDEX_SHARD_ENDPOINT="https://..."
 
 go run ./cmd/server
 ```
+
+### Queue-backed sync workers
+
+Set `NATS_URL` on the server to enqueue sync shards into NATS JetStream. The API
+then only writes shard manifests and publishes job pointers; thin Go dispatchers
+pull/ack jobs, invoke Modal shard compute endpoints, and coordinate commit:
+
+```bash
+nats-server -js
+export NATS_URL="nats://127.0.0.1:4222"
+
+go run ./cmd/server
+go run ./cmd/worker --stage=chunk --concurrency=16
+go run ./cmd/worker --stage=embed --concurrency=8
+go run ./cmd/worker --stage=index --concurrency=16
+go run ./cmd/worker --stage=commit --concurrency=2
+```
+
+`go test ./internal/queue` starts an embedded JetStream server locally and
+verifies enqueue, pull, ack, and delayed redelivery semantics.
 
 ## Modal Functions
 

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pufferfs/pufferfs/internal/storage"
 )
 
 type queueJobStatus string
@@ -56,11 +55,11 @@ type objectQueueSummary struct {
 }
 
 type objectQueueBroker struct {
-	s3 *storage.Client
+	s3 objectStore
 	mu sync.Mutex
 }
 
-func newObjectQueueBroker(s3 *storage.Client) *objectQueueBroker {
+func newObjectQueueBroker(s3 objectStore) *objectQueueBroker {
 	return &objectQueueBroker{s3: s3}
 }
 

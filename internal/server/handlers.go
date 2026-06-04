@@ -17,21 +17,35 @@ import (
 	"time"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
+type objectStore interface {
+	Upload(ctx context.Context, key string, data []byte, contentType string) error
+	UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error)
+	Download(ctx context.Context, key string) ([]byte, error)
+	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
+	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+}
+
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
 	db    *DB
-	s3    *storage.Client
+	s3    objectStore
 	modal *ModalClient
 	tp    *TPClient
+	queue queue.Queue
 	mux   *http.ServeMux
 }
 
 // New creates a new Server with all dependencies.
 func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
+	return NewWithStore(db, s3, modal, tp)
+}
+
+func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Server {
 	s := &Server{
 		db:    db,
 		s3:    s3,
@@ -41,6 +55,12 @@ func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// SetQueue enables the JetStream-backed sync path. Without a queue the server
+// keeps using the legacy in-process sync pipeline.
+func (s *Server) SetQueue(q queue.Queue) {
+	s.queue = q
 }
 
 // Handler returns the HTTP handler.
@@ -586,7 +606,7 @@ func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest
 }
 
 func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	resp, err := s.processSync(ctx, orgID, generation, req, job)
+	resp, err := s.runSyncPipeline(ctx, orgID, userID, generation, req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
@@ -594,6 +614,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
 		return nil, err
+	}
+	if s.queue != nil {
+		return resp, nil
 	}
 
 	if req.ContentProof != nil {
@@ -621,6 +644,13 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		resp.SyncJobID = job.ID
 	}
 	return resp, nil
+}
+
+func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+	if s.queue != nil {
+		return s.enqueueSync(ctx, orgID, userID, generation, req, job)
+	}
+	return s.processSync(ctx, orgID, generation, req, job)
 }
 
 // ---------------------------------------------------------------------------
@@ -919,12 +949,12 @@ type pendingEmbedding struct {
 }
 
 type syncSourceCache struct {
-	s3      *storage.Client
+	s3      objectStore
 	mu      sync.Mutex
 	objects map[string][]byte
 }
 
-func newSyncSourceCache(s3 *storage.Client) *syncSourceCache {
+func newSyncSourceCache(s3 objectStore) *syncSourceCache {
 	return &syncSourceCache{s3: s3, objects: make(map[string][]byte)}
 }
 

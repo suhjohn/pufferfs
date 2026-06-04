@@ -23,9 +23,11 @@ import (
 
 func syncCmd() *cobra.Command {
 	var (
-		dryRun bool
-		name   string
-		rootID string
+		dryRun  bool
+		name    string
+		rootID  string
+		follow  bool
+		options followOptions
 	)
 
 	cmd := &cobra.Command{
@@ -47,13 +49,24 @@ func syncCmd() *cobra.Command {
 				return fmt.Errorf("loading config: %w", err)
 			}
 
+			if follow {
+				if dryRun {
+					return fmt.Errorf("--follow cannot be combined with --dry-run")
+				}
+				if cfg.Server.URL == "" {
+					return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
+				}
+				return runFollow(cfg, absDir, name, rootID, options)
+			}
 			return runSync(cfg, absDir, name, rootID, dryRun)
 		},
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be synced without syncing")
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Continuously sync when files change")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
+	addFollowFlags(cmd, &options)
 
 	return cmd
 }
