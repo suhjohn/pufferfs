@@ -140,12 +140,26 @@ func (db *DB) migrateFallback() error {
 		);
 
 		CREATE TABLE IF NOT EXISTS embedding_cache (
-			org_id       TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			content_hash TEXT NOT NULL,
-			embedding    BYTEA NOT NULL,
-			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, content_hash)
+			org_id        TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			model_version TEXT NOT NULL DEFAULT '',
+			content_hash  TEXT NOT NULL,
+			embedding     BYTEA NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, model_version, content_hash)
 		);
+		ALTER TABLE embedding_cache ADD COLUMN IF NOT EXISTS model_version TEXT NOT NULL DEFAULT '';
+		DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'embedding_cache_pkey')
+				AND NOT EXISTS (
+					SELECT 1 FROM pg_constraint c
+					JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+					WHERE c.conname = 'embedding_cache_pkey' AND a.attname = 'model_version'
+				) THEN
+				ALTER TABLE embedding_cache DROP CONSTRAINT embedding_cache_pkey;
+				ALTER TABLE embedding_cache ADD PRIMARY KEY (org_id, model_version, content_hash);
+			END IF;
+		END $$;
 
 		CREATE TABLE IF NOT EXISTS root_acls (
 			id          TEXT PRIMARY KEY,
@@ -736,16 +750,18 @@ func (db *DB) MarkSyncGenerationFailedForJob(ctx context.Context, jobID string) 
 // Embedding Cache
 // ---------------------------------------------------------------------------
 
-// GetCachedEmbeddings looks up cached embeddings by content hash within an org.
-func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID string, hashes []string) (map[string][]float64, error) {
+// GetCachedEmbeddings looks up cached embeddings by content hash within an org,
+// scoped to a specific embedding model version so vectors are never reused
+// across model versions.
+func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID, modelVersion string, hashes []string) (map[string][]float64, error) {
 	result := make(map[string][]float64)
 	if len(hashes) == 0 {
 		return result, nil
 	}
 
 	rows, err := db.pool.Query(ctx,
-		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND content_hash = ANY($2)`,
-		orgID, hashes,
+		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND model_version = $2 AND content_hash = ANY($3)`,
+		orgID, modelVersion, hashes,
 	)
 	if err != nil {
 		return nil, err
@@ -767,27 +783,28 @@ func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID string, hashes []st
 	return result, nil
 }
 
-// SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value INSERT.
-func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID string, entries map[string][]float64) error {
+// SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value
+// INSERT, keyed by (org_id, model_version, content_hash).
+func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID, modelVersion string, entries map[string][]float64) error {
 	if len(entries) == 0 {
 		return nil
 	}
 
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO embedding_cache (org_id, content_hash, embedding, created_at) VALUES `)
-	args := make([]any, 0, len(entries)*3)
-	args = append(args, orgID) // $1 = org_id
+	sb.WriteString(`INSERT INTO embedding_cache (org_id, model_version, content_hash, embedding, created_at) VALUES `)
+	args := make([]any, 0, len(entries)*2+2)
+	args = append(args, orgID, modelVersion) // $1 = org_id, $2 = model_version
 	i := 0
 	for hash, emb := range entries {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		p := i*2 + 2 // starts at $2 since $1 is org_id
-		fmt.Fprintf(&sb, "($1, $%d, $%d, NOW())", p, p+1)
+		p := i*2 + 3 // value placeholders start at $3 ($1=org_id, $2=model_version)
+		fmt.Fprintf(&sb, "($1, $2, $%d, $%d, NOW())", p, p+1)
 		args = append(args, hash, encodeEmbedding(emb))
 		i++
 	}
-	sb.WriteString(` ON CONFLICT (org_id, content_hash) DO NOTHING`)
+	sb.WriteString(` ON CONFLICT (org_id, model_version, content_hash) DO NOTHING`)
 
 	_, err := db.pool.Exec(ctx, sb.String(), args...)
 	return err

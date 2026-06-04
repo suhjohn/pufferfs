@@ -8,14 +8,22 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
+
+// defaultEmbeddingModelVersion identifies the embedding model whose vectors are
+// stored in the embedding cache. It MUST match EMBEDDING_MODEL in modal/app.py.
+// Bump it (or set PUFFERFS_EMBEDDING_MODEL_VERSION) whenever the Modal embedding
+// model changes so cached vectors from the old model are never reused.
+const defaultEmbeddingModelVersion = "nomic-ai/nomic-embed-text-v1.5"
 
 // ModalClient calls Modal web endpoints for chunking and embedding.
 type ModalClient struct {
 	chunkURL      string
 	embedURL      string
 	queryEmbedURL string
+	modelVersion  string
 	httpClient    *http.Client
 }
 
@@ -25,8 +33,26 @@ func NewModalClient() *ModalClient {
 		chunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		embedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		queryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
+		modelVersion:  embeddingModelVersion(),
 		httpClient:    &http.Client{Timeout: 900 * time.Second},
 	}
+}
+
+// EmbeddingModelVersion returns the identifier of the active embedding model.
+// It is used as part of the embedding cache key so vectors are never reused
+// across model versions.
+func (m *ModalClient) EmbeddingModelVersion() string {
+	if m.modelVersion == "" {
+		return defaultEmbeddingModelVersion
+	}
+	return m.modelVersion
+}
+
+func embeddingModelVersion() string {
+	if v := strings.TrimSpace(os.Getenv("PUFFERFS_EMBEDDING_MODEL_VERSION")); v != "" {
+		return v
+	}
+	return defaultEmbeddingModelVersion
 }
 
 // ChunkFileRequest is the payload sent to the Modal chunk endpoint.
