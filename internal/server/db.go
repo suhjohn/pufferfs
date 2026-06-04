@@ -746,6 +746,15 @@ func (db *DB) MarkSyncGenerationFailedForJob(ctx context.Context, jobID string) 
 	return err
 }
 
+func (db *DB) GetSyncGenerationStatus(ctx context.Context, generationID string) (string, error) {
+	var status string
+	err := db.pool.QueryRow(ctx,
+		`SELECT status FROM sync_generations WHERE id = $1`,
+		generationID,
+	).Scan(&status)
+	return status, err
+}
+
 // ---------------------------------------------------------------------------
 // Embedding Cache
 // ---------------------------------------------------------------------------

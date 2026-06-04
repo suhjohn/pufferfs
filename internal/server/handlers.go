@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
@@ -27,6 +28,7 @@ type Server struct {
 	s3    *storage.Client
 	modal *ModalClient
 	tp    *TPClient
+	queue queue.Queue
 	mux   *http.ServeMux
 }
 
@@ -41,6 +43,12 @@ func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
 	}
 	s.routes()
 	return s
+}
+
+// SetQueue enables the JetStream-backed sync path. Without a queue the server
+// keeps using the legacy in-process sync pipeline.
+func (s *Server) SetQueue(q queue.Queue) {
+	s.queue = q
 }
 
 // Handler returns the HTTP handler.
@@ -586,7 +594,7 @@ func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest
 }
 
 func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	resp, err := s.processSync(ctx, orgID, generation, req, job)
+	resp, err := s.runSyncPipeline(ctx, orgID, userID, generation, req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
@@ -594,6 +602,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
 		return nil, err
+	}
+	if s.queue != nil {
+		return resp, nil
 	}
 
 	if req.ContentProof != nil {
@@ -621,6 +632,13 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		resp.SyncJobID = job.ID
 	}
 	return resp, nil
+}
+
+func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+	if s.queue != nil {
+		return s.enqueueSync(ctx, orgID, userID, generation, req, job)
+	}
+	return s.processSync(ctx, orgID, generation, req, job)
 }
 
 // ---------------------------------------------------------------------------
