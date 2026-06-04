@@ -3,11 +3,13 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -17,6 +19,23 @@ type TPClient struct {
 	region       string
 	httpClient   *http.Client
 	baseOverride string
+}
+
+type tpHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *tpHTTPError) Error() string {
+	return fmt.Sprintf("turbopuffer HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+func isTPNotFound(err error) bool {
+	var httpErr *tpHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusNotFound
+	}
+	return err != nil && strings.Contains(err.Error(), "turbopuffer HTTP 404:")
 }
 
 // NewTPClient creates a Turbopuffer client.
@@ -106,6 +125,9 @@ func (t *TPClient) DeleteByFilter(ns string, filters any, allowPartial bool) (bo
 	}
 	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
 	if err != nil {
+		if isTPNotFound(err) {
+			return false, nil
+		}
 		return false, err
 	}
 	var result struct {
@@ -168,6 +190,9 @@ func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, a
 	}
 	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
 	if err != nil {
+		if isTPNotFound(err) {
+			return false, 0, nil
+		}
 		return false, 0, err
 	}
 	var result struct {
@@ -201,6 +226,9 @@ func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeA
 	}
 	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
 	if err != nil {
+		if isTPNotFound(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -220,6 +248,9 @@ func (t *TPClient) MultiQuery(ns string, queries []map[string]any) ([][]map[stri
 	}
 	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
 	if err != nil {
+		if isTPNotFound(err) {
+			return make([][]map[string]any, len(queries)), nil
+		}
 		return nil, err
 	}
 
@@ -272,7 +303,7 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return respBody, nil
 		}
-		lastErr = fmt.Errorf("turbopuffer HTTP %d: %s", resp.StatusCode, string(respBody))
+		lastErr = &tpHTTPError{StatusCode: resp.StatusCode, Body: string(respBody)}
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			return nil, lastErr
 		}

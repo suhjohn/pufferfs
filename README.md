@@ -7,7 +7,7 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 - **CLI** (Go) — `pufferfs sync`, `pufferfs query`, `pufferfs watch`
 - **Server** (Go) — API gateway for sync orchestration and query proxy
 - **Compute** (Python/Modal) — file→chunks and chunks→embeddings on GPU
-- **Search** (Turbopuffer) — hybrid BM25 + vector search, one namespace per synced root
+- **Search** (Turbopuffer) — hybrid BM25 + vector search, with one or more physical namespaces per synced root
 - **Storage** (S3-compatible) — files, chunk images, and state
 
 ## Quick Start
@@ -42,6 +42,9 @@ pufferfs sync ./my-project --dry-run
 
 # Sync
 pufferfs sync ./my-project --name my-project
+
+# Create a user-owned root instead of an org root
+pufferfs sync ./my-project --name my-project --scope user
 ```
 
 ### Search
@@ -60,7 +63,7 @@ pufferfs root delete my-project
 pufferfs root delete my-project --yes
 ```
 
-This deletes PufferFS metadata, storage artifacts, and the Turbopuffer namespace
+This deletes PufferFS metadata, storage artifacts, and all Turbopuffer namespaces
 for the synced root. It does not delete the original source files.
 
 ### Watch (continuous sync)
@@ -68,6 +71,23 @@ for the synced root. It does not delete the original source files.
 ```bash
 pufferfs watch ./my-project
 ```
+
+For a supervised background sync, install a user service instead of running
+`watch` with `&`:
+
+```bash
+pufferfs service install ./my-project --name my-project
+pufferfs service start my-project
+pufferfs service status my-project
+pufferfs service logs my-project
+pufferfs service restart my-project
+pufferfs service stop my-project
+pufferfs service uninstall my-project
+```
+
+`service install` writes a macOS `launchd` LaunchAgent or Linux `systemd --user`
+unit that runs `pufferfs sync ./my-project --follow --name my-project`. The OS
+supervisor restarts it on failure and captures logs.
 
 ## Server
 
@@ -98,6 +118,36 @@ When `PUFFERFS_ADMIN_KEY` or `PUFFERFS_ADMIN_KEY_HASH` is configured, PufferFS
 accepts that key on `/admin/*` routes:
 
 ```bash
+curl -X POST "$PUFFERFS_SERVER_URL/admin/orgs" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Example Tenant","slug":"example-tenant","external_id":"tenant-example"}'
+
+curl -X POST "$PUFFERFS_SERVER_URL/admin/users" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","name":"User","external_id":"user-123"}'
+
+curl -X PUT "$PUFFERFS_SERVER_URL/admin/orgs/$ORG_ID/members/$USER_ID" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"role":"viewer"}'
+
+curl -X POST "$PUFFERFS_SERVER_URL/admin/orgs/$ORG_ID/users/$USER_ID/api-keys" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"member-query","scopes":["query"]}'
+
+curl -X POST "$PUFFERFS_SERVER_URL/admin/orgs/$ORG_ID/roots" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"shared","source_path":"/shared","scope":"org"}'
+
+curl -X POST "$PUFFERFS_SERVER_URL/admin/orgs/$ORG_ID/roots" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"private\",\"source_path\":\"/private\",\"scope\":\"user\",\"owner_user_id\":\"$USER_ID\"}"
+
 curl -X DELETE "$PUFFERFS_SERVER_URL/admin/roots/$ROOT_ID" \
   -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY"
 
@@ -108,8 +158,24 @@ curl -X DELETE "$PUFFERFS_SERVER_URL/admin/users/$USER_ID" \
   -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY"
 ```
 
+The admin key is a platform control-plane key. Do not pass it to tenant clients.
+Provision member API keys instead; a `query`-only key can search allowed roots
+but cannot create, sync, upload, or delete roots.
+
+Roots can be `scope:"org"` or `scope:"user"`. Org roots are visible to org
+members. User roots are visible to their owner and org `admin`/`owner` members.
+Org admins can view and delete user roots; regular members cannot see other
+members' user roots.
+
 Admin root/org deletion removes PufferFS metadata, storage artifacts, and
-Turbopuffer namespaces. It does not delete original source files.
+Turbopuffer namespaces. Admin user deletion also removes that user's owned
+roots. These delete APIs do not delete original source files.
+
+Each root is a logical sync and access-control unit. Its index can be split
+across multiple short Turbopuffer namespaces; set `PUFFERFS_TP_NAMESPACE_SHARDS`
+before creating roots to choose the shard count. The default is `1`. Indexing
+routes each file by a stable hash of `file_path`, and queries fan out across the
+root's namespaces before merging top results.
 
 ### Queue-backed sync workers
 
@@ -162,8 +228,8 @@ This creates three web endpoints:
 
 ## How It Works
 
-1. **Sync**: CLI scans directory → computes diff against previous state → uploads changed files to S3 → server calls Modal to chunk and embed → upserts to Turbopuffer
-2. **Query**: CLI sends query to server → server embeds query via Modal → hybrid search (BM25 + vector ANN) on Turbopuffer → reciprocal rank fusion → results returned to CLI
+1. **Sync**: CLI scans directory → computes diff against previous state → uploads changed files to S3 → server calls Modal to chunk and embed → routes rows by `file_path` hash → upserts to the root's Turbopuffer namespace shards
+2. **Query**: CLI sends query to server → server embeds query via Modal → fans out hybrid search (BM25 + vector ANN) across the root's Turbopuffer namespace shards → reciprocal rank fusion → results returned to CLI
 3. **Watch**: OS file watcher (fsnotify) → debounced incremental syncs
 
 ## File Type Support

@@ -146,39 +146,48 @@ func (d *SyncDispatcher) processCleanup(ctx context.Context, msg queue.JobMessag
 }
 
 func (s *Server) cleanupFailedGenerationRows(ctx context.Context, orgID, rootID, generationID string) error {
-	if s == nil || s.tp == nil || orgID == "" || rootID == "" || generationID == "" {
+	if s == nil || s.tp == nil || s.db == nil || orgID == "" || rootID == "" || generationID == "" {
 		return nil
 	}
-	ns := tpNamespace(orgID, rootID)
+	namespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
+	if err != nil {
+		return fmt.Errorf("listing root index namespaces for failed generation cleanup: %w", err)
+	}
+	activeNamespaces := activeRootIndexNamespaces(namespaces)
 	closeFilter := []any{"valid_to_generation", "Eq", generationID}
 	reopenPatch := map[string]any{
 		"valid_to_generation":     "",
 		"valid_to_generation_seq": 0,
 	}
-	for pass := 0; pass < 100; pass++ {
-		rowsRemaining, _, err := s.tp.PatchByFilter(ns, closeFilter, reopenPatch, true)
-		if err != nil {
-			return fmt.Errorf("reopening rows closed by failed generation %s: %w", generationID, err)
+	for _, ns := range activeNamespaces {
+		for pass := 0; pass < 100; pass++ {
+			rowsRemaining, _, err := s.tp.PatchByFilter(ns.Namespace, closeFilter, reopenPatch, true)
+			if err != nil {
+				return fmt.Errorf("reopening rows closed by failed generation %s in %s: %w", generationID, ns.Namespace, err)
+			}
+			if !rowsRemaining {
+				break
+			}
+			if pass == 99 {
+				return fmt.Errorf("reopening rows closed by failed generation %s in %s: rows remain after repeated patch passes", generationID, ns.Namespace)
+			}
 		}
-		if !rowsRemaining {
-			break
-		}
-		if pass == 99 {
-			return fmt.Errorf("reopening rows closed by failed generation %s: rows remain after repeated patch passes", generationID)
-		}
-	}
 
-	orphanFilter := []any{"generation_id", "Eq", generationID}
-	for pass := 0; pass < 100; pass++ {
-		rowsRemaining, err := s.tp.DeleteByFilter(ns, orphanFilter, true)
-		if err != nil {
-			return fmt.Errorf("deleting failed generation rows %s: %w", generationID, err)
-		}
-		if !rowsRemaining {
-			return nil
+		orphanFilter := []any{"generation_id", "Eq", generationID}
+		for pass := 0; pass < 100; pass++ {
+			rowsRemaining, err := s.tp.DeleteByFilter(ns.Namespace, orphanFilter, true)
+			if err != nil {
+				return fmt.Errorf("deleting failed generation rows %s in %s: %w", generationID, ns.Namespace, err)
+			}
+			if !rowsRemaining {
+				break
+			}
+			if pass == 99 {
+				return fmt.Errorf("deleting failed generation rows %s in %s: rows remain after repeated delete passes", generationID, ns.Namespace)
+			}
 		}
 	}
-	return fmt.Errorf("deleting failed generation rows %s: rows remain after repeated delete passes", generationID)
+	return nil
 }
 
 func (s *Server) cleanupFailedGenerationRowsForRoot(ctx context.Context, orgID, rootID string) error {

@@ -34,6 +34,7 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 				"",
 			),
 		),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(), opts...)
@@ -57,13 +58,44 @@ func (c *Client) Upload(ctx context.Context, key string, data []byte, contentTyp
 }
 
 func (c *Client) UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error {
-	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+	seekableBody, cleanup, err := seekableUploadBody(body)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	_, err = c.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      &c.bucket,
 		Key:         &key,
-		Body:        body,
+		Body:        seekableBody,
 		ContentType: &contentType,
 	})
 	return err
+}
+
+func seekableUploadBody(body io.Reader) (io.Reader, func(), error) {
+	if seeker, ok := body.(io.ReadSeeker); ok {
+		return seeker, func() {}, nil
+	}
+
+	f, err := os.CreateTemp("", "pufferfs-upload-*")
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("creating upload spool file: %w", err)
+	}
+	cleanup := func() {
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+	}
+	if _, err := io.Copy(f, body); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("spooling upload body: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("rewinding upload body: %w", err)
+	}
+	return f, cleanup, nil
 }
 
 // UploadCAS puts an object only if the supplied ETag precondition matches.

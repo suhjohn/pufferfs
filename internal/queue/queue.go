@@ -22,22 +22,29 @@ const (
 )
 
 type JobMessage struct {
-	JobID             string    `json:"job_id"`
-	SyncJobID         string    `json:"sync_job_id,omitempty"`
-	UserID            string    `json:"user_id,omitempty"`
-	OrgID             string    `json:"org_id"`
-	RootID            string    `json:"root_id"`
-	GenerationID      string    `json:"generation_id"`
-	GenerationSeq     int64     `json:"generation_seq"`
-	BaseGenerationID  string    `json:"base_generation_id"`
-	BaseGenerationSeq int64     `json:"base_generation_seq"`
-	Stage             string    `json:"stage"`
-	PayloadRef        string    `json:"payload_ref,omitempty"`
-	CleanupKeys       []string  `json:"cleanup_keys,omitempty"`
-	ShardIndex        int       `json:"shard_index"`
-	TotalShards       int       `json:"total_shards"`
-	Priority          int       `json:"priority,omitempty"`
-	EnqueuedAt        time.Time `json:"enqueued_at"`
+	JobID             string           `json:"job_id"`
+	SyncJobID         string           `json:"sync_job_id,omitempty"`
+	UserID            string           `json:"user_id,omitempty"`
+	OrgID             string           `json:"org_id"`
+	RootID            string           `json:"root_id"`
+	GenerationID      string           `json:"generation_id"`
+	GenerationSeq     int64            `json:"generation_seq"`
+	BaseGenerationID  string           `json:"base_generation_id"`
+	BaseGenerationSeq int64            `json:"base_generation_seq"`
+	Stage             string           `json:"stage"`
+	PayloadRef        string           `json:"payload_ref,omitempty"`
+	CleanupKeys       []string         `json:"cleanup_keys,omitempty"`
+	IndexNamespaces   []IndexNamespace `json:"index_namespaces,omitempty"`
+	ShardIndex        int              `json:"shard_index"`
+	TotalShards       int              `json:"total_shards"`
+	Priority          int              `json:"priority,omitempty"`
+	EnqueuedAt        time.Time        `json:"enqueued_at"`
+}
+
+type IndexNamespace struct {
+	Namespace  string `json:"namespace"`
+	ShardIndex int    `json:"shard_index"`
+	ShardCount int    `json:"shard_count"`
 }
 
 type ReceivedMessage struct {

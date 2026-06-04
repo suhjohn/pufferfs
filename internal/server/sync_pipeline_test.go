@@ -150,6 +150,37 @@ func TestChunkShardBackpressureMessages(t *testing.T) {
 	}
 }
 
+func TestPathShardIndexStableWithModalContract(t *testing.T) {
+	cases := []struct {
+		path       string
+		shardCount int
+		want       int
+	}{
+		{path: "docs/readme.md", shardCount: 2, want: 1},
+		{path: "queued/architecture.md", shardCount: 2, want: 0},
+		{path: "ops/runbooks/deploy/rollback.txt", shardCount: 4, want: 2},
+	}
+	for _, tc := range cases {
+		if got := pathShardIndex(tc.path, tc.shardCount); got != tc.want {
+			t.Fatalf("pathShardIndex(%q, %d) = %d, want %d", tc.path, tc.shardCount, got, tc.want)
+		}
+	}
+}
+
+func TestRootIndexNamespaceForPathSelectsShard(t *testing.T) {
+	namespaces := []models.RootIndexNamespace{
+		{Namespace: "ns-0", ShardIndex: 0, ShardCount: 2},
+		{Namespace: "ns-1", ShardIndex: 1, ShardCount: 2},
+	}
+	ns, err := rootIndexNamespaceForPath(namespaces, "docs/readme.md")
+	if err != nil {
+		t.Fatalf("select namespace: %v", err)
+	}
+	if ns.Namespace != "ns-1" {
+		t.Fatalf("namespace = %q, want ns-1", ns.Namespace)
+	}
+}
+
 func TestEnsureSyncStateRefUploadsAndClearsInlineState(t *testing.T) {
 	ctx := context.Background()
 	store := newMemoryObjectStore()

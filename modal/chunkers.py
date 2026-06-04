@@ -150,8 +150,49 @@ def _split_large(text: str, max_chars: int, overlap: int) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Document chunking: PDF / DOCX / PPTX → PDF pages → images → Gemini text
+# Document chunking: PDF / DOCX / PPTX → PDF pages → images → text
 # ---------------------------------------------------------------------------
+
+MIN_USABLE_EXTRACTED_TEXT_CHARS = 40
+
+
+def extracted_text_is_usable(text: str, text_coverage: float | None = None) -> bool:
+    """Return true when native/OCR-layer PDF text is good enough to skip Gemini."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    alnum_chars = sum(1 for ch in stripped if ch.isalnum())
+    if alnum_chars < MIN_USABLE_EXTRACTED_TEXT_CHARS:
+        return False
+
+    replacement_chars = stripped.count("\ufffd")
+    printable_chars = sum(1 for ch in stripped if ch.isprintable() or ch.isspace())
+    if printable_chars / max(len(stripped), 1) < 0.9:
+        return False
+    if replacement_chars / max(len(stripped), 1) > 0.02:
+        return False
+
+    if _looks_garbled(stripped):
+        return False
+
+    if text_coverage is not None and text_coverage < 0.001 and alnum_chars < 200:
+        return False
+
+    return True
+
+
+def _looks_garbled(text: str) -> bool:
+    letters = 0
+    vowels = 0
+    for ch in text:
+        if ch.isascii() and ch.isalpha():
+            letters += 1
+            if ch.lower() in "aeiou":
+                vowels += 1
+    if letters < 30:
+        return False
+    return vowels * 5 < letters
 
 
 def _convert_to_pdf(file_bytes: bytes, file_type: str) -> bytes:
@@ -209,22 +250,30 @@ def chunk_document_via_images(
 
     render_start = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages: list[tuple[int, bytes, str]] = []
+    pages: list[tuple[int, bytes, str, bool]] = []
     for page_num in range(len(doc)):
         page = doc[page_num]
         pix = page.get_pixmap(dpi=200)
         img_bytes = pix.tobytes("jpeg")
-        fallback_text = page.get_text("text")
-        pages.append((page_num, img_bytes, fallback_text))
+        extracted_text = page.get_text("text")
+        text_coverage = _page_text_coverage(page)
+        pages.append(
+            (
+                page_num,
+                img_bytes,
+                extracted_text,
+                extracted_text_is_usable(extracted_text, text_coverage),
+            )
+        )
     doc.close()
     print(
         f"timing file={file_path} stage=pdf_render pages={len(pages)} elapsed={time.perf_counter() - render_start:.3f}s",
         flush=True,
     )
 
-    def page_to_chunk(page_data: tuple[int, bytes, str]) -> Chunk:
+    def page_to_chunk(page_data: tuple[int, bytes, str, bool]) -> Chunk:
         page_start = time.perf_counter()
-        page_num, img_bytes, fallback_text = page_data
+        page_num, img_bytes, extracted_text, use_extracted_text = page_data
         image_key = _page_image_key(root_id, file_path, page_num)
         if s3_client and bucket:
             upload_start = time.perf_counter()
@@ -241,13 +290,18 @@ def chunk_document_via_images(
             )
 
         text_start = time.perf_counter()
-        if gemini_api_key:
+        if use_extracted_text:
+            text = extracted_text
+            source = "native_text"
+        elif gemini_api_key:
             text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
+            source = "gemini"
         else:
-            text = fallback_text
+            text = extracted_text
+            source = "native_fallback"
         print(
             f"timing file={file_path} page={page_num} stage=image_to_text "
-            f"chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
+            f"source={source} chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
             flush=True,
         )
 
@@ -293,6 +347,20 @@ def chunk_document_via_images(
         flush=True,
     )
     return chunks
+
+
+def _page_text_coverage(page) -> float:
+    page_area = max(float(page.rect.width * page.rect.height), 1.0)
+    text_area = 0.0
+    for block in page.get_text("blocks"):
+        if len(block) >= 7 and block[6] != 0:
+            continue
+        text = block[4] if len(block) >= 5 else ""
+        if not str(text).strip():
+            continue
+        x0, y0, x1, y1 = block[:4]
+        text_area += max(float(x1 - x0), 0.0) * max(float(y1 - y0), 0.0)
+    return min(text_area / page_area, 1.0)
 
 
 # ---------------------------------------------------------------------------

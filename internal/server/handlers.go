@@ -91,6 +91,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleRemoveMember)
 
 	// Platform admin
+	s.mux.HandleFunc("POST /admin/orgs", s.handleAdminProvisionOrg)
+	s.mux.HandleFunc("POST /admin/users", s.handleAdminProvisionUser)
+	s.mux.HandleFunc("PUT /admin/orgs/{orgId}/members/{userId}", s.handleAdminUpsertMember)
+	s.mux.HandleFunc("POST /admin/orgs/{orgId}/users/{userId}/api-keys", s.handleAdminCreateAPIKey)
+	s.mux.HandleFunc("POST /admin/orgs/{orgId}/roots", s.handleAdminCreateRoot)
 	s.mux.HandleFunc("DELETE /admin/roots/{id}", s.handleAdminDeleteRoot)
 	s.mux.HandleFunc("DELETE /admin/orgs/{id}", s.handleAdminDeleteOrg)
 	s.mux.HandleFunc("DELETE /admin/users/{id}", s.handleAdminDeleteUser)
@@ -161,6 +166,10 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "api_keys:write", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "api key write scope required"})
+		return
+	}
 
 	var req struct {
 		Name   string   `json:"name"`
@@ -174,7 +183,7 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		req.Name = "CLI Key"
 	}
 	if len(req.Scopes) == 0 {
-		req.Scopes = []string{"sync", "query"}
+		req.Scopes = []string{"sync", "query", "root:delete"}
 	}
 
 	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, req.Scopes)
@@ -194,6 +203,10 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "api_keys:read", "api_keys:write", "admin", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "api key read scope required"})
+		return
+	}
 	keys, err := s.db.ListAPIKeys(r.Context(), id.OrgID, id.UserID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -206,6 +219,10 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "api_keys:write", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "api key write scope required"})
 		return
 	}
 	keyID := r.PathValue("id")
@@ -254,6 +271,10 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
 		return
 	}
+	if !auth.HasScope(id, "org:admin", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required"})
+		return
+	}
 
 	var req struct {
 		UserID string `json:"user_id"`
@@ -276,6 +297,10 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
 		return
 	}
+	if !auth.HasScope(id, "org:admin", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required"})
+		return
+	}
 	userID := r.PathValue("userId")
 	if err := s.db.RemoveOrgMember(r.Context(), id.OrgID, userID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -287,6 +312,214 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // Platform admin
 // ---------------------------------------------------------------------------
+
+func (s *Server) handleAdminProvisionOrg(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+
+	var req struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		Slug       string `json:"slug"`
+		ExternalID string `json:"external_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.Slug = cleanSlug(req.Slug)
+	req.ExternalID = strings.TrimSpace(req.ExternalID)
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	if req.Slug == "" {
+		req.Slug = cleanSlug(req.Name)
+	}
+	if req.Slug == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "slug is required"})
+		return
+	}
+
+	org, err := s.db.ProvisionOrganization(r.Context(), strings.TrimSpace(req.ID), req.Name, req.Slug, req.ExternalID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, org)
+}
+
+func (s *Server) handleAdminProvisionUser(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+
+	var req struct {
+		ID         string `json:"id"`
+		Email      string `json:"email"`
+		Name       string `json:"name"`
+		AvatarURL  string `json:"avatar_url"`
+		Provider   string `json:"provider"`
+		ProviderID string `json:"provider_id"`
+		ExternalID string `json:"external_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	req.Name = strings.TrimSpace(req.Name)
+	req.Provider = strings.TrimSpace(req.Provider)
+	req.ProviderID = strings.TrimSpace(req.ProviderID)
+	req.ExternalID = strings.TrimSpace(req.ExternalID)
+	if req.Email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "email is required"})
+		return
+	}
+
+	user, err := s.db.ProvisionUser(r.Context(), strings.TrimSpace(req.ID), req.Email, req.Name, strings.TrimSpace(req.AvatarURL), req.Provider, req.ProviderID, req.ExternalID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
+func (s *Server) handleAdminUpsertMember(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+
+	orgID := r.PathValue("orgId")
+	userID := r.PathValue("userId")
+	var req struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	role, err := parseRole(req.Role, auth.RoleViewer)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		return
+	}
+	if _, err := s.db.GetUser(r.Context(), userID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+		return
+	}
+	if err := s.db.AddOrgMember(r.Context(), orgID, userID, role); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	member, err := s.db.GetOrgMember(r.Context(), orgID, userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, member)
+}
+
+func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+
+	orgID := r.PathValue("orgId")
+	userID := r.PathValue("userId")
+	var req struct {
+		Name   string   `json:"name"`
+		Scopes []string `json:"scopes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Name == "" {
+		req.Name = "provisioned-key"
+	}
+	if len(req.Scopes) == 0 {
+		req.Scopes = []string{"query"}
+	}
+	if _, err := s.db.GetOrgMember(r.Context(), orgID, userID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
+		return
+	}
+	rawKey, err := s.db.CreateAPIKey(r.Context(), orgID, userID, req.Name, req.Scopes)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"key":     rawKey,
+		"org_id":  orgID,
+		"user_id": userID,
+		"scopes":  req.Scopes,
+	})
+}
+
+func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+
+	orgID := r.PathValue("orgId")
+	var req struct {
+		Name        string `json:"name"`
+		SourcePath  string `json:"source_path"`
+		Scope       string `json:"scope"`
+		OwnerUserID string `json:"owner_user_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		return
+	}
+	scope, err := parseRootScope(req.Scope)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ownerUserID := strings.TrimSpace(req.OwnerUserID)
+	if scope == models.RootScopeUser {
+		if ownerUserID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner_user_id is required for user roots"})
+			return
+		}
+		if _, err := s.db.GetOrgMember(r.Context(), orgID, ownerUserID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be a member of the org"})
+			return
+		}
+	} else {
+		ownerUserID = ""
+	}
+
+	root, err := s.db.CreateRootWithScope(r.Context(), orgID, req.Name, req.SourcePath, scope, ownerUserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, root)
+}
 
 func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 	if !auth.IsAdmin(r.Context()) {
@@ -318,12 +551,13 @@ func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":             "deleted",
-		"org_id":             root.OrgID,
-		"root_id":            root.ID,
-		"name":               root.Name,
-		"turbopuffer_ns":     result.TurbopufferNamespace,
-		"s3_objects_deleted": result.S3ObjectsDeleted,
+		"status":                 "deleted",
+		"org_id":                 root.OrgID,
+		"root_id":                root.ID,
+		"name":                   root.Name,
+		"turbopuffer_ns":         result.TurbopufferNamespace,
+		"turbopuffer_namespaces": result.TurbopufferNamespaces,
+		"s3_objects_deleted":     result.S3ObjectsDeleted,
 	})
 }
 
@@ -353,7 +587,7 @@ func (s *Server) handleAdminDeleteOrg(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deletedObjects := 0
-	namespaces := make([]string, 0, len(roots))
+	namespaces := []string{}
 	for _, root := range roots {
 		result, err := s.deleteRootArtifacts(r.Context(), orgID, root.ID)
 		if err != nil {
@@ -361,7 +595,7 @@ func (s *Server) handleAdminDeleteOrg(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		deletedObjects += result.S3ObjectsDeleted
-		namespaces = append(namespaces, result.TurbopufferNamespace)
+		namespaces = append(namespaces, result.TurbopufferNamespaces...)
 	}
 	if err := s.db.DeleteOrganization(r.Context(), orgID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting org metadata: " + err.Error()})
@@ -397,31 +631,71 @@ func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "user has active sync jobs; wait for them to finish before deleting"})
 		return
 	}
+	roots, err := s.db.ListRootsOwnedByUser(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing user roots: " + err.Error()})
+		return
+	}
+	for _, root := range roots {
+		active, err := s.db.RootHasActiveSync(r.Context(), root.OrgID, root.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
+			return
+		}
+		if active {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "user owns roots with active sync jobs; wait for them to finish before deleting"})
+			return
+		}
+	}
+	deletedObjects := 0
+	namespaces := []string{}
+	for _, root := range roots {
+		result, err := s.deleteRootArtifacts(r.Context(), root.OrgID, root.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		deletedObjects += result.S3ObjectsDeleted
+		namespaces = append(namespaces, result.TurbopufferNamespaces...)
+		if err := s.db.DeleteRoot(r.Context(), root.OrgID, root.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting user root metadata: " + err.Error()})
+			return
+		}
+	}
 	if err := s.db.DeleteUser(r.Context(), userID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting user metadata: " + err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":  "deleted",
-		"user_id": user.ID,
-		"email":   user.Email,
+		"status":                 "deleted",
+		"user_id":                user.ID,
+		"email":                  user.Email,
+		"roots_deleted":          len(roots),
+		"turbopuffer_namespaces": namespaces,
+		"s3_objects_deleted":     deletedObjects,
 	})
 }
 
 // ---------------------------------------------------------------------------
-// Roots (org-scoped)
+// Roots
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "root:create", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
 		return
 	}
 
 	var req struct {
-		Name       string `json:"name"`
-		SourcePath string `json:"source_path"`
+		Name        string `json:"name"`
+		SourcePath  string `json:"source_path"`
+		Scope       string `json:"scope"`
+		OwnerUserID string `json:"owner_user_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -431,8 +705,34 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
+	scope, err := parseRootScope(req.Scope)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ownerUserID := strings.TrimSpace(req.OwnerUserID)
+	switch scope {
+	case models.RootScopeOrg:
+		if !auth.HasMinRole(id.Role, auth.RoleEditor) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required for org roots"})
+			return
+		}
+		ownerUserID = ""
+	case models.RootScopeUser:
+		if ownerUserID == "" {
+			ownerUserID = id.UserID
+		}
+		if ownerUserID != id.UserID && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required to create roots for another user"})
+			return
+		}
+		if _, err := s.db.GetOrgMember(r.Context(), id.OrgID, ownerUserID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be a member of the org"})
+			return
+		}
+	}
 
-	root, err := s.db.CreateRoot(r.Context(), id.OrgID, req.Name, req.SourcePath)
+	root, err := s.db.CreateRootWithScope(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -447,7 +747,11 @@ func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
-	roots, err := s.db.ListRoots(r.Context(), id.OrgID)
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
+		return
+	}
+	roots, err := s.db.ListAccessibleRoots(r.Context(), id.OrgID, id.UserID, id.Role)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -463,8 +767,12 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	rootID := r.PathValue("id")
 	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil {
+	if err != nil || !canReadRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
 		return
 	}
 	writeJSON(w, http.StatusOK, root)
@@ -472,14 +780,18 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "root:delete", "delete", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "root delete scope required"})
 		return
 	}
 
 	rootID := r.PathValue("id")
 	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil {
+	if err != nil || !canDeleteRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -504,29 +816,44 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":             "deleted",
-		"root_id":            root.ID,
-		"name":               root.Name,
-		"turbopuffer_ns":     result.TurbopufferNamespace,
-		"s3_objects_deleted": result.S3ObjectsDeleted,
+		"status":                 "deleted",
+		"root_id":                root.ID,
+		"name":                   root.Name,
+		"turbopuffer_ns":         result.TurbopufferNamespace,
+		"turbopuffer_namespaces": result.TurbopufferNamespaces,
+		"s3_objects_deleted":     result.S3ObjectsDeleted,
 	})
 }
 
 type rootArtifactDeleteResult struct {
-	TurbopufferNamespace string
-	S3ObjectsDeleted     int
+	TurbopufferNamespace  string
+	TurbopufferNamespaces []string
+	S3ObjectsDeleted      int
 }
 
 func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) (rootArtifactDeleteResult, error) {
-	result := rootArtifactDeleteResult{TurbopufferNamespace: tpNamespace(orgID, rootID)}
+	result := rootArtifactDeleteResult{}
 
 	generationIDs, err := s.db.ListSyncGenerationIDs(ctx, orgID, rootID)
 	if err != nil {
 		return result, fmt.Errorf("listing sync generations: %w", err)
 	}
+	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
+	if err != nil {
+		return result, fmt.Errorf("listing root index namespaces: %w", err)
+	}
+	for _, ns := range activeRootIndexNamespaces(indexNamespaces) {
+		result.TurbopufferNamespaces = append(result.TurbopufferNamespaces, ns.Namespace)
+	}
+	if len(result.TurbopufferNamespaces) == 0 {
+		result.TurbopufferNamespaces = []string{tpNamespace(orgID, rootID)}
+	}
+	result.TurbopufferNamespace = result.TurbopufferNamespaces[0]
 	if s.tp != nil {
-		if err := s.tp.DeleteNamespace(result.TurbopufferNamespace); err != nil {
-			return result, fmt.Errorf("deleting turbopuffer namespace: %w", err)
+		for _, namespace := range result.TurbopufferNamespaces {
+			if err := s.tp.DeleteNamespace(namespace); err != nil {
+				return result, fmt.Errorf("deleting turbopuffer namespace %s: %w", namespace, err)
+			}
 		}
 	}
 
@@ -554,8 +881,12 @@ func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) 
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
 		return
 	}
 
@@ -571,8 +902,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify root belongs to org
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canWriteRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -597,13 +928,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
 		return
 	}
 
 	rootID := r.PathValue("id")
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canWriteRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -658,10 +994,14 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
+		return
+	}
 	rootID := r.PathValue("id")
 
-	// Verify root belongs to org
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -677,13 +1017,18 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 // handleSyncInit is kept for old clients. Namespace cloning is disabled.
 func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
 		return
 	}
 
 	rootID := r.PathValue("id")
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canWriteRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -696,16 +1041,19 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleEditor) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "editor role required"})
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
 		return
 	}
 
 	rootID := r.PathValue("id")
 
-	// Verify root belongs to org
 	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil {
+	if err != nil || !canWriteRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -974,7 +1322,16 @@ func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
+		return
+	}
 	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
 
 	jobs, err := s.db.ListSyncJobs(r.Context(), id.OrgID, rootID, 20)
 	if err != nil {
@@ -994,7 +1351,16 @@ func (s *Server) handleCreateACL(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
 		return
 	}
+	if !auth.HasScope(id, "acl:write", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "ACL write scope required"})
+		return
+	}
 	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
 
 	var req struct {
 		PathPrefix string `json:"path_prefix"`
@@ -1036,7 +1402,16 @@ func (s *Server) handleListACLs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
 		return
 	}
+	if !auth.HasScope(id, "acl:read", "acl:write", "admin", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "ACL read scope required"})
+		return
+	}
 	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
 
 	acls, err := s.db.ListACLs(r.Context(), id.OrgID, rootID)
 	if err != nil {
@@ -1050,6 +1425,16 @@ func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+	if !auth.HasScope(id, "acl:write", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "ACL write scope required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
 	aclID := r.PathValue("aclId")
@@ -1070,8 +1455,8 @@ func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
 func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
 	if err != nil || len(acls) == 0 {
-		// No ACLs configured → default: editors+ can write
-		return auth.HasMinRole(id.Role, auth.RoleEditor)
+		root, rootErr := s.db.GetRoot(ctx, id.OrgID, rootID)
+		return rootErr == nil && canWriteRoot(id, root)
 	}
 
 	return checkPermission(acls, filePath, "write")
@@ -1080,10 +1465,11 @@ func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, f
 func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
 	if err != nil || len(acls) == 0 {
-		if auth.HasMinRole(id.Role, auth.RoleEditor) {
+		root, rootErr := s.db.GetRoot(ctx, id.OrgID, rootID)
+		if rootErr == nil && canWriteRoot(id, root) {
 			return nil
 		}
-		return fmt.Errorf("editor role required")
+		return fmt.Errorf("write permission required")
 	}
 
 	canWrite := func(filePath string) bool {
@@ -1569,6 +1955,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "query", "read") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query scope required"})
+		return
+	}
 
 	var req models.QueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1592,13 +1982,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	queryLimit := filteredQueryLimit(req.TopK)
 
-	// Verify root belongs to org
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, req.RootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, req.RootID)
+	if err != nil || !canReadRoot(id, root) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
 
-	ns := tpNamespace(id.OrgID, req.RootID)
+	indexNamespaces, err := s.db.ListRootIndexNamespaces(r.Context(), id.OrgID, req.RootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing root index namespaces: " + err.Error()})
+		return
+	}
 	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	var filters []any
@@ -1621,12 +2015,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	deniedPrefixes := s.buildACLFilter(r.Context(), id, req.RootID)
 
 	var rows []map[string]any
-	var err error
+	var queryErr error
 
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = s.tp.Query(ns, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
+		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
+		})
 
 	case "vector":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1635,7 +2031,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = s.tp.Query(ns, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
+		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
+		})
 
 	case "hybrid":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1643,15 +2041,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
 			return
 		}
-		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, queryLimit, tpAndFilter(filters))
+		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+			return s.tp.HybridSearch(namespace, req.Query, embedding, queryLimit, tpAndFilter(filters))
+		})
 
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
 		return
 	}
 
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	if queryErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": queryErr.Error()})
 		return
 	}
 
@@ -1671,8 +2071,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Content proof filtering: only return results for files the user can prove they have
-	filteredRows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, req.RootID, filteredRows)
+	// Content proof filtering is only needed for user-owned roots. Org roots are
+	// shared by membership plus ACL; applying per-user proofs there would hide
+	// shared results from members who did not run the sync.
+	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		filteredRows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, req.RootID, filteredRows)
+	}
 	if len(filteredRows) > req.TopK {
 		filteredRows = filteredRows[:req.TopK]
 	}
@@ -1714,6 +2118,98 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func parseRole(raw string, defaultRole auth.Role) (auth.Role, error) {
+	role := auth.Role(strings.TrimSpace(raw))
+	if role == "" {
+		role = defaultRole
+	}
+	switch role {
+	case auth.RoleOwner, auth.RoleAdmin, auth.RoleEditor, auth.RoleViewer:
+		return role, nil
+	default:
+		return "", fmt.Errorf("role must be owner, admin, editor, or viewer")
+	}
+}
+
+func parseRootScope(raw string) (string, error) {
+	scope := strings.TrimSpace(raw)
+	if scope == "" {
+		scope = models.RootScopeOrg
+	}
+	switch scope {
+	case models.RootScopeOrg, models.RootScopeUser:
+		return scope, nil
+	default:
+		return "", fmt.Errorf("scope must be org or user")
+	}
+}
+
+func cleanSlug(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	var b strings.Builder
+	previousDash := false
+	for _, r := range raw {
+		writeDash := false
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			previousDash = false
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+			previousDash = false
+		case r == '-' || r == '_' || r == ' ' || r == '.':
+			writeDash = true
+		}
+		if writeDash && !previousDash && b.Len() > 0 {
+			b.WriteByte('-')
+			previousDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func canReadRoot(id *auth.Identity, root *models.RootMetadata) bool {
+	if id == nil || root == nil || id.OrgID != root.OrgID {
+		return false
+	}
+	switch root.Scope {
+	case "", models.RootScopeOrg:
+		return true
+	case models.RootScopeUser:
+		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
+	default:
+		return false
+	}
+}
+
+func canWriteRoot(id *auth.Identity, root *models.RootMetadata) bool {
+	if !canReadRoot(id, root) {
+		return false
+	}
+	switch root.Scope {
+	case "", models.RootScopeOrg:
+		return auth.HasMinRole(id.Role, auth.RoleEditor)
+	case models.RootScopeUser:
+		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
+	default:
+		return false
+	}
+}
+
+func canDeleteRoot(id *auth.Identity, root *models.RootMetadata) bool {
+	if !canReadRoot(id, root) {
+		return false
+	}
+	switch root.Scope {
+	case "", models.RootScopeOrg:
+		return auth.HasMinRole(id.Role, auth.RoleAdmin)
+	case models.RootScopeUser:
+		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
+	default:
+		return false
+	}
+}
 
 func detectFileType(path string) string {
 	ext := strings.ToLower(filepath.Ext(path))

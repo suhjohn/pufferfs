@@ -29,10 +29,11 @@ func MakeGenerationChunkID(rootID, generationID, filePath string, chunkIndex int
 
 // Organization represents a tenant.
 type Organization struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Slug      string    `json:"slug"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Slug       string    `json:"slug"`
+	ExternalID string    `json:"external_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -41,12 +42,13 @@ type Organization struct {
 
 // User represents an authenticated user.
 type User struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	Name      string    `json:"name"`
-	AvatarURL string    `json:"avatar_url"`
-	Provider  string    `json:"provider"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	Email      string    `json:"email"`
+	Name       string    `json:"name"`
+	AvatarURL  string    `json:"avatar_url"`
+	Provider   string    `json:"provider"`
+	ExternalID string    `json:"external_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // OrgMember is a user's membership in an org.
@@ -82,11 +84,30 @@ type RootMetadata struct {
 	OrgID                string    `json:"org_id" db:"org_id"`
 	Name                 string    `json:"name" db:"name"`
 	SourcePath           string    `json:"source_path" db:"source_path"`
+	Scope                string    `json:"scope" db:"scope"`
+	OwnerUserID          string    `json:"owner_user_id,omitempty" db:"owner_user_id"`
 	VisibleGenerationID  string    `json:"visible_generation_id" db:"visible_generation_id"`
 	VisibleGenerationSeq int64     `json:"visible_generation_seq" db:"visible_generation_seq"`
 	CreatedAt            time.Time `json:"created_at" db:"created_at"`
 	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`
 }
+
+// RootIndexNamespace maps a logical root to one physical Turbopuffer namespace shard.
+type RootIndexNamespace struct {
+	ID         string     `json:"id" db:"id"`
+	OrgID      string     `json:"org_id" db:"org_id"`
+	RootID     string     `json:"root_id" db:"root_id"`
+	Namespace  string     `json:"namespace" db:"namespace"`
+	ShardIndex int        `json:"shard_index" db:"shard_index"`
+	ShardCount int        `json:"shard_count" db:"shard_count"`
+	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
+	RetiredAt  *time.Time `json:"retired_at,omitempty" db:"retired_at"`
+}
+
+const (
+	RootScopeOrg  = "org"
+	RootScopeUser = "user"
+)
 
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {

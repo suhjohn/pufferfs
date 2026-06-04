@@ -97,8 +97,11 @@ func (db *DB) migrateFallback() error {
 			id         TEXT PRIMARY KEY,
 			name       TEXT NOT NULL,
 			slug       TEXT NOT NULL UNIQUE,
+			external_id TEXT,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE organizations ADD COLUMN IF NOT EXISTS external_id TEXT;
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_external_id ON organizations(external_id) WHERE external_id IS NOT NULL;
 
 		CREATE TABLE IF NOT EXISTS users (
 			id          TEXT PRIMARY KEY,
@@ -107,8 +110,11 @@ func (db *DB) migrateFallback() error {
 			avatar_url  TEXT NOT NULL DEFAULT '',
 			provider    TEXT NOT NULL DEFAULT 'google',
 			provider_id TEXT NOT NULL DEFAULT '',
+			external_id TEXT,
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS external_id TEXT;
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id ON users(external_id) WHERE external_id IS NOT NULL;
 
 		CREATE TABLE IF NOT EXISTS org_members (
 			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -129,19 +135,49 @@ func (db *DB) migrateFallback() error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 
-		CREATE TABLE IF NOT EXISTS roots (
-			id          TEXT PRIMARY KEY,
-			org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
+			CREATE TABLE IF NOT EXISTS roots (
+				id          TEXT PRIMARY KEY,
+				org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
 			name        TEXT NOT NULL,
 			source_path TEXT NOT NULL,
+			scope       TEXT NOT NULL DEFAULT 'org',
+			owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
 			simhash     TEXT NOT NULL DEFAULT '',
 			visible_generation_id TEXT NOT NULL DEFAULT '',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS visible_generation_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE roots ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'org';
+			ALTER TABLE roots ADD COLUMN IF NOT EXISTS owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
+			CREATE INDEX IF NOT EXISTS idx_roots_owner ON roots(owner_user_id) WHERE owner_user_id IS NOT NULL;
 
-		CREATE TABLE IF NOT EXISTS root_states (
+			CREATE TABLE IF NOT EXISTS root_index_namespaces (
+				id          TEXT PRIMARY KEY,
+				org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+				root_id     TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+				namespace   TEXT NOT NULL UNIQUE,
+				shard_index INT NOT NULL,
+				shard_count INT NOT NULL,
+				created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				retired_at  TIMESTAMPTZ,
+				UNIQUE(root_id, shard_index)
+			);
+			CREATE INDEX IF NOT EXISTS idx_root_index_namespaces_root ON root_index_namespaces(root_id, shard_index);
+			CREATE INDEX IF NOT EXISTS idx_root_index_namespaces_org ON root_index_namespaces(org_id);
+			INSERT INTO root_index_namespaces (id, org_id, root_id, namespace, shard_index, shard_count)
+			SELECT
+				'rin_' || substr(md5(r.org_id || ':' || r.id || ':0'), 1, 24),
+				r.org_id,
+				r.id,
+				'org-' || r.org_id || '-root-' || r.id,
+				0,
+				1
+			FROM roots r
+			WHERE r.org_id IS NOT NULL
+			ON CONFLICT (root_id, shard_index) DO NOTHING;
+
+			CREATE TABLE IF NOT EXISTS root_states (
 			root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
 			state      JSONB NOT NULL DEFAULT '{}',
 			state_ref  TEXT NOT NULL DEFAULT '',
@@ -248,12 +284,57 @@ func (db *DB) CreateOrganization(ctx context.Context, name, slug string) (*model
 func (db *DB) GetOrganization(ctx context.Context, id string) (*models.Organization, error) {
 	org := &models.Organization{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, name, slug, created_at FROM organizations WHERE id = $1`, id,
-	).Scan(&org.ID, &org.Name, &org.Slug, &org.CreatedAt)
+		`SELECT id, name, slug, COALESCE(external_id, ''), created_at FROM organizations WHERE id = $1`, id,
+	).Scan(&org.ID, &org.Name, &org.Slug, &org.ExternalID, &org.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return org, nil
+}
+
+func (db *DB) ProvisionOrganization(ctx context.Context, id, name, slug, externalID string) (*models.Organization, error) {
+	if id == "" {
+		id = uuid.New().String()
+	}
+
+	var existingID string
+	switch {
+	case externalID != "":
+		err := db.pool.QueryRow(ctx, `SELECT id FROM organizations WHERE external_id = $1`, externalID).Scan(&existingID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	case slug != "":
+		err := db.pool.QueryRow(ctx, `SELECT id FROM organizations WHERE slug = $1`, slug).Scan(&existingID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	if existingID != "" {
+		_, err := db.pool.Exec(ctx,
+			`UPDATE organizations
+			 SET name = $1,
+			     slug = $2,
+			     external_id = COALESCE(NULLIF($3, ''), external_id)
+			 WHERE id = $4`,
+			name, slug, externalID, existingID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return db.GetOrganization(ctx, existingID)
+	}
+
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO organizations (id, name, slug, external_id, created_at)
+		 VALUES ($1, $2, $3, NULLIF($4, ''), NOW())`,
+		id, name, slug, externalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return db.GetOrganization(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -323,12 +404,63 @@ func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider strin
 func (db *DB) GetUser(ctx context.Context, id string) (*models.User, error) {
 	u := &models.User{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, email, name, avatar_url, provider, created_at FROM users WHERE id = $1`, id,
-	).Scan(&u.ID, &u.Email, &u.Name, &u.AvatarURL, &u.Provider, &u.CreatedAt)
+		`SELECT id, email, name, avatar_url, provider, COALESCE(external_id, ''), created_at FROM users WHERE id = $1`, id,
+	).Scan(&u.ID, &u.Email, &u.Name, &u.AvatarURL, &u.Provider, &u.ExternalID, &u.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	return u, nil
+}
+
+func (db *DB) ProvisionUser(ctx context.Context, id, email, name, avatarURL, provider, providerID, externalID string) (*models.User, error) {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	if provider == "" {
+		provider = "admin"
+	}
+
+	var existingID string
+	switch {
+	case externalID != "":
+		err := db.pool.QueryRow(ctx, `SELECT id FROM users WHERE external_id = $1`, externalID).Scan(&existingID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	case email != "":
+		err := db.pool.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, email).Scan(&existingID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	if existingID != "" {
+		_, err := db.pool.Exec(ctx,
+			`UPDATE users
+			 SET email = $1,
+			     name = $2,
+			     avatar_url = $3,
+			     provider = $4,
+			     provider_id = $5,
+			     external_id = COALESCE(NULLIF($6, ''), external_id)
+			 WHERE id = $7`,
+			email, name, avatarURL, provider, providerID, externalID, existingID,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return db.GetUser(ctx, existingID)
+	}
+
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO users (id, email, name, avatar_url, provider, provider_id, external_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), NOW())`,
+		id, email, name, avatarURL, provider, providerID, externalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return db.GetUser(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,14 +487,15 @@ func (db *DB) CreateAPIKey(ctx context.Context, orgID, userID, name string, scop
 // ResolveAPIKey looks up an API key by its hash and returns the associated identity.
 func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity, error) {
 	var orgID, userID, role string
+	var scopes []string
 	err := db.pool.QueryRow(ctx,
-		`SELECT ak.org_id, ak.user_id, om.role
+		`SELECT ak.org_id, ak.user_id, om.role, ak.scopes
 		 FROM api_keys ak
 		 JOIN org_members om ON om.org_id = ak.org_id AND om.user_id = ak.user_id
 		 WHERE ak.key_hash = $1
 		   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`,
 		keyHash,
-	).Scan(&orgID, &userID, &role)
+	).Scan(&orgID, &userID, &role, &scopes)
 	if err != nil {
 		return nil, err
 	}
@@ -375,6 +508,7 @@ func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity
 		OrgID:  orgID,
 		Role:   auth.Role(role),
 		Email:  email,
+		Scopes: scopes,
 	}, nil
 }
 
@@ -424,6 +558,20 @@ func (db *DB) AddOrgMember(ctx context.Context, orgID, userID string, role auth.
 	return err
 }
 
+func (db *DB) GetOrgMember(ctx context.Context, orgID, userID string) (*models.OrgMember, error) {
+	var m models.OrgMember
+	err := db.pool.QueryRow(ctx,
+		`SELECT u.id, u.email, u.name, u.avatar_url, om.role, om.joined_at
+		 FROM org_members om JOIN users u ON u.id = om.user_id
+		 WHERE om.org_id = $1 AND om.user_id = $2`,
+		orgID, userID,
+	).Scan(&m.UserID, &m.Email, &m.Name, &m.AvatarURL, &m.Role, &m.JoinedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
 // ListOrgMembers lists all members of an org.
 func (db *DB) ListOrgMembers(ctx context.Context, orgID string) ([]models.OrgMember, error) {
 	rows, err := db.pool.Query(ctx,
@@ -457,27 +605,67 @@ func (db *DB) RemoveOrgMember(ctx context.Context, orgID, userID string) error {
 }
 
 // ---------------------------------------------------------------------------
-// Roots (org-scoped)
+// Roots
 // ---------------------------------------------------------------------------
 
 // CreateRoot creates a new root metadata entry scoped to an org.
 func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*models.RootMetadata, error) {
+	return db.CreateRootWithScope(ctx, orgID, name, sourcePath, models.RootScopeOrg, "")
+}
+
+func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string) (*models.RootMetadata, error) {
+	if scope == "" {
+		scope = models.RootScopeOrg
+	}
+	if scope == models.RootScopeOrg {
+		ownerUserID = ""
+	}
 	root := &models.RootMetadata{
 		ID:                   uuid.New().String(),
 		OrgID:                orgID,
 		Name:                 name,
 		SourcePath:           sourcePath,
+		Scope:                scope,
+		OwnerUserID:          ownerUserID,
 		VisibleGenerationID:  "",
 		VisibleGenerationSeq: 0,
 		CreatedAt:            time.Now(),
 		UpdatedAt:            time.Now(),
 	}
 
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO roots (id, org_id, name, source_path, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		root.ID, root.OrgID, root.Name, root.SourcePath, root.CreatedAt, root.UpdatedAt,
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO roots (id, org_id, name, source_path, scope, owner_user_id, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8)`,
+		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.CreatedAt, root.UpdatedAt,
 	)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.insertRootIndexNamespacesTx(ctx, tx, root, rootIndexNamespaceShardCount()); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	tx = nil
+	return root, nil
+}
+
+const rootSelectColumns = `r.id, r.org_id, r.name, r.source_path, r.scope, COALESCE(r.owner_user_id, ''), r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at`
+
+func scanRoot(row pgx.Row) (*models.RootMetadata, error) {
+	root := &models.RootMetadata{}
+	err := row.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope, &root.OwnerUserID, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -486,52 +674,37 @@ func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*
 
 // GetRoot retrieves a root by ID, scoped to an org.
 func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetadata, error) {
-	root := &models.RootMetadata{}
-	err := db.pool.QueryRow(ctx,
-		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+	return scanRoot(db.pool.QueryRow(ctx,
+		`SELECT `+rootSelectColumns+`
 		 FROM roots r
 		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.id = $1 AND r.org_id = $2`, id, orgID,
-	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return root, nil
+	))
 }
 
 func (db *DB) GetRootAnyOrg(ctx context.Context, id string) (*models.RootMetadata, error) {
-	root := &models.RootMetadata{}
-	err := db.pool.QueryRow(ctx,
-		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+	return scanRoot(db.pool.QueryRow(ctx,
+		`SELECT `+rootSelectColumns+`
 		 FROM roots r
 		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.id = $1`, id,
-	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return root, nil
+	))
 }
 
 // GetRootByName retrieves a root by name, scoped to an org.
 func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.RootMetadata, error) {
-	root := &models.RootMetadata{}
-	err := db.pool.QueryRow(ctx,
-		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+	return scanRoot(db.pool.QueryRow(ctx,
+		`SELECT `+rootSelectColumns+`
 		 FROM roots r
 		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.name = $1 AND r.org_id = $2`, name, orgID,
-	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	return root, nil
+	))
 }
 
 // ListRoots returns all roots for an org.
 func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadata, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+		`SELECT `+rootSelectColumns+`
 		 FROM roots r
 		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.org_id = $1 ORDER BY r.created_at DESC`, orgID,
@@ -544,12 +717,69 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
 	}
 	return roots, nil
+}
+
+func (db *DB) ListAccessibleRoots(ctx context.Context, orgID, userID string, role auth.Role) ([]models.RootMetadata, error) {
+	where := `r.org_id = $1 AND (r.scope = 'org' OR r.owner_user_id = $2`
+	args := []any{orgID, userID}
+	if auth.HasMinRole(role, auth.RoleAdmin) {
+		where += ` OR r.scope = 'user'`
+	}
+	where += `)`
+
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+rootSelectColumns+`
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE `+where+`
+		 ORDER BY r.created_at DESC`,
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var roots []models.RootMetadata
+	for rows.Next() {
+		var r models.RootMetadata
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		roots = append(roots, r)
+	}
+	return roots, rows.Err()
+}
+
+func (db *DB) ListRootsOwnedByUser(ctx context.Context, userID string) ([]models.RootMetadata, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+rootSelectColumns+`
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE r.owner_user_id = $1
+		 ORDER BY r.created_at DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var roots []models.RootMetadata
+	for rows.Next() {
+		var r models.RootMetadata
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		roots = append(roots, r)
+	}
+	return roots, rows.Err()
 }
 
 func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
@@ -562,6 +792,112 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 	if tag.RowsAffected() == 0 {
 		return pgx.ErrNoRows
 	}
+	return nil
+}
+
+func (db *DB) insertRootIndexNamespacesTx(ctx context.Context, tx pgx.Tx, root *models.RootMetadata, shardCount int) error {
+	if shardCount < 1 {
+		shardCount = defaultRootIndexNamespaceShards
+	}
+	if shardCount > maxRootIndexNamespaceShards {
+		shardCount = maxRootIndexNamespaceShards
+	}
+	for shardIndex := 0; shardIndex < shardCount; shardIndex++ {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO root_index_namespaces (id, org_id, root_id, namespace, shard_index, shard_count, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			uuid.NewString(), root.OrgID, root.ID, rootIndexNamespaceName(root.OrgID, root.ID, shardIndex), shardIndex, shardCount, root.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const rootIndexNamespaceSelectColumns = `id, org_id, root_id, namespace, shard_index, shard_count, created_at, retired_at`
+
+func scanRootIndexNamespaces(rows pgx.Rows) ([]models.RootIndexNamespace, error) {
+	defer rows.Close()
+	var namespaces []models.RootIndexNamespace
+	for rows.Next() {
+		var ns models.RootIndexNamespace
+		if err := rows.Scan(&ns.ID, &ns.OrgID, &ns.RootID, &ns.Namespace, &ns.ShardIndex, &ns.ShardCount, &ns.CreatedAt, &ns.RetiredAt); err != nil {
+			return nil, err
+		}
+		namespaces = append(namespaces, ns)
+	}
+	return namespaces, rows.Err()
+}
+
+func (db *DB) listRootIndexNamespaces(ctx context.Context, orgID, rootID string) ([]models.RootIndexNamespace, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT `+rootIndexNamespaceSelectColumns+`
+		 FROM root_index_namespaces
+		 WHERE org_id = $1 AND root_id = $2 AND retired_at IS NULL
+		 ORDER BY shard_index`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return scanRootIndexNamespaces(rows)
+}
+
+func (db *DB) ListRootIndexNamespaces(ctx context.Context, orgID, rootID string) ([]models.RootIndexNamespace, error) {
+	namespaces, err := db.listRootIndexNamespaces(ctx, orgID, rootID)
+	if err != nil {
+		return nil, err
+	}
+	if len(namespaces) > 0 {
+		return namespaces, nil
+	}
+	if err := db.EnsureRootIndexNamespaces(ctx, orgID, rootID); err != nil {
+		return nil, err
+	}
+	return db.listRootIndexNamespaces(ctx, orgID, rootID)
+}
+
+func (db *DB) EnsureRootIndexNamespaces(ctx context.Context, orgID, rootID string) error {
+	namespaces, err := db.listRootIndexNamespaces(ctx, orgID, rootID)
+	if err != nil {
+		return err
+	}
+	if len(namespaces) > 0 {
+		return nil
+	}
+
+	root, err := db.GetRoot(ctx, orgID, rootID)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	var existing int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM root_index_namespaces WHERE org_id = $1 AND root_id = $2 AND retired_at IS NULL`,
+		orgID, rootID,
+	).Scan(&existing); err != nil {
+		return err
+	}
+	if existing == 0 {
+		if err := db.insertRootIndexNamespacesTx(ctx, tx, root, rootIndexNamespaceShardCount()); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	tx = nil
 	return nil
 }
 

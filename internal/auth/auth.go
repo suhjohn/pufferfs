@@ -29,6 +29,7 @@ type Identity struct {
 	OrgID  string
 	Role   Role
 	Email  string
+	Scopes []string
 }
 
 type contextKey string
@@ -54,6 +55,31 @@ func IsAdmin(ctx context.Context) bool {
 
 func WithAdmin(ctx context.Context) context.Context {
 	return context.WithValue(ctx, adminKey, true)
+}
+
+// HasScope reports whether an identity is allowed to perform an API-key scoped
+// action. JWT identities and legacy keys with no scopes are treated as
+// unrestricted; scoped API keys must include the exact scope, an alias, or "*".
+func HasScope(id *Identity, required string, aliases ...string) bool {
+	if id == nil {
+		return false
+	}
+	if len(id.Scopes) == 0 {
+		return true
+	}
+	allowed := map[string]struct{}{
+		required: {},
+		"*":      {},
+	}
+	for _, alias := range aliases {
+		allowed[alias] = struct{}{}
+	}
+	for _, scope := range id.Scopes {
+		if _, ok := allowed[scope]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // JWTClaims are the custom claims in a PufferFs JWT.

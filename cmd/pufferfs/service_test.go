@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,6 +22,52 @@ func TestSanitizeServiceName(t *testing.T) {
 		if got := sanitizeServiceName(input); got != want {
 			t.Fatalf("sanitizeServiceName(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestServiceCommandIncludesLifecycleCommands(t *testing.T) {
+	cmd := serviceCmd()
+	want := map[string]bool{
+		"install":   true,
+		"start":     true,
+		"restart":   true,
+		"stop":      true,
+		"status":    true,
+		"logs":      true,
+		"uninstall": true,
+	}
+	for _, child := range cmd.Commands() {
+		use := strings.Fields(child.Use)[0]
+		delete(want, use)
+	}
+	if len(want) != 0 {
+		t.Fatalf("service command missing subcommands: %#v", want)
+	}
+}
+
+func TestServiceActionCmdSanitizesName(t *testing.T) {
+	var got string
+	cmd := serviceActionCmd("test", "test service action", func(name string) error {
+		got = name
+		return nil
+	})
+	cmd.SetArgs([]string{" Team / Project "})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute action: %v", err)
+	}
+	if got != "team-project" {
+		t.Fatalf("sanitized service name = %q, want team-project", got)
+	}
+}
+
+func TestServiceActionCmdReturnsActionError(t *testing.T) {
+	wantErr := errors.New("boom")
+	cmd := serviceActionCmd("test", "test service action", func(name string) error {
+		return wantErr
+	})
+	cmd.SetArgs([]string{"repo"})
+	if err := cmd.Execute(); !errors.Is(err, wantErr) {
+		t.Fatalf("execute error = %v, want %v", err, wantErr)
 	}
 }
 
