@@ -499,6 +499,20 @@ func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetada
 	return root, nil
 }
 
+func (db *DB) GetRootAnyOrg(ctx context.Context, id string) (*models.RootMetadata, error) {
+	root := &models.RootMetadata{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE r.id = $1`, id,
+	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
 // GetRootByName retrieves a root by name, scoped to an org.
 func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
@@ -551,6 +565,17 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 	return nil
 }
 
+func (db *DB) DeleteOrganization(ctx context.Context, orgID string) error {
+	tag, err := db.pool.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, orgID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
 func (db *DB) RootHasActiveSync(ctx context.Context, orgID, rootID string) (bool, error) {
 	var exists bool
 	err := db.pool.QueryRow(ctx,
@@ -564,6 +589,62 @@ func (db *DB) RootHasActiveSync(ctx context.Context, orgID, rootID string) (bool
 		orgID, rootID,
 	).Scan(&exists)
 	return exists, err
+}
+
+func (db *DB) OrgHasActiveSync(ctx context.Context, orgID string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_generations
+			 WHERE org_id = $1 AND status = 'building'
+			UNION ALL
+			SELECT 1 FROM sync_jobs
+			 WHERE org_id = $1 AND status NOT IN ('completed', 'failed')
+		)`,
+		orgID,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (db *DB) UserHasActiveSync(ctx context.Context, userID string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_jobs
+			 WHERE user_id = $1 AND status NOT IN ('completed', 'failed')
+		)`,
+		userID,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (db *DB) DeleteUser(ctx context.Context, userID string) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM api_keys WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM content_proofs WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM org_members WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM sync_jobs WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return tx.Commit(ctx)
 }
 
 func (db *DB) ListSyncGenerationIDs(ctx context.Context, orgID, rootID string) ([]string, error) {

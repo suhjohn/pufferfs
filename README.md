@@ -86,9 +86,30 @@ export MODAL_QUERY_EMBED_ENDPOINT="https://..."
 export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
 export MODAL_EMBED_SHARD_ENDPOINT="https://..."
 export MODAL_INDEX_SHARD_ENDPOINT="https://..."
+# Optional platform admin key for /admin/* APIs.
+export PUFFERFS_ADMIN_KEY="..."
 
 go run ./cmd/server
 ```
+
+### Platform admin APIs
+
+When `PUFFERFS_ADMIN_KEY` or `PUFFERFS_ADMIN_KEY_HASH` is configured, PufferFS
+accepts that key on `/admin/*` routes:
+
+```bash
+curl -X DELETE "$PUFFERFS_SERVER_URL/admin/roots/$ROOT_ID" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY"
+
+curl -X DELETE "$PUFFERFS_SERVER_URL/admin/orgs/$ORG_ID" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY"
+
+curl -X DELETE "$PUFFERFS_SERVER_URL/admin/users/$USER_ID" \
+  -H "Authorization: Bearer $PUFFERFS_ADMIN_KEY"
+```
+
+Admin root/org deletion removes PufferFS metadata, storage artifacts, and
+Turbopuffer namespaces. It does not delete original source files.
 
 ### Queue-backed sync workers
 

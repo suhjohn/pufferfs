@@ -90,6 +90,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /org/members", s.handleAddMember)
 	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleRemoveMember)
 
+	// Platform admin
+	s.mux.HandleFunc("DELETE /admin/roots/{id}", s.handleAdminDeleteRoot)
+	s.mux.HandleFunc("DELETE /admin/orgs/{id}", s.handleAdminDeleteOrg)
+	s.mux.HandleFunc("DELETE /admin/users/{id}", s.handleAdminDeleteUser)
+
 	// Roots (org-scoped)
 	s.mux.HandleFunc("POST /roots", s.handleCreateRoot)
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
@@ -179,8 +184,7 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"key":  rawKey,
-		"note": "Store this key securely. It will not be shown again.",
+		"key": rawKey,
 	})
 }
 
@@ -281,6 +285,130 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Platform admin
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRootAnyOrg(r.Context(), rootID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	active, err := s.db.RootHasActiveSync(r.Context(), root.OrgID, root.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
+		return
+	}
+	if active {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "root has active sync jobs; wait for them to finish before deleting"})
+		return
+	}
+	result, err := s.deleteRootArtifacts(r.Context(), root.OrgID, root.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.db.DeleteRoot(r.Context(), root.OrgID, root.ID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting root metadata: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":             "deleted",
+		"org_id":             root.OrgID,
+		"root_id":            root.ID,
+		"name":               root.Name,
+		"turbopuffer_ns":     result.TurbopufferNamespace,
+		"s3_objects_deleted": result.S3ObjectsDeleted,
+	})
+}
+
+func (s *Server) handleAdminDeleteOrg(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("id")
+	org, err := s.db.GetOrganization(r.Context(), orgID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		return
+	}
+	active, err := s.db.OrgHasActiveSync(r.Context(), orgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
+		return
+	}
+	if active {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "org has active sync jobs; wait for them to finish before deleting"})
+		return
+	}
+	roots, err := s.db.ListRoots(r.Context(), orgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing roots: " + err.Error()})
+		return
+	}
+	deletedObjects := 0
+	namespaces := make([]string, 0, len(roots))
+	for _, root := range roots {
+		result, err := s.deleteRootArtifacts(r.Context(), orgID, root.ID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		deletedObjects += result.S3ObjectsDeleted
+		namespaces = append(namespaces, result.TurbopufferNamespace)
+	}
+	if err := s.db.DeleteOrganization(r.Context(), orgID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting org metadata: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":                 "deleted",
+		"org_id":                 org.ID,
+		"name":                   org.Name,
+		"roots_deleted":          len(roots),
+		"turbopuffer_namespaces": namespaces,
+		"s3_objects_deleted":     deletedObjects,
+	})
+}
+
+func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	userID := r.PathValue("id")
+	user, err := s.db.GetUser(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
+		return
+	}
+	active, err := s.db.UserHasActiveSync(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
+		return
+	}
+	if active {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "user has active sync jobs; wait for them to finish before deleting"})
+		return
+	}
+	if err := s.db.DeleteUser(r.Context(), userID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting user metadata: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "deleted",
+		"user_id": user.ID,
+		"email":   user.Email,
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Roots (org-scoped)
 // ---------------------------------------------------------------------------
 
@@ -364,36 +492,10 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "root has active sync jobs; wait for them to finish before deleting"})
 		return
 	}
-
-	generationIDs, err := s.db.ListSyncGenerationIDs(r.Context(), id.OrgID, rootID)
+	result, err := s.deleteRootArtifacts(r.Context(), id.OrgID, rootID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing sync generations: " + err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
-	}
-
-	ns := tpNamespace(id.OrgID, rootID)
-	if err := s.tp.DeleteNamespace(ns); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting turbopuffer namespace: " + err.Error()})
-		return
-	}
-
-	prefixes := []string{
-		fmt.Sprintf("files/%s/", rootID),
-		fmt.Sprintf("bundles/%s/", rootID),
-		fmt.Sprintf("states/%s/", rootID),
-		fmt.Sprintf("chunks/%s/", rootID),
-	}
-	for _, generationID := range generationIDs {
-		prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
-	}
-	deletedObjects := 0
-	for _, prefix := range prefixes {
-		count, err := s.s3.DeletePrefix(r.Context(), prefix)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("deleting storage prefix %s: %v", prefix, err)})
-			return
-		}
-		deletedObjects += count
 	}
 
 	if err := s.db.DeleteRoot(r.Context(), id.OrgID, rootID); err != nil {
@@ -405,9 +507,49 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"status":             "deleted",
 		"root_id":            root.ID,
 		"name":               root.Name,
-		"turbopuffer_ns":     ns,
-		"s3_objects_deleted": deletedObjects,
+		"turbopuffer_ns":     result.TurbopufferNamespace,
+		"s3_objects_deleted": result.S3ObjectsDeleted,
 	})
+}
+
+type rootArtifactDeleteResult struct {
+	TurbopufferNamespace string
+	S3ObjectsDeleted     int
+}
+
+func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) (rootArtifactDeleteResult, error) {
+	result := rootArtifactDeleteResult{TurbopufferNamespace: tpNamespace(orgID, rootID)}
+
+	generationIDs, err := s.db.ListSyncGenerationIDs(ctx, orgID, rootID)
+	if err != nil {
+		return result, fmt.Errorf("listing sync generations: %w", err)
+	}
+	if s.tp != nil {
+		if err := s.tp.DeleteNamespace(result.TurbopufferNamespace); err != nil {
+			return result, fmt.Errorf("deleting turbopuffer namespace: %w", err)
+		}
+	}
+
+	prefixes := []string{
+		fmt.Sprintf("files/%s/", rootID),
+		fmt.Sprintf("bundles/%s/", rootID),
+		fmt.Sprintf("states/%s/", rootID),
+		fmt.Sprintf("chunks/%s/", rootID),
+	}
+	for _, generationID := range generationIDs {
+		prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
+	}
+	if s.s3 == nil {
+		return result, nil
+	}
+	for _, prefix := range prefixes {
+		count, err := s.s3.DeletePrefix(ctx, prefix)
+		if err != nil {
+			return result, fmt.Errorf("deleting storage prefix %s: %w", prefix, err)
+		}
+		result.S3ObjectsDeleted += count
+	}
+	return result, nil
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
