@@ -31,6 +31,7 @@ type objectStore interface {
 	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
 	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
 	DeleteMany(ctx context.Context, keys []string) error
+	DeletePrefix(ctx context.Context, prefix string) (int, error)
 }
 
 // Server holds the dependencies for HTTP handlers.
@@ -93,6 +94,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots", s.handleCreateRoot)
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
+	s.mux.HandleFunc("DELETE /roots/{id}", s.handleDeleteRoot)
 	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
 	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
@@ -338,6 +340,74 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, root)
+}
+
+func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return
+	}
+
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	active, err := s.db.RootHasActiveSync(r.Context(), id.OrgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
+		return
+	}
+	if active {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "root has active sync jobs; wait for them to finish before deleting"})
+		return
+	}
+
+	generationIDs, err := s.db.ListSyncGenerationIDs(r.Context(), id.OrgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing sync generations: " + err.Error()})
+		return
+	}
+
+	ns := tpNamespace(id.OrgID, rootID)
+	if err := s.tp.DeleteNamespace(ns); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting turbopuffer namespace: " + err.Error()})
+		return
+	}
+
+	prefixes := []string{
+		fmt.Sprintf("files/%s/", rootID),
+		fmt.Sprintf("bundles/%s/", rootID),
+		fmt.Sprintf("states/%s/", rootID),
+		fmt.Sprintf("chunks/%s/", rootID),
+	}
+	for _, generationID := range generationIDs {
+		prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
+	}
+	deletedObjects := 0
+	for _, prefix := range prefixes {
+		count, err := s.s3.DeletePrefix(r.Context(), prefix)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("deleting storage prefix %s: %v", prefix, err)})
+			return
+		}
+		deletedObjects += count
+	}
+
+	if err := s.db.DeleteRoot(r.Context(), id.OrgID, rootID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "deleting root metadata: " + err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":             "deleted",
+		"root_id":            root.ID,
+		"name":               root.Name,
+		"turbopuffer_ns":     ns,
+		"s3_objects_deleted": deletedObjects,
+	})
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {

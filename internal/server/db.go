@@ -538,6 +538,55 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	return roots, nil
 }
 
+func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
+	tag, err := db.pool.Exec(ctx,
+		`DELETE FROM roots WHERE id = $1 AND org_id = $2`, rootID, orgID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (db *DB) RootHasActiveSync(ctx context.Context, orgID, rootID string) (bool, error) {
+	var exists bool
+	err := db.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_generations
+			 WHERE org_id = $1 AND root_id = $2 AND status = 'building'
+			UNION ALL
+			SELECT 1 FROM sync_jobs
+			 WHERE org_id = $1 AND root_id = $2 AND status NOT IN ('completed', 'failed')
+		)`,
+		orgID, rootID,
+	).Scan(&exists)
+	return exists, err
+}
+
+func (db *DB) ListSyncGenerationIDs(ctx context.Context, orgID, rootID string) ([]string, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id FROM sync_generations WHERE org_id = $1 AND root_id = $2`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // SaveState persists the filesystem state for a root.
 func (db *DB) SaveState(ctx context.Context, rootID string, state map[string]models.FileState) error {
 	_, err := db.pool.Exec(ctx,

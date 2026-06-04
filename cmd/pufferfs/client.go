@@ -43,6 +43,10 @@ func (c *apiClient) get(path string) ([]byte, error) {
 	return c.request("GET", path, nil)
 }
 
+func (c *apiClient) delete(path string) ([]byte, error) {
+	return c.request("DELETE", path, nil)
+}
+
 func (c *apiClient) request(method, path string, body any) ([]byte, error) {
 	var bodyReader io.Reader
 	if body != nil {

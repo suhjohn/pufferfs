@@ -40,3 +40,39 @@ func TestPatchByFilterParsesAffectedRows(t *testing.T) {
 		t.Fatalf("affected = %d, want 42", affected)
 	}
 }
+
+func TestDeleteNamespace(t *testing.T) {
+	mux := http.NewServeMux()
+	calls := 0
+	mux.HandleFunc("/v2/namespaces/ns-1", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewTPClientWithURL("test-key", server.URL)
+	if err := client.DeleteNamespace("ns-1"); err != nil {
+		t.Fatalf("delete namespace: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1", calls)
+	}
+}
+
+func TestDeleteNamespaceTreatsNotFoundAsDeleted(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/namespaces/ns-1", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewTPClientWithURL("test-key", server.URL)
+	if err := client.DeleteNamespace("ns-1"); err != nil {
+		t.Fatalf("delete missing namespace: %v", err)
+	}
+}

@@ -117,6 +117,44 @@ func (t *TPClient) DeleteByFilter(ns string, filters any, allowPartial bool) (bo
 	return result.RowsRemaining, nil
 }
 
+func (t *TPClient) DeleteNamespace(ns string) error {
+	url := t.baseURL() + fmt.Sprintf("/v2/namespaces/%s", ns)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest(http.MethodDelete, url, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+t.apiKey)
+
+		resp, err := t.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+		respBody, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return nil
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil
+		}
+		lastErr = fmt.Errorf("turbopuffer HTTP %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			return lastErr
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	return lastErr
+}
+
 // PatchByFilter updates attributes on documents that match a Turbopuffer filter.
 func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, allowPartial bool) (bool, int, error) {
 	body := map[string]any{

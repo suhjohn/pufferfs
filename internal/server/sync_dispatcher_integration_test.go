@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -297,6 +298,19 @@ func (s *memoryObjectStore) DeleteMany(_ context.Context, keys []string) error {
 		delete(s.objects, key)
 	}
 	return nil
+}
+
+func (s *memoryObjectStore) DeletePrefix(_ context.Context, prefix string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := 0
+	for key := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.objects, key)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 func (s *memoryObjectStore) Has(key string) bool {

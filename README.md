@@ -52,6 +52,17 @@ pufferfs query "login flow" --mode fts
 pufferfs query "database schema" --glob "*.sql"
 ```
 
+### Delete a test root
+
+```bash
+pufferfs root delete my-project
+# or skip the confirmation prompt
+pufferfs root delete my-project --yes
+```
+
+This deletes PufferFS metadata, storage artifacts, and the Turbopuffer namespace
+for the synced root. It does not delete the original source files.
+
 ### Watch (continuous sync)
 
 ```bash

@@ -177,6 +177,41 @@ func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
 	return err
 }
 
+func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
+	if prefix == "" {
+		return 0, nil
+	}
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: &c.bucket,
+		Prefix: &prefix,
+	})
+	deleted := 0
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return deleted, err
+		}
+		keys := make([]string, 0, len(page.Contents))
+		for _, obj := range page.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			keys = append(keys, *obj.Key)
+		}
+		for start := 0; start < len(keys); start += 1000 {
+			end := start + 1000
+			if end > len(keys) {
+				end = len(keys)
+			}
+			if err := c.DeleteMany(ctx, keys[start:end]); err != nil {
+				return deleted, err
+			}
+			deleted += end - start
+		}
+	}
+	return deleted, nil
+}
+
 // Rename copies an object to a new key and deletes the old one.
 func (c *Client) Rename(ctx context.Context, oldKey, newKey string) error {
 	copySource := fmt.Sprintf("%s/%s", c.bucket, oldKey)
