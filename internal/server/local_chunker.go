@@ -34,11 +34,15 @@ func chunkLocally(content []byte, rootID, filePath string) []map[string]any {
 	return chunkMarkdown(text, rootID, filePath, ft)
 }
 
-// chunkCode splits by lines (300 lines/chunk, 50 overlap) — mirrors Python chunk_code.
-func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
-	const chunkLines = 300
-	const overlapLines = 50
+const (
+	textChunkChars   = 2400
+	textOverlapChars = 400
+	codeChunkChars   = 3000
+	codeOverlapChars = 1000
+)
 
+// chunkCode uses a sliding window with line-boundary overlap.
+func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 	lines := strings.SplitAfter(text, "\n")
 	if len(lines) == 0 {
 		return nil
@@ -49,9 +53,11 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 	idx := 0
 
 	for start < len(lines) {
-		end := start + chunkLines
-		if end > len(lines) {
-			end = len(lines)
+		end := start
+		size := 0
+		for end < len(lines) && (size == 0 || size+len(lines[end]) <= codeChunkChars) {
+			size += len(lines[end])
+			end++
 		}
 		piece := strings.Join(lines[start:end], "")
 		if strings.TrimSpace(piece) != "" {
@@ -61,22 +67,29 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 		if end >= len(lines) {
 			break
 		}
-		start = end - overlapLines
+		overlapStart := end
+		overlapSize := 0
+		for overlapStart > start && overlapSize < codeOverlapChars {
+			overlapStart--
+			overlapSize += len(lines[overlapStart])
+		}
+		if overlapStart <= start {
+			start = end
+		} else {
+			start = overlapStart
+		}
 	}
 	return chunks
 }
 
-// chunkMarkdown splits by headings then by size — mirrors Python chunk_markdown.
+// chunkMarkdown splits by headings, then uses a boundary-aware sliding window with overlap.
 func chunkMarkdown(text, rootID, filePath, fileType string) []map[string]any {
-	const maxSectionChars = 2000
-	const sectionOverlapChars = 200
-
 	sections := splitByHeadings(text)
 	var chunks []map[string]any
 	idx := 0
 
 	for _, section := range sections {
-		for _, piece := range splitLarge(section, maxSectionChars, sectionOverlapChars) {
+		for _, piece := range splitTextWithOverlap(section, textChunkChars, textOverlapChars) {
 			if strings.TrimSpace(piece) != "" {
 				chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece, fileType))
 				idx++
@@ -110,24 +123,48 @@ func splitByHeadings(text string) []string {
 	return sections
 }
 
-func splitLarge(text string, maxChars, overlap int) []string {
-	if len(text) <= maxChars {
+func splitTextWithOverlap(text string, targetChars, overlapChars int) []string {
+	if len(text) <= targetChars {
 		return []string{text}
 	}
+
 	var pieces []string
 	start := 0
 	for start < len(text) {
-		end := start + maxChars
-		if end > len(text) {
+		end := start + targetChars
+		if end >= len(text) {
 			end = len(text)
+		} else {
+			end = bestTextBoundary(text, start, end, targetChars/2)
 		}
 		pieces = append(pieces, text[start:end])
 		if end >= len(text) {
 			break
 		}
-		start = end - overlap
+		nextStart := end - overlapChars
+		if nextStart <= start {
+			nextStart = end
+		}
+		start = nextStart
 	}
 	return pieces
+}
+
+func bestTextBoundary(text string, start, hardEnd, minSize int) int {
+	minEnd := start + minSize
+	if minEnd >= hardEnd {
+		return hardEnd
+	}
+	window := text[minEnd:hardEnd]
+	for _, sep := range []string{"\n\n", "\n", ". ", " ", ""} {
+		if sep == "" {
+			break
+		}
+		if idx := strings.LastIndex(window, sep); idx >= 0 {
+			return minEnd + idx + len(sep)
+		}
+	}
+	return hardEnd
 }
 
 func makeChunkMap(rootID, filePath string, chunkIndex int, content, fileType string) map[string]any {
