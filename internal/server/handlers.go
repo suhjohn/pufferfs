@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -494,6 +495,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
 
 	// Store SimHash for future index reuse
 	if req.SimHash != "" {
@@ -525,12 +530,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync generation: " + err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSyncInProgress) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
 		return
 	}
 	if r.URL.Query().Get("async") == "true" {
 		go func(req models.SyncRequest, generation *SyncGeneration, job *models.SyncJob) {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), syncJobTimeout())
 			defer cancel()
 			if _, err := s.runSyncJob(ctx, id.OrgID, id.UserID, rootID, generation, &req, job); err != nil {
 				log.Printf("async sync error for root %s: %v", rootID, err)
@@ -570,26 +579,12 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		}
 	}
 
-	if err := s.db.SaveState(ctx, rootID, req.State); err != nil {
+	if err := s.db.CommitSyncGeneration(ctx, generation, req.State); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		return nil, fmt.Errorf("saving state: %w", err)
-	}
-	if err := s.db.UpdateRootTimestamp(ctx, rootID); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		return nil, fmt.Errorf("updating root timestamp: %w", err)
-	}
-	if err := s.db.MarkSyncGenerationVisible(ctx, rootID, generation.ID); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		return nil, fmt.Errorf("marking generation visible: %w", err)
+		return nil, fmt.Errorf("committing generation: %w", err)
 	}
 	if job != nil {
 		if err := s.db.CompleteSyncJob(ctx, job.ID, "completed", nil); err != nil {
@@ -625,7 +620,51 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no sync jobs found"})
 		return
 	}
+	if job.RootID != rootID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync job not found"})
+		return
+	}
+	job = s.failExpiredSyncJob(r.Context(), job)
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *models.SyncJob {
+	if job == nil || job.Status == "completed" || job.Status == "failed" {
+		return job
+	}
+	timeout := syncJobTimeout()
+	if time.Since(job.StartedAt) <= timeout {
+		return job
+	}
+
+	message := fmt.Sprintf("sync job expired after %s; background worker is no longer running", timeout)
+	errors := []map[string]string{{"error": message}}
+	if err := s.db.CompleteSyncJob(ctx, job.ID, "failed", errors); err != nil {
+		log.Printf("warning: failed to expire sync job %s: %v", job.ID, err)
+		return job
+	}
+	if err := s.db.MarkSyncGenerationFailedForJob(ctx, job.ID); err != nil {
+		log.Printf("warning: failed to expire sync generation for job %s: %v", job.ID, err)
+	}
+	errBytes, _ := json.Marshal(errors)
+	now := time.Now()
+	job.Status = "failed"
+	job.Errors = errBytes
+	job.FinishedAt = &now
+	return job
+}
+
+func syncJobTimeout() time.Duration {
+	const defaultTimeout = 30 * time.Minute
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_JOB_TIMEOUT"))
+	if raw == "" {
+		return defaultTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout < time.Second {
+		return defaultTimeout
+	}
+	return timeout
 }
 
 func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
@@ -735,6 +774,37 @@ func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, f
 	}
 
 	return checkPermission(acls, filePath, "write")
+}
+
+func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
+	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
+	if err != nil || len(acls) == 0 {
+		if auth.HasMinRole(id.Role, auth.RoleEditor) {
+			return nil
+		}
+		return fmt.Errorf("editor role required")
+	}
+
+	canWrite := func(filePath string) bool {
+		return checkPermission(acls, filePath, "write")
+	}
+
+	for _, change := range req.Changes {
+		switch change.Status {
+		case models.StatusAdded, models.StatusModified, models.StatusRemoved:
+			if !canWrite(change.Path) {
+				return fmt.Errorf("no write permission for %s", change.Path)
+			}
+		case models.StatusMoved, models.StatusRenamed:
+			if !canWrite(change.OldPath) {
+				return fmt.Errorf("no write permission for %s", change.OldPath)
+			}
+			if !canWrite(change.Path) {
+				return fmt.Errorf("no write permission for %s", change.Path)
+			}
+		}
+	}
+	return nil
 }
 
 // checkReadACL checks if a user has read permission for a path in a root.

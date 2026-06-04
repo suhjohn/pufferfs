@@ -216,7 +216,11 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 func pollSyncJob(client *apiClient, rootID, jobID string) error {
 	fmt.Printf("Sync job %s started; polling until committed...\n", jobID)
+	deadline := time.Now().Add(syncPollTimeout())
 	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for sync job %s", jobID)
+		}
 		body, err := client.get(fmt.Sprintf("/roots/%s/sync/status?job_id=%s", rootID, url.QueryEscape(jobID)))
 		if err != nil {
 			return fmt.Errorf("polling sync job: %w", err)
@@ -235,6 +239,19 @@ func pollSyncJob(client *apiClient, rootID, jobID string) error {
 			time.Sleep(2 * time.Second)
 		}
 	}
+}
+
+func syncPollTimeout() time.Duration {
+	const defaultTimeout = 35 * time.Minute
+	raw := os.Getenv("PUFFERFS_SYNC_POLL_TIMEOUT")
+	if raw == "" {
+		return defaultTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout < time.Second {
+		return defaultTimeout
+	}
+	return timeout
 }
 
 // merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.
@@ -435,7 +452,7 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 		if err != nil {
 			return "", fmt.Errorf("stat %s: %w", change.Path, err)
 		}
-		if info.Size() > smallLimit {
+		if info.Size() == 0 || info.Size() > smallLimit {
 			key, err := uploadFile(client, rootID, change.Path, localPath)
 			if err != nil {
 				return "", fmt.Errorf("uploading %s: %w", change.Path, err)

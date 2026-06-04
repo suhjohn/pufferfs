@@ -23,6 +23,16 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 			}
 			req.Changes[i].OldPath = oldPath
 		}
+
+		if req.Changes[i].Status == models.StatusMoved || req.Changes[i].Status == models.StatusRenamed {
+			if req.Changes[i].OldPath == "" {
+				return fmt.Errorf("old_path is required for %s change %q", req.Changes[i].Status, req.Changes[i].Path)
+			}
+		}
+
+		if err := validateSourceRef(req.RootID, &req.Changes[i]); err != nil {
+			return fmt.Errorf("invalid source for %q: %w", req.Changes[i].Path, err)
+		}
 	}
 
 	if req.State != nil {
@@ -69,6 +79,53 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 	}
 
 	return nil
+}
+
+func validateSourceRef(rootID string, change *models.FileChange) error {
+	if change.SourceOffset < 0 {
+		return fmt.Errorf("source_offset must be non-negative")
+	}
+	if change.SourceLength < 0 {
+		return fmt.Errorf("source_length must be non-negative")
+	}
+	if change.Status != models.StatusAdded && change.Status != models.StatusModified {
+		if change.SourceKey != "" || change.SourceOffset != 0 || change.SourceLength != 0 {
+			return fmt.Errorf("source fields are only valid for added or modified files")
+		}
+		return nil
+	}
+	change.SourceKey = strings.TrimSpace(strings.ReplaceAll(change.SourceKey, "\\", "/"))
+	if change.SourceKey == "" {
+		if change.SourceOffset != 0 || change.SourceLength != 0 {
+			return fmt.Errorf("source range requires source_key")
+		}
+		return nil
+	}
+	if strings.Contains(change.SourceKey, "\x00") {
+		return fmt.Errorf("source_key contains NUL byte")
+	}
+
+	fileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
+	if change.SourceKey == fileKey {
+		if change.SourceOffset != 0 {
+			return fmt.Errorf("source_offset must be zero for file uploads")
+		}
+		return nil
+	}
+
+	bundlePrefix := fmt.Sprintf("bundles/%s/", rootID)
+	if strings.HasPrefix(change.SourceKey, bundlePrefix) {
+		name := strings.TrimPrefix(change.SourceKey, bundlePrefix)
+		if name == "" || name != safeObjectName(name) {
+			return fmt.Errorf("source bundle key is invalid")
+		}
+		if change.SourceLength <= 0 {
+			return fmt.Errorf("source_length must be positive for bundled files")
+		}
+		return nil
+	}
+
+	return fmt.Errorf("source_key must reference this root's upload or bundle")
 }
 
 func cleanFilePath(filePath string) (string, error) {

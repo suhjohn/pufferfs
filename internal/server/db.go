@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pressly/goose/v3"
 
@@ -32,6 +35,8 @@ type SyncGeneration struct {
 	Seq               int64
 	BaseGenerationSeq int64
 }
+
+var errSyncInProgress = errors.New("sync already in progress for root")
 
 // NewDB creates a connection pool and runs migrations.
 func NewDB(databaseURL string) (*DB, error) {
@@ -170,11 +175,16 @@ func (db *DB) migrateFallback() error {
 			root_id            TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
 			sync_job_id        TEXT REFERENCES sync_jobs(id) ON DELETE SET NULL,
 			base_generation_id TEXT NOT NULL DEFAULT '',
+			seq                BIGSERIAL,
+			base_generation_seq BIGINT NOT NULL DEFAULT 0,
 			status             TEXT NOT NULL DEFAULT 'building',
 			manifest_ref       TEXT NOT NULL DEFAULT '',
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			visible_at         TIMESTAMPTZ
 		);
+		ALTER TABLE sync_generations ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+		ALTER TABLE sync_generations ADD COLUMN IF NOT EXISTS base_generation_seq BIGINT NOT NULL DEFAULT 0;
+		CREATE UNIQUE INDEX IF NOT EXISTS sync_generations_seq_idx ON sync_generations(seq);
 
 		CREATE TABLE IF NOT EXISTS content_proofs (
 			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -554,23 +564,66 @@ func (db *DB) GetVisibleGenerationSeq(ctx context.Context, rootID string) (int64
 }
 
 func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef string) (*SyncGeneration, error) {
-	baseGenerationID, err := db.GetVisibleGeneration(ctx, rootID)
+	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	baseSeq, err := db.GetGenerationSeq(ctx, baseGenerationID)
+	defer tx.Rollback(ctx)
+
+	var baseGenerationID string
+	err = tx.QueryRow(ctx,
+		`SELECT visible_generation_id FROM roots WHERE id = $1 FOR UPDATE`, rootID,
+	).Scan(&baseGenerationID)
 	if err != nil {
 		return nil, err
 	}
+
+	staleCutoff := time.Now().Add(-syncJobTimeout())
+	if _, err := tx.Exec(ctx,
+		`UPDATE sync_generations
+		 SET status = 'failed'
+		 WHERE root_id = $1 AND status = 'building' AND created_at < $2`,
+		rootID, staleCutoff,
+	); err != nil {
+		return nil, err
+	}
+
+	var buildingID string
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM sync_generations
+		 WHERE root_id = $1 AND status = 'building'
+		 LIMIT 1`,
+		rootID,
+	).Scan(&buildingID)
+	if err == nil {
+		return nil, errSyncInProgress
+	}
+	if err != pgx.ErrNoRows {
+		return nil, err
+	}
+
+	var baseSeq int64
+	if baseGenerationID != "" {
+		err = tx.QueryRow(ctx,
+			`SELECT seq FROM sync_generations WHERE id = $1`, baseGenerationID,
+		).Scan(&baseSeq)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	generationID := uuid.New().String()
 	var seq int64
-	err = db.pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, base_generation_seq, status, manifest_ref)
 		 VALUES ($1, $2, $3, $4, $5, $6, 'building', $7)
 		 RETURNING seq`,
 		generationID, orgID, rootID, syncJobID, baseGenerationID, baseSeq, manifestRef,
 	).Scan(&seq)
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &SyncGeneration{
@@ -582,24 +635,56 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 	}, nil
 }
 
-func (db *DB) MarkSyncGenerationVisible(ctx context.Context, rootID, generationID string) error {
+func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGeneration, state map[string]models.FileState) error {
+	if generation == nil {
+		return fmt.Errorf("sync generation is required")
+	}
+	stateJSON, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE roots
+		 SET visible_generation_id = $1, updated_at = NOW()
+		 WHERE id = $2 AND visible_generation_id = $3`,
+		generation.ID, generation.RootID, generation.BaseGenerationID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("root visible generation changed while sync was running")
+	}
+
 	if _, err := tx.Exec(ctx,
-		`UPDATE sync_generations SET status = 'visible', visible_at = NOW() WHERE id = $1`,
-		generationID,
+		`INSERT INTO root_states (root_id, state, updated_at)
+		 VALUES ($1, $2::jsonb, NOW())
+		 ON CONFLICT (root_id) DO UPDATE SET state = $2::jsonb, updated_at = NOW()`,
+		generation.RootID, string(stateJSON),
 	); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx,
-		`UPDATE roots SET visible_generation_id = $1, updated_at = NOW() WHERE id = $2`,
-		generationID, rootID,
-	); err != nil {
+
+	tag, err = tx.Exec(ctx,
+		`UPDATE sync_generations
+		 SET status = 'visible', visible_at = NOW()
+		 WHERE id = $1 AND status = 'building'`,
+		generation.ID,
+	)
+	if err != nil {
 		return err
 	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("sync generation %s is no longer building", generation.ID)
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -610,6 +695,17 @@ func (db *DB) MarkSyncGenerationFailed(ctx context.Context, generationID string)
 	_, err := db.pool.Exec(ctx,
 		`UPDATE sync_generations SET status = 'failed' WHERE id = $1 AND status = 'building'`,
 		generationID,
+	)
+	return err
+}
+
+func (db *DB) MarkSyncGenerationFailedForJob(ctx context.Context, jobID string) error {
+	if jobID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_generations SET status = 'failed' WHERE sync_job_id = $1 AND status = 'building'`,
+		jobID,
 	)
 	return err
 }
