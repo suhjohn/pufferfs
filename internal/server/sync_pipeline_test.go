@@ -43,6 +43,20 @@ func TestShardChangesBoundsBytes(t *testing.T) {
 	}
 }
 
+func TestIndexedChunkCarriesAbsolutePath(t *testing.T) {
+	row := indexedChunkFromModal("root-1", "gen-1", 1, "hash", map[string]any{
+		"file_path":     "src/main.go",
+		"absolute_path": "/Users/john/project/src/main.go",
+		"chunk_index":   0,
+		"content":       "package main",
+		"content_hash":  "content-hash",
+		"file_type":     "go",
+	}).mapRow()
+	if row["absolute_path"] != "/Users/john/project/src/main.go" {
+		t.Fatalf("absolute_path = %#v", row["absolute_path"])
+	}
+}
+
 func TestCleanupGenerationKeysIncludesTransientArtifactsOnly(t *testing.T) {
 	req := &models.SyncRequest{
 		ManifestRef: "bundles/root-1/manifest.json",

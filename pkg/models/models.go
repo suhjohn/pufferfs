@@ -112,6 +112,7 @@ const (
 // FileChange describes a single file's change between two states.
 type FileChange struct {
 	Path         string           `json:"path"`
+	AbsolutePath string           `json:"absolute_path,omitempty"`
 	Status       FileChangeStatus `json:"status"`
 	OldPath      string           `json:"old_path,omitempty"`
 	ContentHash  string           `json:"content_hash"`
@@ -144,15 +145,16 @@ type DiffResult struct {
 
 // Chunk is a text chunk extracted from a file.
 type Chunk struct {
-	ID          string  `json:"id"`
-	RootID      string  `json:"root_id"`
-	FilePath    string  `json:"file_path"`
-	ChunkIndex  int     `json:"chunk_index"`
-	Content     string  `json:"content"`
-	ContentHash string  `json:"content_hash"`
-	FileType    string  `json:"file_type"`
-	PageNumber  *int    `json:"page_number,omitempty"`
-	ImagePath   *string `json:"image_path,omitempty"`
+	ID           string  `json:"id"`
+	RootID       string  `json:"root_id"`
+	FilePath     string  `json:"file_path"`
+	AbsolutePath string  `json:"absolute_path,omitempty"`
+	ChunkIndex   int     `json:"chunk_index"`
+	Content      string  `json:"content"`
+	ContentHash  string  `json:"content_hash"`
+	FileType     string  `json:"file_type"`
+	PageNumber   *int    `json:"page_number,omitempty"`
+	ImagePath    *string `json:"image_path,omitempty"`
 }
 
 // ChunkWithEmbedding is a Chunk plus its embedding vector.
@@ -222,13 +224,14 @@ type QueryRequest struct {
 
 // QueryResult is a single search result returned to the user.
 type QueryResult struct {
-	FilePath   string  `json:"file_path"`
-	ChunkIndex int     `json:"chunk_index"`
-	Content    string  `json:"content"`
-	Score      float64 `json:"score"`
-	FileType   string  `json:"file_type"`
-	PageNumber *int    `json:"page_number,omitempty"`
-	ImagePath  *string `json:"image_path,omitempty"`
+	FilePath     string  `json:"file_path"`
+	AbsolutePath string  `json:"absolute_path,omitempty"`
+	ChunkIndex   int     `json:"chunk_index"`
+	Content      string  `json:"content"`
+	Score        float64 `json:"score"`
+	FileType     string  `json:"file_type"`
+	PageNumber   *int    `json:"page_number,omitempty"`
+	ImagePath    *string `json:"image_path,omitempty"`
 }
 
 // QueryResponse wraps query results.

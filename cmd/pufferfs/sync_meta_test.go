@@ -76,3 +76,12 @@ func TestSyncConflictFromAPIError(t *testing.T) {
 		t.Fatalf("conflict = %#v", conflict)
 	}
 }
+
+func TestWithAbsolutePaths(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "workspace")
+	changes := withAbsolutePaths(root, []models.FileChange{{Path: "src/main.go", Status: models.StatusAdded}})
+	want := filepath.Join(root, "src", "main.go")
+	if len(changes) != 1 || changes[0].AbsolutePath != want {
+		t.Fatalf("absolute path = %#v, want %q", changes, want)
+	}
+}

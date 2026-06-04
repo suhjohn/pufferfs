@@ -1134,6 +1134,9 @@ func modalChunkPayload(row map[string]any) map[string]any {
 		"file_type":    row["file_type"],
 		"root_id":      row["root_id"],
 	}
+	if absolutePath, ok := row["absolute_path"]; ok && absolutePath != nil {
+		chunk["absolute_path"] = absolutePath
+	}
 	if pageNumber, ok := row["page_number"]; ok && pageNumber != nil {
 		chunk["page_number"] = pageNumber
 	}
@@ -1262,7 +1265,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := tpNamespace(id.OrgID, req.RootID)
-	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
+	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	var filters []any
 	if req.Glob != "" {
@@ -1340,10 +1343,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	results := make([]models.QueryResult, len(filteredRows))
 	for i, row := range filteredRows {
 		results[i] = models.QueryResult{
-			FilePath: strVal(row, "file_path"),
-			Content:  strVal(row, "content"),
-			FileType: strVal(row, "file_type"),
-			Score:    floatVal(row, "$dist"),
+			FilePath:     strVal(row, "file_path"),
+			AbsolutePath: strVal(row, "absolute_path"),
+			Content:      strVal(row, "content"),
+			FileType:     strVal(row, "file_type"),
+			Score:        floatVal(row, "$dist"),
 		}
 		if ci, ok := row["chunk_index"]; ok {
 			if f, ok := ci.(float64); ok {
