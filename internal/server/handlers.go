@@ -525,13 +525,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if job != nil {
 		syncJobID = job.ID
 	}
-	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef)
+	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef, req.BaseGenerationID, req.BaseGenerationSeq)
 	if err != nil {
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
 		status := http.StatusInternalServerError
-		if errors.Is(err, errSyncInProgress) {
+		if errors.Is(err, errSyncInProgress) || errors.Is(err, errStaleSyncBase) {
 			status = http.StatusConflict
 		}
 		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
@@ -545,7 +545,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				log.Printf("async sync error for root %s: %v", rootID, err)
 			}
 		}(req, generation, job)
-		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job)})
+		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job), GenerationID: generation.ID, GenerationSeq: generation.Seq})
 		return
 	}
 

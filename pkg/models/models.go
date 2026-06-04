@@ -78,12 +78,14 @@ type APIKey struct {
 
 // RootMetadata represents a synced directory root.
 type RootMetadata struct {
-	ID         string    `json:"id" db:"id"`
-	OrgID      string    `json:"org_id" db:"org_id"`
-	Name       string    `json:"name" db:"name"`
-	SourcePath string    `json:"source_path" db:"source_path"`
-	CreatedAt  time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
+	ID                   string    `json:"id" db:"id"`
+	OrgID                string    `json:"org_id" db:"org_id"`
+	Name                 string    `json:"name" db:"name"`
+	SourcePath           string    `json:"source_path" db:"source_path"`
+	VisibleGenerationID  string    `json:"visible_generation_id" db:"visible_generation_id"`
+	VisibleGenerationSeq int64     `json:"visible_generation_seq" db:"visible_generation_seq"`
+	CreatedAt            time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // FileState stores the last-known state of a single file for diff computation.
@@ -165,12 +167,14 @@ type ChunkWithEmbedding struct {
 
 // SyncRequest is sent from CLI to server to trigger a sync.
 type SyncRequest struct {
-	RootID       string               `json:"root_id"`
-	Changes      []FileChange         `json:"changes"`
-	State        map[string]FileState `json:"state"`
-	SimHash      string               `json:"simhash,omitempty"`
-	ContentProof *ContentProofData    `json:"content_proof,omitempty"`
-	ManifestRef  string               `json:"manifest_ref,omitempty"`
+	RootID            string               `json:"root_id"`
+	BaseGenerationID  string               `json:"base_generation_id"`
+	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
+	Changes           []FileChange         `json:"changes"`
+	State             map[string]FileState `json:"state"`
+	SimHash           string               `json:"simhash,omitempty"`
+	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
+	ManifestRef       string               `json:"manifest_ref,omitempty"`
 }
 
 // ContentProofData is the serialized content proof sent with sync/query requests.
@@ -184,6 +188,8 @@ type ContentProofData struct {
 type SyncResponse struct {
 	RootID         string `json:"root_id"`
 	SyncJobID      string `json:"sync_job_id,omitempty"`
+	GenerationID   string `json:"generation_id,omitempty"`
+	GenerationSeq  int64  `json:"generation_seq,omitempty"`
 	ChunksAdded    int    `json:"chunks_added"`
 	ChunksRemoved  int    `json:"chunks_removed"`
 	ChunksMoved    int    `json:"chunks_moved"`

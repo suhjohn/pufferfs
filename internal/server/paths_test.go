@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -112,6 +113,63 @@ func TestNormalizeSyncRequestValidatesSourceRefs(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("normalizeSyncRequest error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateSyncBase(t *testing.T) {
+	tests := []struct {
+		name       string
+		clientID   string
+		clientSeq  int64
+		visibleID  string
+		visibleSeq int64
+		wantErr    bool
+	}{
+		{
+			name: "empty base matches empty visible generation",
+		},
+		{
+			name:       "matching generation id and seq",
+			clientID:   "gen-1",
+			clientSeq:  7,
+			visibleID:  "gen-1",
+			visibleSeq: 7,
+		},
+		{
+			name:       "matching generation id accepts omitted seq",
+			clientID:   "gen-1",
+			visibleID:  "gen-1",
+			visibleSeq: 7,
+		},
+		{
+			name:      "stale generation id",
+			clientID:  "gen-1",
+			visibleID: "gen-2",
+			wantErr:   true,
+		},
+		{
+			name:       "stale generation seq",
+			clientID:   "gen-1",
+			clientSeq:  6,
+			visibleID:  "gen-1",
+			visibleSeq: 7,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSyncBase(tt.clientID, tt.clientSeq, tt.visibleID, tt.visibleSeq)
+			if tt.wantErr {
+				if !errors.Is(err, errStaleSyncBase) {
+					t.Fatalf("validateSyncBase error = %v, want errStaleSyncBase", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateSyncBase: %v", err)
 			}
 		})
 	}

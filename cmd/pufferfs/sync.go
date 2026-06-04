@@ -62,15 +62,35 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		name = filepath.Base(dir)
 	}
 
+	var (
+		client     *apiClient
+		localMeta  *rootMeta
+		remoteRoot *models.RootMetadata
+	)
 	if rootID == "" {
-		if localRootID, err := findLocalRootID(name, dir); err == nil {
-			rootID = localRootID
+		if meta, err := findLocalRootMeta(name, dir); err == nil {
+			rootID = meta.ID
+			localMeta = meta
 		} else if !dryRun {
-			resolvedRootID, err := resolveOrCreateRoot(newAPIClient(cfg), name, dir)
+			client = newAPIClient(cfg)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, dir)
 			if err != nil {
 				return err
 			}
-			rootID = resolvedRootID
+			rootID = resolvedRoot.ID
+			remoteRoot = resolvedRoot
+		}
+	} else if meta, err := loadRootMeta(rootID); err == nil {
+		localMeta = meta
+	}
+	if !dryRun && cfg.Server.URL != "" && rootID != "" && remoteRoot == nil {
+		if client == nil {
+			client = newAPIClient(cfg)
+		}
+		var err error
+		remoteRoot, err = loadRemoteRoot(client, rootID)
+		if err != nil {
+			return fmt.Errorf("loading remote root metadata: %w", err)
 		}
 	}
 
@@ -87,6 +107,22 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 	// Extract flat state for backward compatibility with server
 	currentState := currentTree.ToFileStateMap()
 
+	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
+	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
+	if !useLocalCache {
+		fmt.Println("Remote generation changed; diffing against remote state.")
+		previousState, err := loadRemoteState(client, rootID)
+		if err != nil {
+			return fmt.Errorf("loading remote state: %w", err)
+		}
+		result := diff.Compute(previousState, currentState)
+		if countChanges(result) == 0 {
+			fmt.Println("No changes detected (remote state matches local filesystem).")
+			return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+		}
+		return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+	}
+
 	// Load previous tree — try local first, then fall back to flat state
 	var prevTree *merkle.Tree
 	prevTree, err = loadLocalTree(rootID)
@@ -102,7 +138,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree)
+			return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -120,11 +156,11 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree)
+	return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree) error {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
 	var err error
 
 	// Detect secrets
@@ -144,10 +180,13 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 	// Get or create root
 	if rootID == "" {
-		rootID, err = resolveOrCreateRoot(client, name, dir)
+		resolvedRoot, err := resolveOrCreateRoot(client, name, dir)
 		if err != nil {
 			return err
 		}
+		rootID = resolvedRoot.ID
+		baseGenerationID = resolvedRoot.VisibleGenerationID
+		baseGenerationSeq = resolvedRoot.VisibleGenerationSeq
 	}
 
 	// Upload changed files to S3 via the server
@@ -170,12 +209,14 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
-		RootID:       rootID,
-		Changes:      changes,
-		State:        currentState,
-		SimHash:      currentTree.SimHashHex(),
-		ContentProof: contentProof,
-		ManifestRef:  manifestRef,
+		RootID:            rootID,
+		BaseGenerationID:  baseGenerationID,
+		BaseGenerationSeq: baseGenerationSeq,
+		Changes:           changes,
+		State:             currentState,
+		SimHash:           currentTree.SimHashHex(),
+		ContentProof:      contentProof,
+		ManifestRef:       manifestRef,
 	}
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
@@ -193,20 +234,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		}
 	}
 
-	// Save Merkle tree locally (replaces flat state)
-	if err := saveLocalTree(rootID, currentTree); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save Merkle tree: %v\n", err)
-	}
-
-	// Also save flat state for backward compatibility
-	if err := saveLocalState(rootID, currentState); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save local state: %v\n", err)
-	}
-
-	// Cache root info
-	if err := saveRootMeta(rootID, name, dir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save root meta: %v\n", err)
-	}
+	saveLocalSyncCacheWarnings(rootID, name, dir, currentState, currentTree, syncResp.GenerationID, syncResp.GenerationSeq)
 
 	fmt.Printf("Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
@@ -330,22 +358,22 @@ func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.T
 	return result
 }
 
-func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (string, error) {
+func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (*models.RootMetadata, error) {
 	// Try to find existing root by name
 	respBody, err := client.get("/roots")
 	if err != nil {
-		return "", fmt.Errorf("listing roots: %w", err)
+		return nil, fmt.Errorf("listing roots: %w", err)
 	}
 
 	var roots []models.RootMetadata
 	if err := json.Unmarshal(respBody, &roots); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	for _, r := range roots {
 		if r.Name == name {
 			fmt.Printf("Using existing root: %s (%s)\n", r.Name, r.ID)
-			return r.ID, nil
+			return &r, nil
 		}
 	}
 
@@ -356,47 +384,47 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (string, er
 	}
 	respBody, err = client.post("/roots", createReq)
 	if err != nil {
-		return "", fmt.Errorf("creating root: %w", err)
+		return nil, fmt.Errorf("creating root: %w", err)
 	}
 
 	var root models.RootMetadata
 	if err := json.Unmarshal(respBody, &root); err != nil {
-		return "", err
+		return nil, err
 	}
 
 	fmt.Printf("Created root: %s (%s)\n", root.Name, root.ID)
-	return root.ID, nil
+	return &root, nil
 }
 
-func findLocalRootID(name, sourcePath string) (string, error) {
+type rootMeta struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	SourcePath    string `json:"source_path"`
+	GenerationID  string `json:"generation_id"`
+	GenerationSeq int64  `json:"generation_seq"`
+}
+
+func findLocalRootMeta(name, sourcePath string) (*rootMeta, error) {
 	rootsDir := filepath.Join(appconfig.DefaultConfigDir(), "roots")
 	entries, err := os.ReadDir(rootsDir)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(rootsDir, entry.Name(), "meta.json"))
+		meta, err := loadRootMeta(entry.Name())
 		if err != nil {
 			continue
 		}
-		var meta struct {
-			ID         string `json:"id"`
-			Name       string `json:"name"`
-			SourcePath string `json:"source_path"`
-		}
-		if err := json.Unmarshal(data, &meta); err != nil {
-			continue
-		}
 		if meta.Name == name && meta.SourcePath == sourcePath {
-			return meta.ID, nil
+			return meta, nil
 		}
 	}
 
-	return "", fmt.Errorf("local root metadata not found")
+	return nil, fmt.Errorf("local root metadata not found")
 }
 
 type bundleManifestEntry struct {
@@ -587,6 +615,47 @@ func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileSt
 	return state, nil
 }
 
+func loadRemoteRoot(client *apiClient, rootID string) (*models.RootMetadata, error) {
+	respBody, err := client.get(fmt.Sprintf("/roots/%s", rootID))
+	if err != nil {
+		return nil, err
+	}
+	var root models.RootMetadata
+	if err := json.Unmarshal(respBody, &root); err != nil {
+		return nil, err
+	}
+	return &root, nil
+}
+
+func syncBaseFromMeta(localMeta *rootMeta, remoteRoot *models.RootMetadata) (string, int64) {
+	if remoteRoot != nil {
+		return remoteRoot.VisibleGenerationID, remoteRoot.VisibleGenerationSeq
+	}
+	if localMeta != nil {
+		return localMeta.GenerationID, localMeta.GenerationSeq
+	}
+	return "", 0
+}
+
+func localCacheMatchesRemote(localMeta *rootMeta, remoteRoot *models.RootMetadata) bool {
+	if remoteRoot == nil {
+		return true
+	}
+	if remoteRoot.VisibleGenerationID == "" {
+		return true
+	}
+	if localMeta == nil {
+		return false
+	}
+	if localMeta.GenerationID != remoteRoot.VisibleGenerationID {
+		return false
+	}
+	if localMeta.GenerationSeq != 0 && localMeta.GenerationSeq != remoteRoot.VisibleGenerationSeq {
+		return false
+	}
+	return true
+}
+
 func loadLocalTree(rootID string) (*merkle.Tree, error) {
 	if rootID == "" {
 		return nil, fmt.Errorf("no root ID")
@@ -637,21 +706,66 @@ func saveLocalState(rootID string, state map[string]models.FileState) error {
 	return os.WriteFile(filepath.Join(dir, "state.json"), data, 0o600)
 }
 
-func saveRootMeta(rootID, name, sourcePath string) error {
+func loadRootMeta(rootID string) (*rootMeta, error) {
+	if rootID == "" {
+		return nil, fmt.Errorf("no root ID")
+	}
+	data, err := os.ReadFile(filepath.Join(appconfig.RootDir(rootID), "meta.json"))
+	if err != nil {
+		return nil, err
+	}
+	var meta rootMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	if meta.ID == "" {
+		meta.ID = rootID
+	}
+	return &meta, nil
+}
+
+func saveRootMeta(rootID, name, sourcePath, generationID string, generationSeq int64) error {
 	dir := appconfig.RootDir(rootID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	meta := map[string]string{
-		"id":          rootID,
-		"name":        name,
-		"source_path": sourcePath,
+	meta := rootMeta{
+		ID:            rootID,
+		Name:          name,
+		SourcePath:    sourcePath,
+		GenerationID:  generationID,
+		GenerationSeq: generationSeq,
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "meta.json"), data, 0o600)
+}
+
+func saveLocalSyncCache(rootID, name, dir string, currentState map[string]models.FileState, currentTree *merkle.Tree, generationID string, generationSeq int64) error {
+	if err := saveLocalTree(rootID, currentTree); err != nil {
+		return fmt.Errorf("saving Merkle tree: %w", err)
+	}
+	if err := saveLocalState(rootID, currentState); err != nil {
+		return fmt.Errorf("saving local state: %w", err)
+	}
+	if err := saveRootMeta(rootID, name, dir, generationID, generationSeq); err != nil {
+		return fmt.Errorf("saving root meta: %w", err)
+	}
+	return nil
+}
+
+func saveLocalSyncCacheWarnings(rootID, name, dir string, currentState map[string]models.FileState, currentTree *merkle.Tree, generationID string, generationSeq int64) {
+	if err := saveLocalTree(rootID, currentTree); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to save Merkle tree: %v\n", err)
+	}
+	if err := saveLocalState(rootID, currentState); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to save local state: %v\n", err)
+	}
+	if err := saveRootMeta(rootID, name, dir, generationID, generationSeq); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to save root meta: %v\n", err)
+	}
 }
 
 func filterChanges(result models.DiffResult) []models.FileChange {
