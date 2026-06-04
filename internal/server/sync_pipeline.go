@@ -263,7 +263,7 @@ func (p *syncPipeline) processEmbedJob(ctx context.Context, job objectQueueJob) 
 			indexRows = append(indexRows, syncIndexArtifact{Op: "upsert", Row: row})
 		}
 	}
-	cached, err := p.server.db.GetCachedEmbeddings(ctx, p.orgID, contentHashes)
+	cached, err := p.server.db.GetCachedEmbeddings(ctx, p.orgID, p.server.modal.EmbeddingModelVersion(), contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup failed: %v", err)
 		cached = map[string][]float64{}

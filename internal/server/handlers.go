@@ -1267,7 +1267,7 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 	}
 
 	cacheSaveStart := time.Now()
-	if err := s.db.SaveCachedEmbeddings(ctx, orgID, cacheEntries); err != nil {
+	if err := s.db.SaveCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), cacheEntries); err != nil {
 		log.Printf("warning: failed to save embedding cache: %v", err)
 	}
 	log.Printf("timing stage=embedding_cache_save_global entries=%d elapsed=%s", len(cacheEntries), time.Since(cacheSaveStart))
@@ -1437,7 +1437,7 @@ func (s *Server) processFileAdd(ctx context.Context, orgID, generationID, rootID
 	}
 
 	cacheLookupStart := time.Now()
-	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
+	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup failed: %v", err)
 		cached = make(map[string][]float64)
@@ -1578,7 +1578,7 @@ func (s *Server) processFileMove(ctx context.Context, orgID, generationID, rootI
 	}
 
 	cacheLookupStart := time.Now()
-	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, contentHashes)
+	cached, err := s.db.GetCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup for move failed: %v", err)
 		cached = make(map[string][]float64)
@@ -1742,9 +1742,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if req.Glob != "" {
 		filters = append(filters, []any{"file_path", "Glob", req.Glob})
 	}
-	if visibleSeq, err := s.db.GetVisibleGenerationSeq(r.Context(), req.RootID); err == nil && visibleSeq > 0 {
-		filters = append(filters, activeGenerationFilter(visibleSeq))
+	// Always constrain results to the visible generation's active window. If we
+	// cannot resolve it, fail closed (return an error) rather than returning
+	// unfiltered rows. When the root has no committed generation yet
+	// (visibleSeq == 0), activeGenerationFilter matches no rows, so
+	// uncommitted/in-flight rows from a building or failed sync are never served.
+	visibleSeq, vErr := s.db.GetVisibleGenerationSeq(r.Context(), req.RootID)
+	if vErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolving visible generation: " + vErr.Error()})
+		return
 	}
+	filters = append(filters, activeGenerationFilter(visibleSeq))
 
 	// Get denied paths from ACLs and filter results post-query
 	deniedPrefixes := s.buildACLFilter(r.Context(), id, req.RootID)
