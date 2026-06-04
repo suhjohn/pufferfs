@@ -22,10 +22,18 @@ import (
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
+type objectStore interface {
+	Upload(ctx context.Context, key string, data []byte, contentType string) error
+	UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error)
+	Download(ctx context.Context, key string) ([]byte, error)
+	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
+	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+}
+
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
 	db    *DB
-	s3    *storage.Client
+	s3    objectStore
 	modal *ModalClient
 	tp    *TPClient
 	queue queue.Queue
@@ -34,6 +42,10 @@ type Server struct {
 
 // New creates a new Server with all dependencies.
 func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
+	return NewWithStore(db, s3, modal, tp)
+}
+
+func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Server {
 	s := &Server{
 		db:    db,
 		s3:    s3,
@@ -937,12 +949,12 @@ type pendingEmbedding struct {
 }
 
 type syncSourceCache struct {
-	s3      *storage.Client
+	s3      objectStore
 	mu      sync.Mutex
 	objects map[string][]byte
 }
 
-func newSyncSourceCache(s3 *storage.Client) *syncSourceCache {
+func newSyncSourceCache(s3 objectStore) *syncSourceCache {
 	return &syncSourceCache{s3: s3, objects: make(map[string][]byte)}
 }
 
