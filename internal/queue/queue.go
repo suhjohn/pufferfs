@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	StageChunk  = "chunk"
-	StageEmbed  = "embed"
-	StageIndex  = "index"
-	StageCommit = "commit"
+	StageChunk   = "chunk"
+	StageEmbed   = "embed"
+	StageIndex   = "index"
+	StageCommit  = "commit"
+	StageCleanup = "cleanup"
 )
 
 type JobMessage struct {
@@ -30,6 +31,7 @@ type JobMessage struct {
 	BaseGenerationSeq int64     `json:"base_generation_seq"`
 	Stage             string    `json:"stage"`
 	PayloadRef        string    `json:"payload_ref,omitempty"`
+	CleanupKeys       []string  `json:"cleanup_keys,omitempty"`
 	ShardIndex        int       `json:"shard_index"`
 	TotalShards       int       `json:"total_shards"`
 	Priority          int       `json:"priority,omitempty"`
@@ -99,7 +101,7 @@ func WithConsumerPrefix(prefix string) NATSOption {
 }
 
 func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
-	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit} {
+	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit, StageCleanup} {
 		stream := streamName(stage)
 		subject := subjectForStage(stage)
 		if _, err := q.js.StreamInfo(stream); err != nil {
@@ -123,7 +125,7 @@ func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
 			}
 			ackWait := 5 * time.Minute
 			maxDeliver := 3
-			if stage == StageCommit {
+			if stage == StageCommit || stage == StageCleanup {
 				ackWait = 30 * time.Second
 				maxDeliver = 30
 			}

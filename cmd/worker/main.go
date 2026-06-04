@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageChunk), "sync stage to run: chunk, embed, index, commit")
+	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageChunk), "sync stage to run: chunk, embed, index, commit, cleanup")
 	concurrency := flag.Int("concurrency", getenvInt("PUFFERFS_WORKER_CONCURRENCY", 4), "maximum jobs processed concurrently")
 	flag.Parse()
 

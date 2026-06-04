@@ -75,6 +75,7 @@ export MODAL_QUERY_EMBED_ENDPOINT="https://..."
 export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
 export MODAL_EMBED_SHARD_ENDPOINT="https://..."
 export MODAL_INDEX_SHARD_ENDPOINT="https://..."
+export PUFFERFS_CLEANUP_SYNC_ARTIFACTS="true"
 
 go run ./cmd/server
 ```
@@ -94,10 +95,16 @@ go run ./cmd/worker --stage=chunk --concurrency=16
 go run ./cmd/worker --stage=embed --concurrency=8
 go run ./cmd/worker --stage=index --concurrency=16
 go run ./cmd/worker --stage=commit --concurrency=2
+go run ./cmd/worker --stage=cleanup --concurrency=4
 ```
 
 `go test ./internal/queue` starts an embedded JetStream server locally and
 verifies enqueue, pull, ack, and delayed redelivery semantics.
+
+When `PUFFERFS_CLEANUP_SYNC_ARTIFACTS=true`, index and commit workers enqueue
+cleanup jobs that batch-delete transient sync/raw-source transport artifacts
+after they are no longer needed. OCR page images are preserved because indexed
+chunks keep their exact `image_path` object keys.
 
 ## Modal Functions
 

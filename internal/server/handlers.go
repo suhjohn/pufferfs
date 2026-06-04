@@ -28,6 +28,7 @@ type objectStore interface {
 	Download(ctx context.Context, key string) ([]byte, error)
 	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
 	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	DeleteMany(ctx context.Context, keys []string) error
 }
 
 // Server holds the dependencies for HTTP handlers.

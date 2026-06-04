@@ -107,35 +107,51 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if msg.SyncJobID != "" {
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "chunking", 0)
 		}
+		cleanupKeys := append([]string(nil), msg.CleanupKeys...)
+		if msg.PayloadRef != "" {
+			cleanupKeys = append(cleanupKeys, msg.PayloadRef)
+		}
 		if d.server.modal.HasChunkShardEndpoint() {
 			resp, err := d.server.modal.ChunkShard(modalJob(msg))
 			if err != nil {
 				return err
 			}
-			return d.queue.Enqueue(ctx, syncStageEmbed, p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resp.ResultRef, msg.ShardIndex, msg.TotalShards))
+			next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resp.ResultRef, msg.ShardIndex, msg.TotalShards)
+			next.CleanupKeys = cleanupKeys
+			return d.queue.Enqueue(ctx, syncStageEmbed, next)
 		}
 		sourceCache := newSyncSourceCache(d.server.s3)
 		resultRef, err := p.processChunkJob(ctx, objectQueueJobFromMessage(msg), sourceCache)
 		if err != nil {
 			return err
 		}
-		return d.queue.Enqueue(ctx, syncStageEmbed, p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resultRef, msg.ShardIndex, msg.TotalShards))
+		next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resultRef, msg.ShardIndex, msg.TotalShards)
+		next.CleanupKeys = cleanupKeys
+		return d.queue.Enqueue(ctx, syncStageEmbed, next)
 	case syncStageEmbed:
 		if msg.SyncJobID != "" {
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "embedding", 0)
+		}
+		cleanupKeys := append([]string(nil), msg.CleanupKeys...)
+		if msg.PayloadRef != "" {
+			cleanupKeys = append(cleanupKeys, msg.PayloadRef)
 		}
 		if d.server.modal.HasEmbedShardEndpoint() {
 			resp, err := d.server.modal.EmbedShard(modalJob(msg))
 			if err != nil {
 				return err
 			}
-			return d.queue.Enqueue(ctx, syncStageIndex, p.jobMessage(syncStageIndex, msg.JobID+"-index", resp.ResultRef, msg.ShardIndex, msg.TotalShards))
+			next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resp.ResultRef, msg.ShardIndex, msg.TotalShards)
+			next.CleanupKeys = cleanupKeys
+			return d.queue.Enqueue(ctx, syncStageIndex, next)
 		}
 		resultRef, err := p.processEmbedJob(ctx, objectQueueJobFromMessage(msg))
 		if err != nil {
 			return err
 		}
-		return d.queue.Enqueue(ctx, syncStageIndex, p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards))
+		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards)
+		next.CleanupKeys = cleanupKeys
+		return d.queue.Enqueue(ctx, syncStageIndex, next)
 	case syncStageIndex:
 		if msg.SyncJobID != "" {
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing", 0)
@@ -152,9 +168,14 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err := d.writeShardDone(ctx, msg); err != nil {
 			return err
 		}
+		if err := enqueueCleanupBatches(ctx, d.queue, msg, cleanupShardKeys(msg)); err != nil {
+			return err
+		}
 		return d.queue.Enqueue(ctx, syncStageCommit, p.jobMessage(syncStageCommit, msg.JobID+"-commit", syncRequestKey(msg.GenerationID), msg.ShardIndex, msg.TotalShards))
 	case syncStageCommit:
 		return d.processCommit(ctx, msg)
+	case syncStageCleanup:
+		return d.processCleanup(ctx, msg)
 	default:
 		return fmt.Errorf("unknown sync stage %q", msg.Stage)
 	}
@@ -231,7 +252,11 @@ func (d *SyncDispatcher) writeShardDone(ctx context.Context, msg queue.JobMessag
 func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage) error {
 	status, err := d.server.db.GetSyncGenerationStatus(ctx, msg.GenerationID)
 	if err == nil && status == "visible" {
-		return nil
+		req, readErr := d.readSyncRequest(ctx, msg.GenerationID)
+		if readErr != nil {
+			return nil
+		}
+		return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
 	}
 	if err != nil {
 		return err
@@ -270,9 +295,11 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		return err
 	}
 	if msg.SyncJobID != "" {
-		return d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "completed", nil)
+		if err := d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "completed", nil); err != nil {
+			return err
+		}
 	}
-	return nil
+	return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
 }
 
 func (d *SyncDispatcher) readSyncRequest(ctx context.Context, generationID string) (*models.SyncRequest, error) {

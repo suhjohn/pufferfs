@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
 )
@@ -151,6 +152,23 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &c.bucket,
 		Key:    &key,
+	})
+	return err
+}
+
+// DeleteMany removes objects from S3 in one batch.
+func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	objects := make([]types.ObjectIdentifier, 0, len(keys))
+	for _, key := range keys {
+		key := key
+		objects = append(objects, types.ObjectIdentifier{Key: &key})
+	}
+	_, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		Bucket: &c.bucket,
+		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
 	})
 	return err
 }
