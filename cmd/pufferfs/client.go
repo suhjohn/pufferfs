@@ -18,6 +18,15 @@ type apiClient struct {
 	httpClient *http.Client
 }
 
+type apiError struct {
+	StatusCode int
+	Body       []byte
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, string(e.Body))
+}
+
 func newAPIClient(cfg *appconfig.Config) *apiClient {
 	return &apiClient{
 		baseURL:    cfg.Server.URL,
@@ -69,7 +78,7 @@ func (c *apiClient) request(method, path string, body any) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, &apiError{StatusCode: resp.StatusCode, Body: respBody}
 	}
 
 	return respBody, nil
@@ -97,7 +106,7 @@ func (c *apiClient) postRaw(path string, data []byte, contentType string) ([]byt
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return nil, &apiError{StatusCode: resp.StatusCode, Body: respBody}
 	}
 	return respBody, nil
 }

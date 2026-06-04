@@ -55,8 +55,10 @@ func (s *Server) processSync(ctx context.Context, orgID string, generation *Sync
 		req:        req,
 		broker:     newObjectQueueBroker(s.s3),
 		resp: &models.SyncResponse{
-			RootID:    req.RootID,
-			SyncJobID: syncJobIdentifier(job),
+			RootID:        req.RootID,
+			SyncJobID:     syncJobIdentifier(job),
+			GenerationID:  generation.ID,
+			GenerationSeq: generation.Seq,
 		},
 	}
 	return p.run(ctx)

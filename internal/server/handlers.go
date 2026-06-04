@@ -480,7 +480,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	rootID := r.PathValue("id")
 
 	// Verify root belongs to org
-	if _, err := s.db.GetRoot(r.Context(), id.OrgID, rootID); err != nil {
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -491,12 +492,24 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RootID = rootID
+	if req.ProtocolVersion != models.SyncProtocolVersion {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":            fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion),
+			"protocol_version": req.ProtocolVersion,
+			"required_version": models.SyncProtocolVersion,
+		})
+		return
+	}
 	if err := normalizeSyncRequest(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := validateSyncBase(req.BaseGenerationID, req.BaseGenerationSeq, root.VisibleGenerationID, root.VisibleGenerationSeq); err != nil {
+		writeSyncConflict(w, err, &req, root.VisibleGenerationID, root.VisibleGenerationSeq)
 		return
 	}
 
@@ -525,10 +538,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	if job != nil {
 		syncJobID = job.ID
 	}
-	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef)
+	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef, req.BaseGenerationID, req.BaseGenerationSeq)
 	if err != nil {
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		if errors.Is(err, errStaleSyncBase) {
+			if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
+				writeSyncConflict(w, err, &req, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
+				return
+			}
 		}
 		status := http.StatusInternalServerError
 		if errors.Is(err, errSyncInProgress) {
@@ -545,7 +564,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				log.Printf("async sync error for root %s: %v", rootID, err)
 			}
 		}(req, generation, job)
-		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job)})
+		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job), GenerationID: generation.ID, GenerationSeq: generation.Seq})
 		return
 	}
 
@@ -555,6 +574,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest, currentGenerationID string, currentGenerationSeq int64) {
+	writeJSON(w, http.StatusConflict, models.SyncConflictResponse{
+		Error:                   err.Error(),
+		ClientBaseGenerationID:  req.BaseGenerationID,
+		ClientBaseGenerationSeq: req.BaseGenerationSeq,
+		CurrentGenerationID:     currentGenerationID,
+		CurrentGenerationSeq:    currentGenerationSeq,
+	})
 }
 
 func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {

@@ -37,6 +37,7 @@ type SyncGeneration struct {
 }
 
 var errSyncInProgress = errors.New("sync already in progress for root")
+var errStaleSyncBase = errors.New("sync base generation is stale")
 
 // NewDB creates a connection pool and runs migrations.
 func NewDB(databaseURL string) (*DB, error) {
@@ -438,12 +439,14 @@ func (db *DB) RemoveOrgMember(ctx context.Context, orgID, userID string) error {
 // CreateRoot creates a new root metadata entry scoped to an org.
 func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{
-		ID:         uuid.New().String(),
-		OrgID:      orgID,
-		Name:       name,
-		SourcePath: sourcePath,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		ID:                   uuid.New().String(),
+		OrgID:                orgID,
+		Name:                 name,
+		SourcePath:           sourcePath,
+		VisibleGenerationID:  "",
+		VisibleGenerationSeq: 0,
+		CreatedAt:            time.Now(),
+		UpdatedAt:            time.Now(),
 	}
 
 	_, err := db.pool.Exec(ctx,
@@ -461,9 +464,11 @@ func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*
 func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, name, source_path, created_at, updated_at
-		 FROM roots WHERE id = $1 AND org_id = $2`, id, orgID,
-	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
+		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE r.id = $1 AND r.org_id = $2`, id, orgID,
+	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -474,9 +479,11 @@ func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetada
 func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, name, source_path, created_at, updated_at
-		 FROM roots WHERE name = $1 AND org_id = $2`, name, orgID,
-	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.CreatedAt, &root.UpdatedAt)
+		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE r.name = $1 AND r.org_id = $2`, name, orgID,
+	).Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -486,8 +493,10 @@ func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.Ro
 // ListRoots returns all roots for an org.
 func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadata, error) {
 	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, name, source_path, created_at, updated_at
-		 FROM roots WHERE org_id = $1 ORDER BY created_at DESC`, orgID,
+		`SELECT r.id, r.org_id, r.name, r.source_path, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at
+		 FROM roots r
+		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
+		 WHERE r.org_id = $1 ORDER BY r.created_at DESC`, orgID,
 	)
 	if err != nil {
 		return nil, err
@@ -497,7 +506,7 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
@@ -563,7 +572,7 @@ func (db *DB) GetVisibleGenerationSeq(ctx context.Context, rootID string) (int64
 	return db.GetGenerationSeq(ctx, visibleID)
 }
 
-func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef string) (*SyncGeneration, error) {
+func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef, clientBaseGenerationID string, clientBaseGenerationSeq int64) (*SyncGeneration, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -611,6 +620,9 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 			return nil, err
 		}
 	}
+	if err := validateSyncBase(clientBaseGenerationID, clientBaseGenerationSeq, baseGenerationID, baseSeq); err != nil {
+		return nil, err
+	}
 
 	generationID := uuid.New().String()
 	var seq int64
@@ -633,6 +645,16 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 		Seq:               seq,
 		BaseGenerationSeq: baseSeq,
 	}, nil
+}
+
+func validateSyncBase(clientBaseGenerationID string, clientBaseGenerationSeq int64, visibleGenerationID string, visibleGenerationSeq int64) error {
+	if clientBaseGenerationID != visibleGenerationID {
+		return fmt.Errorf("%w: client base generation %q does not match visible generation %q", errStaleSyncBase, clientBaseGenerationID, visibleGenerationID)
+	}
+	if clientBaseGenerationSeq != 0 && clientBaseGenerationSeq != visibleGenerationSeq {
+		return fmt.Errorf("%w: client base generation seq %d does not match visible generation seq %d", errStaleSyncBase, clientBaseGenerationSeq, visibleGenerationSeq)
+	}
+	return nil
 }
 
 func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGeneration, state map[string]models.FileState) error {
