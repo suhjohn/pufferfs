@@ -27,9 +27,9 @@ type TurbopufferConfig struct {
 }
 
 type StorageConfig struct {
-	EndpointURL    string `toml:"endpoint_url"`
-	Bucket         string `toml:"bucket"`
-	AccessKeyID    string `toml:"access_key_id"`
+	EndpointURL     string `toml:"endpoint_url"`
+	Bucket          string `toml:"bucket"`
+	AccessKeyID     string `toml:"access_key_id"`
 	SecretAccessKey string `toml:"secret_access_key"`
 }
 
@@ -58,7 +58,9 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Config{}, nil
+			cfg := &Config{}
+			cfg.applyEnvOverrides()
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("reading config %s: %w", path, err)
 	}
@@ -80,7 +82,7 @@ func Save(cfg *Config) error {
 		return err
 	}
 
-	f, err := os.Create(ConfigPath())
+	f, err := os.OpenFile(ConfigPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}

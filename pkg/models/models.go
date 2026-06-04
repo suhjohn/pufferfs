@@ -16,6 +16,13 @@ func MakeChunkID(rootID, filePath string, chunkIndex int) string {
 	return fmt.Sprintf("%s:%d", pathHash, chunkIndex)
 }
 
+// MakeGenerationChunkID produces a stable row ID for one generation's copy of a chunk.
+func MakeGenerationChunkID(rootID, generationID, filePath string, chunkIndex int) string {
+	h := sha256.Sum256([]byte(rootID + ":" + generationID + ":" + filePath))
+	pathHash := hex.EncodeToString(h[:])[:16]
+	return fmt.Sprintf("%s:%d", pathHash, chunkIndex)
+}
+
 // ---------------------------------------------------------------------------
 // Organizations
 // ---------------------------------------------------------------------------
@@ -79,14 +86,6 @@ type RootMetadata struct {
 	UpdatedAt  time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// RootWithSimHash is a root with its SimHash for similarity matching.
-type RootWithSimHash struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	SourcePath string `json:"source_path"`
-	SimHash    string `json:"simhash"`
-}
-
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {
 	Size        int64  `json:"size"`
@@ -110,11 +109,14 @@ const (
 
 // FileChange describes a single file's change between two states.
 type FileChange struct {
-	Path        string           `json:"path"`
-	Status      FileChangeStatus `json:"status"`
-	OldPath     string           `json:"old_path,omitempty"`
-	ContentHash string           `json:"content_hash"`
-	Size        int64            `json:"size"`
+	Path         string           `json:"path"`
+	Status       FileChangeStatus `json:"status"`
+	OldPath      string           `json:"old_path,omitempty"`
+	ContentHash  string           `json:"content_hash"`
+	Size         int64            `json:"size"`
+	SourceKey    string           `json:"source_key,omitempty"`
+	SourceOffset int64            `json:"source_offset,omitempty"`
+	SourceLength int64            `json:"source_length,omitempty"`
 }
 
 // DiffStats summarises counts per status.
@@ -168,6 +170,7 @@ type SyncRequest struct {
 	State        map[string]FileState `json:"state"`
 	SimHash      string               `json:"simhash,omitempty"`
 	ContentProof *ContentProofData    `json:"content_proof,omitempty"`
+	ManifestRef  string               `json:"manifest_ref,omitempty"`
 }
 
 // ContentProofData is the serialized content proof sent with sync/query requests.
@@ -239,14 +242,14 @@ type RootACL struct {
 
 // SyncJob tracks the lifecycle of a sync operation.
 type SyncJob struct {
-	ID         string              `json:"id"`
-	OrgID      string              `json:"org_id"`
-	RootID     string              `json:"root_id"`
-	UserID     string              `json:"user_id"`
-	Status     string              `json:"status"`
-	TotalFiles int                 `json:"total_files"`
-	Processed  int                 `json:"processed"`
-	Errors     json.RawMessage     `json:"errors"`
-	StartedAt  time.Time           `json:"started_at"`
-	FinishedAt *time.Time          `json:"finished_at,omitempty"`
+	ID         string          `json:"id"`
+	OrgID      string          `json:"org_id"`
+	RootID     string          `json:"root_id"`
+	UserID     string          `json:"user_id"`
+	Status     string          `json:"status"`
+	TotalFiles int             `json:"total_files"`
+	Processed  int             `json:"processed"`
+	Errors     json.RawMessage `json:"errors"`
+	StartedAt  time.Time       `json:"started_at"`
+	FinishedAt *time.Time      `json:"finished_at,omitempty"`
 }

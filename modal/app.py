@@ -66,6 +66,175 @@ gemini_secret = modal.Secret.from_name(
 
 @app.function(
     image=chunking_image,
+    timeout=600,
+    memory=2048,
+)
+def office_to_pdf(file_bytes: bytes, file_type: str, file_path: str) -> bytes:
+    """Convert an Office document to PDF bytes."""
+    import time
+
+    from chunkers import _convert_to_pdf
+
+    convert_start = time.perf_counter()
+    pdf_bytes = _convert_to_pdf(file_bytes, file_type)
+    print(
+        f"timing file={file_path} stage=office_to_pdf file_type={file_type} "
+        f"bytes_in={len(file_bytes)} bytes_out={len(pdf_bytes)} elapsed={time.perf_counter() - convert_start:.3f}s",
+        flush=True,
+    )
+    return pdf_bytes
+
+
+@app.function(
+    image=chunking_image,
+    timeout=600,
+    memory=2048,
+)
+def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
+    """Render PDF bytes to per-page JPEG images plus fallback text."""
+    import time
+
+    import fitz
+
+    render_start = time.perf_counter()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages: list[dict] = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        pix = page.get_pixmap(dpi=200)
+        pages.append(
+            {
+                "page_num": page_num,
+                "image_bytes": pix.tobytes("jpeg"),
+                "fallback_text": page.get_text("text"),
+            }
+        )
+    doc.close()
+    print(
+        f"timing file={file_path} stage=pdf_render pages={len(pages)} elapsed={time.perf_counter() - render_start:.3f}s",
+        flush=True,
+    )
+    return pages
+
+
+@app.function(
+    image=chunking_image,
+    secrets=[gemini_secret],
+    timeout=600,
+    memory=2048,
+    min_containers=int(os.getenv("PUFFERFS_MODAL_PAGE_TEXT_MIN_CONTAINERS", "4")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_PAGE_TEXT_MAX_CONTAINERS", "32")),
+    scaledown_window=900,
+)
+def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallback_text: str) -> str:
+    """Extract text from one rendered page image."""
+    import time
+
+    from chunkers import image_to_text
+
+    text_start = time.perf_counter()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        text = image_to_text(image_bytes, gemini_key, mime_type="image/jpeg")
+    else:
+        text = fallback_text
+    print(
+        f"timing file={file_path} page={page_num} stage=image_to_text "
+        f"chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
+    return text
+
+
+def chunk_document_with_stage_functions(
+    file_bytes: bytes,
+    root_id: str,
+    file_path: str,
+    file_type: str,
+    s3_client,
+    bucket: str,
+) -> list[Chunk]:
+    """Orchestrate split Modal functions for PDF/DOCX/PPTX chunking."""
+    import concurrent.futures
+    import os
+    import time
+
+    from chunkers import _page_image_key
+
+    total_start = time.perf_counter()
+    if file_type in ("docx", "pptx"):
+        pdf_bytes = office_to_pdf.remote(file_bytes, file_type, file_path)
+    else:
+        pdf_bytes = file_bytes
+
+    pages = pdf_to_page_images.remote(pdf_bytes, file_path)
+    if not pages:
+        print(
+            f"timing file={file_path} stage=document_chunk_total pages=0 chunks=0 elapsed={time.perf_counter() - total_start:.3f}s",
+            flush=True,
+        )
+        return []
+
+    def page_to_chunk(page_data: dict) -> Chunk:
+        page_start = time.perf_counter()
+        page_num = int(page_data["page_num"])
+        img_bytes = page_data["image_bytes"]
+        fallback_text = page_data["fallback_text"]
+        image_key = _page_image_key(root_id, file_path, page_num)
+        if s3_client and bucket:
+            upload_start = time.perf_counter()
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=image_key,
+                Body=img_bytes,
+                ContentType="image/jpeg",
+            )
+            print(
+                f"timing file={file_path} page={page_num} stage=page_image_upload "
+                f"bytes={len(img_bytes)} elapsed={time.perf_counter() - upload_start:.3f}s",
+                flush=True,
+            )
+
+        text = page_image_to_text.remote(file_path, page_num, img_bytes, fallback_text)
+        if not text.strip():
+            text = f"[Page {page_num + 1}: no extractable text]"
+
+        chunk = Chunk(
+            id=Chunk.make_id(root_id, file_path, page_num),
+            root_id=root_id,
+            file_path=file_path,
+            chunk_index=page_num,
+            content=text,
+            content_hash=Chunk.hash_content(text),
+            file_type=file_type,
+            page_number=page_num,
+            image_path=image_key,
+        )
+        print(
+            f"timing file={file_path} page={page_num} stage=page_total elapsed={time.perf_counter() - page_start:.3f}s",
+            flush=True,
+        )
+        return chunk
+
+    max_workers = max(1, int(os.getenv("PUFFERFS_PAGE_TEXT_WORKERS", "8")))
+    max_workers = min(max_workers, len(pages))
+    text_start = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        chunks = list(executor.map(page_to_chunk, pages))
+    print(
+        f"timing file={file_path} stage=parallel_image_to_text pages={len(pages)} workers={max_workers} elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
+    chunks.sort(key=lambda chunk: chunk.chunk_index)
+    print(
+        f"timing file={file_path} stage=document_chunk_total pages={len(pages)} chunks={len(chunks)} elapsed={time.perf_counter() - total_start:.3f}s",
+        flush=True,
+    )
+    return chunks
+
+
+@app.function(
+    image=chunking_image,
     secrets=[s3_secret, gemini_secret],
     timeout=600,
     memory=2048,
@@ -84,7 +253,6 @@ def file_to_chunks(
     from chunkers import (
         CODE_EXTENSIONS,
         chunk_code,
-        chunk_document_via_images,
         chunk_image,
         chunk_markdown,
         detect_file_type,
@@ -132,9 +300,7 @@ def file_to_chunks(
     chunks: list[Chunk] = []
 
     if file_type in ("pdf", "docx", "pptx"):
-        chunks = chunk_document_via_images(
-            file_bytes, root_id, file_path, file_type, s3c, bkt, gemini_key,
-        )
+        chunks = chunk_document_with_stage_functions(file_bytes, root_id, file_path, file_type, s3c, bkt)
     elif file_type == "image":
         chunks = chunk_image(file_bytes, root_id, file_path, s3c, bkt, gemini_key)
     elif file_type in CODE_EXTENSIONS:
@@ -157,28 +323,43 @@ EMBEDDING_DIM = 768
 
 @app.cls(
     image=embedding_image,
-    cpu=2,
+    gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
+    cpu=4,
     timeout=600,
-    memory=4096,
-    scaledown_window=300,
+    memory=8192,
+    min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "1")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "8")),
+    scaledown_window=900,
 )
 class Embedder:
-    """Persistent embedding model container (CPU-only, Nomic Embed v1.5)."""
+    """Persistent embedding model container (GPU-backed, Nomic Embed v1.5)."""
 
     @modal.enter()
     def load_model(self):
+        import torch
         from sentence_transformers import SentenceTransformer
 
-        self.model = SentenceTransformer(EMBEDDING_MODEL, trust_remote_code=True)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.encode_batch_size = int(os.getenv("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", "64"))
+        self.model = SentenceTransformer(
+            EMBEDDING_MODEL,
+            trust_remote_code=True,
+            device=self.device,
+        )
 
-    @modal.method()
-    def embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
+    def _embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
         """Embed a batch of Chunk dicts, return ChunkWithEmbedding dicts."""
         if not chunk_dicts:
             return []
 
         texts = [f"search_document: {c['content']}" for c in chunk_dicts]
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        embeddings = self.model.encode(
+            texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.encode_batch_size,
+            device=self.device,
+        )
 
         results: list[dict] = []
         for chunk_dict, emb in zip(chunk_dicts, embeddings):
@@ -188,14 +369,31 @@ class Embedder:
 
         return results
 
-    @modal.method()
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of raw text strings. Used for query embedding."""
         if not texts:
             return []
         prefixed = [f"search_query: {t}" for t in texts]
-        embeddings = self.model.encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
+        embeddings = self.model.encode(
+            prefixed,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.encode_batch_size,
+            device=self.device,
+        )
         return [emb.tolist() for emb in embeddings]
+
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-chunks-endpoint")
+    def embed_chunks_endpoint(self, item: dict) -> dict:
+        """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
+        results = self._embed_chunks(item["chunks"])
+        return {"results": results, "count": len(results)}
+
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-query-endpoint")
+    def embed_query_endpoint(self, item: dict) -> dict:
+        """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
+        embeddings = self._embed_texts(item["texts"])
+        return {"embeddings": embeddings}
 
 
 # ---------------------------------------------------------------------------
@@ -220,31 +418,3 @@ def chunk_file_endpoint(item: dict) -> dict:
         content_b64=item.get("content_b64"),
     )
     return {"chunks": chunks, "count": len(chunks)}
-
-
-@app.function(
-    image=embedding_image,
-    cpu=2,
-    timeout=600,
-    memory=4096,
-)
-@modal.fastapi_endpoint(method="POST")
-def embed_chunks_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
-    embedder = Embedder()
-    results = embedder.embed_chunks.local(item["chunks"])
-    return {"results": results, "count": len(results)}
-
-
-@app.function(
-    image=embedding_image,
-    cpu=2,
-    timeout=600,
-    memory=4096,
-)
-@modal.fastapi_endpoint(method="POST")
-def embed_query_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
-    embedder = Embedder()
-    embeddings = embedder.embed_texts.local(item["texts"])
-    return {"embeddings": embeddings}

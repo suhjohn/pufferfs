@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 )
@@ -19,15 +20,20 @@ type TPClient struct {
 }
 
 // NewTPClient creates a Turbopuffer client.
+// If TURBOPUFFER_API_URL is set, it overrides the default API URL.
 func NewTPClient(apiKey, region string) *TPClient {
 	if region == "" {
 		region = "gcp-us-central1"
 	}
-	return &TPClient{
+	c := &TPClient{
 		apiKey:     apiKey,
 		region:     region,
 		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
+	if u := os.Getenv("TURBOPUFFER_API_URL"); u != "" {
+		c.baseOverride = u
+	}
+	return c
 }
 
 // NewTPClientWithURL creates a TP client with a custom base URL (for testing).
@@ -55,21 +61,36 @@ func namespaceName(rootID string) string {
 // UpsertRows writes documents to a namespace.
 func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric string) error {
 	body := map[string]any{
-		"upsert_rows":    rows,
+		"upsert_rows":     rows,
 		"distance_metric": distanceMetric,
 		"schema": map[string]any{
 			"content": map[string]any{
 				"type":             "string",
 				"full_text_search": true,
 			},
-			"file_path":    map[string]any{"type": "string"},
-			"chunk_index":  map[string]any{"type": "uint"},
-			"content_hash": map[string]any{"type": "string"},
-			"file_type":    map[string]any{"type": "string"},
-			"page_number":  map[string]any{"type": "uint"},
-			"image_path":   map[string]any{"type": "string"},
-			"root_id":      map[string]any{"type": "string"},
+			"file_path":                 map[string]any{"type": "string"},
+			"chunk_index":               map[string]any{"type": "uint"},
+			"content_hash":              map[string]any{"type": "string"},
+			"file_hash":                 map[string]any{"type": "string"},
+			"file_type":                 map[string]any{"type": "string"},
+			"page_number":               map[string]any{"type": "uint"},
+			"image_path":                map[string]any{"type": "string"},
+			"root_id":                   map[string]any{"type": "string"},
+			"generation_id":             map[string]any{"type": "string"},
+			"valid_from_generation":     map[string]any{"type": "string"},
+			"valid_from_generation_seq": map[string]any{"type": "uint"},
+			"valid_to_generation":       map[string]any{"type": "string"},
+			"valid_to_generation_seq":   map[string]any{"type": "uint"},
 		},
+	}
+	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
+	return err
+}
+
+// PatchRows updates attributes on existing documents without replacing vectors.
+func (t *TPClient) PatchRows(ns string, rows []map[string]any) error {
+	body := map[string]any{
+		"patch_rows": rows,
 	}
 	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
 	return err
@@ -176,8 +197,8 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 }
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
-func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, globFilter string) ([]map[string]any, error) {
-	includeAttrs := []string{"content", "file_path", "chunk_index", "file_type", "page_number", "image_path"}
+func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, filters any) ([]map[string]any, error) {
+	includeAttrs := []string{"content", "file_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	queries := []map[string]any{
 		{
@@ -192,10 +213,9 @@ func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float
 		},
 	}
 
-	// Add glob filter if specified
-	if globFilter != "" {
+	if filters != nil {
 		for i := range queries {
-			queries[i]["filters"] = []any{"file_path", "Glob", globFilter}
+			queries[i]["filters"] = filters
 		}
 	}
 
@@ -241,4 +261,3 @@ func reciprocalRankFusion(resultSets [][]map[string]any, k int) []map[string]any
 	}
 	return results
 }
-
