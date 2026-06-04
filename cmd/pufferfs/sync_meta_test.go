@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/pufferfs/pufferfs/internal/merkle"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -83,5 +84,23 @@ func TestWithAbsolutePaths(t *testing.T) {
 	want := filepath.Join(root, "src", "main.go")
 	if len(changes) != 1 || changes[0].AbsolutePath != want {
 		t.Fatalf("absolute path = %#v, want %q", changes, want)
+	}
+}
+
+func TestLargeMovesFallBackToRemoveAndAdd(t *testing.T) {
+	t.Setenv("PUFFERFS_MOVE_REUSE_MAX_BYTES", "1024")
+	result := merkleChangesToDiffResult([]merkle.DiffChange{
+		{Type: "removed", Path: "old.bin", ContentHash: "same", Size: 2048},
+		{Type: "added", Path: "new.bin", ContentHash: "same", Size: 2048},
+	}, &merkle.Tree{}, &merkle.Tree{})
+	if result.Stats.Moved != 0 || result.Stats.Removed != 1 || result.Stats.Added != 1 {
+		t.Fatalf("stats = %#v, want removed+added without move", result.Stats)
+	}
+	statuses := map[models.FileChangeStatus]bool{}
+	for _, change := range result.Changes {
+		statuses[change.Status] = true
+	}
+	if !statuses[models.StatusRemoved] || !statuses[models.StatusAdded] || statuses[models.StatusMoved] {
+		t.Fatalf("changes = %#v", result.Changes)
 	}
 }

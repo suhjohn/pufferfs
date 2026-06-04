@@ -156,7 +156,7 @@ func (s *Server) cleanupFailedGenerationRows(ctx context.Context, orgID, rootID,
 		"valid_to_generation_seq": 0,
 	}
 	for pass := 0; pass < 100; pass++ {
-		rowsRemaining, err := s.tp.PatchByFilter(ns, closeFilter, reopenPatch, true)
+		rowsRemaining, _, err := s.tp.PatchByFilter(ns, closeFilter, reopenPatch, true)
 		if err != nil {
 			return fmt.Errorf("reopening rows closed by failed generation %s: %w", generationID, err)
 		}

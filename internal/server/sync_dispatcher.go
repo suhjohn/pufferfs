@@ -83,12 +83,46 @@ func (d *SyncDispatcher) processReceived(ctx context.Context, msg queue.Received
 		_ = d.queue.NakWithDelay(msg, 5*time.Second)
 		return
 	}
+	if maxAttempts := syncStageMaxAttempts(d.stage); maxAttempts > 0 && msg.Attempts >= maxAttempts {
+		log.Printf("failing sync job stage=%s job_id=%s generation_id=%s after attempts=%d: %v", d.stage, msg.Job.JobID, msg.Job.GenerationID, msg.Attempts, err)
+		d.markMessageFailed(ctx, msg.Job, err)
+		if ackErr := d.queue.Ack(msg); ackErr != nil {
+			log.Printf("acking failed %s job %s: %v", d.stage, msg.Job.JobID, ackErr)
+		}
+		return
+	}
 	delay := time.Duration(msg.Attempts*msg.Attempts) * 10 * time.Second
 	if delay < time.Second {
 		delay = time.Second
 	}
 	log.Printf("processing %s job %s after %s: %v", d.stage, msg.Job.JobID, elapsed, err)
 	_ = d.queue.NakWithDelay(msg, delay)
+}
+
+func syncStageMaxAttempts(stage string) int {
+	switch stage {
+	case syncStageCommit, syncStageCleanup:
+		return 30
+	default:
+		return 3
+	}
+}
+
+func (d *SyncDispatcher) markMessageFailed(ctx context.Context, msg queue.JobMessage, cause error) {
+	if d == nil || d.server == nil || d.server.db == nil {
+		return
+	}
+	if msg.GenerationID != "" {
+		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+	}
+	if d.server.tp != nil && msg.OrgID != "" && msg.RootID != "" && msg.GenerationID != "" {
+		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
+	}
+	if msg.SyncJobID != "" {
+		_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": cause.Error()}})
+	}
 }
 
 func (d *SyncDispatcher) startHeartbeat(ctx context.Context, msg queue.ReceivedMessage) func() {
@@ -294,7 +328,12 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 	if err == nil && status == "visible" {
 		req, readErr := d.readSyncRequest(ctx, msg.GenerationID)
 		if readErr != nil {
-			return nil
+			req = nil
+		}
+		if msg.SyncJobID != "" {
+			if completeErr := d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "completed", nil); completeErr != nil {
+				return completeErr
+			}
 		}
 		return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
 	}
@@ -330,7 +369,27 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 			return fmt.Errorf("storing content proof: %w", err)
 		}
 	}
-	if err := d.server.db.CommitSyncGeneration(ctx, generation, req.State); err != nil {
+	if err := d.server.ensureSyncStateRef(ctx, msg.RootID, msg.GenerationID, req); err != nil {
+		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
+		if msg.SyncJobID != "" {
+			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return fmt.Errorf("preparing sync state: %w", err)
+	}
+	if err := d.server.cleanupFailedGenerationRowsForRoot(ctx, msg.OrgID, msg.RootID); err != nil {
+		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
+		if msg.SyncJobID != "" {
+			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return fmt.Errorf("cleaning failed generations before commit: %w", err)
+	}
+	if err := d.server.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
 		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
 			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)

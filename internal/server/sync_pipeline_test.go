@@ -150,6 +150,56 @@ func TestChunkShardBackpressureMessages(t *testing.T) {
 	}
 }
 
+func TestEnsureSyncStateRefUploadsAndClearsInlineState(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	srv := NewWithStore(nil, store, &ModalClient{}, nil)
+	req := &models.SyncRequest{
+		RootID: "root-1",
+		State: map[string]models.FileState{
+			"docs/a.txt": {Size: 7, ContentHash: "hash-a", Mtime: 123},
+		},
+	}
+	if err := srv.ensureSyncStateRef(ctx, "root-1", "gen-1", req); err != nil {
+		t.Fatalf("ensure state ref: %v", err)
+	}
+	if req.State != nil {
+		t.Fatalf("inline state was not cleared")
+	}
+	if req.StateRef != "states/root-1/gen-1.json.gz" {
+		t.Fatalf("state_ref = %q", req.StateRef)
+	}
+	data, err := store.Download(ctx, req.StateRef)
+	if err != nil {
+		t.Fatalf("download state ref: %v", err)
+	}
+	state, err := decodeRootState(req.StateRef, data)
+	if err != nil {
+		t.Fatalf("parse state object: %v", err)
+	}
+	if state["docs/a.txt"].ContentHash != "hash-a" {
+		t.Fatalf("state object = %#v", state)
+	}
+}
+
+func TestObjectQueuePushDedupesJobIDs(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	broker := newObjectQueueBroker(store)
+	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageChunk, "syncs/gen-1/inputs/shard-000000.jsonl")
+	job.JobID = "job-1"
+	if err := broker.Push(ctx, "gen-1", syncStageChunk, job, job); err != nil {
+		t.Fatalf("push duplicate jobs: %v", err)
+	}
+	summary, err := broker.Summary(ctx, "gen-1", syncStageChunk)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if summary.Queued != 1 {
+		t.Fatalf("queued = %d, want 1", summary.Queued)
+	}
+}
+
 type recordingQueue struct {
 	stage string
 	jobs  []queue.JobMessage

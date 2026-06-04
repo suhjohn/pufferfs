@@ -56,6 +56,7 @@ func indexedChunkFromExisting(rootID, generationID string, generationSeq int64, 
 		GenerationSeq: generationSeq,
 		PageNumber:    row["page_number"],
 		ImagePath:     row["image_path"],
+		Vector:        row["vector"],
 	}
 }
 

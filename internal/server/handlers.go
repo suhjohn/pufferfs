@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,6 +25,7 @@ import (
 
 type objectStore interface {
 	Upload(ctx context.Context, key string, data []byte, contentType string) error
+	UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error
 	UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error)
 	Download(ctx context.Context, key string) ([]byte, error)
 	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
@@ -371,14 +373,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	const maxUploadSize = 512 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reading body: " + err.Error()})
-		return
-	}
 
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
-	if err := s.s3.Upload(r.Context(), s3Key, data, "application/octet-stream"); err != nil {
+	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, "application/octet-stream"); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
 		return
 	}
@@ -412,18 +409,13 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 
 	const maxUploadSize = 1024 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reading body: " + err.Error()})
-		return
-	}
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	s3Key := fmt.Sprintf("bundles/%s/%s", rootID, bundleID)
-	if err := s.s3.Upload(r.Context(), s3Key, data, contentType); err != nil {
+	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
 		return
 	}
@@ -462,7 +454,7 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := s.db.LoadState(r.Context(), rootID)
+	state, err := s.loadRootState(r.Context(), rootID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -524,6 +516,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if req.State == nil && req.StateRef == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state or state_ref is required"})
+		return
+	}
 	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
@@ -574,6 +570,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusConflict
 		}
 		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
+		return
+	}
+	if err := s.ensureSyncStateRef(r.Context(), rootID, generation.ID, &req); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
+		if job != nil {
+			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing sync state: " + err.Error()})
 		return
 	}
 	go func() {
@@ -643,8 +647,18 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 			return nil, fmt.Errorf("storing content proof: %w", err)
 		}
 	}
+	if err := s.cleanupFailedGenerationRowsForRoot(ctx, orgID, rootID); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+		}
+		if job != nil {
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return nil, fmt.Errorf("cleaning failed generations before commit: %w", err)
+	}
 
-	if err := s.db.CommitSyncGeneration(ctx, generation, req.State); err != nil {
+	if err := s.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
 			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
@@ -933,12 +947,12 @@ func checkPermission(acls []models.RootACL, filePath, _ string) bool {
 func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID string, rows []map[string]any) []map[string]any {
 	proofBytes, _, err := s.db.GetContentProof(ctx, orgID, userID, rootID)
 	if err != nil {
-		return rows
+		return nil
 	}
 
 	var proof models.ContentProofData
 	if err := json.Unmarshal(proofBytes, &proof); err != nil {
-		return rows
+		return nil
 	}
 
 	var filtered []map[string]any
@@ -971,6 +985,80 @@ type syncSourceCache struct {
 	objects map[string][]byte
 }
 
+func stateObjectKey(rootID, generationID string) string {
+	return fmt.Sprintf("states/%s/%s.json.gz", rootID, safeObjectName(generationID))
+}
+
+func (s *Server) ensureSyncStateRef(ctx context.Context, rootID, generationID string, req *models.SyncRequest) error {
+	if req == nil || req.StateRef != "" || req.State == nil {
+		return nil
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(gz).Encode(req.State); err != nil {
+		_ = gz.Close()
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	data := buf.Bytes()
+	key := stateObjectKey(rootID, generationID)
+	if err := s.s3.Upload(ctx, key, data, "application/gzip"); err != nil {
+		return fmt.Errorf("uploading root state object %s: %w", key, err)
+	}
+	req.StateRef = key
+	req.State = nil
+	return nil
+}
+
+func (s *Server) loadRootState(ctx context.Context, rootID string) (map[string]models.FileState, error) {
+	record, err := s.db.LoadStateRecord(ctx, rootID)
+	if err != nil {
+		return nil, err
+	}
+	if record.Ref == "" {
+		if record.State == nil {
+			return make(map[string]models.FileState), nil
+		}
+		return record.State, nil
+	}
+	if err := validateStateRef(rootID, record.Ref); err != nil {
+		return nil, err
+	}
+	data, err := s.s3.Download(ctx, record.Ref)
+	if err != nil {
+		return nil, fmt.Errorf("downloading root state %s: %w", record.Ref, err)
+	}
+	state, err := decodeRootState(record.Ref, data)
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func decodeRootState(ref string, data []byte) (map[string]models.FileState, error) {
+	reader := io.Reader(bytes.NewReader(data))
+	var gz *gzip.Reader
+	var err error
+	if strings.HasSuffix(ref, ".gz") {
+		gz, err = gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("opening compressed root state %s: %w", ref, err)
+		}
+		defer gz.Close()
+		reader = gz
+	}
+	var state map[string]models.FileState
+	if err := json.NewDecoder(reader).Decode(&state); err != nil {
+		return nil, fmt.Errorf("parsing root state %s: %w", ref, err)
+	}
+	if state == nil {
+		state = make(map[string]models.FileState)
+	}
+	return state, nil
+}
+
 func newSyncSourceCache(s3 objectStore) *syncSourceCache {
 	return &syncSourceCache{s3: s3, objects: make(map[string][]byte)}
 }
@@ -979,8 +1067,11 @@ func (c *syncSourceCache) read(ctx context.Context, key string, offset, length i
 	if key == "" {
 		return nil, fmt.Errorf("empty source key")
 	}
-	if !strings.HasPrefix(key, "bundles/") {
+	if length > 0 {
 		return c.s3.DownloadRange(ctx, key, offset, length)
+	}
+	if !strings.HasPrefix(key, "bundles/") {
+		return c.s3.Download(ctx, key)
 	}
 	c.mu.Lock()
 	data, ok := c.objects[key]
@@ -1050,16 +1141,16 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 	if err != nil {
 		return fmt.Errorf("embedding sync chunks: %w", err)
 	}
+	if len(embedResults) != len(pending) {
+		return fmt.Errorf("embedding sync chunks: got %d results for %d chunks", len(embedResults), len(pending))
+	}
 	log.Printf("timing stage=modal_embed_global chunks=%d elapsed=%s", len(chunks), time.Since(embedStart))
 
 	cacheEntries := make(map[string][]float64)
 	for i, result := range embedResults {
-		if i >= len(pending) {
-			break
-		}
 		embedding, ok := result["embedding"].([]any)
 		if !ok {
-			continue
+			return fmt.Errorf("embedding result %d missing embedding vector", i)
 		}
 		pending[i].row["vector"] = embedding
 		hash := pending[i].contentHash
@@ -1133,6 +1224,20 @@ func tpWriteBatchSize() int {
 		return 5000
 	}
 	return rows
+}
+
+func filteredQueryLimit(topK int) int {
+	if topK < 1 {
+		topK = 10
+	}
+	limit := topK * 10
+	if limit < 50 {
+		limit = 50
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	return limit
 }
 
 // tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
@@ -1273,6 +1378,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if req.Mode == "" {
 		req.Mode = "hybrid"
 	}
+	queryLimit := filteredQueryLimit(req.TopK)
 
 	// Verify root belongs to org
 	if _, err := s.db.GetRoot(r.Context(), id.OrgID, req.RootID); err != nil {
@@ -1308,7 +1414,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = s.tp.Query(ns, rankBy, req.TopK, tpAndFilter(filters), includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 
 	case "vector":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1317,7 +1423,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = s.tp.Query(ns, rankBy, req.TopK, tpAndFilter(filters), includeAttrs)
+		rows, err = s.tp.Query(ns, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 
 	case "hybrid":
 		embedding, embedErr := s.modal.EmbedQuery(req.Query)
@@ -1325,7 +1431,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
 			return
 		}
-		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, req.TopK, tpAndFilter(filters))
+		rows, err = s.tp.HybridSearch(ns, req.Query, embedding, queryLimit, tpAndFilter(filters))
 
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
@@ -1355,6 +1461,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Content proof filtering: only return results for files the user can prove they have
 	filteredRows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, req.RootID, filteredRows)
+	if len(filteredRows) > req.TopK {
+		filteredRows = filteredRows[:req.TopK]
+	}
 
 	results := make([]models.QueryResult, len(filteredRows))
 	for i, row := range filteredRows {
