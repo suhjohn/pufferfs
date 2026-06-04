@@ -223,7 +223,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		writeFile(t, projectDir, "queued/search.txt", "Dispatcher integration test document for semantic retrieval.\n")
 		writePDF(t, projectDir, "queued/document.pdf", "Queued PDF document chunking through Modal and JetStream.")
 
+		syncStart := time.Now()
 		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		t.Logf("queued CLI sync command elapsed=%s", time.Since(syncStart))
 		if err != nil {
 			t.Fatalf("queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}

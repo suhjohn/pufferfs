@@ -59,8 +59,11 @@ func (d *SyncDispatcher) processReceived(ctx context.Context, msg queue.Received
 	stopHeartbeat := d.startHeartbeat(ctx, msg)
 	defer stopHeartbeat()
 
+	start := time.Now()
 	err := d.Process(ctx, msg.Job)
+	elapsed := time.Since(start)
 	if err == nil {
+		log.Printf("processed sync job stage=%s job_id=%s generation_id=%s shard=%d/%d elapsed=%s", d.stage, msg.Job.JobID, msg.Job.GenerationID, msg.Job.ShardIndex+1, msg.Job.TotalShards, elapsed)
 		if ackErr := d.queue.Ack(msg); ackErr != nil {
 			log.Printf("acking %s job %s: %v", d.stage, msg.Job.JobID, ackErr)
 		}
@@ -74,7 +77,7 @@ func (d *SyncDispatcher) processReceived(ctx context.Context, msg queue.Received
 	if delay < time.Second {
 		delay = time.Second
 	}
-	log.Printf("processing %s job %s: %v", d.stage, msg.Job.JobID, err)
+	log.Printf("processing %s job %s after %s: %v", d.stage, msg.Job.JobID, elapsed, err)
 	_ = d.queue.NakWithDelay(msg, delay)
 }
 
