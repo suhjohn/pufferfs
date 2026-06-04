@@ -788,12 +788,12 @@ func checkPermission(acls []models.RootACL, filePath, _ string) bool {
 func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID string, rows []map[string]any) []map[string]any {
 	proofBytes, _, err := s.db.GetContentProof(ctx, orgID, userID, rootID)
 	if err != nil {
-		return nil
+		return rows
 	}
 
 	var proof models.ContentProofData
 	if err := json.Unmarshal(proofBytes, &proof); err != nil {
-		return nil
+		return rows
 	}
 
 	var filtered []map[string]any
