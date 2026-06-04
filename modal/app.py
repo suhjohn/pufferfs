@@ -40,6 +40,7 @@ chunking_image = (
 embedding_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
+        "boto3>=1.34.0",
         "sentence-transformers>=3.0.0",
         "torch>=2.0.0",
         "einops>=0.7.0",
