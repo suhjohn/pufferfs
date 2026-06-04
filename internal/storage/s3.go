@@ -53,10 +53,14 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 
 // Upload puts an object into S3.
 func (c *Client) Upload(ctx context.Context, key string, data []byte, contentType string) error {
+	return c.UploadStream(ctx, key, bytes.NewReader(data), contentType)
+}
+
+func (c *Client) UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error {
 	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      &c.bucket,
 		Key:         &key,
-		Body:        bytes.NewReader(data),
+		Body:        body,
 		ContentType: &contentType,
 	})
 	return err

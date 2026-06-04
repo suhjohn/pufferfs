@@ -39,6 +39,11 @@ type SyncGeneration struct {
 	BaseGenerationSeq int64
 }
 
+type RootStateRecord struct {
+	State map[string]models.FileState
+	Ref   string
+}
+
 var errSyncInProgress = errors.New("sync already in progress for root")
 var errStaleSyncBase = errors.New("sync base generation is stale")
 
@@ -139,8 +144,10 @@ func (db *DB) migrateFallback() error {
 		CREATE TABLE IF NOT EXISTS root_states (
 			root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
 			state      JSONB NOT NULL DEFAULT '{}',
+			state_ref  TEXT NOT NULL DEFAULT '',
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE root_states ADD COLUMN IF NOT EXISTS state_ref TEXT NOT NULL DEFAULT '';
 
 		CREATE TABLE IF NOT EXISTS embedding_cache (
 			org_id        TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -534,24 +541,46 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 // SaveState persists the filesystem state for a root.
 func (db *DB) SaveState(ctx context.Context, rootID string, state map[string]models.FileState) error {
 	_, err := db.pool.Exec(ctx,
-		`INSERT INTO root_states (root_id, state, updated_at)
-		 VALUES ($1, $2, NOW())
-		 ON CONFLICT (root_id) DO UPDATE SET state = $2, updated_at = NOW()`,
+		`INSERT INTO root_states (root_id, state, state_ref, updated_at)
+		 VALUES ($1, $2, '', NOW())
+		 ON CONFLICT (root_id) DO UPDATE SET state = $2, state_ref = '', updated_at = NOW()`,
 		rootID, state,
+	)
+	return err
+}
+
+func (db *DB) SaveStateRef(ctx context.Context, rootID, stateRef string) error {
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO root_states (root_id, state, state_ref, updated_at)
+		 VALUES ($1, '{}'::jsonb, $2, NOW())
+		 ON CONFLICT (root_id) DO UPDATE SET state = '{}'::jsonb, state_ref = $2, updated_at = NOW()`,
+		rootID, stateRef,
 	)
 	return err
 }
 
 // LoadState retrieves the filesystem state for a root.
 func (db *DB) LoadState(ctx context.Context, rootID string) (map[string]models.FileState, error) {
-	var state map[string]models.FileState
-	err := db.pool.QueryRow(ctx,
-		`SELECT state FROM root_states WHERE root_id = $1`, rootID,
-	).Scan(&state)
+	record, err := db.LoadStateRecord(ctx, rootID)
 	if err != nil {
+		return nil, err
+	}
+	if record.State == nil {
 		return make(map[string]models.FileState), nil
 	}
-	return state, nil
+	return record.State, nil
+}
+
+func (db *DB) LoadStateRecord(ctx context.Context, rootID string) (*RootStateRecord, error) {
+	var state map[string]models.FileState
+	var stateRef string
+	err := db.pool.QueryRow(ctx,
+		`SELECT state, COALESCE(state_ref, '') FROM root_states WHERE root_id = $1`, rootID,
+	).Scan(&state, &stateRef)
+	if err != nil {
+		return &RootStateRecord{State: make(map[string]models.FileState)}, nil
+	}
+	return &RootStateRecord{State: state, Ref: stateRef}, nil
 }
 
 // UpdateRootTimestamp updates the updated_at on a root.
@@ -675,13 +704,17 @@ func validateSyncBase(clientBaseGenerationID string, clientBaseGenerationSeq int
 	return nil
 }
 
-func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGeneration, state map[string]models.FileState) error {
+func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGeneration, state map[string]models.FileState, stateRef string) error {
 	if generation == nil {
 		return fmt.Errorf("sync generation is required")
 	}
-	stateJSON, err := json.Marshal(state)
-	if err != nil {
-		return err
+	var stateJSON []byte
+	var err error
+	if stateRef == "" {
+		stateJSON, err = json.Marshal(state)
+		if err != nil {
+			return err
+		}
 	}
 
 	tx, err := db.pool.Begin(ctx)
@@ -703,13 +736,24 @@ func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGenerati
 		return fmt.Errorf("root visible generation changed while sync was running")
 	}
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO root_states (root_id, state, updated_at)
-		 VALUES ($1, $2::jsonb, NOW())
-		 ON CONFLICT (root_id) DO UPDATE SET state = $2::jsonb, updated_at = NOW()`,
-		generation.RootID, string(stateJSON),
-	); err != nil {
-		return err
+	if stateRef != "" {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO root_states (root_id, state, state_ref, updated_at)
+			 VALUES ($1, '{}'::jsonb, $2, NOW())
+			 ON CONFLICT (root_id) DO UPDATE SET state = '{}'::jsonb, state_ref = $2, updated_at = NOW()`,
+			generation.RootID, stateRef,
+		); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO root_states (root_id, state, state_ref, updated_at)
+			 VALUES ($1, $2::jsonb, '', NOW())
+			 ON CONFLICT (root_id) DO UPDATE SET state = $2::jsonb, state_ref = '', updated_at = NOW()`,
+			generation.RootID, string(stateJSON),
+		); err != nil {
+			return err
+		}
 	}
 
 	tag, err = tx.Exec(ctx,

@@ -28,6 +28,7 @@ const (
 	defaultSyncShardMaxFiles     = 5000
 	defaultSyncShardMaxBytes     = 256 * 1024 * 1024
 	defaultSyncMaxInFlightShards = 32
+	activeRowsQueryLimit         = 10000
 )
 
 type syncPipeline struct {
@@ -250,22 +251,21 @@ func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
 }
 
 func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
-	var batch []models.FileChange
-	for _, change := range p.req.Changes {
-		if change.Status == models.StatusUnchanged {
-			continue
-		}
-		batch = append(batch, change)
-	}
-	if len(batch) == 0 {
+	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
+	if len(shards) == 0 {
 		return nil
 	}
-	ref, err := p.writeJSONL(ctx, "inputs", "batch-000001", batch)
-	if err != nil {
-		return err
+	jobs := make([]objectQueueJob, 0, len(shards))
+	for i, shard := range shards {
+		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
+		if err != nil {
+			return err
+		}
+		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref)
+		job.JobID = chunkShardJobID(p.generation.ID, i)
+		jobs = append(jobs, job)
 	}
-	job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref)
-	return p.broker.Push(ctx, p.generation.ID, syncStageChunk, job)
+	return p.broker.Push(ctx, p.generation.ID, syncStageChunk, jobs...)
 }
 
 func (p *syncPipeline) runChunkStage(ctx context.Context) error {
@@ -288,6 +288,7 @@ func (p *syncPipeline) runChunkStage(ctx context.Context) error {
 				return err
 			}
 			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageEmbed, resultRef)
+			next.JobID = job.JobID + "-embed"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageChunk, job.JobID, resultRef, next); err != nil {
 				return err
 			}
@@ -343,21 +344,29 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 		if s3Key == "" {
 			s3Key = fmt.Sprintf("files/%s/%s", p.rootID, change.Path)
 		}
-		fileData, err := sourceCache.read(ctx, s3Key, change.SourceOffset, change.SourceLength)
-		if err != nil {
-			return nil, fmt.Errorf("downloading %s: %w", s3Key, err)
-		}
 		var chunks []map[string]any
 		if localChunkable(change.Path) {
+			fileData, err := sourceCache.read(ctx, s3Key, change.SourceOffset, change.SourceLength)
+			if err != nil {
+				return nil, fmt.Errorf("downloading %s: %w", s3Key, err)
+			}
 			chunks = chunkLocally(fileData, p.rootID, change.Path)
 		} else {
+			var contentB64 string
+			if !modalCanReadSourceDirectly(s3Key, change) {
+				fileData, err := sourceCache.read(ctx, s3Key, change.SourceOffset, change.SourceLength)
+				if err != nil {
+					return nil, fmt.Errorf("downloading %s: %w", s3Key, err)
+				}
+				contentB64 = base64.StdEncoding.EncodeToString(fileData)
+			}
 			chunkResp, err := p.server.modal.ChunkFile(ChunkFileRequest{
 				S3Key:        s3Key,
 				FilePath:     change.Path,
 				AbsolutePath: change.AbsolutePath,
 				FileType:     detectFileType(change.Path),
 				RootID:       p.rootID,
-				ContentB64:   base64.StdEncoding.EncodeToString(fileData),
+				ContentB64:   contentB64,
 			})
 			if err != nil {
 				return nil, err
@@ -376,9 +385,12 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 	case models.StatusRemoved:
 		return []syncChunkArtifact{{Op: "close", Change: change}}, nil
 	case models.StatusMoved, models.StatusRenamed:
-		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"})
+		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "vector"})
 		if err != nil {
 			return nil, err
+		}
+		if len(rows) >= activeRowsQueryLimit {
+			return nil, fmt.Errorf("move/rename %s has at least %d active chunks; re-sync as remove+add to avoid partial metadata copy", change.OldPath, activeRowsQueryLimit)
 		}
 		out := []syncChunkArtifact{{Op: "close", Change: models.FileChange{Path: change.OldPath, Status: models.StatusRemoved}}}
 		for i, row := range rows {
@@ -389,6 +401,10 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 	default:
 		return nil, nil
 	}
+}
+
+func modalCanReadSourceDirectly(s3Key string, change models.FileChange) bool {
+	return s3Key != "" && !strings.HasPrefix(s3Key, "bundles/") && change.SourceOffset == 0
 }
 
 func attachAbsolutePath(chunks []map[string]any, absolutePath string) {
@@ -419,6 +435,7 @@ func (p *syncPipeline) runEmbedStage(ctx context.Context) error {
 				return err
 			}
 			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageIndex, resultRef)
+			next.JobID = job.JobID + "-index"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageEmbed, job.JobID, resultRef, next); err != nil {
 				return err
 			}
@@ -456,6 +473,9 @@ func (p *syncPipeline) processEmbedJob(ctx context.Context, job objectQueueJob) 
 	}
 	for i := range indexRows {
 		if indexRows[i].Op != "upsert" {
+			continue
+		}
+		if _, ok := indexRows[i].Row["vector"]; ok {
 			continue
 		}
 		hash := strVal(indexRows[i].Row, "content_hash")
@@ -536,16 +556,11 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) 
 		p.resp.ChunksAdded += len(upserts)
 	}
 	for path := range closePaths {
-		closeRows, err := p.closeRowsForPath(ctx, path)
+		closed, err := p.closeRowsForPath(ctx, path)
 		if err != nil {
 			return err
 		}
-		if len(closeRows) > 0 {
-			if err := p.server.patchRowsInBatches(ns, closeRows); err != nil {
-				return err
-			}
-			p.resp.ChunksRemoved += len(closeRows)
-		}
+		p.resp.ChunksRemoved += closed
 	}
 	p.resp.FilesProcessed += len(processedPaths)
 	if p.job != nil {
@@ -554,24 +569,29 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) 
 	return nil
 }
 
-func (p *syncPipeline) closeRowsForPath(ctx context.Context, path string) ([]map[string]any, error) {
-	rows, err := p.queryActiveRows(ctx, path, []string{"id"})
-	if err != nil {
-		return nil, err
+func (p *syncPipeline) closeRowsForPath(ctx context.Context, path string) (int, error) {
+	filters := []any{
+		[]any{"file_path", "Eq", path},
 	}
-	out := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		id := fmt.Sprintf("%v", row["id"])
-		if id == "" || id == "<nil>" {
-			continue
+	if p.generation.BaseGenerationSeq > 0 {
+		filters = append(filters, activeGenerationFilter(p.generation.BaseGenerationSeq))
+	}
+	patch := map[string]any{
+		"valid_to_generation":     p.generation.ID,
+		"valid_to_generation_seq": p.generation.Seq,
+	}
+	total := 0
+	for pass := 0; pass < 100; pass++ {
+		rowsRemaining, affected, err := p.server.tp.PatchByFilter(tpNamespace(p.orgID, p.rootID), tpAndFilter(filters), patch, true)
+		if err != nil {
+			return total, err
 		}
-		out = append(out, map[string]any{
-			"id":                      id,
-			"valid_to_generation":     p.generation.ID,
-			"valid_to_generation_seq": p.generation.Seq,
-		})
+		total += affected
+		if !rowsRemaining {
+			return total, nil
+		}
 	}
-	return out, nil
+	return total, fmt.Errorf("closing rows for %s: rows remain after repeated patch passes", path)
 }
 
 func (p *syncPipeline) queryActiveRows(ctx context.Context, path string, attrs []string) ([]map[string]any, error) {
@@ -581,7 +601,7 @@ func (p *syncPipeline) queryActiveRows(ctx context.Context, path string, attrs [
 	if p.generation.BaseGenerationSeq > 0 {
 		filters = append(filters, activeGenerationFilter(p.generation.BaseGenerationSeq))
 	}
-	return p.server.tp.Query(tpNamespace(p.orgID, p.rootID), []any{"file_path", "asc"}, 10000, tpAndFilter(filters), attrs)
+	return p.server.tp.Query(tpNamespace(p.orgID, p.rootID), []any{"file_path", "asc"}, activeRowsQueryLimit, tpAndFilter(filters), attrs)
 }
 
 func (p *syncPipeline) ensureStageComplete(ctx context.Context, stage string) error {

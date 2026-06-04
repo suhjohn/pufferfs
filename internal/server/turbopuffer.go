@@ -118,7 +118,7 @@ func (t *TPClient) DeleteByFilter(ns string, filters any, allowPartial bool) (bo
 }
 
 // PatchByFilter updates attributes on documents that match a Turbopuffer filter.
-func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, allowPartial bool) (bool, error) {
+func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, allowPartial bool) (bool, int, error) {
 	body := map[string]any{
 		"patch_by_filter": map[string]any{
 			"filters": filters,
@@ -130,15 +130,25 @@ func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, a
 	}
 	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	var result struct {
 		RowsRemaining bool `json:"rows_remaining"`
+		RowsAffected  int  `json:"rows_affected"`
+		RowsPatched   int  `json:"rows_patched"`
+		Count         int  `json:"count"`
 	}
 	if len(resp) > 0 {
 		_ = json.Unmarshal(resp, &result)
 	}
-	return result.RowsRemaining, nil
+	affected := result.RowsAffected
+	if affected == 0 {
+		affected = result.RowsPatched
+	}
+	if affected == 0 {
+		affected = result.Count
+	}
+	return result.RowsRemaining, affected, nil
 }
 
 // Query performs a search query.
@@ -198,29 +208,39 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 	}
 
 	url := t.baseURL() + path
-	req, err := http.NewRequest(method, url, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+t.apiKey)
-	req.Header.Set("Content-Type", "application/json")
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequest(method, url, bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+t.apiKey)
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := t.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		resp, err := t.httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+		respBody, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return respBody, nil
+		}
+		lastErr = fmt.Errorf("turbopuffer HTTP %d: %s", resp.StatusCode, string(respBody))
+		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+			return nil, lastErr
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("turbopuffer HTTP %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	return respBody, nil
+	return nil, lastErr
 }
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.

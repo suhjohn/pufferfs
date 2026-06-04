@@ -78,6 +78,61 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 		req.ContentProof.DirHashes = dirHashes
 	}
 
+	req.StateRef = strings.TrimSpace(strings.ReplaceAll(req.StateRef, "\\", "/"))
+	if err := validateStateRef(req.RootID, req.StateRef); err != nil {
+		return err
+	}
+	req.ManifestRef = strings.TrimSpace(strings.ReplaceAll(req.ManifestRef, "\\", "/"))
+	if err := validateBundleObjectRef(req.RootID, req.ManifestRef, "manifest_ref"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateStateRef(rootID, stateRef string) error {
+	stateRef = strings.TrimSpace(strings.ReplaceAll(stateRef, "\\", "/"))
+	if stateRef == "" {
+		return nil
+	}
+	if strings.Contains(stateRef, "\x00") {
+		return fmt.Errorf("state_ref contains NUL byte")
+	}
+	statePrefix := fmt.Sprintf("states/%s/", rootID)
+	bundlePrefix := fmt.Sprintf("bundles/%s/", rootID)
+	if strings.HasPrefix(stateRef, statePrefix) {
+		name := strings.TrimPrefix(stateRef, statePrefix)
+		if name == "" || name != safeObjectName(name) {
+			return fmt.Errorf("state_ref is invalid")
+		}
+		return nil
+	}
+	if strings.HasPrefix(stateRef, bundlePrefix) {
+		name := strings.TrimPrefix(stateRef, bundlePrefix)
+		if name == "" || name != safeObjectName(name) {
+			return fmt.Errorf("state_ref bundle key is invalid")
+		}
+		return nil
+	}
+	return fmt.Errorf("state_ref must reference this root's state object")
+}
+
+func validateBundleObjectRef(rootID, ref, field string) error {
+	ref = strings.TrimSpace(strings.ReplaceAll(ref, "\\", "/"))
+	if ref == "" {
+		return nil
+	}
+	if strings.Contains(ref, "\x00") {
+		return fmt.Errorf("%s contains NUL byte", field)
+	}
+	bundlePrefix := fmt.Sprintf("bundles/%s/", rootID)
+	if !strings.HasPrefix(ref, bundlePrefix) {
+		return fmt.Errorf("%s must reference this root's bundle object", field)
+	}
+	name := strings.TrimPrefix(ref, bundlePrefix)
+	if name == "" || name != safeObjectName(name) {
+		return fmt.Errorf("%s bundle key is invalid", field)
+	}
 	return nil
 }
 

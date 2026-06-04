@@ -176,7 +176,8 @@ type SyncRequest struct {
 	BaseGenerationID  string               `json:"base_generation_id"`
 	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
 	Changes           []FileChange         `json:"changes"`
-	State             map[string]FileState `json:"state"`
+	State             map[string]FileState `json:"state,omitempty"`
+	StateRef          string               `json:"state_ref,omitempty"`
 	SimHash           string               `json:"simhash,omitempty"`
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
 	ManifestRef       string               `json:"manifest_ref,omitempty"`

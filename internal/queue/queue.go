@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,7 +106,8 @@ func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
 	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit, StageCleanup} {
 		stream := streamName(stage)
 		subject := subjectForStage(stage)
-		if _, err := q.js.StreamInfo(stream); err != nil {
+		streamInfo, err := q.js.StreamInfo(stream)
+		if err != nil {
 			if !errors.Is(err, nats.ErrStreamNotFound) {
 				return err
 			}
@@ -113,35 +116,74 @@ func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
 				Subjects:   []string{subject},
 				Storage:    nats.FileStorage,
 				Retention:  nats.WorkQueuePolicy,
-				Duplicates: 5 * time.Minute,
+				Duplicates: duplicateWindow(),
 			}); err != nil {
+				return err
+			}
+		} else if streamInfo.Config.Duplicates != duplicateWindow() {
+			cfg := streamInfo.Config
+			cfg.Duplicates = duplicateWindow()
+			if _, err := q.js.UpdateStream(&cfg); err != nil {
 				return err
 			}
 		}
 		consumer := consumerName(consumerPrefix, stage)
-		if _, err := q.js.ConsumerInfo(stream, consumer); err != nil {
+		desired := consumerConfig(stage, consumer, subject)
+		consumerInfo, err := q.js.ConsumerInfo(stream, consumer)
+		if err != nil {
 			if !errors.Is(err, nats.ErrConsumerNotFound) {
 				return err
 			}
-			ackWait := 5 * time.Minute
-			maxDeliver := 3
-			if stage == StageCommit || stage == StageCleanup {
-				ackWait = 30 * time.Second
-				maxDeliver = 30
+			if _, err := q.js.AddConsumer(stream, &desired); err != nil {
+				return err
 			}
-			if _, err := q.js.AddConsumer(stream, &nats.ConsumerConfig{
-				Durable:       consumer,
-				AckPolicy:     nats.AckExplicitPolicy,
-				AckWait:       ackWait,
-				MaxDeliver:    maxDeliver,
-				MaxAckPending: 10000,
-				FilterSubject: subject,
-			}); err != nil {
+		} else if consumerInfo.Config.AckWait != desired.AckWait ||
+			consumerInfo.Config.MaxDeliver != desired.MaxDeliver ||
+			consumerInfo.Config.MaxAckPending != desired.MaxAckPending ||
+			consumerInfo.Config.FilterSubject != desired.FilterSubject {
+			cfg := consumerInfo.Config
+			cfg.AckWait = desired.AckWait
+			cfg.MaxDeliver = desired.MaxDeliver
+			cfg.MaxAckPending = desired.MaxAckPending
+			cfg.FilterSubject = desired.FilterSubject
+			if _, err := q.js.UpdateConsumer(stream, &cfg); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func consumerConfig(stage, consumer, subject string) nats.ConsumerConfig {
+	ackWait := 5 * time.Minute
+	maxDeliver := 5
+	if stage == StageCommit || stage == StageCleanup {
+		ackWait = 30 * time.Second
+		maxDeliver = 30
+	}
+	return nats.ConsumerConfig{
+		Durable:       consumer,
+		AckPolicy:     nats.AckExplicitPolicy,
+		AckWait:       ackWait,
+		MaxDeliver:    maxDeliver,
+		MaxAckPending: 10000,
+		FilterSubject: subject,
+	}
+}
+
+func duplicateWindow() time.Duration {
+	const defaultWindow = 24 * time.Hour
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_QUEUE_DEDUPE_WINDOW"))
+	if raw == "" {
+		return defaultWindow
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultWindow
 }
 
 func (q *NATSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage) error {

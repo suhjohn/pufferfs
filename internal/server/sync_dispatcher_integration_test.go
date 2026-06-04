@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -239,6 +240,14 @@ func (s *memoryObjectStore) Upload(_ context.Context, key string, data []byte, _
 	defer s.mu.Unlock()
 	s.objects[key] = append([]byte(nil), data...)
 	return nil
+}
+
+func (s *memoryObjectStore) UploadStream(_ context.Context, key string, body io.Reader, _ string) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	return s.Upload(context.Background(), key, data, "")
 }
 
 func (s *memoryObjectStore) UploadCAS(ctx context.Context, key string, data []byte, contentType, _, _ string) (string, error) {

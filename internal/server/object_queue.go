@@ -88,6 +88,16 @@ func (b *objectQueueBroker) Push(ctx context.Context, generationID, stage string
 			if jobs[i].JobID == "" {
 				jobs[i].JobID = uuid.New().String()
 			}
+			exists := false
+			for j := range state.Jobs {
+				if state.Jobs[j].JobID == jobs[i].JobID {
+					exists = true
+					break
+				}
+			}
+			if exists {
+				continue
+			}
 			jobs[i].Status = queueJobQueued
 			if jobs[i].CreatedAt.IsZero() {
 				jobs[i].CreatedAt = now
@@ -129,6 +139,11 @@ func (b *objectQueueBroker) Claim(ctx context.Context, generationID, stage, work
 }
 
 func (b *objectQueueBroker) Complete(ctx context.Context, generationID, stage, jobID, resultRef string, nextJobs ...objectQueueJob) error {
+	for _, next := range nextJobs {
+		if err := b.Push(ctx, generationID, next.Stage, next); err != nil {
+			return err
+		}
+	}
 	if err := b.updateJob(ctx, generationID, stage, jobID, func(job *objectQueueJob) {
 		job.Status = queueJobDone
 		job.ResultRef = resultRef
@@ -137,11 +152,6 @@ func (b *objectQueueBroker) Complete(ctx context.Context, generationID, stage, j
 		job.Error = ""
 	}); err != nil {
 		return err
-	}
-	for _, next := range nextJobs {
-		if err := b.Push(ctx, generationID, next.Stage, next); err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -258,7 +268,7 @@ func objectQueueKey(generationID, stage string) string {
 
 func isObjectNotFound(err error) bool {
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "notfound") || strings.Contains(msg, "status code: 404")
+	return strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "notfound") || strings.Contains(msg, "not found") || strings.Contains(msg, "status code: 404")
 }
 
 func isObjectPreconditionError(err error) bool {

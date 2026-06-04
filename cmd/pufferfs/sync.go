@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -221,6 +222,10 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		DirHashes:  proof.DirHashes,
 		RootHash:   proof.RootHash,
 	}
+	stateRef, err := uploadRootState(client, rootID, currentState)
+	if err != nil {
+		return fmt.Errorf("uploading root state: %w", err)
+	}
 
 	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
@@ -229,7 +234,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
 		Changes:           changes,
-		State:             currentState,
+		StateRef:          stateRef,
 		SimHash:           currentTree.SimHashHex(),
 		ContentProof:      contentProof,
 		ManifestRef:       manifestRef,
@@ -385,7 +390,7 @@ func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.T
 			if usedRemoved[ri] || usedAdded[ai] {
 				continue
 			}
-			if a.ContentHash == r.ContentHash {
+			if a.ContentHash == r.ContentHash && a.Size <= moveReuseMaxBytes() {
 				result.Changes = append(result.Changes, models.FileChange{
 					Path:        a.Path,
 					Status:      models.StatusMoved,
@@ -426,6 +431,19 @@ func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.T
 	}
 
 	return result
+}
+
+func moveReuseMaxBytes() int64 {
+	const defaultBytes = 64 << 20
+	raw := os.Getenv("PUFFERFS_MOVE_REUSE_MAX_BYTES")
+	if raw == "" {
+		return defaultBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return defaultBytes
+	}
+	return value
 }
 
 func resolveOrCreateRoot(client *apiClient, name, sourcePath string) (*models.RootMetadata, error) {
@@ -614,12 +632,13 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 }
 
 func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, error) {
-	data, err := os.ReadFile(localPath)
+	file, err := os.Open(localPath)
 	if err != nil {
 		return "", err
 	}
+	defer file.Close()
 	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, url.QueryEscape(relPath))
-	respBody, err := client.postRaw(url, data, "application/octet-stream")
+	respBody, err := client.postStream(url, file, "application/octet-stream")
 	if err != nil {
 		return "", err
 	}
@@ -645,6 +664,19 @@ func uploadBundle(client *apiClient, rootID, bundleID string, data []byte, conte
 		return "", err
 	}
 	return resp.Key, nil
+}
+
+func uploadRootState(client *apiClient, rootID string, state map[string]models.FileState) (string, error) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(gz).Encode(state); err != nil {
+		_ = gz.Close()
+		return "", err
+	}
+	if err := gz.Close(); err != nil {
+		return "", err
+	}
+	return uploadBundle(client, rootID, fmt.Sprintf("state-%d.json.gz", time.Now().UnixNano()), buf.Bytes(), "application/gzip")
 }
 
 func uploadBundleSmallFileLimit() int64 {

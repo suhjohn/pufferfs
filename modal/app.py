@@ -390,17 +390,26 @@ def _tp_base_url() -> str:
 
 def _tp_request(method: str, path: str, body: dict) -> dict:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(_tp_base_url() + path, data=data, method=method)
-    req.add_header("Authorization", f"Bearer {os.environ['TURBOPUFFER_API_KEY']}")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = resp.read()
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"turbopuffer HTTP {exc.code}: {exc.read().decode('utf-8')}") from exc
-    if not payload:
-        return {}
-    return json.loads(payload.decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(3):
+        req = urllib.request.Request(_tp_base_url() + path, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {os.environ['TURBOPUFFER_API_KEY']}")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = resp.read()
+            if not payload:
+                return {}
+            return json.loads(payload.decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8")
+            last_error = RuntimeError(f"turbopuffer HTTP {exc.code}: {body_text}")
+            if exc.code != 429 and exc.code < 500:
+                raise last_error from exc
+        except urllib.error.URLError as exc:
+            last_error = exc
+        time.sleep(attempt + 1)
+    raise RuntimeError(f"turbopuffer request failed: {last_error}") from last_error
 
 
 def _active_generation_filter(seq: int) -> list:
@@ -414,31 +423,48 @@ def _active_generation_filter(seq: int) -> list:
 
 
 def _query_active_rows(job: dict, file_path: str, attrs: list[str]) -> list[dict]:
+    limit = 10000
     filters = [["file_path", "Eq", file_path]]
     base_seq = int(job.get("base_generation_seq") or 0)
     if base_seq > 0:
         filters.append(_active_generation_filter(base_seq))
     body = {
         "rank_by": ["file_path", "asc"],
-        "limit": 10000,
+        "limit": limit,
         "filters": ["And", filters],
         "include_attributes": attrs,
     }
     ns = urllib.parse.quote(_namespace(job["org_id"], job["root_id"]), safe="")
-    return _tp_request("POST", f"/v2/namespaces/{ns}/query", body).get("rows", [])
+    rows = _tp_request("POST", f"/v2/namespaces/{ns}/query", body).get("rows", [])
+    if len(rows) >= limit:
+        raise RuntimeError(f"{file_path} has at least {limit} active chunks; refusing partial metadata copy")
+    return rows
 
 
-def _close_rows_for_path(job: dict, file_path: str) -> list[dict]:
-    rows = _query_active_rows(job, file_path, ["id"])
-    return [
-        {
-            "id": row["id"],
-            "valid_to_generation": job["generation_id"],
-            "valid_to_generation_seq": job["generation_seq"],
-        }
-        for row in rows
-        if row.get("id")
-    ]
+def _close_rows_for_path(job: dict, file_path: str) -> int:
+    filters = [["file_path", "Eq", file_path]]
+    base_seq = int(job.get("base_generation_seq") or 0)
+    if base_seq > 0:
+        filters.append(_active_generation_filter(base_seq))
+    patch = {
+        "valid_to_generation": job["generation_id"],
+        "valid_to_generation_seq": job["generation_seq"],
+    }
+    ns = urllib.parse.quote(_namespace(job["org_id"], job["root_id"]), safe="")
+    closed = 0
+    for _ in range(100):
+        result = _tp_request(
+            "POST",
+            f"/v2/namespaces/{ns}",
+            {
+                "patch_by_filter": {"filters": ["And", filters], "patch": patch},
+                "patch_by_filter_allow_partial": True,
+            },
+        )
+        closed += int(result.get("rows_affected") or result.get("rows_patched") or result.get("count") or 0)
+        if not result.get("rows_remaining"):
+            return closed
+    raise RuntimeError(f"closing rows for {file_path}: rows remain after repeated patch passes")
 
 
 def _row_from_chunk(job: dict, file_hash: str, chunk: dict) -> dict:
@@ -491,7 +517,13 @@ def _row_from_existing(job: dict, file_path: str, absolute_path: str, file_hash:
         out["page_number"] = row["page_number"]
     if row.get("image_path") is not None:
         out["image_path"] = row["image_path"]
+    if row.get("vector") is not None:
+        out["vector"] = row["vector"]
     return out
+
+
+def _modal_can_read_source_directly(s3_key: str, change: dict) -> bool:
+    return bool(s3_key) and not s3_key.startswith("bundles/") and int(change.get("source_offset") or 0) == 0
 
 
 @app.function(
@@ -522,7 +554,9 @@ def chunk_shard_endpoint(item: dict) -> dict:
                 absolute_path=change.get("absolute_path", ""),
                 file_type=detect_file_type(change["path"]),
                 root_id=job["root_id"],
-                content_b64=base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
+                content_b64=None
+                if _modal_can_read_source_directly(s3_key, change)
+                else base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
             )
             artifacts.extend({"op": "chunk", "change": change, "chunk": chunk} for chunk in chunks)
         elif status == "REMOVED":
@@ -533,7 +567,7 @@ def chunk_shard_endpoint(item: dict) -> dict:
             rows = _query_active_rows(
                 job,
                 old_path,
-                ["content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path"],
+                ["content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "vector"],
             )
             for idx, existing in enumerate(rows):
                 artifacts.append(
@@ -647,14 +681,39 @@ class Embedder:
                 if path:
                     out.append({"op": "close", "close_path": path})
             elif op == "row" and artifact.get("row"):
-                out.append({"op": "upsert", "row": artifact["row"]})
+                row = artifact["row"]
+                if row.get("vector") is not None:
+                    out.append({"op": "upsert", "row": row})
+                else:
+                    pending.append(
+                        (
+                            {
+                                "id": row.get("id"),
+                                "content": row.get("content", ""),
+                                "file_path": row.get("file_path", ""),
+                                "chunk_index": row.get("chunk_index", 0),
+                                "content_hash": row.get("content_hash", ""),
+                                "file_type": row.get("file_type", ""),
+                                "root_id": row.get("root_id"),
+                                "absolute_path": row.get("absolute_path", ""),
+                                "page_number": row.get("page_number"),
+                                "image_path": row.get("image_path"),
+                            },
+                            row,
+                        )
+                    )
             elif op == "chunk" and artifact.get("chunk"):
                 row = _row_from_chunk(job, artifact.get("change", {}).get("content_hash", ""), artifact["chunk"])
                 pending.append((artifact["chunk"], row))
         if pending:
             embedded = self._embed_chunks([chunk for chunk, _ in pending])
+            if len(embedded) != len(pending):
+                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(pending)} pending rows")
             for (_, row), result in zip(pending, embedded):
-                row["vector"] = result.get("embedding", [])
+                embedding = result.get("embedding")
+                if embedding is None:
+                    raise RuntimeError("embedding result missing embedding vector")
+                row["vector"] = embedding
                 out.append({"op": "upsert", "row": row})
         result_ref = _write_jsonl(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]), out)
         return {"result_ref": result_ref, "count": len(out)}
@@ -718,9 +777,7 @@ def index_shard_endpoint(item: dict) -> dict:
     _tp_upsert_rows(namespace, upserts)
     closed = 0
     for path in close_paths:
-        rows = _close_rows_for_path(job, path)
-        closed += len(rows)
-        _tp_patch_rows(namespace, rows)
+        closed += _close_rows_for_path(job, path)
     return {"count": len(upserts) + closed}
 
 

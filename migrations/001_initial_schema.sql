@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS roots (
 CREATE TABLE IF NOT EXISTS root_states (
     root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
     state      JSONB NOT NULL DEFAULT '{}',
+    state_ref  TEXT NOT NULL DEFAULT '',
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
