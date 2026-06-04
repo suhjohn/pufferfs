@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -52,5 +53,26 @@ func TestLocalCacheMatchesRemote(t *testing.T) {
 	remote.VisibleGenerationID = "gen-2"
 	if localCacheMatchesRemote(local, remote) {
 		t.Fatal("stale local generation should not use local cache")
+	}
+}
+
+func TestSyncConflictFromAPIError(t *testing.T) {
+	body, err := json.Marshal(models.SyncConflictResponse{
+		Error:                   "sync base generation is stale",
+		ClientBaseGenerationID:  "gen-1",
+		ClientBaseGenerationSeq: 1,
+		CurrentGenerationID:     "gen-2",
+		CurrentGenerationSeq:    2,
+	})
+	if err != nil {
+		t.Fatalf("marshal conflict response: %v", err)
+	}
+
+	conflict, ok := syncConflictFromError(&apiError{StatusCode: 409, Body: body})
+	if !ok {
+		t.Fatal("syncConflictFromError did not parse conflict response")
+	}
+	if conflict.CurrentGenerationID != "gen-2" || conflict.CurrentGenerationSeq != 2 {
+		t.Fatalf("conflict = %#v", conflict)
 	}
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -120,7 +122,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 			fmt.Println("No changes detected (remote state matches local filesystem).")
 			return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 		}
-		return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -138,7 +140,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -156,7 +158,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID string, dryRun bool) error
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
@@ -209,6 +211,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
+		ProtocolVersion:   models.SyncProtocolVersion,
 		RootID:            rootID,
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
@@ -221,6 +224,9 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
 	if err != nil {
+		if conflict, ok := syncConflictFromError(err); ok {
+			return conflict
+		}
 		return fmt.Errorf("sync request: %w", err)
 	}
 
@@ -240,6 +246,57 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID string, dryRun b
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
 
 	return nil
+}
+
+type syncConflictError struct {
+	models.SyncConflictResponse
+}
+
+func (e *syncConflictError) Error() string {
+	return fmt.Sprintf("remote generation changed from %q/%d to %q/%d", e.ClientBaseGenerationID, e.ClientBaseGenerationSeq, e.CurrentGenerationID, e.CurrentGenerationSeq)
+}
+
+func syncConflictFromError(err error) (*syncConflictError, bool) {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
+		return nil, false
+	}
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(apiErr.Body, &raw) != nil {
+		return nil, false
+	}
+	if _, ok := raw["current_generation_id"]; !ok {
+		return nil, false
+	}
+	var resp models.SyncConflictResponse
+	if json.Unmarshal(apiErr.Body, &resp) != nil || resp.Error == "" {
+		return nil, false
+	}
+	return &syncConflictError{SyncConflictResponse: resp}, true
+}
+
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
+	err := runSyncWithResult(cfg, dir, name, rootID, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+	var conflict *syncConflictError
+	if !errors.As(err, &conflict) {
+		return err
+	}
+	if dryRun {
+		return err
+	}
+
+	fmt.Println("Remote generation changed during sync; reconciling against latest remote state.")
+	client := newAPIClient(cfg)
+	previousState, loadErr := loadRemoteState(client, rootID)
+	if loadErr != nil {
+		return fmt.Errorf("loading remote state after sync conflict: %w", loadErr)
+	}
+	reconciled := diff.Compute(previousState, currentState)
+	if countChanges(reconciled) == 0 {
+		fmt.Println("No changes detected (remote state matches local filesystem).")
+		return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
+	}
+	return runSyncWithResult(cfg, dir, name, rootID, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
 }
 
 func pollSyncJob(client *apiClient, rootID, jobID string) error {

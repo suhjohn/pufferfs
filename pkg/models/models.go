@@ -165,8 +165,11 @@ type ChunkWithEmbedding struct {
 // Sync
 // ---------------------------------------------------------------------------
 
+const SyncProtocolVersion = 1
+
 // SyncRequest is sent from CLI to server to trigger a sync.
 type SyncRequest struct {
+	ProtocolVersion   int                  `json:"protocol_version"`
 	RootID            string               `json:"root_id"`
 	BaseGenerationID  string               `json:"base_generation_id"`
 	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
@@ -175,6 +178,14 @@ type SyncRequest struct {
 	SimHash           string               `json:"simhash,omitempty"`
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
 	ManifestRef       string               `json:"manifest_ref,omitempty"`
+}
+
+type SyncConflictResponse struct {
+	Error                   string `json:"error"`
+	ClientBaseGenerationID  string `json:"client_base_generation_id"`
+	ClientBaseGenerationSeq int64  `json:"client_base_generation_seq"`
+	CurrentGenerationID     string `json:"current_generation_id"`
+	CurrentGenerationSeq    int64  `json:"current_generation_seq"`
 }
 
 // ContentProofData is the serialized content proof sent with sync/query requests.
