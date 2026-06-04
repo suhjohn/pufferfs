@@ -96,24 +96,6 @@ func (t *TPClient) PatchRows(ns string, rows []map[string]any) error {
 	return err
 }
 
-// DeleteByFilter deletes documents matching a filter.
-func (t *TPClient) DeleteByFilter(ns string, filter any) error {
-	body := map[string]any{
-		"delete_by_filter": filter,
-	}
-	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	return err
-}
-
-// DeleteIDs deletes documents by their IDs.
-func (t *TPClient) DeleteIDs(ns string, ids []string) error {
-	body := map[string]any{
-		"deletes": ids,
-	}
-	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	return err
-}
-
 // Query performs a search query.
 func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeAttrs []string) ([]map[string]any, error) {
 	body := map[string]any{
