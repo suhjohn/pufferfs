@@ -278,19 +278,30 @@ type realServices struct {
 	modalChunkURL      string
 	modalEmbedURL      string
 	modalQueryEmbedURL string
+	modalChunkShardURL string
+	modalEmbedShardURL string
+	modalIndexShardURL string
 	turbopufferAPIKey  string
 	turbopufferAPIURL  string
+	storageEnv         []string
 }
 
 func requireRealServices(t *testing.T) realServices {
 	t.Helper()
 
+	useRealS3 := os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1"
 	cfg := realServices{
 		modalChunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		modalEmbedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		modalQueryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
 		turbopufferAPIKey:  os.Getenv("TURBOPUFFER_API_KEY"),
 		turbopufferAPIURL:  os.Getenv("TURBOPUFFER_API_URL"),
+		storageEnv:         e2eStorageEnv(),
+	}
+	if useRealS3 {
+		cfg.modalChunkShardURL = os.Getenv("MODAL_CHUNK_SHARD_ENDPOINT")
+		cfg.modalEmbedShardURL = os.Getenv("MODAL_EMBED_SHARD_ENDPOINT")
+		cfg.modalIndexShardURL = os.Getenv("MODAL_INDEX_SHARD_ENDPOINT")
 	}
 
 	var missing []string
@@ -306,10 +317,34 @@ func requireRealServices(t *testing.T) realServices {
 	if cfg.turbopufferAPIKey == "" {
 		missing = append(missing, "TURBOPUFFER_API_KEY")
 	}
+	if useRealS3 {
+		for _, name := range []string{"AWS_ENDPOINT_URL", "AWS_BUCKET_NAME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+			if os.Getenv(name) == "" {
+				missing = append(missing, name)
+			}
+		}
+	}
 	if len(missing) > 0 {
 		t.Skipf("real Modal/Turbopuffer integration requires env vars: %s", strings.Join(missing, ", "))
 	}
 	return cfg
+}
+
+func e2eStorageEnv() []string {
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		return []string{
+			"AWS_ENDPOINT_URL=" + os.Getenv("AWS_ENDPOINT_URL"),
+			"AWS_BUCKET_NAME=" + os.Getenv("AWS_BUCKET_NAME"),
+			"AWS_ACCESS_KEY_ID=" + os.Getenv("AWS_ACCESS_KEY_ID"),
+			"AWS_SECRET_ACCESS_KEY=" + os.Getenv("AWS_SECRET_ACCESS_KEY"),
+		}
+	}
+	return []string{
+		"AWS_ENDPOINT_URL=" + fmt.Sprintf("http://localhost:%s", e2eMinioPort),
+		"AWS_BUCKET_NAME=" + e2eMinioBucket,
+		"AWS_ACCESS_KEY_ID=" + e2eMinioUser,
+		"AWS_SECRET_ACCESS_KEY=" + e2eMinioPass,
+	}
 }
 
 func setupE2EInfra(t *testing.T) {
@@ -418,6 +453,9 @@ func waitForPostgres(t *testing.T, timeout time.Duration) {
 
 func createMinioBucket(t *testing.T) {
 	t.Helper()
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		return
+	}
 
 	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
@@ -443,9 +481,16 @@ func newMinioClient(t *testing.T) *s3sdk.Client {
 	t.Helper()
 
 	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
+	accessKey := e2eMinioUser
+	secretKey := e2eMinioPass
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		endpoint = os.Getenv("AWS_ENDPOINT_URL")
+		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
+		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 		awsconfig.WithRegion("us-east-1"),
-		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(e2eMinioUser, e2eMinioPass, "")),
+		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 	)
 	if err != nil {
 		t.Fatalf("loading AWS config: %v", err)
@@ -460,8 +505,12 @@ func assertMinioHasPrefix(t *testing.T, prefix string) {
 	t.Helper()
 
 	client := newMinioClient(t)
+	bucket := e2eMinioBucket
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		bucket = os.Getenv("AWS_BUCKET_NAME")
+	}
 	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
-		Bucket:  aws.String(e2eMinioBucket),
+		Bucket:  aws.String(bucket),
 		Prefix:  aws.String(prefix),
 		MaxKeys: aws.Int32(1),
 	})
@@ -572,11 +621,8 @@ func startServerWithExtraEnv(t *testing.T, services realServices, turbopufferKey
 		"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
 		"TURBOPUFFER_API_KEY="+tpKey,
 		"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
-		"AWS_ENDPOINT_URL="+fmt.Sprintf("http://localhost:%s", e2eMinioPort),
-		"AWS_BUCKET_NAME="+e2eMinioBucket,
-		"AWS_ACCESS_KEY_ID="+e2eMinioUser,
-		"AWS_SECRET_ACCESS_KEY="+e2eMinioPass,
 	)
+	cmd.Env = append(cmd.Env, services.storageEnv...)
 	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.Dir = repoRoot(t)
 	cmd.Stdout = os.Stderr
@@ -656,16 +702,13 @@ func startStageWorkers(t *testing.T, services realServices, natsURL string, stag
 			"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
 			"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
 			"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
-			"MODAL_CHUNK_SHARD_ENDPOINT=",
-			"MODAL_EMBED_SHARD_ENDPOINT=",
-			"MODAL_INDEX_SHARD_ENDPOINT=",
+			"MODAL_CHUNK_SHARD_ENDPOINT="+services.modalChunkShardURL,
+			"MODAL_EMBED_SHARD_ENDPOINT="+services.modalEmbedShardURL,
+			"MODAL_INDEX_SHARD_ENDPOINT="+services.modalIndexShardURL,
 			"TURBOPUFFER_API_KEY="+services.turbopufferAPIKey,
 			"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
-			"AWS_ENDPOINT_URL="+fmt.Sprintf("http://localhost:%s", e2eMinioPort),
-			"AWS_BUCKET_NAME="+e2eMinioBucket,
-			"AWS_ACCESS_KEY_ID="+e2eMinioUser,
-			"AWS_SECRET_ACCESS_KEY="+e2eMinioPass,
 		)
+		cmd.Env = append(cmd.Env, services.storageEnv...)
 		cmd.Dir = repoRoot(t)
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
