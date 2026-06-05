@@ -153,11 +153,9 @@ at `https://api.pufferfs.com/billing/webhook`.
 
 Production deploys should normally run through
 [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml), which can
-deploy only `backend`, `frontend`, `installer`, or `all` and uses immutable
-commit SHA image tags. The workflow defaults to `us-west-2`, derives a
-single active stack name such as `prod`, and exposes an `aws_region` input for
-supported west-region deploys. It also derives AZs from the selected region
-unless an explicit `availability_zones` JSON list is provided.
+deploy only `backend`, `frontend`, `installer`, `cli-release`, or `all` and
+uses immutable commit SHA image tags. The workflow is pinned to `us-west-2` and
+derives a single active stack name such as `prod`.
 
 For local deploys:
 

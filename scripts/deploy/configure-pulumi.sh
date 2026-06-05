@@ -43,15 +43,18 @@ done
 default_availability_zones() {
   case "$1" in
     us-west-2) printf '%s\n' '["us-west-2a","us-west-2b"]' ;;
-    us-west-1) printf '%s\n' '["us-west-1a","us-west-1c"]' ;;
     *) printf '%s\n' "" ;;
   esac
 }
 
 DEPLOY_REGION="${AWS_REGION:-us-west-2}"
+if [ "$DEPLOY_REGION" != "us-west-2" ]; then
+  echo "Unsupported deploy region: $DEPLOY_REGION. PufferFS production deploys only use us-west-2." >&2
+  exit 1
+fi
 DEPLOY_AZS="${AVAILABILITY_ZONES:-$(default_availability_zones "$DEPLOY_REGION")}"
 if [ -z "$DEPLOY_AZS" ]; then
-  echo "Set AVAILABILITY_ZONES for unsupported deploy region: $DEPLOY_REGION" >&2
+  echo "Set AVAILABILITY_ZONES for deploy region: $DEPLOY_REGION" >&2
   exit 1
 fi
 pulumi config set aws:region "$DEPLOY_REGION"

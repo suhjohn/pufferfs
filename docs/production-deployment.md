@@ -127,10 +127,8 @@ Run `.github/workflows/deploy.yml` from GitHub Actions with:
 
 ```text
 environment: production
-aws_region: us-west-2 | us-west-1
 pulumi_stack: optional override, defaults to the environment stack
-availability_zones: optional JSON override, defaults from aws_region
-component: backend | frontend | installer | all
+component: backend | frontend | installer | cli-release | all
 ```
 
 Component behavior:
@@ -141,6 +139,8 @@ Component behavior:
   bucket, and invalidates CloudFront.
 - `installer`: uploads `scripts/install.sh` to `/install.sh` in the web bucket
   and invalidates only that path.
+- `cli-release`: mirrors a tagged CLI release to `/releases/<tag>/` in the web
+  bucket, writes `/releases/latest.txt`, and invalidates those paths.
 - `all`: runs backend, frontend, then installer.
 
 ## CLI Releases
@@ -169,16 +169,15 @@ cd infra/pulumi
 set -a
 source ../../.env
 set +a
-pulumi stack select prod-us-west-2
+pulumi stack select prod
 ../../scripts/deploy/configure-pulumi.sh
 ```
 
-For west production, use the `prod` stack with `AWS_REGION=us-west-2`. Region
-selection moves the single active environment stack; do not use a second
-production stack with the same `pufferfs.com` / `api.pufferfs.com` domains
-unless you also use different domain names. The only `us-east-1` resource that
-remains is the CloudFront ACM certificate provider, because AWS requires
-CloudFront certificates in `us-east-1`.
+For production, use the `prod` stack with `AWS_REGION=us-west-2`. Do not use a
+second production stack with the same `pufferfs.com` / `api.pufferfs.com`
+domains unless you also use different domain names. The only `us-east-1`
+resource that remains is the CloudFront ACM certificate provider, because AWS
+requires CloudFront certificates in `us-east-1`.
 
 Backend:
 
