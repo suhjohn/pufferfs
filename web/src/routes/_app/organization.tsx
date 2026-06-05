@@ -15,17 +15,23 @@ function Organization() {
 
   return (
     <main className="container">
-      <h1 className="prompt">{orgQuery.data?.name ?? "organization"}</h1>
-      <h2>members</h2>
-      {membersQuery.isPending && <p className="muted">// loading…</p>}
-      {membersQuery.data?.map((m) => (
-        <div key={m.userId} className="card">
-          <div className="row">
-            <strong>{m.email}</strong>
-            <span className="tag">{m.role}</span>
-          </div>
+      <div className="page-heading">
+        <h1>{orgQuery.data?.name ?? "organization"}</h1>
+        <h2>members</h2>
+      </div>
+      {membersQuery.isPending && <p className="muted">loading</p>}
+      {membersQuery.data && (
+        <div className="list">
+          {membersQuery.data.map((m) => (
+            <div key={m.userId} className="list-item">
+              <div className="row">
+                <strong>{m.email}</strong>
+                <span className="tag">{m.role}</span>
+              </div>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
     </main>
   );
 }

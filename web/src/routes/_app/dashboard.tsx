@@ -14,16 +14,22 @@ function Dashboard() {
 
   return (
     <main className="container">
-      <h1 className="prompt">dashboard</h1>
-      {isPending && <p className="muted">// loading…</p>}
-      {isError && <p className="muted">// error: {(error as Error).message}</p>}
-      {roots && roots.length === 0 && <p className="muted">// no roots yet</p>}
-      {roots?.map((root) => (
-        <div key={root.id} className="card">
-          <strong>{root.name}</strong>
-          <div className="muted">{root.id}</div>
+      <div className="page-heading">
+        <h1>dashboard</h1>
+      </div>
+      {isPending && <p className="muted">loading</p>}
+      {isError && <p className="muted">error: {(error as Error).message}</p>}
+      {roots && roots.length === 0 && <p className="muted">no roots yet</p>}
+      {roots && roots.length > 0 && (
+        <div className="list">
+          {roots.map((root) => (
+            <div key={root.id} className="list-item">
+              <strong>{root.name}</strong>
+              <div className="muted">{root.id}</div>
+            </div>
+          ))}
         </div>
-      ))}
+      )}
     </main>
   );
 }

@@ -30,21 +30,23 @@ function BillingPage() {
 
   return (
     <main className="container">
-      <h1 className="prompt">billing</h1>
+      <div className="page-heading">
+        <h1>billing</h1>
+      </div>
       {isPending ? (
-        <p className="muted">// loading…</p>
+        <p className="muted">loading</p>
       ) : (
         <div className="card">
-          <div className="row">
-            <span className="muted">plan</span>{" "}
+          <div className="meta-row">
+            <span className="muted">plan</span>
             <strong>{billing?.plan}</strong>
           </div>
-          <div className="row">
-            <span className="muted">status</span>{" "}
+          <div className="meta-row">
+            <span className="muted">status</span>
             <strong>{billing?.status}</strong>
           </div>
           {billing?.currentPeriodEnd && (
-            <div className="row">
+            <div className="meta-row">
               <span className="muted">renews</span> {billing.currentPeriodEnd}
             </div>
           )}
@@ -56,8 +58,8 @@ function BillingPage() {
         disabled={checkout.isPending}
       >
         {billing?.status === "active"
-          ? "> manage subscription"
-          : "> upgrade to pro"}
+          ? "manage subscription"
+          : "upgrade to pro"}
       </button>
     </main>
   );
