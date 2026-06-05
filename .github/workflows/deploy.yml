@@ -36,9 +36,14 @@ on:
           - backend
           - frontend
           - installer
+          - cli-release
           - all
       image_tag:
         description: Optional backend image tag; defaults to the workflow commit SHA
+        required: false
+        type: string
+      cli_release_version:
+        description: Optional CLI release version to mirror, for example v0.2.0; defaults to PUFFERFS_CLI_LATEST_VERSION
         required: false
         type: string
 
@@ -63,6 +68,7 @@ jobs:
       PROJECT_NAME: ${{ vars.PROJECT_NAME || 'pufferfs' }}
       AVAILABILITY_ZONES: ${{ inputs.availability_zones }}
       IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+      CLI_RELEASE_VERSION: ${{ inputs.cli_release_version || vars.PUFFERFS_CLI_LATEST_VERSION }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
@@ -206,6 +212,33 @@ jobs:
             --content-type 'text/x-shellscript' \
             --cache-control 'public, max-age=300'
           aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/install.sh'
+
+      - name: Mirror CLI release
+        if: ${{ inputs.component == 'cli-release' }}
+        working-directory: infra/pulumi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${CLI_RELEASE_VERSION#v}"
+          [ -n "$VERSION" ] || { echo "Set cli_release_version or PUFFERFS_CLI_LATEST_VERSION." >&2; exit 1; }
+          TAG="v${VERSION}"
+          TMPDIR="$(mktemp -d)"
+          trap 'rm -rf "$TMPDIR"' EXIT
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$TMPDIR" \
+            --pattern 'checksums.txt' \
+            --pattern "pufferfs_${VERSION}_*.tar.gz"
+          test -s "$TMPDIR/checksums.txt"
+          WEB_BUCKET="$(pulumi stack output webBucketName)"
+          WEB_DISTRIBUTION="$(pulumi stack output webDistributionId)"
+          aws s3 sync "$TMPDIR/" "s3://${WEB_BUCKET}/releases/${TAG}/" \
+            --delete \
+            --cache-control 'public, max-age=31536000, immutable'
+          printf '%s\n' "$TAG" > "$TMPDIR/latest.txt"
+          aws s3 cp "$TMPDIR/latest.txt" "s3://${WEB_BUCKET}/releases/latest.txt" \
+            --content-type 'text/plain' \
+            --cache-control 'public, max-age=300'
+          aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths "/releases/${TAG}/*" '/releases/latest.txt'
 
       - name: Verify deployment
         working-directory: infra/pulumi
