@@ -132,15 +132,35 @@ func HashAPIKey(raw string) string {
 // APIKeyResolver is called to look up an API key hash → Identity.
 type APIKeyResolver func(ctx context.Context, keyHash string) (*Identity, error)
 
-// Middleware creates auth middleware that supports both JWT and API key auth.
-// Unauthenticated paths (health, readyz, OAuth callbacks) are skipped.
+// tokenFromRequest extracts the bearer token from the Authorization header, or
+// falls back to the session cookie set by the OAuth callback (browser clients).
+func tokenFromRequest(r *http.Request) (string, bool) {
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if token == authHeader {
+			return "", false
+		}
+		return token, true
+	}
+	if c, err := r.Cookie(SessionCookieName); err == nil && c.Value != "" {
+		return c.Value, true
+	}
+	return "", false
+}
+
+// Middleware creates auth middleware that supports JWT (header or session
+// cookie) and API key auth. Unauthenticated paths (health, readyz, OAuth
+// endpoints, the CLI version manifest, the Stripe webhook) are skipped.
 func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handler) http.Handler {
 	unauthPaths := map[string]bool{
-		"/healthz":       true,
-		"/readyz":        true,
-		"/health":        true,
-		"/auth/google":   true,
-		"/auth/callback": true,
+		"/healthz":         true,
+		"/readyz":          true,
+		"/health":          true,
+		"/cli/version":     true,
+		"/auth/google":     true,
+		"/auth/callback":   true,
+		"/auth/logout":     true,
+		"/billing/webhook": true,
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -150,15 +170,9 @@ func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handle
 				return
 			}
 
-			authHeader := r.Header.Get("Authorization")
-			if authHeader == "" {
-				http.Error(w, `{"error":"missing Authorization header"}`, http.StatusUnauthorized)
-				return
-			}
-
-			token := strings.TrimPrefix(authHeader, "Bearer ")
-			if token == authHeader {
-				http.Error(w, `{"error":"invalid Authorization format, expected Bearer token"}`, http.StatusUnauthorized)
+			token, ok := tokenFromRequest(r)
+			if !ok {
+				http.Error(w, `{"error":"missing or malformed credentials"}`, http.StatusUnauthorized)
 				return
 			}
 

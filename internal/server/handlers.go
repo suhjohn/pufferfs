@@ -36,12 +36,13 @@ type objectStore interface {
 
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
-	db    *DB
-	s3    objectStore
-	modal *ModalClient
-	tp    *TPClient
-	queue queue.Queue
-	mux   *http.ServeMux
+	db      *DB
+	s3      objectStore
+	modal   *ModalClient
+	tp      *TPClient
+	queue   queue.Queue
+	billing *StripeClient
+	mux     *http.ServeMux
 }
 
 // New creates a new Server with all dependencies.
@@ -77,6 +78,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
 	s.mux.HandleFunc("GET /health", s.handleHealthz) // backward compat
+	s.mux.HandleFunc("GET /cli/version", s.handleCLIVersion)
 
 	// Auth
 	s.mux.HandleFunc("GET /auth/me", s.handleMe)
@@ -120,6 +122,12 @@ func (s *Server) routes() {
 
 	// Query
 	s.mux.HandleFunc("POST /query", s.handleQuery)
+
+	// Billing (active only when Stripe is configured via SetBilling; otherwise
+	// these return 404). The webhook is left unauthenticated in auth.Middleware.
+	s.mux.HandleFunc("GET /billing", s.handleGetBilling)
+	s.mux.HandleFunc("POST /billing/checkout-session", s.handleCreateCheckoutSession)
+	s.mux.HandleFunc("POST /billing/webhook", s.handleStripeWebhook)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,6 +144,63 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+}
+
+func (s *Server) handleCLIVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, cliReleaseManifestFromEnv())
+}
+
+func cliReleaseManifestFromEnv() models.CLIReleaseManifest {
+	latest := cleanVersionEnv("PUFFERFS_CLI_LATEST_VERSION")
+	minimum := cleanVersionEnv("PUFFERFS_CLI_MIN_VERSION")
+	if latest == "" {
+		latest = minimum
+	}
+	if latest == "" {
+		latest = "dev"
+	}
+
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PUFFERFS_CLI_DOWNLOAD_BASE_URL")), "/")
+	if baseURL == "" {
+		baseURL = "https://github.com/suhjohn/pufferfs/releases/download"
+	}
+	downloadVersion := latest
+	if downloadVersion != "dev" && !strings.HasPrefix(downloadVersion, "v") {
+		downloadVersion = "v" + downloadVersion
+	}
+
+	manifest := models.CLIReleaseManifest{
+		Latest:      latest,
+		Minimum:     minimum,
+		ProtocolMin: models.SyncProtocolVersion,
+		ProtocolMax: models.SyncProtocolVersion,
+		Downloads:   make(map[string]models.CLIDownload),
+	}
+	if downloadVersion != "dev" {
+		for _, platform := range []string{"darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64"} {
+			assetOS, assetArch, _ := strings.Cut(platform, "-")
+			assetName := fmt.Sprintf("pufferfs_%s_%s_%s.tar.gz", strings.TrimPrefix(downloadVersion, "v"), assetOS, assetArch)
+			manifest.Downloads[platform] = models.CLIDownload{
+				URL:    fmt.Sprintf("%s/%s/%s", baseURL, downloadVersion, assetName),
+				SHA256: cleanSHAEnv(platform),
+			}
+		}
+		manifest.NotesURL = fmt.Sprintf("%s/%s", baseURL, downloadVersion)
+	}
+	return manifest
+}
+
+func cleanVersionEnv(name string) string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return ""
+	}
+	return strings.TrimPrefix(value, "v")
+}
+
+func cleanSHAEnv(platform string) string {
+	key := "PUFFERFS_CLI_SHA256_" + strings.ToUpper(strings.ReplaceAll(platform, "-", "_"))
+	return strings.TrimSpace(os.Getenv(key))
 }
 
 // ---------------------------------------------------------------------------

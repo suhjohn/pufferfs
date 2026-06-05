@@ -1,0 +1,67 @@
+version: 2
+
+project_name: pufferfs
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: pufferfs
+    main: ./cmd/pufferfs
+    binary: pufferfs
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }} -X main.date={{ .Date }}
+
+archives:
+  - id: pufferfs
+    ids:
+      - pufferfs
+    formats:
+      - tar.gz
+    name_template: >-
+      pufferfs_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+homebrew_casks:
+  - name: pufferfs
+    ids:
+      - pufferfs
+    binaries:
+      - pufferfs
+    repository:
+      owner: suhjohn
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    url:
+      verified: github.com/suhjohn/pufferfs
+    homepage: https://pufferfs.com
+    description: Hybrid search for your filesystem
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/pufferfs"]
+          end

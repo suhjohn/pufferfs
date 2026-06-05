@@ -24,6 +24,18 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 ### Install CLI
 
 ```bash
+brew install --cask suhjohn/tap/pufferfs
+```
+
+Direct installs can use the installer script once releases are published:
+
+```bash
+curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+For local development:
+
+```bash
 go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest
 ```
 
@@ -89,6 +101,40 @@ pufferfs service uninstall my-project
 unit that runs `pufferfs sync ./my-project --follow --name my-project`. The OS
 supervisor restarts it on failure and captures logs.
 
+### CLI upgrades and versioning
+
+PufferFS CLI releases are SemVer git tags (`v0.3.0`, `v0.3.1`, ...). GoReleaser
+builds macOS and Linux archives for `amd64` and `arm64`, publishes them to
+GitHub Releases with `checksums.txt`, and can update the Homebrew tap.
+
+```bash
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+Homebrew users upgrade with:
+
+```bash
+brew upgrade --cask pufferfs
+```
+
+Direct installs upgrade with:
+
+```bash
+pufferfs upgrade
+```
+
+`pufferfs upgrade` reads the server's unauthenticated `GET /cli/version`
+manifest, downloads the matching GoReleaser archive, verifies its SHA-256
+checksum, replaces the current binary, and restarts installed user services.
+The CLI also checks this manifest at most once per day and prints an upgrade
+notice when a newer release is available. Set `PUFFERFS_NO_UPDATE_CHECK=1` to
+disable the passive check.
+
+The CLI SemVer and sync wire protocol are separate. CLI versions are injected at
+release build time, while sync compatibility is controlled by
+`models.SyncProtocolVersion`.
+
 ## Server
 
 ```bash
@@ -106,6 +152,11 @@ export MODAL_QUERY_EMBED_ENDPOINT="https://..."
 export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
 export MODAL_EMBED_SHARD_ENDPOINT="https://..."
 export MODAL_INDEX_SHARD_ENDPOINT="https://..."
+
+# Optional: advertise CLI release compatibility at GET /cli/version.
+export PUFFERFS_CLI_LATEST_VERSION="0.3.0"
+export PUFFERFS_CLI_MIN_VERSION="0.2.0"
+export PUFFERFS_CLI_DOWNLOAD_BASE_URL="https://github.com/suhjohn/pufferfs/releases/download"
 
 # Optional: enable platform provisioning/deletion APIs.
 export PUFFERFS_ADMIN_KEY="..."

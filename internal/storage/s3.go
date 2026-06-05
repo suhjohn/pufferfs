@@ -25,16 +25,26 @@ type Client struct {
 
 // NewClient creates a new S3-compatible storage client.
 func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
+	region := os.Getenv("AWS_REGION")
+	if region == "" {
+		region = os.Getenv("AWS_DEFAULT_REGION")
+	}
+	if region == "" {
+		region = "auto"
+	}
+
 	opts := []func(*config.LoadOptions) error{
-		config.WithRegion("auto"),
-		config.WithCredentialsProvider(
+		config.WithRegion(region),
+		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+	}
+	if cfg.AccessKeyID != "" || cfg.SecretAccessKey != "" {
+		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(
 				cfg.AccessKeyID,
 				cfg.SecretAccessKey,
 				"",
 			),
-		),
-		config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		))
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(), opts...)

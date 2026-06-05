@@ -1,32 +1,21 @@
 config:
-  # Use projectId/environmentId for an existing Railway project.
-  pufferfs:projectId: "railway-project-id"
-  pufferfs:environmentId: "railway-environment-id"
+  aws:region: "us-east-1"
 
-  # Or omit projectId/environmentId and set workspaceId to create a new project.
-  # pufferfs:workspaceId: "railway-workspace-id"
-  # pufferfs:projectName: "pufferfs"
-  pufferfs:environmentName: "production"
+  pufferfs:projectName: "pufferfs"
+  pufferfs:availabilityZones:
+    - "us-east-1a"
+    - "us-east-1b"
+  pufferfs:vpcCidr: "10.80.0.0/16"
+  pufferfs:imageTag: "prod"
 
-  pufferfs:sourceRepo: "suhjohn/pufferfs"
-  pufferfs:sourceRepoBranch: "main"
-  pufferfs:apiSubdomain: "pufferfs-prod"
-
-  # Existing Railway shared variable reference. This stack does not create Postgres.
-  pufferfs:databaseUrlRef: "${{shared.DATABASE_URL}}"
-
-  # Existing S3-compatible storage. This stack does not create Railway buckets.
-  pufferfs:awsEndpointUrl: "https://..."
-  pufferfs:awsBucketName: "pufferfs-prod"
-  pufferfs:awsAccessKeyId:
-    secure: "pulumi-secret-access-key"
-  pufferfs:awsSecretAccessKey:
-    secure: "pulumi-secret-secret-key"
-
+  pufferfs:databaseUrl:
+    secure: "pulumi-secret-postgres-url"
   pufferfs:jwtSecret:
     secure: "pulumi-secret-jwt-secret"
   pufferfs:turbopufferApiKey:
     secure: "pulumi-secret-turbopuffer-api-key"
+  pufferfs:adminKeyHash:
+    secure: "optional-admin-key-sha256"
 
   pufferfs:modalChunkEndpoint: "https://...chunk-file-endpoint.modal.run"
   pufferfs:modalEmbedEndpoint: "https://...embed-chunks-endpoint.modal.run"
@@ -35,8 +24,36 @@ config:
   pufferfs:modalEmbedShardEndpoint: "https://...embed-shard-endpoint.modal.run"
   pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
 
-  pufferfs:natsVolumeSizeMb: 50000
-  pufferfs:apiReplicas: 1
-  pufferfs:workerReplicas: 1
-  pufferfs:adminKeyHash:
-    secure: "optional-admin-key-sha256"
+  # CLI release manifest advertised at GET /cli/version.
+  pufferfs:cliLatestVersion: "0.3.0"
+  pufferfs:cliMinVersion: "0.2.0"
+  pufferfs:cliDownloadBaseUrl: "https://github.com/suhjohn/pufferfs/releases/download"
+
+  # Frontend + Google login. DNS is in Cloudflare; *HttpsReady stays false until
+  # the ACM certs validate (see README "Custom domains").
+  pufferfs:webDomain: "pufferfs.com"
+  pufferfs:apiDomain: "api.pufferfs.com"
+  pufferfs:frontendUrl: "https://pufferfs.com"
+  pufferfs:cookieDomain: ".pufferfs.com"
+  pufferfs:oauthRedirectUrl: "https://api.pufferfs.com/auth/callback"
+  pufferfs:googleClientId: "xxxx.apps.googleusercontent.com"
+  pufferfs:googleClientSecret:
+    secure: "pulumi-secret-google-client-secret"
+  pufferfs:webHttpsReady: false
+  pufferfs:apiHttpsReady: false
+
+  # Billing (optional). Leave disabled to deploy without payments.
+  pufferfs:enableBilling: false
+  # pufferfs:stripePriceId: "price_xxx"
+  # pufferfs:stripeSecretKey:
+  #   secure: "pulumi-secret-stripe-secret-key"
+  # pufferfs:stripeWebhookSecret:
+  #   secure: "pulumi-secret-stripe-webhook-secret"
+
+  pufferfs:apiDesiredCount: 2
+  pufferfs:worker-chunkDesiredCount: 1
+  pufferfs:worker-embedDesiredCount: 1
+  pufferfs:worker-indexDesiredCount: 1
+  pufferfs:worker-commitDesiredCount: 1
+  pufferfs:worker-cleanupDesiredCount: 1
+  pufferfs:tpNamespaceShards: 4
