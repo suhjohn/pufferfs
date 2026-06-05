@@ -44,6 +44,7 @@ Pulumi's current npm packages require Node 20+.
 - Configure Pulumi from `.env`; do not hand-edit `Pulumi.<stack>.yaml` unless the user asks.
 - Prefer `pulumi stack output ...` for reporting deploy results.
 - Secrets (`DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `GOOGLE_CLIENT_SECRET`, `STRIPE_*`, `PUFFERFS_ADMIN_KEY_HASH`) must be set with `pulumi config set --secret`. `.env` and `Pulumi.*.yaml` are git-ignored — never commit them or print secret values; report key names and presence only.
+- Backend image deploys should use an immutable git SHA image tag (`pufferfs:imageTag`) so ECS rolls through a task-definition change instead of relying on a mutable `prod` tag.
 - The frontend is a separate static deploy: build `web/` (Node 20+), `aws s3 sync web/dist/client/` to the `webBucketName` bucket, then invalidate `webDistributionId`. The browser API base is baked in at build time via `VITE_API_URL`.
 - Custom domains use Cloudflare DNS in a two-phase flow: first `pulumi up` creates the ACM certs, then add the exported validation + host CNAMEs in Cloudflare (DNS-only), wait for ACM `Issued`, then set `apiHttpsReady=true`/`webHttpsReady=true` and `pulumi up` again.
 

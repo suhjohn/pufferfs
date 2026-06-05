@@ -314,6 +314,9 @@ pointing at shared state. Each environment should have its own Postgres
 database, object storage bucket/prefix, Turbopuffer key or namespace set, Modal
 app, Modal secrets, and NATS JetStream deployment if queued sync is enabled.
 
+For production CI/CD, GitHub Environment setup, component deploys, and release
+automation, see [Production Deployment](docs/production-deployment.md).
+
 API services need:
 
 ```bash

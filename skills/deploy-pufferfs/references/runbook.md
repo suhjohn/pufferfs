@@ -90,7 +90,7 @@ pulumi stack select prod || pulumi stack init prod
 pulumi config set aws:region "${AWS_REGION:-us-east-1}"
 pulumi config set pufferfs:projectName pufferfs
 pulumi config set pufferfs:availabilityZones '["us-east-1a","us-east-1b"]'
-pulumi config set pufferfs:imageTag prod
+pulumi config set pufferfs:imageTag "$(git -C /Users/johnsuh/pufferfs rev-parse --short HEAD)"
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"

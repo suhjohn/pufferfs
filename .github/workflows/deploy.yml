@@ -1,0 +1,196 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment to deploy
+        required: true
+        type: choice
+        default: production
+        options:
+          - staging
+          - production
+      component:
+        description: Deployment component
+        required: true
+        type: choice
+        default: all
+        options:
+          - backend
+          - frontend
+          - installer
+          - all
+      image_tag:
+        description: Optional backend image tag; defaults to the workflow commit SHA
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+      PULUMI_BACKEND_URL: ${{ vars.PULUMI_BACKEND_URL }}
+      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+      PULUMI_STACK: ${{ vars.PULUMI_STACK }}
+      PROJECT_NAME: ${{ vars.PROJECT_NAME || 'pufferfs' }}
+      AVAILABILITY_ZONES: ${{ vars.AVAILABILITY_ZONES || '["us-east-1a","us-east-1b"]' }}
+      IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
+      PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
+      MODAL_CHUNK_ENDPOINT: ${{ vars.MODAL_CHUNK_ENDPOINT || secrets.MODAL_CHUNK_ENDPOINT }}
+      MODAL_EMBED_ENDPOINT: ${{ vars.MODAL_EMBED_ENDPOINT || secrets.MODAL_EMBED_ENDPOINT }}
+      MODAL_QUERY_EMBED_ENDPOINT: ${{ vars.MODAL_QUERY_EMBED_ENDPOINT || secrets.MODAL_QUERY_EMBED_ENDPOINT }}
+      MODAL_CHUNK_SHARD_ENDPOINT: ${{ vars.MODAL_CHUNK_SHARD_ENDPOINT || secrets.MODAL_CHUNK_SHARD_ENDPOINT }}
+      MODAL_EMBED_SHARD_ENDPOINT: ${{ vars.MODAL_EMBED_SHARD_ENDPOINT || secrets.MODAL_EMBED_SHARD_ENDPOINT }}
+      MODAL_INDEX_SHARD_ENDPOINT: ${{ vars.MODAL_INDEX_SHARD_ENDPOINT || secrets.MODAL_INDEX_SHARD_ENDPOINT }}
+      FRONTEND_URL: ${{ vars.FRONTEND_URL }}
+      COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
+      API_DOMAIN: ${{ vars.API_DOMAIN }}
+      WEB_DOMAIN: ${{ vars.WEB_DOMAIN }}
+      OAUTH_REDIRECT_URL: ${{ vars.OAUTH_REDIRECT_URL }}
+      GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      API_HTTPS_READY: ${{ vars.API_HTTPS_READY }}
+      WEB_HTTPS_READY: ${{ vars.WEB_HTTPS_READY }}
+      ENABLE_BILLING: ${{ vars.ENABLE_BILLING }}
+      VITE_ENABLE_BILLING: ${{ vars.VITE_ENABLE_BILLING || vars.ENABLE_BILLING }}
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+      STRIPE_PRICE_ID: ${{ vars.STRIPE_PRICE_ID }}
+      PUFFERFS_CLI_LATEST_VERSION: ${{ vars.PUFFERFS_CLI_LATEST_VERSION }}
+      PUFFERFS_CLI_MIN_VERSION: ${{ vars.PUFFERFS_CLI_MIN_VERSION }}
+      PUFFERFS_CLI_DOWNLOAD_BASE_URL: ${{ vars.PUFFERFS_CLI_DOWNLOAD_BASE_URL }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Resolve deployment defaults
+        run: |
+          set -euo pipefail
+          if [ -z "${PULUMI_STACK:-}" ]; then
+            case "${{ inputs.environment }}" in
+              production) echo "PULUMI_STACK=prod" >> "$GITHUB_ENV" ;;
+              *) echo "PULUMI_STACK=${{ inputs.environment }}" >> "$GITHUB_ENV" ;;
+            esac
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Go
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            infra/pulumi/package-lock.json
+            web/package-lock.json
+
+      - name: Install Pulumi CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://get.pulumi.com | sh -s -- --version 3.236.0
+          echo "$HOME/.pulumi/bin" >> "$GITHUB_PATH"
+
+      - name: Login to Pulumi backend
+        run: |
+          set -euo pipefail
+          if [ -n "${PULUMI_BACKEND_URL:-}" ]; then
+            pulumi login "$PULUMI_BACKEND_URL"
+          elif [ -n "${PULUMI_ACCESS_TOKEN:-}" ]; then
+            pulumi login
+          else
+            echo "Set PULUMI_ACCESS_TOKEN or PULUMI_BACKEND_URL for the selected GitHub Environment." >&2
+            exit 1
+          fi
+
+      - name: Install Pulumi dependencies
+        working-directory: infra/pulumi
+        run: npm ci
+
+      - name: Configure Pulumi stack
+        working-directory: infra/pulumi
+        run: |
+          set -euo pipefail
+          pulumi stack select "$PULUMI_STACK"
+          ../../scripts/deploy/configure-pulumi.sh
+
+      - name: Preview backend and infrastructure
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        run: |
+          npm run build
+          pulumi preview --diff
+
+      - name: Deploy backend and infrastructure
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        run: pulumi up --yes
+
+      - name: Build frontend
+        if: ${{ inputs.component == 'frontend' || inputs.component == 'all' }}
+        working-directory: web
+        run: |
+          npm ci
+          VITE_API_URL="${VITE_API_URL:-https://api.pufferfs.com}" \
+            VITE_ENABLE_BILLING="${VITE_ENABLE_BILLING:-false}" \
+            npm run build
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL || vars.API_URL || 'https://api.pufferfs.com' }}
+
+      - name: Deploy frontend
+        if: ${{ inputs.component == 'frontend' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        run: |
+          set -euo pipefail
+          WEB_BUCKET="$(pulumi stack output webBucketName)"
+          WEB_DISTRIBUTION="$(pulumi stack output webDistributionId)"
+          aws s3 sync ../../web/dist/client/ "s3://${WEB_BUCKET}" --delete
+          aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/*'
+
+      - name: Deploy installer
+        if: ${{ inputs.component == 'installer' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        run: |
+          set -euo pipefail
+          WEB_BUCKET="$(pulumi stack output webBucketName)"
+          WEB_DISTRIBUTION="$(pulumi stack output webDistributionId)"
+          aws s3 cp ../../scripts/install.sh "s3://${WEB_BUCKET}/install.sh" \
+            --content-type 'text/x-shellscript' \
+            --cache-control 'public, max-age=300'
+          aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/install.sh'
+
+      - name: Verify deployment
+        working-directory: infra/pulumi
+        run: |
+          set -euo pipefail
+          API_URL="$(pulumi stack output apiUrl)"
+          WEB_URL="$(pulumi stack output webUrl)"
+          curl -fsS --max-time 15 "${API_URL}/health"
+          curl -fsS --max-time 15 "${API_URL}/cli/version" >/dev/null
+          curl -fsSI --max-time 15 "$WEB_URL" >/dev/null
+          curl -fsSI --max-time 15 "${WEB_URL}/install.sh" >/dev/null

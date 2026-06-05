@@ -16,7 +16,7 @@ if (azs.length < 2) {
 const containerPort = cfg.getNumber("containerPort") ?? 8080;
 const cpu = cfg.getNumber("taskCpu") ?? 1024;
 const memory = cfg.getNumber("taskMemory") ?? 2048;
-const imageTag = cfg.get("imageTag") ?? stack;
+const imageTag = cfg.get("imageTag") ?? process.env.GITHUB_SHA ?? stack;
 
 // Optional payment surface. When false (default) no Stripe config is required
 // and the frontend ships with billing hidden (VITE_ENABLE_BILLING=false).
