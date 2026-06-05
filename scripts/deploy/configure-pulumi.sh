@@ -40,9 +40,23 @@ do
   require_env "$key"
 done
 
-pulumi config set aws:region "${AWS_REGION:-us-east-1}"
+default_availability_zones() {
+  case "$1" in
+    us-west-2) printf '%s\n' '["us-west-2a","us-west-2b"]' ;;
+    us-west-1) printf '%s\n' '["us-west-1a","us-west-1c"]' ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+DEPLOY_REGION="${AWS_REGION:-us-west-2}"
+DEPLOY_AZS="${AVAILABILITY_ZONES:-$(default_availability_zones "$DEPLOY_REGION")}"
+if [ -z "$DEPLOY_AZS" ]; then
+  echo "Set AVAILABILITY_ZONES for unsupported deploy region: $DEPLOY_REGION" >&2
+  exit 1
+fi
+pulumi config set aws:region "$DEPLOY_REGION"
 pulumi config set pufferfs:projectName "${PROJECT_NAME:-pufferfs}"
-pulumi config set pufferfs:availabilityZones "${AVAILABILITY_ZONES:-[\"us-east-1a\",\"us-east-1b\"]}"
+pulumi config set pufferfs:availabilityZones "$DEPLOY_AZS"
 pulumi config set pufferfs:imageTag "${IMAGE_TAG:-${GITHUB_SHA:-prod}}"
 
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"

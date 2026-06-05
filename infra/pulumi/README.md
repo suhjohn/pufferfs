@@ -28,14 +28,14 @@ npm install
 pulumi stack init dev
 pulumi stack init prod
 pulumi stack select prod
-pulumi config set aws:region us-east-1
+pulumi config set aws:region us-west-2
 ```
 
 Set environment shape:
 
 ```sh
 pulumi config set pufferfs:projectName pufferfs
-pulumi config set pufferfs:availabilityZones '["us-east-1a","us-east-1b"]'
+pulumi config set pufferfs:availabilityZones '["us-west-2a","us-west-2b"]'
 pulumi config set pufferfs:imageTag "$(git rev-parse --short HEAD)"
 ```
 
@@ -154,7 +154,10 @@ at `https://api.pufferfs.com/billing/webhook`.
 Production deploys should normally run through
 [`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml), which can
 deploy only `backend`, `frontend`, `installer`, or `all` and uses immutable
-commit SHA image tags.
+commit SHA image tags. The workflow defaults to `us-west-2`, derives a
+single active stack name such as `prod`, and exposes an `aws_region` input for
+supported west-region deploys. It also derives AZs from the selected region
+unless an explicit `availability_zones` JSON list is provided.
 
 For local deploys:
 

@@ -1,10 +1,10 @@
 config:
-  aws:region: "us-east-1"
+  aws:region: "us-west-2"
 
   pufferfs:projectName: "pufferfs"
   pufferfs:availabilityZones:
-    - "us-east-1a"
-    - "us-east-1b"
+    - "us-west-2a"
+    - "us-west-2b"
   pufferfs:vpcCidr: "10.80.0.0/16"
   pufferfs:imageTag: "git-sha"
 

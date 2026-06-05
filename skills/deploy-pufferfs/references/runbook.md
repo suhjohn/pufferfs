@@ -87,9 +87,9 @@ Run from `/Users/johnsuh/pufferfs/infra/pulumi`:
 
 ```sh
 pulumi stack select prod || pulumi stack init prod
-pulumi config set aws:region "${AWS_REGION:-us-east-1}"
+pulumi config set aws:region "${AWS_REGION:-us-west-2}"
 pulumi config set pufferfs:projectName pufferfs
-pulumi config set pufferfs:availabilityZones '["us-east-1a","us-east-1b"]'
+pulumi config set pufferfs:availabilityZones '["us-west-2a","us-west-2b"]'
 pulumi config set pufferfs:imageTag "$(git -C /Users/johnsuh/pufferfs rev-parse --short HEAD)"
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
@@ -206,8 +206,8 @@ ECS services:
 ```sh
 aws ecs describe-services \
   --cluster "$(pulumi stack output ecsClusterArn | awk -F/ '{print $NF}')" \
-  --services $(aws ecs list-services --cluster "$(pulumi stack output ecsClusterArn | awk -F/ '{print $NF}')" --region "${AWS_REGION:-us-east-1}" --query 'serviceArns[]' --output text | tr '\t' ' ') \
-  --region "${AWS_REGION:-us-east-1}" \
+  --services $(aws ecs list-services --cluster "$(pulumi stack output ecsClusterArn | awk -F/ '{print $NF}')" --region "${AWS_REGION:-us-west-2}" --query 'serviceArns[]' --output text | tr '\t' ' ') \
+  --region "${AWS_REGION:-us-west-2}" \
   --query 'services[].{name:serviceName,desired:desiredCount,running:runningCount,pending:pendingCount}' \
   --output json
 ```
@@ -247,7 +247,7 @@ Check ECS state before assuming a crash:
 aws ecs describe-services \
   --cluster <cluster-name> \
   --services <api-service-name> \
-  --region "${AWS_REGION:-us-east-1}" \
+  --region "${AWS_REGION:-us-west-2}" \
   --query 'services[].{desired:desiredCount,running:runningCount,pending:pendingCount,events:events[0:3].message}' \
   --output json
 ```

@@ -11,6 +11,22 @@ on:
         options:
           - staging
           - production
+      aws_region:
+        description: AWS region for regional infrastructure
+        required: true
+        type: choice
+        default: us-west-2
+        options:
+          - us-west-2
+          - us-west-1
+      pulumi_stack:
+        description: Optional Pulumi stack override; defaults to the environment stack
+        required: false
+        type: string
+      availability_zones:
+        description: Optional JSON AZ list override for the selected region
+        required: false
+        type: string
       component:
         description: Deployment component
         required: true
@@ -31,7 +47,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: deploy-${{ inputs.environment }}
+  group: deploy-${{ inputs.environment }}-${{ inputs.aws_region }}
   cancel-in-progress: false
 
 jobs:
@@ -39,13 +55,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     env:
-      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_REGION: ${{ inputs.aws_region }}
       PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
       PULUMI_BACKEND_URL: ${{ vars.PULUMI_BACKEND_URL }}
       PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
-      PULUMI_STACK: ${{ vars.PULUMI_STACK }}
+      PULUMI_STACK: ${{ inputs.pulumi_stack }}
       PROJECT_NAME: ${{ vars.PROJECT_NAME || 'pufferfs' }}
-      AVAILABILITY_ZONES: ${{ vars.AVAILABILITY_ZONES || '["us-east-1a","us-east-1b"]' }}
+      AVAILABILITY_ZONES: ${{ inputs.availability_zones }}
       IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
@@ -81,6 +97,13 @@ jobs:
       - name: Resolve deployment defaults
         run: |
           set -euo pipefail
+          if [ -z "${AVAILABILITY_ZONES:-}" ]; then
+            case "$AWS_REGION" in
+              us-west-2) echo 'AVAILABILITY_ZONES=["us-west-2a","us-west-2b"]' >> "$GITHUB_ENV" ;;
+              us-west-1) echo 'AVAILABILITY_ZONES=["us-west-1a","us-west-1c"]' >> "$GITHUB_ENV" ;;
+              *) echo "Unsupported deploy region: $AWS_REGION" >&2; exit 1 ;;
+            esac
+          fi
           if [ -z "${PULUMI_STACK:-}" ]; then
             case "${{ inputs.environment }}" in
               production) echo "PULUMI_STACK=prod" >> "$GITHUB_ENV" ;;
@@ -136,7 +159,7 @@ jobs:
         working-directory: infra/pulumi
         run: |
           set -euo pipefail
-          pulumi stack select "$PULUMI_STACK"
+          pulumi stack select "$PULUMI_STACK" || pulumi stack init "$PULUMI_STACK" --secrets-provider passphrase
           ../../scripts/deploy/configure-pulumi.sh
 
       - name: Preview backend and infrastructure

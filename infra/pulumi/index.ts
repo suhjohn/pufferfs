@@ -8,7 +8,7 @@ const project = cfg.get("projectName") ?? "pufferfs";
 const name = (suffix: string) => `${project}-${stack}-${suffix}`;
 
 const vpcCidr = cfg.get("vpcCidr") ?? "10.80.0.0/16";
-const azs = cfg.getObject<string[]>("availabilityZones") ?? ["us-east-1a", "us-east-1b"];
+const azs = cfg.getObject<string[]>("availabilityZones") ?? ["us-west-2a", "us-west-2b"];
 if (azs.length < 2) {
   throw new Error("pufferfs:availabilityZones must include at least two AZs");
 }
@@ -548,7 +548,7 @@ const secrets = Object.entries(secretValues).map(([key, value]) => {
 const appEnv = [
   { name: "PORT", value: containerPort.toString() },
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
-  { name: "AWS_REGION", value: aws.config.region ?? "us-east-1" },
+  { name: "AWS_REGION", value: aws.config.region ?? "us-west-2" },
   { name: "AWS_ENDPOINT_URL", value: "" },
   { name: "NATS_URL", value: natsURL },
   { name: "PUFFERFS_QUEUE_REPLICAS", value: natsNodes.length.toString() },
@@ -613,7 +613,7 @@ function logConfig(streamPrefix: string) {
     logDriver: "awslogs",
     options: {
       "awslogs-group": logGroupName,
-      "awslogs-region": aws.config.region ?? "us-east-1",
+      "awslogs-region": aws.config.region ?? "us-west-2",
       "awslogs-stream-prefix": streamPrefix,
     },
   };

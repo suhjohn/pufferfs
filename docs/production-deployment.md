@@ -59,10 +59,7 @@ Modal endpoints may be stored as variables instead of secrets.
 Set these variables on each deploy environment:
 
 ```text
-AWS_REGION=us-east-1
-PULUMI_STACK=prod
 PROJECT_NAME=pufferfs
-AVAILABILITY_ZONES=["us-east-1a","us-east-1b"]
 FRONTEND_URL=https://pufferfs.com
 COOKIE_DOMAIN=.pufferfs.com
 API_DOMAIN=api.pufferfs.com
@@ -118,7 +115,8 @@ For GitHub Actions, use a remote Pulumi backend. The deploy workflow supports:
 
 - Pulumi Cloud: set `PULUMI_ACCESS_TOKEN`.
 - S3 backend: set environment variable `PULUMI_BACKEND_URL`, for example
-  `s3://pufferfs-pulumi-state`, and set `PULUMI_CONFIG_PASSPHRASE`.
+  `s3://pufferfs-pulumi-state-940827433648-us-west-2?region=us-west-2`,
+  and set `PULUMI_CONFIG_PASSPHRASE`.
 
 Do not commit `Pulumi.<stack>.yaml`; stack config is set by
 `scripts/deploy/configure-pulumi.sh`.
@@ -129,6 +127,9 @@ Run `.github/workflows/deploy.yml` from GitHub Actions with:
 
 ```text
 environment: production
+aws_region: us-west-2 | us-west-1
+pulumi_stack: optional override, defaults to the environment stack
+availability_zones: optional JSON override, defaults from aws_region
 component: backend | frontend | installer | all
 ```
 
@@ -168,9 +169,16 @@ cd infra/pulumi
 set -a
 source ../../.env
 set +a
-pulumi stack select prod
+pulumi stack select prod-us-west-2
 ../../scripts/deploy/configure-pulumi.sh
 ```
+
+For west production, use the `prod` stack with `AWS_REGION=us-west-2`. Region
+selection moves the single active environment stack; do not use a second
+production stack with the same `pufferfs.com` / `api.pufferfs.com` domains
+unless you also use different domain names. The only `us-east-1` resource that
+remains is the CloudFront ACM certificate provider, because AWS requires
+CloudFront certificates in `us-east-1`.
 
 Backend:
 
@@ -186,7 +194,7 @@ Frontend:
 cd ../../web
 VITE_API_URL=https://api.pufferfs.com VITE_ENABLE_BILLING=false npm run build
 cd ../infra/pulumi
-aws s3 sync ../../web/dist/client/ "s3://$(pulumi stack output webBucketName)" --delete
+aws s3 sync ../../web/dist/client/ "s3://$(pulumi stack output webBucketName)" --delete --exclude 'releases/*'
 aws cloudfront create-invalidation --distribution-id "$(pulumi stack output webDistributionId)" --paths '/*'
 ```
 
