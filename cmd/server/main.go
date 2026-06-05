@@ -99,10 +99,7 @@ func main() {
 		log.Println("Google OAuth2 disabled (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to enable)")
 	}
 
-	addr := os.Getenv("LISTEN_ADDR")
-	if addr == "" {
-		addr = ":8080"
-	}
+	addr := listenAddr()
 
 	httpSrv := &http.Server{
 		Addr:         addr,
@@ -145,4 +142,17 @@ func adminKeyHash() string {
 		return auth.HashAPIKey(rawKey)
 	}
 	return ""
+}
+
+func listenAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("LISTEN_ADDR")); addr != "" {
+		return addr
+	}
+	if port := strings.TrimSpace(os.Getenv("PORT")); port != "" {
+		if strings.Contains(port, ":") {
+			return port
+		}
+		return ":" + port
+	}
+	return ":8080"
 }

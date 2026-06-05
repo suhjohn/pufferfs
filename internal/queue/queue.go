@@ -73,10 +73,11 @@ type NATSOption func(*natsQueueConfig)
 
 type natsQueueConfig struct {
 	consumerPrefix string
+	replicas       int
 }
 
 func NewNATSQueue(url string, opts ...NATSOption) (*NATSQueue, error) {
-	cfg := natsQueueConfig{consumerPrefix: "pufferfs"}
+	cfg := natsQueueConfig{consumerPrefix: "pufferfs", replicas: queueReplicas()}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -94,7 +95,7 @@ func NewNATSQueue(url string, opts ...NATSOption) (*NATSQueue, error) {
 		return nil, err
 	}
 	q := &NATSQueue{nc: nc, js: js, consumerPrefix: cfg.consumerPrefix}
-	if err := q.ensureTopology(cfg.consumerPrefix); err != nil {
+	if err := q.ensureTopology(cfg.consumerPrefix, cfg.replicas); err != nil {
 		nc.Close()
 		return nil, err
 	}
@@ -109,33 +110,46 @@ func WithConsumerPrefix(prefix string) NATSOption {
 	}
 }
 
-func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
+func WithReplicas(replicas int) NATSOption {
+	return func(cfg *natsQueueConfig) {
+		cfg.replicas = normalizeQueueReplicas(replicas)
+	}
+}
+
+func (q *NATSQueue) ensureTopology(consumerPrefix string, replicas int) error {
 	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit, StageCleanup} {
 		stream := streamName(stage)
 		subject := subjectForStage(stage)
+		streamConfig := nats.StreamConfig{
+			Name:       stream,
+			Subjects:   []string{subject},
+			Storage:    nats.FileStorage,
+			Retention:  nats.WorkQueuePolicy,
+			Duplicates: duplicateWindow(),
+		}
+		if replicas > 0 {
+			streamConfig.Replicas = replicas
+		}
 		streamInfo, err := q.js.StreamInfo(stream)
 		if err != nil {
 			if !errors.Is(err, nats.ErrStreamNotFound) {
 				return err
 			}
-			if _, err := q.js.AddStream(&nats.StreamConfig{
-				Name:       stream,
-				Subjects:   []string{subject},
-				Storage:    nats.FileStorage,
-				Retention:  nats.WorkQueuePolicy,
-				Duplicates: duplicateWindow(),
-			}); err != nil {
+			if _, err := q.js.AddStream(&streamConfig); err != nil {
 				return err
 			}
-		} else if streamInfo.Config.Duplicates != duplicateWindow() {
+		} else if streamNeedsUpdate(streamInfo.Config, streamConfig, replicas) {
 			cfg := streamInfo.Config
-			cfg.Duplicates = duplicateWindow()
+			cfg.Duplicates = streamConfig.Duplicates
+			if replicas > 0 {
+				cfg.Replicas = replicas
+			}
 			if _, err := q.js.UpdateStream(&cfg); err != nil {
 				return err
 			}
 		}
 		consumer := consumerName(consumerPrefix, stage)
-		desired := consumerConfig(stage, consumer, subject)
+		desired := consumerConfig(stage, consumer, subject, replicas)
 		consumerInfo, err := q.js.ConsumerInfo(stream, consumer)
 		if err != nil {
 			if !errors.Is(err, nats.ErrConsumerNotFound) {
@@ -147,12 +161,16 @@ func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
 		} else if consumerInfo.Config.AckWait != desired.AckWait ||
 			consumerInfo.Config.MaxDeliver != desired.MaxDeliver ||
 			consumerInfo.Config.MaxAckPending != desired.MaxAckPending ||
-			consumerInfo.Config.FilterSubject != desired.FilterSubject {
+			consumerInfo.Config.FilterSubject != desired.FilterSubject ||
+			consumerReplicasNeedUpdate(consumerInfo.Config, desired) {
 			cfg := consumerInfo.Config
 			cfg.AckWait = desired.AckWait
 			cfg.MaxDeliver = desired.MaxDeliver
 			cfg.MaxAckPending = desired.MaxAckPending
 			cfg.FilterSubject = desired.FilterSubject
+			if desired.Replicas > 0 {
+				cfg.Replicas = desired.Replicas
+			}
 			if _, err := q.js.UpdateConsumer(stream, &cfg); err != nil {
 				return err
 			}
@@ -161,14 +179,25 @@ func (q *NATSQueue) ensureTopology(consumerPrefix string) error {
 	return nil
 }
 
-func consumerConfig(stage, consumer, subject string) nats.ConsumerConfig {
+func streamNeedsUpdate(current, desired nats.StreamConfig, replicas int) bool {
+	if current.Duplicates != desired.Duplicates {
+		return true
+	}
+	return replicas > 0 && current.Replicas != replicas
+}
+
+func consumerReplicasNeedUpdate(current, desired nats.ConsumerConfig) bool {
+	return desired.Replicas > 0 && current.Replicas != desired.Replicas
+}
+
+func consumerConfig(stage, consumer, subject string, replicas int) nats.ConsumerConfig {
 	ackWait := 5 * time.Minute
 	maxDeliver := 5
 	if stage == StageCommit || stage == StageCleanup {
 		ackWait = 30 * time.Second
 		maxDeliver = 30
 	}
-	return nats.ConsumerConfig{
+	cfg := nats.ConsumerConfig{
 		Durable:       consumer,
 		AckPolicy:     nats.AckExplicitPolicy,
 		AckWait:       ackWait,
@@ -176,6 +205,10 @@ func consumerConfig(stage, consumer, subject string) nats.ConsumerConfig {
 		MaxAckPending: 10000,
 		FilterSubject: subject,
 	}
+	if replicas > 0 {
+		cfg.Replicas = replicas
+	}
+	return cfg
 }
 
 func duplicateWindow() time.Duration {
@@ -191,6 +224,28 @@ func duplicateWindow() time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 	return defaultWindow
+}
+
+func queueReplicas() int {
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_QUEUE_REPLICAS"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return normalizeQueueReplicas(n)
+}
+
+func normalizeQueueReplicas(n int) int {
+	if n < 1 {
+		return 0
+	}
+	if n > 5 {
+		return 5
+	}
+	return n
 }
 
 func (q *NATSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage) error {

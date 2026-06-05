@@ -1,0 +1,42 @@
+config:
+  # Use projectId/environmentId for an existing Railway project.
+  pufferfs:projectId: "railway-project-id"
+  pufferfs:environmentId: "railway-environment-id"
+
+  # Or omit projectId/environmentId and set workspaceId to create a new project.
+  # pufferfs:workspaceId: "railway-workspace-id"
+  # pufferfs:projectName: "pufferfs"
+  pufferfs:environmentName: "production"
+
+  pufferfs:sourceRepo: "suhjohn/pufferfs"
+  pufferfs:sourceRepoBranch: "main"
+  pufferfs:apiSubdomain: "pufferfs-prod"
+
+  # Existing Railway shared variable reference. This stack does not create Postgres.
+  pufferfs:databaseUrlRef: "${{shared.DATABASE_URL}}"
+
+  # Existing S3-compatible storage. This stack does not create Railway buckets.
+  pufferfs:awsEndpointUrl: "https://..."
+  pufferfs:awsBucketName: "pufferfs-prod"
+  pufferfs:awsAccessKeyId:
+    secure: "pulumi-secret-access-key"
+  pufferfs:awsSecretAccessKey:
+    secure: "pulumi-secret-secret-key"
+
+  pufferfs:jwtSecret:
+    secure: "pulumi-secret-jwt-secret"
+  pufferfs:turbopufferApiKey:
+    secure: "pulumi-secret-turbopuffer-api-key"
+
+  pufferfs:modalChunkEndpoint: "https://...chunk-file-endpoint.modal.run"
+  pufferfs:modalEmbedEndpoint: "https://...embed-chunks-endpoint.modal.run"
+  pufferfs:modalQueryEmbedEndpoint: "https://...embed-query-endpoint.modal.run"
+  pufferfs:modalChunkShardEndpoint: "https://...chunk-shard-endpoint.modal.run"
+  pufferfs:modalEmbedShardEndpoint: "https://...embed-shard-endpoint.modal.run"
+  pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
+
+  pufferfs:natsVolumeSizeMb: 50000
+  pufferfs:apiReplicas: 1
+  pufferfs:workerReplicas: 1
+  pufferfs:adminKeyHash:
+    secure: "optional-admin-key-sha256"

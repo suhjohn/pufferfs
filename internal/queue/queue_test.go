@@ -86,6 +86,45 @@ func TestNATSQueueRedeliversAfterNakWithDelay(t *testing.T) {
 	_ = q.Ack(msgs[0])
 }
 
+func TestQueueReplicasFromEnv(t *testing.T) {
+	t.Setenv("PUFFERFS_QUEUE_REPLICAS", "")
+	if got := queueReplicas(); got != 0 {
+		t.Fatalf("unset replicas = %d, want 0", got)
+	}
+
+	t.Setenv("PUFFERFS_QUEUE_REPLICAS", "3")
+	if got := queueReplicas(); got != 3 {
+		t.Fatalf("replicas = %d, want 3", got)
+	}
+
+	t.Setenv("PUFFERFS_QUEUE_REPLICAS", "10")
+	if got := queueReplicas(); got != 5 {
+		t.Fatalf("clamped replicas = %d, want 5", got)
+	}
+
+	t.Setenv("PUFFERFS_QUEUE_REPLICAS", "bad")
+	if got := queueReplicas(); got != 0 {
+		t.Fatalf("invalid replicas = %d, want 0", got)
+	}
+}
+
+func TestNATSQueueCreatesStreamsWithConfiguredReplicas(t *testing.T) {
+	ns := runEmbeddedNATS(t)
+	q, err := NewNATSQueue(ns.ClientURL(), WithConsumerPrefix("replica-test"), WithReplicas(1))
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	defer q.Close()
+
+	info, err := q.js.StreamInfo(streamName(StageChunk))
+	if err != nil {
+		t.Fatalf("stream info: %v", err)
+	}
+	if info.Config.Replicas != 1 {
+		t.Fatalf("stream replicas = %d, want 1", info.Config.Replicas)
+	}
+}
+
 func runEmbeddedNATS(t *testing.T) *natsserver.Server {
 	t.Helper()
 	ns, err := natsserver.NewServer(&natsserver.Options{

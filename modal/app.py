@@ -16,7 +16,7 @@ import modal
 
 from models import Chunk, ChunkWithEmbedding
 
-app = modal.App("pufferfs")
+app = modal.App(os.getenv("PUFFERFS_MODAL_APP_NAME", "pufferfs"))
 
 # ---------------------------------------------------------------------------
 # Container images
@@ -26,7 +26,6 @@ chunking_image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libreoffice-core", "libreoffice-writer", "libreoffice-impress")
     .pip_install(
-        "boto3>=1.34.0",
         "boto3>=1.34.0",
         "pymupdf>=1.24.0",
         "Pillow>=10.0.0",
@@ -54,7 +53,7 @@ embedding_image = (
 # ---------------------------------------------------------------------------
 
 s3_secret = modal.Secret.from_name(
-    "pufferfs-s3",
+    os.getenv("PUFFERFS_MODAL_S3_SECRET_NAME", "pufferfs-s3"),
     required_keys=[
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -64,12 +63,12 @@ s3_secret = modal.Secret.from_name(
 )
 
 gemini_secret = modal.Secret.from_name(
-    "pufferfs-gemini",
+    os.getenv("PUFFERFS_MODAL_GEMINI_SECRET_NAME", "pufferfs-gemini"),
     required_keys=["GEMINI_API_KEY"],
 )
 
 turbopuffer_secret = modal.Secret.from_name(
-    "pufferfs-turbopuffer",
+    os.getenv("PUFFERFS_MODAL_TURBOPUFFER_SECRET_NAME", "pufferfs-turbopuffer"),
     required_keys=["TURBOPUFFER_API_KEY"],
 )
 

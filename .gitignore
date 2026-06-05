@@ -1,10 +1,16 @@
 # Binaries
 /pufferfs
 /server
+/pufferfs-server
+/pufferfs-worker
+bin/
 *.exe
+*.test
 
 # Go
 /vendor/
+coverage.out
+*.coverprofile
 
 # Python
 __pycache__/
@@ -12,6 +18,11 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # IDE
 .idea/
@@ -26,3 +37,16 @@ Thumbs.db
 # Local config
 .tpfs/
 .env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+
+# Local logs and scratch data
+*.log
+tmp/
+data/
+
+# Pulumi local output
+infra/pulumi/node_modules/
+infra/pulumi/dist/

@@ -94,7 +94,7 @@ supervisor restarts it on failure and captures logs.
 ```bash
 # Set environment variables
 export DATABASE_URL="postgres://localhost:5432/pufferfs?sslmode=disable"
-export PUFFERFS_API_KEY="pfs_sk_..."
+export JWT_SECRET="$(openssl rand -base64 32)"
 export TURBOPUFFER_API_KEY="tbp_..."
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
@@ -106,7 +106,8 @@ export MODAL_QUERY_EMBED_ENDPOINT="https://..."
 export MODAL_CHUNK_SHARD_ENDPOINT="https://..."
 export MODAL_EMBED_SHARD_ENDPOINT="https://..."
 export MODAL_INDEX_SHARD_ENDPOINT="https://..."
-# Optional platform admin key for /admin/* APIs.
+
+# Optional: enable platform provisioning/deletion APIs.
 export PUFFERFS_ADMIN_KEY="..."
 
 go run ./cmd/server
@@ -115,7 +116,8 @@ go run ./cmd/server
 ### Platform admin APIs
 
 When `PUFFERFS_ADMIN_KEY` or `PUFFERFS_ADMIN_KEY_HASH` is configured, PufferFS
-accepts that key on `/admin/*` routes:
+accepts that key on `/admin/*` routes. If neither value is configured, `/admin/*`
+is blocked:
 
 ```bash
 curl -X POST "$PUFFERFS_SERVER_URL/admin/orgs" \
@@ -195,8 +197,25 @@ go run ./cmd/worker --stage=commit --concurrency=2
 go run ./cmd/worker --stage=cleanup --concurrency=4
 ```
 
+The worker binary also reads `PUFFERFS_WORKER_STAGE` and
+`PUFFERFS_WORKER_CONCURRENCY`, which is useful for hosted worker services:
+
+```bash
+export PUFFERFS_WORKER_STAGE="chunk"
+export PUFFERFS_WORKER_CONCURRENCY="16"
+go run ./cmd/worker
+```
+
+The Docker image builds both `/pufferfs-server` and `/pufferfs-worker`. Its
+default command starts the server, and worker services can override the command
+with `/pufferfs-worker --stage=chunk --concurrency=16`.
+
 `go test ./internal/queue` starts an embedded JetStream server locally and
 verifies enqueue, pull, ack, and delayed redelivery semantics.
+
+For a clustered JetStream deployment, set `PUFFERFS_QUEUE_REPLICAS=3` on the API
+and every worker before the queue streams are created. Without this value,
+JetStream uses the server default replica count.
 
 Cleanup jobs are enabled by default and batch-delete transient sync/raw-source
 transport artifacts after they are no longer needed. Set
@@ -218,13 +237,62 @@ Deploy the Modal functions:
 ```bash
 cd modal
 pip install -r requirements.txt
+export PUFFERFS_MODAL_APP_NAME="pufferfs-dev"
+export PUFFERFS_MODAL_S3_SECRET_NAME="pufferfs-s3-dev"
+export PUFFERFS_MODAL_GEMINI_SECRET_NAME="pufferfs-gemini-dev"
+export PUFFERFS_MODAL_TURBOPUFFER_SECRET_NAME="pufferfs-turbopuffer-dev"
 modal deploy app.py
 ```
 
-This creates three web endpoints:
+Unset those variables to use the defaults: `pufferfs`, `pufferfs-s3`,
+`pufferfs-gemini`, and `pufferfs-turbopuffer`.
+
+This creates these web endpoints:
+
 - `chunk_file_endpoint` — file → chunks
 - `embed_chunks_endpoint` — chunks → embeddings
 - `embed_query_endpoint` — query text → embedding vector
+- `chunk_shard_endpoint` — sync shard pointer → chunk artifact
+- `embed_shard_endpoint` — chunk artifact → indexed rows artifact
+- `index_shard_endpoint` — indexed rows artifact → Turbopuffer
+
+## Deployment environments
+
+Run development and production as separate environments, not just separate keys
+pointing at shared state. Each environment should have its own Postgres
+database, object storage bucket/prefix, Turbopuffer key or namespace set, Modal
+app, Modal secrets, and NATS JetStream deployment if queued sync is enabled.
+
+API services need:
+
+```bash
+DATABASE_URL="postgres://..."
+JWT_SECRET="..."
+AWS_ENDPOINT_URL="https://..."
+AWS_BUCKET_NAME="pufferfs-dev"
+AWS_ACCESS_KEY_ID="..."
+AWS_SECRET_ACCESS_KEY="..."
+TURBOPUFFER_API_KEY="tbp_..."
+MODAL_CHUNK_ENDPOINT="https://..."
+MODAL_EMBED_ENDPOINT="https://..."
+MODAL_QUERY_EMBED_ENDPOINT="https://..."
+```
+
+Queue-backed API and worker services also need:
+
+```bash
+NATS_URL="nats://..."
+MODAL_CHUNK_SHARD_ENDPOINT="https://..."
+MODAL_EMBED_SHARD_ENDPOINT="https://..."
+MODAL_INDEX_SHARD_ENDPOINT="https://..."
+```
+
+Tenant clients and sandboxes should only receive:
+
+```bash
+PUFFERFS_SERVER_URL="https://..."
+PUFFERFS_API_KEY="pfs_sk_member_..."
+```
 
 ## How It Works
 
