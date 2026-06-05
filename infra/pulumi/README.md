@@ -36,7 +36,7 @@ Set environment shape:
 ```sh
 pulumi config set pufferfs:projectName pufferfs
 pulumi config set pufferfs:availabilityZones '["us-east-1a","us-east-1b"]'
-pulumi config set pufferfs:imageTag prod
+pulumi config set pufferfs:imageTag "$(git rev-parse --short HEAD)"
 ```
 
 Set secrets:
@@ -151,6 +151,13 @@ at `https://api.pufferfs.com/billing/webhook`.
 
 ## Deploy
 
+Production deploys should normally run through
+[`.github/workflows/deploy.yml`](../../.github/workflows/deploy.yml), which can
+deploy only `backend`, `frontend`, `installer`, or `all` and uses immutable
+commit SHA image tags.
+
+For local deploys:
+
 ```sh
 npm run build
 pulumi preview
@@ -158,6 +165,8 @@ pulumi up
 ```
 
 Pulumi will build `../../Dockerfile`, push it to ECR, then update ECS task definitions.
+Set `pufferfs:imageTag` to a new commit SHA for each backend deploy so ECS rolls
+forward by task-definition change instead of relying on a mutable tag.
 
 ## Outputs
 
