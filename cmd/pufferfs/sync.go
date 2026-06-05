@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,6 +30,7 @@ func syncCmd() *cobra.Command {
 		rootID  string
 		scope   string
 		follow  bool
+		jsonOut bool
 		options followOptions
 	)
 
@@ -52,6 +54,9 @@ func syncCmd() *cobra.Command {
 			}
 
 			if follow {
+				if jsonOut {
+					return fmt.Errorf("--json cannot be combined with --follow")
+				}
 				if dryRun {
 					return fmt.Errorf("--follow cannot be combined with --dry-run")
 				}
@@ -60,12 +65,21 @@ func syncCmd() *cobra.Command {
 				}
 				return runFollow(cfg, absDir, name, rootID, options)
 			}
-			return runSync(cfg, absDir, name, rootID, scope, dryRun)
+			log := syncLogWriter(jsonOut)
+			result, err := runSync(cfg, absDir, name, rootID, scope, dryRun, log)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writePrettyJSON(os.Stdout, result)
+			}
+			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be synced without syncing")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Continuously sync when files change")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print sync result as JSON")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
 	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
@@ -74,7 +88,37 @@ func syncCmd() *cobra.Command {
 	return cmd
 }
 
-func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool) error {
+type syncCommandResult struct {
+	Status         string              `json:"status"`
+	RootID         string              `json:"root_id,omitempty"`
+	RootName       string              `json:"root_name,omitempty"`
+	SourcePath     string              `json:"source_path,omitempty"`
+	DryRun         bool                `json:"dry_run,omitempty"`
+	Changes        int                 `json:"changes"`
+	Stats          *models.DiffStats   `json:"stats,omitempty"`
+	FileChanges    []models.FileChange `json:"file_changes,omitempty"`
+	Ignored        []string            `json:"ignored_patterns,omitempty"`
+	Secrets        []string            `json:"secrets,omitempty"`
+	SyncJobID      string              `json:"sync_job_id,omitempty"`
+	GenerationID   string              `json:"generation_id,omitempty"`
+	GenerationSeq  int64               `json:"generation_seq,omitempty"`
+	ChunksAdded    int                 `json:"chunks_added,omitempty"`
+	ChunksRemoved  int                 `json:"chunks_removed,omitempty"`
+	ChunksMoved    int                 `json:"chunks_moved,omitempty"`
+	FilesProcessed int                 `json:"files_processed,omitempty"`
+}
+
+func syncLogWriter(jsonOutput bool) io.Writer {
+	if jsonOutput {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, log io.Writer) (*syncCommandResult, error) {
+	if log == nil {
+		log = os.Stdout
+	}
 	// Default name to directory basename
 	if name == "" {
 		name = filepath.Base(dir)
@@ -91,9 +135,9 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 			localMeta = meta
 		} else if !dryRun {
 			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, log)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			rootID = resolvedRoot.ID
 			remoteRoot = resolvedRoot
@@ -108,19 +152,19 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 		var err error
 		remoteRoot, err = loadRemoteRoot(client, rootID)
 		if err != nil {
-			return fmt.Errorf("loading remote root metadata: %w", err)
+			return nil, fmt.Errorf("loading remote root metadata: %w", err)
 		}
 	}
 
 	// Build Merkle tree (parallel file hashing)
 	matcher := ignore.NewMatcher(dir)
-	fmt.Printf("Building Merkle tree for %s...\n", dir)
+	fmt.Fprintf(log, "Building Merkle tree for %s...\n", dir)
 	start := time.Now()
 	currentTree, err := merkle.BuildTree(dir, matcher)
 	if err != nil {
-		return fmt.Errorf("building Merkle tree: %w", err)
+		return nil, fmt.Errorf("building Merkle tree: %w", err)
 	}
-	fmt.Printf("Merkle tree built in %s (root hash: %s)\n", time.Since(start).Round(time.Millisecond), currentTree.Root.Hash[:20]+"...")
+	fmt.Fprintf(log, "Merkle tree built in %s (root hash: %s)\n", time.Since(start).Round(time.Millisecond), currentTree.Root.Hash[:20]+"...")
 
 	// Extract flat state for backward compatibility with server
 	currentState := currentTree.ToFileStateMap()
@@ -128,17 +172,20 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
 	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
 	if !useLocalCache {
-		fmt.Println("Remote generation changed; diffing against remote state.")
+		fmt.Fprintln(log, "Remote generation changed; diffing against remote state.")
 		previousState, err := loadRemoteState(client, rootID)
 		if err != nil {
-			return fmt.Errorf("loading remote state: %w", err)
+			return nil, fmt.Errorf("loading remote state: %w", err)
 		}
 		result := diff.Compute(previousState, currentState)
 		if countChanges(result) == 0 {
-			fmt.Println("No changes detected (remote state matches local filesystem).")
-			return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+			fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
+			if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq); err != nil {
+				return nil, err
+			}
+			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
 		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -156,7 +203,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -164,43 +211,43 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 
 	// Merkle tree-based diff — only walks changed branches
 	if prevTree.Root.Hash == currentTree.Root.Hash {
-		fmt.Println("No changes detected (Merkle root hash matches).")
-		return nil
+		fmt.Fprintln(log, "No changes detected (Merkle root hash matches).")
+		return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
 	}
 
 	treeChanges := merkle.Diff(prevTree, currentTree)
-	fmt.Printf("Merkle diff found %d changed files (skipped unchanged subtrees)\n", len(treeChanges))
+	fmt.Fprintf(log, "Merkle diff found %d changed files (skipped unchanged subtrees)\n", len(treeChanges))
 
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
 	var err error
 
 	// Detect secrets
 	secrets := diff.DetectSecrets(currentState)
 
 	if dryRun {
-		fmt.Print(diff.FormatDryRun(result, currentState, ignoredPatterns(), secrets))
-		return nil
+		fmt.Fprint(log, diff.FormatDryRun(result, currentState, ignoredPatterns(), secrets))
+		return dryRunSyncResult(rootID, name, dir, result, secrets), nil
 	}
 
 	// Need a server connection for actual sync
 	if cfg.Server.URL == "" {
-		return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
+		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 	}
 
 	client := newAPIClient(cfg)
 
 	// Get or create root
 	if rootID == "" {
-		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope)
+		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, log)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		rootID = resolvedRoot.ID
 		baseGenerationID = resolvedRoot.VisibleGenerationID
@@ -209,12 +256,12 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 
 	// Upload changed files to S3 via the server
 	changeCount := countChanges(result)
-	fmt.Printf("Syncing %d changes to root %s...\n", changeCount, rootID)
+	fmt.Fprintf(log, "Syncing %d changes to root %s...\n", changeCount, rootID)
 
 	changes := withAbsolutePaths(dir, filterChanges(result))
 	manifestRef, err := uploadChangedFiles(client, rootID, dir, changes)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Build content proof from Merkle tree
@@ -226,7 +273,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	}
 	stateRef, err := uploadRootState(client, rootID, currentState)
 	if err != nil {
-		return fmt.Errorf("uploading root state: %w", err)
+		return nil, fmt.Errorf("uploading root state: %w", err)
 	}
 
 	// Send sync request with SimHash for index reuse + content proof
@@ -245,27 +292,30 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
 	if err != nil {
 		if conflict, ok := syncConflictFromError(err); ok {
-			return conflict
+			return nil, conflict
 		}
-		return fmt.Errorf("sync request: %w", err)
+		return nil, fmt.Errorf("sync request: %w", err)
 	}
 
 	var syncResp models.SyncResponse
 	if err := json.Unmarshal(respBody, &syncResp); err != nil {
-		return fmt.Errorf("parsing sync response: %w", err)
+		return nil, fmt.Errorf("parsing sync response: %w", err)
+	}
+	if syncResp.RootID == "" {
+		syncResp.RootID = rootID
 	}
 	if syncResp.SyncJobID != "" {
-		if err := pollSyncJob(client, rootID, syncResp.SyncJobID); err != nil {
-			return err
+		if err := pollSyncJob(client, rootID, syncResp.SyncJobID, log); err != nil {
+			return nil, err
 		}
 	}
 
 	saveLocalSyncCacheWarnings(rootID, name, dir, currentState, currentTree, syncResp.GenerationID, syncResp.GenerationSeq)
 
-	fmt.Printf("Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
+	fmt.Fprintf(log, "Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
 
-	return nil
+	return completedSyncResult(name, dir, changeCount, syncResp), nil
 }
 
 type syncConflictError struct {
@@ -295,32 +345,35 @@ func syncConflictFromError(err error) (*syncConflictError, bool) {
 	return &syncConflictError{SyncConflictResponse: resp}, true
 }
 
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64) error {
-	err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq)
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
+	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
-		return err
+		return syncResult, err
 	}
 	if dryRun {
-		return err
+		return nil, err
 	}
 
-	fmt.Println("Remote generation changed during sync; reconciling against latest remote state.")
+	fmt.Fprintln(log, "Remote generation changed during sync; reconciling against latest remote state.")
 	client := newAPIClient(cfg)
 	previousState, loadErr := loadRemoteState(client, rootID)
 	if loadErr != nil {
-		return fmt.Errorf("loading remote state after sync conflict: %w", loadErr)
+		return nil, fmt.Errorf("loading remote state after sync conflict: %w", loadErr)
 	}
 	reconciled := diff.Compute(previousState, currentState)
 	if countChanges(reconciled) == 0 {
-		fmt.Println("No changes detected (remote state matches local filesystem).")
-		return saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
+		fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
+		if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq); err != nil {
+			return nil, err
+		}
+		return unchangedSyncResult(rootID, name, dir, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq), nil
 	}
-	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq)
+	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, log)
 }
 
-func pollSyncJob(client *apiClient, rootID, jobID string) error {
-	fmt.Printf("Sync job %s started; polling until committed...\n", jobID)
+func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) error {
+	fmt.Fprintf(log, "Sync job %s started; polling until committed...\n", jobID)
 	deadline := time.Now().Add(syncPollTimeout())
 	for {
 		if time.Now().After(deadline) {
@@ -340,7 +393,7 @@ func pollSyncJob(client *apiClient, rootID, jobID string) error {
 		case "failed":
 			return fmt.Errorf("sync job failed: %s", string(job.Errors))
 		default:
-			fmt.Printf("Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
+			fmt.Fprintf(log, "Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -357,6 +410,51 @@ func syncPollTimeout() time.Duration {
 		return defaultTimeout
 	}
 	return timeout
+}
+
+func unchangedSyncResult(rootID, name, dir, generationID string, generationSeq int64) *syncCommandResult {
+	return &syncCommandResult{
+		Status:        "unchanged",
+		RootID:        rootID,
+		RootName:      name,
+		SourcePath:    dir,
+		Changes:       0,
+		GenerationID:  generationID,
+		GenerationSeq: generationSeq,
+	}
+}
+
+func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, secrets []string) *syncCommandResult {
+	stats := result.Stats
+	return &syncCommandResult{
+		Status:      "dry_run",
+		RootID:      rootID,
+		RootName:    name,
+		SourcePath:  dir,
+		DryRun:      true,
+		Changes:     countChanges(result),
+		Stats:       &stats,
+		FileChanges: filterChanges(result),
+		Ignored:     ignoredPatterns(),
+		Secrets:     secrets,
+	}
+}
+
+func completedSyncResult(name, dir string, changes int, resp models.SyncResponse) *syncCommandResult {
+	return &syncCommandResult{
+		Status:         "synced",
+		RootID:         resp.RootID,
+		RootName:       name,
+		SourcePath:     dir,
+		Changes:        changes,
+		SyncJobID:      resp.SyncJobID,
+		GenerationID:   resp.GenerationID,
+		GenerationSeq:  resp.GenerationSeq,
+		ChunksAdded:    resp.ChunksAdded,
+		ChunksRemoved:  resp.ChunksRemoved,
+		ChunksMoved:    resp.ChunksMoved,
+		FilesProcessed: resp.FilesProcessed,
+	}
 }
 
 // merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.
@@ -448,7 +546,7 @@ func moveReuseMaxBytes() int64 {
 	return value
 }
 
-func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string) (*models.RootMetadata, error) {
+func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, log io.Writer) (*models.RootMetadata, error) {
 	// Try to find existing root by name
 	respBody, err := client.get("/roots")
 	if err != nil {
@@ -462,7 +560,7 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string) 
 
 	for _, r := range roots {
 		if r.Name == name {
-			fmt.Printf("Using existing root: %s (%s)\n", r.Name, r.ID)
+			fmt.Fprintf(log, "Using existing root: %s (%s)\n", r.Name, r.ID)
 			return &r, nil
 		}
 	}
@@ -483,7 +581,7 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string) 
 		return nil, err
 	}
 
-	fmt.Printf("Created root: %s (%s)\n", root.Name, root.ID)
+	fmt.Fprintf(log, "Created root: %s (%s)\n", root.Name, root.ID)
 	return &root, nil
 }
 

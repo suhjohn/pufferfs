@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -15,10 +17,11 @@ import (
 
 func queryCmd() *cobra.Command {
 	var (
-		mode   string
-		glob   string
-		rootID string
-		topK   int
+		mode       string
+		glob       string
+		rootID     string
+		topK       int
+		jsonOutput bool
 	)
 
 	cmd := &cobra.Command{
@@ -45,10 +48,11 @@ func queryCmd() *cobra.Command {
 				}
 			}
 
-			return runQuery(cfg, queryText, mode, glob, rootID, topK)
+			return runQuery(cfg, queryText, mode, glob, rootID, topK, jsonOutput)
 		},
 	}
 
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Print raw query response as JSON")
 	cmd.Flags().StringVar(&mode, "mode", "hybrid", "Search mode: fts, vector, or hybrid")
 	cmd.Flags().StringVar(&glob, "glob", "", "Filter results by file path glob")
 	cmd.Flags().StringVar(&rootID, "root", "", "Root ID or name to search")
@@ -57,7 +61,7 @@ func queryCmd() *cobra.Command {
 	return cmd
 }
 
-func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK int) error {
+func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK int, jsonOutput bool) error {
 	client := newAPIClient(cfg)
 
 	// Resolve root name to ID if it's not a UUID
@@ -82,38 +86,100 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK 
 		return fmt.Errorf("query: %w", err)
 	}
 
+	if jsonOutput {
+		return writeRawJSONLine(os.Stdout, respBody)
+	}
+
 	var resp models.QueryResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return fmt.Errorf("parsing response: %w", err)
 	}
 
+	writeQueryResults(os.Stdout, resp)
+	return nil
+}
+
+func writeQueryResults(w io.Writer, resp models.QueryResponse) {
 	if len(resp.Results) == 0 {
-		fmt.Println("No results found.")
-		return nil
+		fmt.Fprintln(w, "No results found.")
+		return
 	}
 
 	for i, r := range resp.Results {
-		fmt.Printf("\n--- Result %d (score: %.4f) ---\n", i+1, r.Score)
+		if i > 0 {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "%d.\n", i+1)
 		displayPath := r.FilePath
 		if r.AbsolutePath != "" {
 			displayPath = r.AbsolutePath
 		}
-		fmt.Printf("File: %s", displayPath)
+		writeKV(w, "score", fmt.Sprintf("%.4f", r.Score))
+		writeKV(w, "file", displayPath)
 		if r.PageNumber != nil {
-			fmt.Printf(" (page %d)", *r.PageNumber)
+			writeKV(w, "page_number", *r.PageNumber)
 		}
-		fmt.Printf(" [chunk %d]\n", r.ChunkIndex)
-		fmt.Printf("Type: %s\n", r.FileType)
-
-		// Show content preview (first 500 chars)
-		content := r.Content
-		if len(content) > 500 {
-			content = content[:500] + "..."
+		writeKV(w, "chunk_index", r.ChunkIndex)
+		writeKV(w, "file_type", r.FileType)
+		if !writeJSONValueAsDotNotation(w, "content", r.Content) {
+			writeKV(w, "content", r.Content)
 		}
-		fmt.Println(content)
 	}
+}
 
-	return nil
+func writeKV(w io.Writer, key string, value any) {
+	fmt.Fprintf(w, "%s: %v\n", key, value)
+}
+
+func writeJSONValueAsDotNotation(w io.Writer, prefix, raw string) bool {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return false
+	}
+	pairs := flattenJSONValue(prefix, value)
+	if len(pairs) == 0 {
+		writeKV(w, prefix, raw)
+		return true
+	}
+	for _, pair := range pairs {
+		writeKV(w, pair.key, pair.value)
+	}
+	return true
+}
+
+type kvPair struct {
+	key   string
+	value any
+}
+
+func flattenJSONValue(prefix string, value any) []kvPair {
+	switch v := value.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		var pairs []kvPair
+		for _, key := range keys {
+			pairs = append(pairs, flattenJSONValue(prefix+"."+key, v[key])...)
+		}
+		return pairs
+	case []any:
+		var pairs []kvPair
+		for i, item := range v {
+			pairs = append(pairs, flattenJSONValue(fmt.Sprintf("%s[%d]", prefix, i), item)...)
+		}
+		return pairs
+	default:
+		return []kvPair{{key: prefix, value: v}}
+	}
 }
 
 func detectRootFromCwd() (string, error) {
