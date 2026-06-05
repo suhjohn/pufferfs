@@ -169,7 +169,7 @@ jobs:
           set -euo pipefail
           WEB_BUCKET="$(pulumi stack output webBucketName)"
           WEB_DISTRIBUTION="$(pulumi stack output webDistributionId)"
-          aws s3 sync ../../web/dist/client/ "s3://${WEB_BUCKET}" --delete
+          aws s3 sync ../../web/dist/client/ "s3://${WEB_BUCKET}" --delete --exclude 'releases/*'
           aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/*'
 
       - name: Deploy installer
