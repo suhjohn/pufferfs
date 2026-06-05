@@ -863,7 +863,7 @@ const natsServices = natsNodes.map((node, i) => {
       },
       tags,
     },
-    { dependsOn: mountTargets },
+    { dependsOn: [...mountTargets, natsDiscoveryServices[i]] },
   );
 });
 
