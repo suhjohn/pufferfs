@@ -36,6 +36,9 @@ const tags = {
   ManagedBy: "pulumi",
 };
 
+const deployRegion = aws.config.region ?? "us-west-2";
+const regionalBucketPrefix = (suffix: string) => `${name(suffix)}-${deployRegion}-`;
+
 const vpc = new aws.ec2.Vpc(name("vpc"), {
   cidrBlock: vpcCidr,
   enableDnsHostnames: true,
@@ -148,6 +151,7 @@ const appImage = new docker.Image(name("app-image"), {
 });
 
 const bucket = new aws.s3.BucketV2(name("artifacts"), {
+  bucketPrefix: regionalBucketPrefix("artifacts"),
   forceDestroy: cfg.getBoolean("forceDestroyBucket") ?? false,
   tags,
 });
@@ -176,6 +180,7 @@ new aws.s3.BucketServerSideEncryptionConfigurationV2(name("artifacts-encryption"
 // out of band (`aws s3 sync` in CI); see web/README.md. CloudFront serves it
 // over HTTPS and rewrites 403/404 -> /index.html so SPA deep links resolve.
 const webBucket = new aws.s3.BucketV2(name("web"), {
+  bucketPrefix: regionalBucketPrefix("web"),
   forceDestroy: true,
   tags,
 });
@@ -548,7 +553,7 @@ const secrets = Object.entries(secretValues).map(([key, value]) => {
 const appEnv = [
   { name: "PORT", value: containerPort.toString() },
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
-  { name: "AWS_REGION", value: aws.config.region ?? "us-west-2" },
+  { name: "AWS_REGION", value: deployRegion },
   { name: "AWS_ENDPOINT_URL", value: "" },
   { name: "NATS_URL", value: natsURL },
   { name: "PUFFERFS_QUEUE_REPLICAS", value: natsNodes.length.toString() },
@@ -613,7 +618,7 @@ function logConfig(streamPrefix: string) {
     logDriver: "awslogs",
     options: {
       "awslogs-group": logGroupName,
-      "awslogs-region": aws.config.region ?? "us-west-2",
+      "awslogs-region": deployRegion,
       "awslogs-stream-prefix": streamPrefix,
     },
   };
