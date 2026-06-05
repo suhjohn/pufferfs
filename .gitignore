@@ -50,3 +50,9 @@ data/
 # Pulumi local output
 infra/pulumi/node_modules/
 infra/pulumi/dist/
+
+# Pulumi stack config — regenerated from .env by the deploy runbook. Holds
+# encrypted secrets + the encryption salt; kept out of git so nothing sensitive
+# is committed even by accident. The base Pulumi.yaml and *.example stay tracked.
+infra/pulumi/Pulumi.*.yaml
+!infra/pulumi/Pulumi.*.yaml.example

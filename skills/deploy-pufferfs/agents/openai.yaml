@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy PufferFS"
+  short_description: "Deploy PufferFS to AWS with Pulumi"
+  default_prompt: "Use $deploy-pufferfs to deploy or update the PufferFS AWS stack and verify service health."

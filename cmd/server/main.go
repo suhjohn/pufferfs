@@ -66,6 +66,32 @@ func main() {
 		log.Println("WARNING: Using default JWT secret. Set JWT_SECRET in production.")
 	}
 
+	// Frontend integration: the web app lives on a different origin (the app.*
+	// subdomain), so we set the session as a cross-subdomain cookie and allow
+	// that origin through CORS.
+	frontendURL := strings.TrimSpace(os.Getenv("FRONTEND_URL"))
+	cookieCfg := auth.CookieConfig{
+		Domain: strings.TrimSpace(os.Getenv("COOKIE_DOMAIN")),
+		Secure: strings.HasPrefix(frontendURL, "https://"),
+	}
+
+	// Billing (Stripe) — optional. Enabled only when ENABLE_BILLING=true and a
+	// secret key is present, mirroring the OAuth wiring below.
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ENABLE_BILLING")), "true") {
+		stripeKey := strings.TrimSpace(os.Getenv("STRIPE_SECRET_KEY"))
+		if stripeKey == "" {
+			log.Println("ENABLE_BILLING is set but STRIPE_SECRET_KEY is missing; billing disabled")
+		} else {
+			srv.SetBilling(server.NewStripeClient(server.StripeConfig{
+				SecretKey:     stripeKey,
+				WebhookSecret: strings.TrimSpace(os.Getenv("STRIPE_WEBHOOK_SECRET")),
+				PriceID:       strings.TrimSpace(os.Getenv("STRIPE_PRICE_ID")),
+				FrontendURL:   frontendURL,
+			}))
+			log.Println("Billing (Stripe) enabled")
+		}
+	}
+
 	// Auth middleware: supports both JWT and tenant API key for normal routes.
 	appHandler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
 	adminHandler := auth.AdminMiddleware(adminKeyHash())(srv.Handler())
@@ -73,7 +99,6 @@ func main() {
 	topMux := http.NewServeMux()
 	topMux.Handle("/admin/", adminHandler)
 	topMux.Handle("/", appHandler)
-	handler := http.Handler(topMux)
 
 	// OAuth2 handler (Google)
 	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
@@ -89,15 +114,22 @@ func main() {
 			GoogleClientSecret: googleClientSecret,
 			RedirectURL:        redirectURL,
 			JWTSecret:          jwtSecret,
+			FrontendURL:        frontendURL,
+			Cookie:             cookieCfg,
 		}, db.UpsertUser)
 
 		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)
 		topMux.HandleFunc("GET /auth/callback", oauthHandler.HandleCallback)
+		topMux.HandleFunc("POST /auth/logout", oauthHandler.HandleLogout)
 
 		log.Println("Google OAuth2 enabled")
 	} else {
 		log.Println("Google OAuth2 disabled (set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to enable)")
 	}
+
+	// CORS wraps everything so the browser can send credentialed requests from
+	// the frontend origin. No-op when FRONTEND_URL is unset.
+	handler := auth.CORS(frontendURL)(topMux)
 
 	addr := listenAddr()
 

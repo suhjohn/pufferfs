@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -17,6 +18,11 @@ type OAuthConfig struct {
 	GoogleClientSecret string
 	RedirectURL        string // e.g. "https://api.pufferfs.com/auth/callback"
 	JWTSecret          []byte
+	// FrontendURL, when set, switches the callback from returning the JWT in the
+	// response body (legacy CLI flow) to setting an httpOnly session cookie and
+	// redirecting the browser to FrontendURL + "/auth/callback".
+	FrontendURL string
+	Cookie      CookieConfig
 }
 
 // UserInfo is the profile returned by Google's userinfo endpoint.
@@ -33,9 +39,11 @@ type UserUpsertFunc func(ctx context.Context, info UserInfo, provider string) (u
 
 // OAuthHandler handles the Google OAuth2 flow.
 type OAuthHandler struct {
-	oauthCfg   *oauth2.Config
-	jwtSecret  []byte
-	upsertUser UserUpsertFunc
+	oauthCfg    *oauth2.Config
+	jwtSecret   []byte
+	upsertUser  UserUpsertFunc
+	frontendURL string
+	cookie      CookieConfig
 }
 
 // NewOAuthHandler creates a handler for Google OAuth2.
@@ -48,8 +56,10 @@ func NewOAuthHandler(cfg OAuthConfig, upsertUser UserUpsertFunc) *OAuthHandler {
 			Scopes:       []string{"openid", "email", "profile"},
 			Endpoint:     google.Endpoint,
 		},
-		jwtSecret:  cfg.JWTSecret,
-		upsertUser: upsertUser,
+		jwtSecret:   cfg.JWTSecret,
+		upsertUser:  upsertUser,
+		frontendURL: strings.TrimRight(cfg.FrontendURL, "/"),
+		cookie:      cfg.Cookie,
 	}
 }
 
@@ -100,12 +110,21 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate JWT
-	jwtToken, err := GenerateJWT(h.jwtSecret, userID, orgID, role, info.Email, 24*time.Hour)
+	const sessionTTL = 24 * time.Hour
+	jwtToken, err := GenerateJWT(h.jwtSecret, userID, orgID, role, info.Email, sessionTTL)
 	if err != nil {
 		http.Error(w, `{"error":"generating token"}`, http.StatusInternalServerError)
 		return
 	}
 
+	// Browser flow: set an httpOnly session cookie and bounce back to the app.
+	if h.frontendURL != "" {
+		SetSessionCookie(w, h.cookie, jwtToken, sessionTTL)
+		http.Redirect(w, r, h.frontendURL+"/auth/callback", http.StatusFound)
+		return
+	}
+
+	// Legacy flow (CLI): return the token in the response body.
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"token":   jwtToken,
@@ -114,4 +133,10 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		"email":   info.Email,
 		"name":    info.Name,
 	})
+}
+
+// HandleLogout clears the session cookie.
+func (h *OAuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	ClearSessionCookie(w, h.cookie)
+	w.WriteHeader(http.StatusNoContent)
 }

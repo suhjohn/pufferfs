@@ -190,6 +190,23 @@ type ChunkWithEmbedding struct {
 
 const SyncProtocolVersion = 1
 
+// CLIReleaseManifest describes the currently supported CLI release range and
+// the download assets available for direct upgrades.
+type CLIReleaseManifest struct {
+	Latest      string                 `json:"latest"`
+	Minimum     string                 `json:"minimum"`
+	ProtocolMin int                    `json:"protocol_min"`
+	ProtocolMax int                    `json:"protocol_max"`
+	Downloads   map[string]CLIDownload `json:"downloads,omitempty"`
+	NotesURL    string                 `json:"notes_url,omitempty"`
+}
+
+// CLIDownload is a platform-specific CLI binary asset.
+type CLIDownload struct {
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256,omitempty"`
+}
+
 // SyncRequest is sent from CLI to server to trigger a sync.
 type SyncRequest struct {
 	ProtocolVersion   int                  `json:"protocol_version"`

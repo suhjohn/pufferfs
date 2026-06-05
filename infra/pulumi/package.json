@@ -8,8 +8,9 @@
     "up": "pulumi up"
   },
   "dependencies": {
-    "@pulumi/pulumi": "^3.236.0",
-    "@pulumi/railway": "file:sdks/railway"
+    "@pulumi/aws": "^7.0.0",
+    "@pulumi/docker": "^4.0.0",
+    "@pulumi/pulumi": "^3.236.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
