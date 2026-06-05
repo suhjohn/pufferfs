@@ -156,6 +156,73 @@ jobs:
           npm run build
           pulumi preview --diff
 
+      - name: Retire legacy us-east-1 service discovery services
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        run: |
+          set -euo pipefail
+          LEGACY_REGION="us-east-1"
+          NAMESPACE_NAME="${PROJECT_NAME}-${PULUMI_STACK}.local"
+          NAMESPACE_ID="$(aws servicediscovery list-namespaces \
+            --region "$LEGACY_REGION" \
+            --filters Name=NAME,Values="$NAMESPACE_NAME",Condition=EQ Name=TYPE,Values=DNS_PRIVATE,Condition=EQ \
+            --query 'Namespaces[0].Id' \
+            --output text 2>/dev/null || true)"
+
+          if [ -z "$NAMESPACE_ID" ] || [ "$NAMESPACE_ID" = "None" ]; then
+            echo "No legacy Cloud Map namespace found in ${LEGACY_REGION}: ${NAMESPACE_NAME}"
+            exit 0
+          fi
+
+          echo "Retiring legacy Cloud Map services in ${LEGACY_REGION}/${NAMESPACE_ID}"
+          SERVICE_IDS="$(aws servicediscovery list-services \
+            --region "$LEGACY_REGION" \
+            --filters Name=NAMESPACE_ID,Values="$NAMESPACE_ID",Condition=EQ \
+            --query 'Services[].Id' \
+            --output text)"
+
+          for SERVICE_ID in $SERVICE_IDS; do
+            INSTANCE_IDS="$(aws servicediscovery list-instances \
+              --region "$LEGACY_REGION" \
+              --service-id "$SERVICE_ID" \
+              --query 'Instances[].Id' \
+              --output text)"
+
+            for INSTANCE_ID in $INSTANCE_IDS; do
+              OPERATION_ID="$(aws servicediscovery deregister-instance \
+                --region "$LEGACY_REGION" \
+                --service-id "$SERVICE_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'OperationId' \
+                --output text || true)"
+              if [ -n "$OPERATION_ID" ] && [ "$OPERATION_ID" != "None" ]; then
+                for _ in $(seq 1 30); do
+                  STATUS="$(aws servicediscovery get-operation \
+                    --region "$LEGACY_REGION" \
+                    --operation-id "$OPERATION_ID" \
+                    --query 'Operation.Status' \
+                    --output text)"
+                  [ "$STATUS" = "SUCCESS" ] && break
+                  if [ "$STATUS" = "FAIL" ]; then
+                    aws servicediscovery get-operation --region "$LEGACY_REGION" --operation-id "$OPERATION_ID"
+                    exit 1
+                  fi
+                  sleep 2
+                done
+              fi
+            done
+
+            for ATTEMPT in $(seq 1 30); do
+              if aws servicediscovery delete-service --region "$LEGACY_REGION" --id "$SERVICE_ID"; then
+                break
+              fi
+              if [ "$ATTEMPT" -eq 30 ]; then
+                echo "Could not delete legacy Cloud Map service: $SERVICE_ID" >&2
+                exit 1
+              fi
+              sleep 2
+            done
+          done
+
       - name: Deploy backend and infrastructure
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
