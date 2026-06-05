@@ -262,7 +262,7 @@ jobs:
           aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/install.sh'
 
       - name: Mirror CLI release
-        if: ${{ inputs.component == 'cli-release' }}
+        if: ${{ inputs.component == 'cli-release' || inputs.component == 'all' }}
         working-directory: infra/pulumi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -292,9 +292,51 @@ jobs:
         working-directory: infra/pulumi
         run: |
           set -euo pipefail
-          API_URL="$(pulumi stack output apiUrl)"
+          COMPONENT="${{ inputs.component }}"
           WEB_URL="$(pulumi stack output webUrl)"
-          curl -fsS --max-time 15 "${API_URL}/health"
-          curl -fsS --max-time 15 "${API_URL}/cli/version" >/dev/null
-          curl -fsSI --max-time 15 "$WEB_URL" >/dev/null
-          curl -fsSI --max-time 15 "${WEB_URL}/install.sh" >/dev/null
+
+          verify_api() {
+            API_URL="$(pulumi stack output apiUrl)"
+            API_HOST="${API_URL#https://}"
+            API_HOST="${API_HOST%%/*}"
+            API_ALB="$(pulumi stack output apiAlbHostname)"
+            API_IP="$(getent ahostsv4 "$API_ALB" | awk 'NR == 1 { print $1 }')"
+            [ -n "$API_IP" ] || { echo "Could not resolve API ALB: $API_ALB" >&2; exit 1; }
+            curl -fsS --max-time 15 --resolve "${API_HOST}:443:${API_IP}" "${API_URL}/health"
+            curl -fsS --max-time 15 --resolve "${API_HOST}:443:${API_IP}" "${API_URL}/cli/version" >/dev/null
+          }
+
+          verify_frontend() {
+            curl -fsSI --max-time 15 "$WEB_URL" >/dev/null
+          }
+
+          verify_installer() {
+            curl -fsSI --max-time 15 "${WEB_URL}/install.sh" >/dev/null
+          }
+
+          verify_cli_release() {
+            RELEASE_TAG="$(curl -fsS --max-time 15 "${WEB_URL}/releases/latest.txt")"
+            [ -n "$RELEASE_TAG" ] || { echo "Missing CLI release tag" >&2; exit 1; }
+            curl -fsSI --max-time 15 "${WEB_URL}/releases/${RELEASE_TAG}/checksums.txt" >/dev/null
+          }
+
+          case "$COMPONENT" in
+            backend)
+              verify_api
+              ;;
+            frontend)
+              verify_frontend
+              ;;
+            installer)
+              verify_installer
+              ;;
+            cli-release)
+              verify_cli_release
+              ;;
+            all)
+              verify_api
+              verify_frontend
+              verify_installer
+              verify_cli_release
+              ;;
+          esac
