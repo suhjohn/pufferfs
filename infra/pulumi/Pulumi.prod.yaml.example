@@ -27,7 +27,7 @@ config:
   # CLI release manifest advertised at GET /cli/version.
   pufferfs:cliLatestVersion: "0.3.0"
   pufferfs:cliMinVersion: "0.2.0"
-  pufferfs:cliDownloadBaseUrl: "https://github.com/suhjohn/pufferfs/releases/download"
+  pufferfs:cliDownloadBaseUrl: "https://pufferfs.com/releases"
 
   # Frontend + Google login. DNS is in Cloudflare; *HttpsReady stays false until
   # the ACM certs validate (see README "Custom domains").

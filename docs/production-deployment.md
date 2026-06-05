@@ -92,7 +92,7 @@ Optional CLI release variables:
 ```text
 PUFFERFS_CLI_LATEST_VERSION=0.3.0
 PUFFERFS_CLI_MIN_VERSION=0.2.0
-PUFFERFS_CLI_DOWNLOAD_BASE_URL=https://github.com/suhjohn/pufferfs/releases/download
+PUFFERFS_CLI_DOWNLOAD_BASE_URL=https://pufferfs.com/releases
 ```
 
 ## AWS OIDC Role

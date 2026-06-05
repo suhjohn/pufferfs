@@ -3,7 +3,7 @@ set -eu
 
 REPO="${PUFFERFS_REPO:-suhjohn/pufferfs}"
 MANIFEST_URL="${PUFFERFS_MANIFEST_URL:-https://api.pufferfs.com/cli/version}"
-DOWNLOAD_BASE_URL="${PUFFERFS_DOWNLOAD_BASE_URL:-https://github.com/${REPO}/releases/download}"
+DOWNLOAD_BASE_URL="${PUFFERFS_DOWNLOAD_BASE_URL:-https://pufferfs.com/releases}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
 fail() {

@@ -69,7 +69,7 @@ Advertise CLI release compatibility from `GET /cli/version`:
 ```sh
 pulumi config set pufferfs:cliLatestVersion 0.3.0
 pulumi config set pufferfs:cliMinVersion 0.2.0
-pulumi config set pufferfs:cliDownloadBaseUrl https://github.com/suhjohn/pufferfs/releases/download
+pulumi config set pufferfs:cliDownloadBaseUrl https://pufferfs.com/releases
 ```
 
 Frontend URL (for API OAuth redirects + CORS):

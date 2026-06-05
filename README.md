@@ -156,7 +156,7 @@ export MODAL_INDEX_SHARD_ENDPOINT="https://..."
 # Optional: advertise CLI release compatibility at GET /cli/version.
 export PUFFERFS_CLI_LATEST_VERSION="0.3.0"
 export PUFFERFS_CLI_MIN_VERSION="0.2.0"
-export PUFFERFS_CLI_DOWNLOAD_BASE_URL="https://github.com/suhjohn/pufferfs/releases/download"
+export PUFFERFS_CLI_DOWNLOAD_BASE_URL="https://pufferfs.com/releases"
 
 # Optional: enable platform provisioning/deletion APIs.
 export PUFFERFS_ADMIN_KEY="..."
