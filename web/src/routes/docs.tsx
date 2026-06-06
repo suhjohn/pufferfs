@@ -326,77 +326,90 @@ const ENDPOINTS = [
   },
 ];
 
-const SECURITY_ITEMS = [
+const SECURITY_SECTIONS = [
   {
-    title: "data boundary and storage",
-    body: "PufferFS is not local-only search. Sync uploads source bytes and derived state to object storage, stores org/root/job metadata in Postgres, writes searchable content and vectors to Turbopuffer, and can send documents through Modal for extraction and embeddings. The local folder remains the source of truth, but synced content leaves the machine.",
+    title: "Hosting",
+    body: [
+      "PufferFS is not local-only search. Sync uploads source bytes and derived state to object storage, stores org/root/job metadata in Postgres, writes searchable content and vectors to Turbopuffer, and can send documents through Modal for extraction and embeddings.",
+      "The local folder remains the source of truth, but synced content leaves the user's machine.",
+    ],
   },
   {
-    title: "data residency",
-    body: "Residency is currently a deployment and provider configuration, not a per-customer product control. The bundled AWS deployment creates regional buckets and infrastructure in the configured AWS region, while Turbopuffer and Modal residency depend on their account and region configuration. PufferFS should only publish named supported regions after production deployment policy is fixed.",
+    title: "Encryption",
+    body: [
+      "The bundled AWS deployment enables S3 server-side encryption with AES-256 for artifacts and encrypted EFS storage for NATS persistence.",
+      "CloudFront redirects the web app to HTTPS, and the API can serve HTTPS behind an ALB with a TLS 1.2/1.3 policy when a validated certificate is configured.",
+    ],
   },
   {
-    title: "encryption",
-    body: "The bundled AWS deployment enables S3 server-side encryption with AES-256 for artifacts and encrypted EFS storage for NATS persistence. CloudFront redirects the web app to HTTPS, and the API can serve HTTPS behind an ALB with a TLS 1.2/1.3 policy when a validated certificate is configured. Encryption for Postgres, Turbopuffer, Modal, logs, and backups is provider/deployment dependent unless separately configured.",
+    title: "Authentication and access control",
+    body: [
+      "Tenant API keys are generated as pfs_ values and stored only as SHA-256 hashes. New user-created API keys must include an explicit non-empty scope list. Browser sessions use an HS256 JWT in an httpOnly cookie, and OAuth callbacks require signed state bound to a short-lived httpOnly state cookie.",
+      "Every normal API request resolves to an org, user, role, and optional scope list. Root lookups are org-scoped; unreadable roots return 404 rather than revealing that the root exists.",
+    ],
   },
   {
-    title: "authentication and sessions",
-    body: "Tenant API keys are generated as pfs_ values and stored only as SHA-256 hashes. The raw key is returned once. Browser sessions use an HS256 JWT in an httpOnly pf_session cookie with SameSite=Lax. OAuth callbacks require signed state bound to a short-lived httpOnly state cookie. CLI browser login redirects the issued key only to a loopback callback. The platform admin key is a separate server-side credential for /admin/* and is compared by hash in constant time.",
+    title: "Query isolation",
+    body: [
+      "Queries are constrained to the root's visible committed generation. If the server cannot resolve that generation, it fails closed instead of returning unfiltered rows.",
+      "Deny-prefix ACLs are filtered out of results, and user-scoped roots add content-proof filtering for non-admin callers.",
+    ],
   },
   {
-    title: "tenant and root access",
-    body: "Every normal API request resolves to an org, user, role, and optional scope list. Root lookups are org-scoped. Org roots are readable by org members, writable by editor+, and deletable by admin+. User roots are readable and writable by their owner or org admins. Unreadable roots return 404 rather than revealing that the root exists.",
+    title: "Secret-file handling",
+    body: [
+      "Before building sync state, the CLI excludes common secret filenames such as .env files, private keys, credentials.json, service-account JSON files, package registry credentials, and certificate bundles.",
+      "PufferFS also honors .gitignore, .tpfsignore, and ~/.tpfs/ignore.",
+    ],
   },
   {
-    title: "scopes and least privilege",
-    body: "New user-created API keys must include an explicit non-empty scope list. Scoped API keys must include the required action, an accepted alias, or *. The dashboard-created CLI key currently requests sync, query, and root:delete; query-only automation keys can be created with [\"query\"]. Legacy empty-scope keys are still treated as unrestricted for compatibility and should be rotated.",
+    title: "Customer data access",
+    body: [
+      "The application enforces tenant and root access before sync and query operations. Direct access to Postgres, object storage, Turbopuffer, Modal outputs, and server logs is privileged operational access that must be controlled by the deployment operator.",
+    ],
   },
   {
-    title: "customer data access",
-    body: "The application code enforces tenant and root access before query and sync operations. There is not yet a formal staff-access workflow, customer approval gate, just-in-time privilege system, or customer-visible support access log. Treat direct access to Postgres, object storage, Turbopuffer, Modal outputs, and server logs as privileged operational access that must be controlled by the deployment operator.",
+    title: "Deletion",
+    body: [
+      "Root deletion removes PufferFS metadata, Turbopuffer namespaces, object-storage artifacts under files/, bundles/, states/, chunks/, and syncs/, plus local PufferFS cache. It does not delete source files from the user's machine.",
+      "Active sync jobs block root deletion with 409.",
+    ],
   },
   {
-    title: "query isolation",
-    body: "Queries are constrained to the root's visible committed generation. If the server cannot resolve that generation, it fails closed instead of returning unfiltered rows. In-flight or failed syncs are not exposed to normal queries. Deny-prefix ACLs are filtered out of results, and user-scoped roots add content-proof filtering for non-admin callers.",
-  },
-  {
-    title: "secret-file handling",
-    body: "Before building sync state, the CLI excludes common secret filenames: .env, .env.*, private keys, credentials.json, service-account*.json, .npmrc, .pypirc, .p12, and .pfx. It also honors .gitignore, .tpfsignore, and ~/.tpfs/ignore. This is filename-based protection, not a content scanner or DLP system.",
-  },
-  {
-    title: "third-party processing",
-    body: "Synced content can be handled by infrastructure and model providers used by the deployment: object storage, Postgres, Turbopuffer, Modal, embedding/OCR models, Stripe for billing events, and Google OAuth for identity. PufferFS should publish a formal subprocessors table only when the production vendor list, data categories, locations, and notification process are committed.",
-  },
-  {
-    title: "deletion and retention",
-    body: "Root deletion removes PufferFS metadata, Turbopuffer namespaces, object-storage artifacts under files/, bundles/, states/, chunks/, and syncs/, plus local PufferFS cache. It does not delete source files from the user's machine. Active sync jobs block root deletion with 409.",
-  },
-  {
-    title: "vulnerability disclosure",
-    body: "Report security issues to security@pufferfs.com. Good-faith testing is in scope when it avoids data destruction, service disruption, spam, social engineering, and access to other users' data. Include affected routes, reproduction steps, impact, and any logs or request IDs that help reproduce the issue.",
-  },
-  {
-    title: "compliance status",
-    body: "PufferFS should not currently claim SOC 2, ISO 27001, HIPAA, GDPR compliance, CCPA compliance, DPAs, BAAs, customer-managed encryption keys, private networking, audit logs, SAML/SSO enforcement, MFA enforcement, malware scanning, or content-level secret detection. Any customer-facing claim should be backed by an implemented control, policy, contract, or report.",
-  },
-  {
-    title: "shared responsibility",
-    body: "PufferFS enforces app-level auth, root isolation, API scopes, committed-generation query filtering, deny-prefix ACLs, filename-based secret exclusions, and root deletion. Operators remain responsible for HTTPS, Secure cookies, secrets management, CORS allowlists, provider encryption, backups, network isolation, key rotation, staff access, logging, incident response, and compliance evidence.",
+    title: "Vulnerability disclosure",
+    body: [
+      "Report security issues to security@pufferfs.com. Include affected routes or commands, reproduction steps, impact, and any relevant logs or request IDs.",
+      "Good-faith testing is in scope when it avoids data destruction, service disruption, spam, social engineering, and access to other users' data.",
+    ],
   },
 ];
 
-const SECURITY_TOBES = [
-  "Add audit logs for login, API key creation/deletion, root creation/deletion, ACL changes, sync submissions, query access, and admin actions.",
-  "Define retention periods for source copies, extracted chunks, sync artifacts, logs, deleted roots, and billing/customer records.",
-  "Publish a formal subprocessors table with vendor, purpose, data category, location, and update-notification policy.",
-  "Add a production backup and restore policy with recovery targets, restore testing, and customer deletion semantics.",
-  "Add SAML/SSO and MFA enforcement for organizations that need centralized identity policy.",
-  "Add customer-visible staff access controls: approval, time bounds, reason codes, and immutable logging.",
-  "Add private networking options for enterprise deployments, such as VPC peering, PrivateLink, or BYOC.",
-  "Add customer-managed encryption key support if enterprise customers require key control.",
-  "Complete SOC 2 readiness before claiming SOC 2; publish report availability only after the audit is complete.",
-  "Create DPA/GDPR/CCPA paperwork and a BAA path only after the data flows, subprocessors, and operational controls support those commitments.",
-  "Add content-level secret detection or DLP integrations if PufferFS will index high-risk repositories or business documents by default.",
+const SECURITY_SUBPROCESSORS = [
+  {
+    name: "Object storage / AWS S3-compatible storage",
+    purpose: "Source file copies, bundles, state snapshots, sync artifacts, extracted chunks",
+    data: "Source bytes and derived artifacts",
+  },
+  {
+    name: "PostgreSQL",
+    purpose: "Organizations, users, API key hashes, roots, ACLs, sync state, billing metadata",
+    data: "Control-plane metadata",
+  },
+  {
+    name: "Turbopuffer",
+    purpose: "Search index rows, extracted content, vectors, path metadata",
+    data: "Searchable document content and embeddings",
+  },
+  {
+    name: "Modal",
+    purpose: "Document extraction, OCR/vision processing, embeddings",
+    data: "Documents and extracted content sent for processing",
+  },
+  {
+    name: "Google OAuth and Stripe",
+    purpose: "Identity and billing",
+    data: "Identity profile data and billing events",
+  },
 ];
 
 function Docs() {
@@ -579,33 +592,50 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
           </section>
 
           <section id="security" className="docs-section">
-            <h2>security</h2>
+            <h2>Security & Compliance</h2>
             <p>
-              This section describes controls that exist in the current code,
-              not a generic trust checklist. The model is closest to a
-              developer infrastructure product: keep credentials scoped, treat
-              the indexing plane as sensitive, and make access decisions at the
-              API before anything is queried.
+              PufferFS stores source copies, extracted content, metadata, and
+              vectors so users and agents can search synced folders. This
+              section describes the controls that exist today.
             </p>
             <div className="docs-security-list">
-              {SECURITY_ITEMS.map((item) => (
-                <article key={item.title}>
-                  <h3>{item.title}</h3>
-                  <p>{item.body}</p>
+              {SECURITY_SECTIONS.map((section) => (
+                <article key={section.title}>
+                  <h3>{section.title}</h3>
+                  {section.body.map((paragraph) => (
+                    <p key={paragraph}>{paragraph}</p>
+                  ))}
                 </article>
               ))}
             </div>
-            <div className="docs-security-roadmap">
-              <h3>TO BE controls</h3>
+            <div className="docs-security-subprocessors">
+              <h3>Subprocessors for customer data</h3>
               <p>
-                These are the next security and compliance commitments PufferFS
-                should implement before making enterprise-grade claims.
+                The exact production vendor list depends on deployment
+                configuration. The systems below are in scope for the current
+                PufferFS architecture and should be reviewed before syncing
+                sensitive folders.
               </p>
-              <ul>
-                {SECURITY_TOBES.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
+              <div className="docs-security-table-wrap">
+                <table className="docs-security-table">
+                  <thead>
+                    <tr>
+                      <th>Subprocessor</th>
+                      <th>Purpose</th>
+                      <th>Data</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {SECURITY_SUBPROCESSORS.map((processor) => (
+                      <tr key={processor.name}>
+                        <td>{processor.name}</td>
+                        <td>{processor.purpose}</td>
+                        <td>{processor.data}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </section>
         </div>
