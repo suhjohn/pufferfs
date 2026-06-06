@@ -164,32 +164,15 @@ change: notes/standup-2026-06-05.md (added) → 3 chunks added`}</pre>
           Install the binary, run init, and sign in in your browser. PufferFS
           issues a scoped CLI key and writes the local config automatically.
         </p>
-        <div className="cli-flow">
-          <div className="code-window">
-            <div className="code-titlebar">
-              <span>terminal</span>
-              <span>browser login issues the CLI key</span>
-            </div>
-            <pre className="code-pane solo">{`$ brew install --cask suhjohn/tap/pufferfs
+        <div className="code-window cli-setup-window">
+          <div className="code-titlebar">
+            <span>terminal</span>
+          </div>
+          <pre className="code-pane solo">{`$ brew install --cask suhjohn/tap/pufferfs
 $ pufferfs init
 Opening browser to connect your PufferFS account...
 Config written to ~/.tpfs/config.toml
 PufferFS CLI connected.`}</pre>
-          </div>
-          <div className="browser-window cli-browser-preview" aria-label="CLI browser success preview">
-            <div className="browser-titlebar">
-              <span></span>
-              <span>127.0.0.1:49152/callback</span>
-            </div>
-            <div className="browser-body">
-              <PixelLogo size={42} />
-              <h3>PufferFS CLI connected</h3>
-              <p>
-                Your scoped CLI key has been issued and saved locally. You can
-                close this window and return to the terminal.
-              </p>
-            </div>
-          </div>
         </div>
       </section>
 
