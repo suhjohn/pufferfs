@@ -7,19 +7,42 @@ AI-agent systems.
 
 ## Installation
 
-Install with Homebrew on macOS:
+### macOS (Homebrew)
 
 ```sh
 brew install --cask suhjohn/tap/pufferfs
 ```
 
-Or use the installer script when direct release artifacts are available:
+### macOS / Linux (installer script)
+
+Works on both macOS and Linux (`amd64` and `arm64`). Downloads the latest release, verifies checksums, and installs to `/usr/local/bin`:
 
 ```sh
 curl -fsSL https://pufferfs.com/install.sh | sh
 ```
 
-For local Go development:
+Pin a version or change the install directory:
+
+```sh
+PUFFERFS_VERSION=0.2.0 INSTALL_DIR=~/.local/bin curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+### Docker / CI
+
+Use the installer script in a `Dockerfile` or CI step:
+
+```dockerfile
+RUN curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+Or in a GitHub Actions step:
+
+```yaml
+- name: Install PufferFS CLI
+  run: curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+### From source (development)
 
 ```sh
 go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest

@@ -153,8 +153,17 @@ git push origin v0.3.0
 ```
 
 It creates GitHub Release artifacts through GoReleaser and updates the Homebrew
-cask tap. To make the tap publish work, create `suhjohn/homebrew-tap` and set
-repository secret `HOMEBREW_TAP_GITHUB_TOKEN` with write access to that tap.
+cask tap. To make the tap publish work:
+
+1. Create the **public** repository `suhjohn/homebrew-tap` on GitHub (it must
+   exist before the first release or `brew install --cask suhjohn/tap/pufferfs`
+   will fail with "repository not found").
+2. Set the repository secret `HOMEBREW_TAP_GITHUB_TOKEN` on `suhjohn/pufferfs`
+   with a fine-grained PAT that has write access to `suhjohn/homebrew-tap`.
+
+If the tap repo does not exist yet, GoReleaser will skip the Homebrew step and
+only publish GitHub Release archives. Users can still install via the cross-
+platform installer script (`curl -fsSL https://pufferfs.com/install.sh | sh`).
 
 After a successful release, update the deploy environment variable
 `PUFFERFS_CLI_LATEST_VERSION` and run the `backend` deploy component so
