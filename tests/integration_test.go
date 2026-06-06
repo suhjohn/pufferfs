@@ -2649,9 +2649,14 @@ func newAcmeCorpS3Client(t *testing.T, cfg *acmeCorpConfig) *s3sdk.Client {
 	})
 }
 
-// downloadAcmeCorp downloads all objects under "acme-corp/" from the integration
+const (
+	acmeCorpWithGitignoreDir    = "with-gitignore"
+	acmeCorpWithoutGitignoreDir = "without-gitignore"
+)
+
+// downloadAcmeCorp downloads selected objects under "acme-corp/" from the integration
 // test bucket into a local directory, returning the list of relative paths downloaded.
-func downloadAcmeCorp(t *testing.T, cfg *acmeCorpConfig, destDir string) []string {
+func downloadAcmeCorp(t *testing.T, cfg *acmeCorpConfig, destDir string, includeGitignore bool) []string {
 	t.Helper()
 
 	ctx := context.Background()
@@ -2689,9 +2694,9 @@ func downloadAcmeCorp(t *testing.T, cfg *acmeCorpConfig, destDir string) []strin
 	}
 
 	sort.Slice(objects, func(i, j int) bool { return objects[i].key < objects[j].key })
-	objects = selectAcmeCorpObjects(objects)
-	t.Logf("timing stage=acme_corp_select objects=%d full_corpus=%t",
-		len(objects), strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_ACME_CORP_FULL_CORPUS")), "1"))
+	objects = selectAcmeCorpObjects(objects, includeGitignore)
+	t.Logf("timing stage=acme_corp_select objects=%d include_gitignore=%t full_corpus=%t",
+		len(objects), includeGitignore, strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_ACME_CORP_FULL_CORPUS")), "1"))
 	if len(objects) == 0 {
 		t.Fatalf("no selected acme-corp objects under s3://%s/%s", cfg.bucketName, prefix)
 	}
@@ -2731,21 +2736,36 @@ func downloadAcmeCorp(t *testing.T, cfg *acmeCorpConfig, destDir string) []strin
 	return relPaths
 }
 
-func selectAcmeCorpObjects(objects []objectEntry) []objectEntry {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_ACME_CORP_FULL_CORPUS")), "1") {
-		return objects
+func prefixAcmeCorpPaths(prefix string, relPaths []string) []string {
+	prefixed := make([]string, 0, len(relPaths))
+	for _, relPath := range relPaths {
+		prefixed = append(prefixed, acmeCorpPath(prefix, relPath))
 	}
+	return prefixed
+}
 
+func acmeCorpPath(prefix, relPath string) string {
+	return path.Join(prefix, relPath)
+}
+
+func selectAcmeCorpObjects(objects []objectEntry, includeGitignore bool) []objectEntry {
+	fullCorpus := strings.EqualFold(strings.TrimSpace(os.Getenv("PUFFERFS_E2E_ACME_CORP_FULL_CORPUS")), "1")
 	var selected []objectEntry
 	for _, object := range objects {
-		if acmeCorpSmokeFixture(object.key) {
+		if !includeGitignore && strings.EqualFold(filepath.Base(object.key), ".gitignore") {
+			continue
+		}
+		if fullCorpus || acmeCorpSmokeFixture(object.key, includeGitignore) {
 			selected = append(selected, object)
 		}
 	}
 	return selected
 }
 
-func acmeCorpSmokeFixture(key string) bool {
+func acmeCorpSmokeFixture(key string, includeGitignore bool) bool {
+	if includeGitignore && strings.EqualFold(filepath.Base(key), ".gitignore") {
+		return true
+	}
 	ext := strings.ToLower(filepath.Ext(key))
 	switch ext {
 	case ".md", ".txt", ".csv", ".tsv", ".html", ".eml", ".msg", ".ics", ".vcf", ".mp3", ".wav", ".mp4", ".mov":
@@ -2758,11 +2778,11 @@ func acmeCorpSmokeFixture(key string) bool {
 // runAcmeCorpSync downloads the acme-corp test directory from the
 // pufferfs-integration-test R2 bucket and syncs it through the full pipeline:
 // local MinIO (storage) + Postgres (DB) + dev Modal (embedding/query embedding).
-// By default it uses text-like fixtures plus lightweight media from acme-corp so
-// the deployed Modal app does not need direct write access to local MinIO for
-// generated image artifacts. Set PUFFERFS_E2E_ACME_CORP_FULL_CORPUS=1 to include
-// PDFs, Office documents, images, and other large binary files when Modal's S3
-// secret is configured for writable storage.
+// By default it syncs two ACME copies: one with ACME's .gitignore and one without
+// it, so the test can assert gitignored video fixtures are skipped in only the
+// scoped directory. Set PUFFERFS_E2E_ACME_CORP_FULL_CORPUS=1 to include PDFs,
+// Office documents, images, and other large binary files when Modal's S3 secret
+// is configured for writable storage.
 //
 // Required env vars:
 //   - PUFFERFS_INTEGRATION_TEST_S3_ENV: R2 credentials for the integration test bucket
@@ -2779,10 +2799,10 @@ func runAcmeCorpSync(t *testing.T, services realServices) {
 	homeDir := t.TempDir()
 	initPufferFS(t, env, homeDir)
 
-	// Download acme-corp from R2 to a local directory.
 	projectDir := filepath.Join(homeDir, "acme-corp-"+suffix)
-	relPaths := downloadAcmeCorp(t, acmeCfg, projectDir)
-	t.Logf("downloaded %d files from acme-corp to %s", len(relPaths), projectDir)
+	withGitignoreRelPaths := prefixAcmeCorpPaths(acmeCorpWithGitignoreDir, downloadAcmeCorp(t, acmeCfg, filepath.Join(projectDir, acmeCorpWithGitignoreDir), true))
+	withoutGitignoreRelPaths := prefixAcmeCorpPaths(acmeCorpWithoutGitignoreDir, downloadAcmeCorp(t, acmeCfg, filepath.Join(projectDir, acmeCorpWithoutGitignoreDir), false))
+	t.Logf("downloaded acme-corp fixture with_gitignore=%d without_gitignore=%d to %s", len(withGitignoreRelPaths), len(withoutGitignoreRelPaths), projectDir)
 
 	// Sync the downloaded directory.
 	syncStart := time.Now()
@@ -2810,32 +2830,33 @@ func runAcmeCorpSync(t *testing.T, services realServices) {
 
 	// Verify indexing completed for a sample of known files.
 	samplePaths := []string{
-		"README.md",
-		"documentation/engineering/deployment_runbook.md",
-		"documentation/process/onboarding_process.md",
-		"documentation/process/sales_process.md",
-		"data/raw/customers.csv",
-		"data/raw/data_dictionary.txt",
-		"web/reports/monthly_report.html",
-		"communications/email/welcome_email.eml",
-		"communications/calendar/all_hands_meeting.ics",
-		"communications/contacts/john_smith.vcf",
-		"shared/style_guide.md",
-		"archives/2024_q1/q1_summary.md",
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "README.md"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "documentation/engineering/deployment_runbook.md"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "documentation/process/onboarding_process.md"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "documentation/process/sales_process.md"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "data/raw/customers.csv"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "data/raw/data_dictionary.txt"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "web/reports/monthly_report.html"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "communications/email/welcome_email.eml"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "communications/calendar/all_hands_meeting.ics"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "communications/contacts/john_smith.vcf"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "shared/style_guide.md"),
+		acmeCorpPath(acmeCorpWithoutGitignoreDir, "archives/2024_q1/q1_summary.md"),
 	}
 	for _, p := range samplePaths {
 		assertHasTPRows(t, services, namespaces, p)
 	}
-	assertAcmeCorpMediaRows(t, services, namespaces, relPaths)
+	assertAcmeCorpMediaRows(t, services, namespaces, withoutGitignoreRelPaths)
+	assertAcmeCorpGitignoreMediaDiff(t, services, namespaces, withGitignoreRelPaths)
 
-	assertAcmeCorpQueries(t, homeDir, env)
+	assertAcmeCorpQueries(t, homeDir, env, acmeCorpWithoutGitignoreDir)
 
 	// Cleanup.
 	deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 	cleanupDone = true
 }
 
-func assertAcmeCorpQueries(t *testing.T, homeDir string, env *e2eEnv) {
+func assertAcmeCorpQueries(t *testing.T, homeDir string, env *e2eEnv, prefix string) {
 	t.Helper()
 
 	cases := []struct {
@@ -2938,7 +2959,13 @@ func assertAcmeCorpQueries(t *testing.T, homeDir string, env *e2eEnv) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assertCLIQuery(t, homeDir, env, tc.query, env.rootName, tc.mode, tc.glob, tc.expectedPath)
+			glob := tc.glob
+			if glob == "" {
+				glob = acmeCorpPath(prefix, "**")
+			} else {
+				glob = acmeCorpPath(prefix, glob)
+			}
+			assertCLIQuery(t, homeDir, env, tc.query, env.rootName, tc.mode, glob, acmeCorpPath(prefix, tc.expectedPath))
 		})
 	}
 }
@@ -2975,6 +3002,42 @@ func assertAcmeCorpMediaRows(t *testing.T, services realServices, namespaces []s
 	}
 }
 
+func assertAcmeCorpGitignoreMediaDiff(t *testing.T, services realServices, namespaces []string, relPaths []string) {
+	t.Helper()
+
+	checkedIgnored := 0
+	checkedIndexed := 0
+	for _, relPath := range relPaths {
+		fileType, ok := mediaFixtureFileType(relPath)
+		if !ok {
+			continue
+		}
+		rows := queryTPRowsForPath(t, services, namespaces, relPath)
+		if gitignoredAcmeMediaFixture(relPath) {
+			if len(rows) != 0 {
+				t.Fatalf("expected ACME gitignore to skip media fixture %s, got rows %#v", relPath, rows)
+			}
+			checkedIgnored++
+			continue
+		}
+		if len(rows) == 0 {
+			t.Fatalf("expected non-gitignored ACME media fixture %s to be indexed", relPath)
+		}
+		for _, row := range rows {
+			if row["file_type"] != fileType {
+				t.Fatalf("expected file_type %s for %s, got %#v", fileType, relPath, row["file_type"])
+			}
+		}
+		checkedIndexed++
+	}
+	if checkedIgnored == 0 {
+		t.Fatal("no ACME gitignored media fixtures selected")
+	}
+	if checkedIndexed == 0 {
+		t.Fatal("no ACME non-gitignored media fixtures selected")
+	}
+}
+
 func mediaFixtureFileType(relPath string) (string, bool) {
 	switch strings.ToLower(filepath.Ext(relPath)) {
 	case ".mp3", ".wav":
@@ -2983,6 +3046,15 @@ func mediaFixtureFileType(relPath string) (string, bool) {
 		return "video", true
 	default:
 		return "", false
+	}
+}
+
+func gitignoredAcmeMediaFixture(relPath string) bool {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".mp4", ".mov":
+		return true
+	default:
+		return false
 	}
 }
 

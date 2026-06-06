@@ -1,6 +1,10 @@
 package ignore
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestMatcherIgnoresSecretFilesByDefault(t *testing.T) {
 	matcher := NewMatcher(t.TempDir())
@@ -26,6 +30,38 @@ func TestMatcherDoesNotIgnoreNormalFilesAsSecrets(t *testing.T) {
 		"README.md",
 		"docs/environment.md",
 		"src/config.go",
+	} {
+		if matcher.ShouldIgnore(path, false) {
+			t.Fatalf("ShouldIgnore(%q) = true, want false", path)
+		}
+	}
+}
+
+func TestMatcherScopesNestedGitignore(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "with-gitignore", "media", "video"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "without-gitignore", "media", "video"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "with-gitignore", ".gitignore"), []byte("*.mp4\n*.mov\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher := NewMatcher(root)
+	for _, path := range []string{
+		"with-gitignore/media/video/company_intro.mp4",
+		"with-gitignore/media/video/product_teaser.mov",
+	} {
+		if !matcher.ShouldIgnore(path, false) {
+			t.Fatalf("ShouldIgnore(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{
+		"without-gitignore/media/video/company_intro.mp4",
+		"without-gitignore/media/video/product_teaser.mov",
+		"with-gitignore/media/audio/hold_message.mp3",
 	} {
 		if matcher.ShouldIgnore(path, false) {
 			t.Fatalf("ShouldIgnore(%q) = true, want false", path)
