@@ -89,6 +89,49 @@ END:VCALENDAR
         self.assertEqual(chunks[0].file_type, "vcf")
         self.assertIn("Alice Example", chunks[0].content)
 
+    def test_long_email_chunks_keep_header_context(self):
+        raw = (
+            b"Subject: Long planning thread\r\n"
+            b"From: Alice <alice@example.com>\r\n"
+            b"To: Bob <bob@example.com>\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            + b"Roadmap detail and launch risk. " * 300
+        )
+
+        chunks = chunk_structured_file(raw, "root", "mail/long.eml", "eml")
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertIn("Subject: Long planning thread", chunk.content)
+            self.assertIn("Roadmap detail", chunk.content)
+
+    def test_many_contacts_chunk_on_record_boundaries(self):
+        contacts = []
+        for idx in range(80):
+            contacts.append(
+                f"BEGIN:VCARD\nFN:Person {idx}\nEMAIL:person{idx}@example.com\nNOTE:{'detail ' * 20}\nEND:VCARD\n"
+            )
+        chunks = chunk_structured_file("".join(contacts).encode(), "root", "contacts/team.vcf", "vcf")
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertTrue(chunk.content.startswith("Contact "))
+            self.assertNotIn("BEGIN:VCARD", chunk.content)
+
+    def test_many_events_chunk_on_record_boundaries(self):
+        events = []
+        for idx in range(80):
+            events.append(
+                f"BEGIN:VEVENT\nSUMMARY:Event {idx}\nDESCRIPTION:{'planning detail ' * 20}\nEND:VEVENT\n"
+            )
+        chunks = chunk_structured_file("".join(events).encode(), "root", "calendar/team.ics", "ics")
+
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertTrue(chunk.content.startswith("Calendar item "))
+            self.assertNotIn("BEGIN:VEVENT", chunk.content)
+
 
     def test_media_time_ranges_use_six_minute_windows_with_overlap(self):
         ranges = _media_time_ranges(900)

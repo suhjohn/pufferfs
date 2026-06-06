@@ -494,25 +494,28 @@ def chunk_structured_file(
     file_type: str,
 ) -> list[Chunk]:
     if file_type == "eml":
-        text = _extract_eml_text(file_bytes)
+        headers, body = _extract_eml_parts(file_bytes)
+        return _chunk_email_parts(headers, body, root_id, file_path, file_type)
     elif file_type == "msg":
-        text = _extract_msg_text(file_bytes)
+        headers, body = _extract_msg_parts(file_bytes)
+        return _chunk_email_parts(headers, body, root_id, file_path, file_type)
     elif file_type == "vcf":
-        text = _extract_vcf_text(file_bytes)
+        return _chunk_record_texts(_vcf_record_texts(file_bytes), root_id, file_path, file_type)
     elif file_type == "ics":
-        text = _extract_ics_text(file_bytes)
+        return _chunk_record_texts(_ics_record_texts(file_bytes), root_id, file_path, file_type)
     else:
         text = file_bytes.decode("utf-8", errors="replace")
-    return chunk_markdown(text, root_id, file_path, file_type)
+        return chunk_markdown(text, root_id, file_path, file_type)
 
 
 def _extract_eml_text(file_bytes: bytes) -> str:
+    headers, body = _extract_eml_parts(file_bytes)
+    return "\n".join(part for part in ("\n".join(headers), body) if part).strip()
+
+
+def _extract_eml_parts(file_bytes: bytes) -> tuple[list[str], str]:
     msg = email.message_from_bytes(file_bytes, policy=policy.default)
-    lines = _email_header_lines(msg)
-    body = _email_body_text(msg)
-    if body:
-        lines.append(body)
-    return "\n".join(line for line in lines if line).strip()
+    return _email_header_lines(msg), _email_body_text(msg)
 
 
 def _email_header_lines(msg) -> list[str]:
@@ -553,6 +556,11 @@ def _html_to_text(html: str) -> str:
 
 
 def _extract_msg_text(file_bytes: bytes) -> str:
+    headers, body = _extract_msg_parts(file_bytes)
+    return "\n".join(part for part in ("\n".join(headers), body) if part).strip()
+
+
+def _extract_msg_parts(file_bytes: bytes) -> tuple[list[str], str]:
     import extract_msg
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -560,7 +568,7 @@ def _extract_msg_text(file_bytes: bytes) -> str:
         with open(path, "wb") as f:
             f.write(file_bytes)
         msg = extract_msg.Message(path)
-        lines: list[str] = []
+        headers: list[str] = []
         for name, value in (
             ("Subject", msg.subject),
             ("From", msg.sender),
@@ -569,19 +577,21 @@ def _extract_msg_text(file_bytes: bytes) -> str:
             ("Date", msg.date),
         ):
             if value:
-                lines.append(f"{name}: {value}")
+                headers.append(f"{name}: {value}")
         body = msg.body or msg.htmlBody or ""
         if isinstance(body, bytes):
             body = body.decode("utf-8", errors="replace")
         if msg.htmlBody and not msg.body:
             body = _html_to_text(str(body))
-        if body:
-            lines.append(str(body).strip())
         msg.close()
-    return "\n".join(line for line in lines if line).strip()
+    return headers, str(body).strip()
 
 
 def _extract_vcf_text(file_bytes: bytes) -> str:
+    return "\n\n".join(_vcf_record_texts(file_bytes)).strip()
+
+
+def _vcf_record_texts(file_bytes: bytes) -> list[str]:
     cards = _split_records(_decode_text_file(file_bytes), "BEGIN:VCARD", "END:VCARD")
     if not cards:
         cards = [_decode_text_file(file_bytes)]
@@ -593,10 +603,14 @@ def _extract_vcf_text(file_bytes: bytes) -> str:
             for value in fields.get(key, []):
                 lines.append(f"{_friendly_vcf_name(key)}: {value}")
         out.append("\n".join(lines))
-    return "\n\n".join(out).strip()
+    return out
 
 
 def _extract_ics_text(file_bytes: bytes) -> str:
+    return "\n\n".join(_ics_record_texts(file_bytes)).strip()
+
+
+def _ics_record_texts(file_bytes: bytes) -> list[str]:
     text = _decode_text_file(file_bytes)
     events = _split_records(text, "BEGIN:VEVENT", "END:VEVENT")
     if not events:
@@ -611,7 +625,77 @@ def _extract_ics_text(file_bytes: bytes) -> str:
             for value in fields.get(key, []):
                 lines.append(f"{_friendly_ics_name(key)}: {value}")
         out.append("\n".join(lines))
-    return "\n\n".join(out).strip()
+    return out
+
+
+def _chunk_email_parts(
+    headers: list[str],
+    body: str,
+    root_id: str,
+    file_path: str,
+    file_type: str,
+) -> list[Chunk]:
+    prelude = "\n".join(headers).strip()
+    body = body.strip()
+    if not body:
+        return _chunks_from_texts([prelude], root_id, file_path, file_type)
+
+    max_body_chars = max(MAX_SECTION_CHARS - len(prelude) - 2, MAX_SECTION_CHARS // 2)
+    pieces = _split_large(body, max_body_chars, min(SECTION_OVERLAP_CHARS, max_body_chars // 4))
+    texts = [f"{prelude}\n\n{piece}".strip() if prelude else piece for piece in pieces]
+    return _chunks_from_texts(texts, root_id, file_path, file_type)
+
+
+def _chunk_record_texts(
+    records: list[str],
+    root_id: str,
+    file_path: str,
+    file_type: str,
+) -> list[Chunk]:
+    texts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush_current() -> None:
+        nonlocal current, current_len
+        if current:
+            texts.append("\n\n".join(current))
+            current = []
+            current_len = 0
+
+    for record in records:
+        record = record.strip()
+        if not record:
+            continue
+        if len(record) > MAX_SECTION_CHARS:
+            flush_current()
+            texts.extend(_split_large(record, MAX_SECTION_CHARS, SECTION_OVERLAP_CHARS))
+            continue
+        projected = current_len + len(record) + (2 if current else 0)
+        if current and projected > MAX_SECTION_CHARS:
+            flush_current()
+        current.append(record)
+        current_len += len(record) + (2 if current_len else 0)
+    flush_current()
+    return _chunks_from_texts(texts, root_id, file_path, file_type)
+
+
+def _chunks_from_texts(texts: list[str], root_id: str, file_path: str, file_type: str) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    for idx, text in enumerate(text for text in texts if text.strip()):
+        content = text.strip()
+        chunks.append(
+            Chunk(
+                id=Chunk.make_id(root_id, file_path, idx),
+                root_id=root_id,
+                file_path=file_path,
+                chunk_index=idx,
+                content=content,
+                content_hash=Chunk.hash_content(content),
+                file_type=file_type,
+            )
+        )
+    return chunks
 
 
 def _decode_text_file(file_bytes: bytes) -> str:
