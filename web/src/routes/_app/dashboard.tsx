@@ -57,12 +57,24 @@ function Dashboard() {
               Copy this now. PufferFS stores only the key hash and cannot show it
               again.
             </p>
-            <pre className="setup-code">{`brew install --cask suhjohn/tap/pufferfs
+            <pre className="setup-code">{`# macOS (Homebrew)
+brew install --cask suhjohn/tap/pufferfs
+
+# macOS / Linux (installer script)
+curl -fsSL https://pufferfs.com/install.sh | sh
+
+# then configure
 pufferfs init --api-key ${newKey}`}</pre>
           </>
         )}
         {!newKey && (
-          <pre className="setup-code">{`brew install --cask suhjohn/tap/pufferfs
+          <pre className="setup-code">{`# macOS (Homebrew)
+brew install --cask suhjohn/tap/pufferfs
+
+# macOS / Linux (installer script)
+curl -fsSL https://pufferfs.com/install.sh | sh
+
+# then configure
 pufferfs init`}</pre>
         )}
         {keysQuery.data && keysQuery.data.length > 0 && (

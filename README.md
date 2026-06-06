@@ -23,17 +23,27 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 
 ### Install CLI
 
+**macOS (Homebrew)**
+
 ```bash
 brew install --cask suhjohn/tap/pufferfs
 ```
 
-Direct installs can use the installer script once releases are published:
+**macOS / Linux (installer script)**
 
 ```bash
 curl -fsSL https://pufferfs.com/install.sh | sh
 ```
 
-For local development:
+The installer auto-detects your OS and architecture (`darwin`/`linux`, `amd64`/`arm64`), downloads the latest release archive from `pufferfs.com/releases/`, verifies the SHA-256 checksum, and installs the binary to `/usr/local/bin`.
+
+Pin a version or override the install directory:
+
+```bash
+PUFFERFS_VERSION=0.2.0 INSTALL_DIR=~/.local/bin curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+**From source (development)**
 
 ```bash
 go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest
