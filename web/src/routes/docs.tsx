@@ -162,6 +162,10 @@ const ENDPOINTS = [
   "name": "CI query key",
   "scopes": ["query"]
 }`,
+    requestFields: [
+      ["name", "string", "required", "Human-readable label for the key. Used for display and audit/debugging; it is not the secret value."],
+      ["scopes", "string[]", "required", "Least-privilege scopes granted to the key. Use [\"query\"] for read-only search automation; include broader scopes only for sync or root management."],
+    ],
     responses: [
       ["201", "Created. Returns the raw key once.", `{
   "key": "pfs_..."
@@ -182,6 +186,11 @@ const ENDPOINTS = [
   "source_path": "/Users/me/Documents/handbook",
   "scope": "org"
 }`,
+    requestFields: [
+      ["name", "string", "required", "Stable root name used by CLI commands and users, for example --root handbook."],
+      ["source_path", "string", "required", "Original filesystem path on the syncing machine. PufferFS stores this for context; it does not read from this path on the server."],
+      ["scope", "\"org\" | \"user\"", "required", "Visibility boundary. org roots are shared with the organization according to role; user roots belong to the creating user."],
+    ],
     responses: [
       ["201", "Root metadata.", `{
   "id": "root_8z7m",
@@ -223,6 +232,21 @@ const ENDPOINTS = [
     "dir_hashes": {}
   }
 }`,
+    requestFields: [
+      ["protocol_version", "number", "required", "Client/server sync wire version. Must match the server's supported SyncProtocolVersion."],
+      ["base_generation_id", "string", "required", "Generation the client diffed from. Use the root's current visible generation before applying local changes."],
+      ["base_generation_seq", "number", "required", "Monotonic sequence for the base generation. The server rejects stale bases with 409."],
+      ["changes", "array", "required", "Files added, modified, or deleted in this sync. Each item names a path plus content metadata or deletion status."],
+      ["changes[].path", "string", "required", "Path relative to the root directory."],
+      ["changes[].status", "string", "required", "File state such as ADDED, MODIFIED, or DELETED."],
+      ["changes[].content_hash", "string", "required for uploaded content", "SHA-256 content identity used for diffing, proof, and dedupe."],
+      ["changes[].size", "number", "required for uploaded content", "File size in bytes. Single-file uploads are limited to 512 MiB."],
+      ["changes[].source_key", "string", "required for uploaded content", "Object-storage key where the uploaded file bytes can be read by the server pipeline."],
+      ["state_ref", "string", "required", "Object-storage reference for the serialized client sync state bundle."],
+      ["content_proof.root_hash", "string", "required", "Merkle root hash for the submitted filesystem state."],
+      ["content_proof.file_hashes", "object", "required", "Per-file proof data keyed by relative path when needed for filtering and validation."],
+      ["content_proof.dir_hashes", "object", "required", "Per-directory proof data keyed by relative path."],
+    ],
     responses: [
       ["202", "Accepted. Poll status until completed or failed.", `{
   "root_id": "root_8z7m",
@@ -245,6 +269,7 @@ const ENDPOINTS = [
     summary: "Read the status of a sync job.",
     auth: "Bearer API key or session with query/sync/read/write and read access to the root.",
     requestBody: "No request body.",
+    requestFields: [],
     responses: [
       ["200", "Current job state.", `{
   "id": "sync_2bd3",
@@ -271,6 +296,13 @@ const ENDPOINTS = [
   "glob": "*.pdf",
   "top_k": 5
 }`,
+    requestFields: [
+      ["root_id", "string", "required", "Root to query. The caller must be able to read this root; unreadable roots return 404."],
+      ["query", "string", "required", "Natural-language or keyword query text."],
+      ["mode", "\"hybrid\" | \"vector\" | \"text\"", "optional", "Search strategy. hybrid combines vector and full-text signals and is the normal default."],
+      ["glob", "string", "optional", "File path filter applied within the root, for example *.pdf or policies/**."],
+      ["top_k", "number", "optional", "Maximum number of chunks to return. Use a small value for agent context and latency."],
+    ],
     responses: [
       ["200", "Ranked query results.", `{
   "query": "how much paid time off do we get",
@@ -461,21 +493,51 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
                       <dd>{endpoint.auth}</dd>
                     </div>
                   </dl>
-                  <div className="docs-request-response">
-                    <div>
-                      <strong>request body</strong>
-                      <pre>{endpoint.requestBody}</pre>
-                    </div>
-                    <div>
-                      <strong>responses</strong>
+                  <div className="docs-openapi-examples">
+                    <section className="docs-example-block">
+                      <div className="docs-example-heading">
+                        <strong>Request body</strong>
+                        {endpoint.requestBody === "No request body." ? null : (
+                          <code>application/json</code>
+                        )}
+                      </div>
+                      {endpoint.requestBody === "No request body." ? (
+                        <p className="docs-empty-body">No request body.</p>
+                      ) : (
+                        <>
+                          <div className="docs-field-list">
+                            {endpoint.requestFields.map(
+                              ([name, type, requirement, description]) => (
+                                <div className="docs-field-row" key={name}>
+                                  <div>
+                                    <code>{name}</code>
+                                    <span>{type}</span>
+                                    <em>{requirement}</em>
+                                  </div>
+                                  <p>{description}</p>
+                                </div>
+                              ),
+                            )}
+                          </div>
+                          <pre>{endpoint.requestBody}</pre>
+                        </>
+                      )}
+                    </section>
+                    <section className="docs-example-block">
+                      <div className="docs-example-heading">
+                        <strong>Responses</strong>
+                        <code>application/json</code>
+                      </div>
                       {endpoint.responses.map(([status, description, body]) => (
                         <div className="docs-response" key={status}>
-                          <code>{status}</code>
-                          <span>{description}</span>
+                          <div className="docs-response-heading">
+                            <code>{status}</code>
+                            <span>{description}</span>
+                          </div>
                           <pre>{body}</pre>
                         </div>
                       ))}
-                    </div>
+                    </section>
                   </div>
                 </article>
               ))}

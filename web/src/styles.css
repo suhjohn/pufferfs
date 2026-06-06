@@ -684,27 +684,95 @@ button:disabled {
   font-size: 0.86rem;
 }
 
-.docs-request-response {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+.docs-openapi-examples {
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
 }
 
-.docs-request-response > div {
-  display: grid;
-  gap: 0.45rem;
+.docs-example-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
   min-width: 0;
 }
 
-.docs-request-response strong {
+.docs-example-heading,
+.docs-response-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.docs-example-heading strong {
   color: var(--ink);
   font-size: 0.76rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.docs-request-response pre {
-  min-height: 100%;
+.docs-example-heading code {
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.docs-empty-body {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.docs-field-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+}
+
+.docs-field-row {
+  display: grid;
+  grid-template-columns: minmax(11rem, 0.35fr) minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.75rem;
+}
+
+.docs-field-row + .docs-field-row {
+  border-top: 1px solid var(--line);
+}
+
+.docs-field-row > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55rem;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.docs-field-row code {
+  color: var(--ink);
+  font-size: 0.8rem;
+}
+
+.docs-field-row span {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.docs-field-row em {
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 0.7rem;
+  font-style: normal;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.docs-field-row p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.docs-openapi-examples pre {
   padding: 0.75rem;
   color: rgba(255, 255, 255, 0.86);
   background: rgba(13, 13, 13, 0.85);
@@ -716,15 +784,22 @@ button:disabled {
 }
 
 .docs-response {
-  display: grid;
-  gap: 0.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
 }
 
 .docs-response + .docs-response {
-  margin-top: 0.75rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
 }
 
-.docs-response span {
+.docs-response-heading code {
+  min-width: 3rem;
+  color: var(--ink);
+}
+
+.docs-response-heading span {
   color: var(--muted);
   font-size: 0.82rem;
 }
@@ -866,8 +941,9 @@ button:disabled {
     text-align: center;
   }
 
-  .docs-request-response {
+  .docs-field-row {
     grid-template-columns: 1fr;
+    gap: 0.35rem;
   }
 
   .use-cases {
