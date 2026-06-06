@@ -7,19 +7,36 @@ AI-agent systems.
 
 ## Installation
 
-Install with Homebrew on macOS:
+### macOS / Linux (installer script)
 
-```sh
-brew install --cask suhjohn/tap/pufferfs
-```
-
-Or use the installer script when direct release artifacts are available:
+Works on both macOS and Linux (`amd64` and `arm64`). Downloads the latest release, verifies checksums, and installs to `/usr/local/bin`:
 
 ```sh
 curl -fsSL https://pufferfs.com/install.sh | sh
 ```
 
-For local Go development:
+Pin a version or change the install directory:
+
+```sh
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+### Docker / CI
+
+Use the installer script in a `Dockerfile` or CI step:
+
+```dockerfile
+RUN curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+Or in a GitHub Actions step:
+
+```yaml
+- name: Install PufferFS CLI
+  run: curl -fsSL https://pufferfs.com/install.sh | sh
+```
+
+### From source (development)
 
 ```sh
 go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest
@@ -408,8 +425,8 @@ If a sync fails repeatedly:
 
 ## Upgrade Behavior
 
-The CLI can check the server's release manifest and print an upgrade notice at
-most once per day.
+The CLI can check the configured server's release manifest and print an upgrade
+notice at most once per day.
 
 Direct installs can run:
 
@@ -419,7 +436,8 @@ pufferfs upgrade
 
 What to expect:
 
-- Homebrew-managed installs should use Homebrew upgrade instead.
+- Direct upgrades use the public `https://api.pufferfs.com/cli/version`
+  manifest unless `--manifest-url` is provided.
 - Direct upgrades download a platform archive.
 - The archive checksum is verified.
 - The current binary is replaced.

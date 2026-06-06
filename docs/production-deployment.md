@@ -152,9 +152,9 @@ git tag v0.3.0
 git push origin v0.3.0
 ```
 
-It creates GitHub Release artifacts through GoReleaser and updates the Homebrew
-cask tap. To make the tap publish work, create `suhjohn/homebrew-tap` and set
-repository secret `HOMEBREW_TAP_GITHUB_TOKEN` with write access to that tap.
+It creates GitHub Release artifacts through GoReleaser. The cross-platform
+installer script (`curl -fsSL https://pufferfs.com/install.sh | sh`) downloads
+these release archives and verifies their checksums.
 
 After a successful release, update the deploy environment variable
 `PUFFERFS_CLI_LATEST_VERSION` and run the `backend` deploy component so

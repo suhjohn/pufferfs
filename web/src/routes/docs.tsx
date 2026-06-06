@@ -137,12 +137,12 @@ Deleted 1,246 storage objects`,
     name: "upgrade",
     usage: "pufferfs upgrade",
     detail:
-      "Upgrades direct CLI installs from the server release manifest. Homebrew-managed installs should use brew upgrade.",
+      "Upgrades CLI installs from the public release manifest.",
     flags: [
       "--manifest-url <url>: use a custom release manifest",
       "--version <version>: install a specific version",
       "--restart-services: restart installed services after upgrade",
-      "--force: upgrade even if the install appears Homebrew-managed",
+      "--force: install even if the current version is already newer or equal",
     ],
     transcript: `$ pufferfs upgrade
 Downloading pufferfs 0.4.0 for darwin/arm64...
@@ -467,18 +467,36 @@ function Docs() {
               local CLI testing without that stack, use <code>--dry-run</code>{" "}
               to inspect filesystem changes before uploading.
             </p>
+            <h3>macOS / Linux</h3>
             <div className="code-window">
               <div className="code-titlebar">
                 <span>terminal</span>
               </div>
-              <pre className="code-pane solo">{`brew install --cask suhjohn/tap/pufferfs
-pufferfs init
+              <pre className="code-pane solo">{`curl -fsSL https://pufferfs.com/install.sh | sh
+pufferfs init`}</pre>
+            </div>
+
+            <h3>Linux / CI / Docker</h3>
+            <div className="code-window">
+              <div className="code-titlebar">
+                <span>terminal</span>
+              </div>
+              <pre className="code-pane solo">{`# download a specific version
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 sh
 
 # non-interactive setup for CI or compute jobs
 pufferfs init --api-key pfs_...
 
 # one-off environment override
 PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
+            </div>
+
+            <h3>Go install (development)</h3>
+            <div className="code-window">
+              <div className="code-titlebar">
+                <span>terminal</span>
+              </div>
+              <pre className="code-pane solo">{`go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest`}</pre>
             </div>
           </section>
 

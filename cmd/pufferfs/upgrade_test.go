@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	appconfig "github.com/pufferfs/pufferfs/internal/config"
+)
 
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {
@@ -36,5 +40,21 @@ func TestRetargetReleaseURL(t *testing.T) {
 	want := "https://github.com/suhjohn/pufferfs/releases/download/v0.4.0/pufferfs_0.4.0_darwin_arm64.tar.gz"
 	if got != want {
 		t.Fatalf("retargetReleaseURL = %q, want %q", got, want)
+	}
+}
+
+func TestManifestURL(t *testing.T) {
+	if got := manifestURL(nil, "https://example.com/manifest.json"); got != "https://example.com/manifest.json" {
+		t.Fatalf("manifestURL override = %q", got)
+	}
+
+	cfg := &appconfig.Config{}
+	cfg.Server.URL = "http://localhost:8080/"
+	if got := manifestURL(cfg, ""); got != "http://localhost:8080/cli/version" {
+		t.Fatalf("manifestURL configured server = %q", got)
+	}
+
+	if got := manifestURL(nil, ""); got != defaultManifestURL {
+		t.Fatalf("manifestURL default = %q, want %q", got, defaultManifestURL)
 	}
 }

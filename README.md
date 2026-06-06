@@ -23,17 +23,21 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 
 ### Install CLI
 
-```bash
-brew install --cask suhjohn/tap/pufferfs
-```
-
-Direct installs can use the installer script once releases are published:
+**macOS / Linux (installer script)**
 
 ```bash
 curl -fsSL https://pufferfs.com/install.sh | sh
 ```
 
-For local development:
+The installer auto-detects your OS and architecture (`darwin`/`linux`, `amd64`/`arm64`), downloads the latest release archive from `pufferfs.com/releases/`, verifies the SHA-256 checksum, and installs the binary to `/usr/local/bin`.
+
+Pin a version or override the install directory:
+
+```bash
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 INSTALL_DIR="$HOME/.local/bin" sh
+```
+
+**From source (development)**
 
 ```bash
 go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest
@@ -104,32 +108,27 @@ supervisor restarts it on failure and captures logs.
 ### CLI upgrades and versioning
 
 PufferFS CLI releases are SemVer git tags (`v0.3.0`, `v0.3.1`, ...). GoReleaser
-builds macOS and Linux archives for `amd64` and `arm64`, publishes them to
-GitHub Releases with `checksums.txt`, and can update the Homebrew tap.
+builds macOS and Linux archives for `amd64` and `arm64` and publishes them to
+GitHub Releases with `checksums.txt`.
 
 ```bash
 git tag v0.3.0
 git push origin v0.3.0
 ```
 
-Homebrew users upgrade with:
-
-```bash
-brew upgrade --cask pufferfs
-```
-
-Direct installs upgrade with:
+CLI installs upgrade with:
 
 ```bash
 pufferfs upgrade
 ```
 
-`pufferfs upgrade` reads the server's unauthenticated `GET /cli/version`
-manifest, downloads the matching GoReleaser archive, verifies its SHA-256
-checksum, replaces the current binary, and restarts installed user services.
-The CLI also checks this manifest at most once per day and prints an upgrade
-notice when a newer release is available. Set `PUFFERFS_NO_UPDATE_CHECK=1` to
-disable the passive check.
+`pufferfs upgrade` reads the public release manifest at
+`https://api.pufferfs.com/cli/version`, downloads the matching GoReleaser
+archive, verifies its SHA-256 checksum, replaces the current binary, and
+restarts installed user services. Pass `--manifest-url` to use a custom
+manifest. The CLI also checks the configured server's manifest at most once per
+day and prints an upgrade notice when a newer release is available. Set
+`PUFFERFS_NO_UPDATE_CHECK=1` to disable the passive check.
 
 The CLI SemVer and sync wire protocol are separate. CLI versions are injected at
 release build time, while sync compatibility is controlled by
