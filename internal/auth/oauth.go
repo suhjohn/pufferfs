@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,11 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+)
+
+const (
+	oauthStateCookieName = "pf_oauth_state"
+	oauthStateTTL        = 10 * time.Minute
 )
 
 // OAuthConfig holds OAuth2 settings.
@@ -77,9 +83,15 @@ func NewOAuthHandler(cfg OAuthConfig, upsertUser UserUpsertFunc) *OAuthHandler {
 
 // HandleLogin redirects the user to Google's consent page.
 func (h *OAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
+	nonce, err := randomOAuthNonce()
+	if err != nil {
+		http.Error(w, `{"error":"creating OAuth state"}`, http.StatusInternalServerError)
+		return
+	}
 	state := oauthState{
 		Flow:     "web",
 		IssuedAt: time.Now().Unix(),
+		Nonce:    nonce,
 	}
 	if redirectURI := strings.TrimSpace(r.URL.Query().Get("cli_redirect_uri")); redirectURI != "" {
 		if !isLoopbackRedirectURI(redirectURI) {
@@ -89,6 +101,7 @@ func (h *OAuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		state.Flow = "cli"
 		state.RedirectURI = redirectURI
 	}
+	h.setOAuthStateCookie(w, nonce)
 	url := h.oauthCfg.AuthCodeURL(h.signOAuthState(state), oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -101,7 +114,7 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"missing code parameter"}`, http.StatusBadRequest)
 		return
 	}
-	state, err := h.parseOAuthState(r.URL.Query().Get("state"))
+	state, err := h.validateOAuthState(w, r)
 	if err != nil {
 		http.Error(w, `{"error":"invalid OAuth state"}`, http.StatusBadRequest)
 		return
@@ -177,6 +190,7 @@ type oauthState struct {
 	Flow        string `json:"flow"`
 	RedirectURI string `json:"redirect_uri,omitempty"`
 	IssuedAt    int64  `json:"iat"`
+	Nonce       string `json:"nonce"`
 }
 
 func (h *OAuthHandler) signOAuthState(state oauthState) string {
@@ -189,9 +203,6 @@ func (h *OAuthHandler) signOAuthState(state oauthState) string {
 }
 
 func (h *OAuthHandler) parseOAuthState(raw string) (oauthState, error) {
-	if raw == "" || raw == "pufferfs-oauth-state" {
-		return oauthState{Flow: "web", IssuedAt: time.Now().Unix()}, nil
-	}
 	payloadB64, sigB64, ok := strings.Cut(raw, ".")
 	if !ok {
 		return oauthState{}, fmt.Errorf("malformed state")
@@ -214,6 +225,9 @@ func (h *OAuthHandler) parseOAuthState(raw string) (oauthState, error) {
 	if state.IssuedAt == 0 || time.Since(time.Unix(state.IssuedAt, 0)) > 10*time.Minute {
 		return oauthState{}, fmt.Errorf("expired state")
 	}
+	if state.Nonce == "" {
+		return oauthState{}, fmt.Errorf("missing nonce")
+	}
 	switch state.Flow {
 	case "web":
 		return state, nil
@@ -225,6 +239,64 @@ func (h *OAuthHandler) parseOAuthState(raw string) (oauthState, error) {
 	default:
 		return oauthState{}, fmt.Errorf("invalid flow")
 	}
+}
+
+func (h *OAuthHandler) validateOAuthState(w http.ResponseWriter, r *http.Request) (oauthState, error) {
+	state, err := h.parseOAuthState(r.URL.Query().Get("state"))
+	if err != nil {
+		return oauthState{}, err
+	}
+	cookie, err := r.Cookie(oauthStateCookieName)
+	if err != nil || cookie.Value == "" {
+		return oauthState{}, fmt.Errorf("missing state cookie")
+	}
+	if !subtleStringEqual(cookie.Value, state.Nonce) {
+		return oauthState{}, fmt.Errorf("state cookie mismatch")
+	}
+	h.clearOAuthStateCookie(w)
+	return state, nil
+}
+
+func (h *OAuthHandler) setOAuthStateCookie(w http.ResponseWriter, nonce string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    nonce,
+		Path:     "/auth",
+		Domain:   h.cookie.Domain,
+		Expires:  time.Now().Add(oauthStateTTL),
+		MaxAge:   int(oauthStateTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   h.cookie.Secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (h *OAuthHandler) clearOAuthStateCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     oauthStateCookieName,
+		Value:    "",
+		Path:     "/auth",
+		Domain:   h.cookie.Domain,
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   h.cookie.Secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func randomOAuthNonce() (string, error) {
+	var buf [32]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf[:]), nil
+}
+
+func subtleStringEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return hmac.Equal([]byte(a), []byte(b))
 }
 
 func (h *OAuthHandler) finishCLILogin(w http.ResponseWriter, r *http.Request, state oauthState, orgID, userID, email string) {

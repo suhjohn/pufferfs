@@ -31,10 +31,12 @@ Three credential types:
 
 1. **Tenant API keys** — `Authorization: Bearer pfs_sk_...`. Stored only as
    SHA-256 hashes; the raw key is shown once at creation and never retrievable
-   afterward. Resolved to an org, user, role, and scope set.
+   afterward. Resolved to an org, user, role, and scope set. Newly created
+   user keys must include an explicit non-empty scope list.
 2. **Session JWTs** — HS256, signed with `JWT_SECRET`, 24-hour TTL. Carried in
    the `Authorization` header or the `pf_session` httpOnly cookie. Issued by the
-   Google OAuth flow.
+   Google OAuth flow. OAuth callbacks require signed state bound to a
+   short-lived httpOnly state cookie.
 3. **Platform admin key** — a separate key for `/admin/*`, compared in constant
    time against `PUFFERFS_ADMIN_KEY_HASH`. If unset, all admin routes return
    `403`.
@@ -62,10 +64,9 @@ in the code: `sync`, `query`, `root:create`, `root:delete`, `api_keys:read`,
 `api_keys:write`, `acl:read`, `acl:write`, `org:admin`, and coarse aliases
 `read` / `write` / `admin` / `delete`.
 
-> Because empty-scope keys are unrestricted, **always create keys with an
-> explicit least-privilege scope list** (e.g. `["query"]` for a read-only agent
-> key). The default scopes for a self-created key are
-> `["sync","query","root:delete"]`.
+> New user-created keys reject empty scope lists. Legacy empty-scope keys are
+> still treated as unrestricted for compatibility; rotate them to explicit
+> least-privilege scopes (e.g. `["query"]` for a read-only agent key).
 
 ### 2. Org roles
 
@@ -149,25 +150,32 @@ dependency folders out of the index and reducing exposure surface.
   machine.**
 - Deletion is **blocked (`409`) while sync jobs are active**; org/user deletes
   cascade to owned roots under the same rule.
+- Deletion does not imply deletion of already exported logs, provider billing
+  records, or vendor-side operational records unless those are covered by the
+  deployment's separate retention process.
 - Failed or partial generations are cleaned up and never become visible to
   queries.
 - The embedding cache is keyed by org + model version + content hash; bumping
   `PUFFERFS_EMBEDDING_MODEL_VERSION` effectively invalidates stale cached
   vectors.
 
+## Vulnerability disclosure
+
+Report security issues to `security@pufferfs.com`. Include affected routes or
+commands, reproduction steps, impact, and any relevant logs or request IDs.
+
+Good-faith testing is in scope when it avoids data destruction, service
+disruption, spam, social engineering, and access to other users' data. Do not
+exfiltrate data beyond what is necessary to prove the issue.
+
 ## Known caveats and hardening notes
 
 These are real, in-code limitations to account for in a deployment:
 
-- **OAuth CSRF state is fixed.** The OAuth login currently uses a constant
-  `state` value (`"pufferfs-oauth-state"`); a code comment notes that production
-  should use a random state stored in a cookie for CSRF protection. Harden this
-  before exposing OAuth to untrusted networks.
 - **ACLs are deny-only.** Do not rely on ACLs to *grant* narrower-than-default
   access; they can only subtract prefixes.
-- **Empty-scope API keys are unrestricted.** Enforce least privilege at key
-  creation; an empty `scopes` list is not a safe default for shared/automation
-  keys.
+- **Legacy empty-scope API keys are unrestricted.** New user-created keys
+  require explicit scopes, but old empty-scope keys should be rotated.
 - **Secret filtering is filename-based** (see above).
 - **JWT secret and admin key are the crown jewels.** Compromise of `JWT_SECRET`
   forges any session; compromise of the admin key grants cross-org

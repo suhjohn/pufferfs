@@ -55,7 +55,8 @@ Two independent layers are checked:
 
 1. **API key scopes** — a scoped key must carry the required scope, a documented
    alias, or `*`. JWT sessions and legacy keys with no scopes are treated as
-   unrestricted. Common scopes: `sync`, `query`, `root:delete`,
+   unrestricted; newly created user keys must send an explicit non-empty scope
+   list. Common scopes: `sync`, `query`, `root:delete`,
    `api_keys:read`, `api_keys:write`, `acl:read`, `acl:write`, `org:admin`,
    plus coarse aliases `read`/`write`/`admin`/`delete`.
 2. **Org role** — `owner > admin > editor > viewer`. Role gates writes,
@@ -136,8 +137,9 @@ Request:
 { "name": "CI key", "scopes": ["query"] }
 ```
 
-Defaults: `name` → `"CLI Key"`; empty `scopes` →
-`["sync", "query", "root:delete"]`.
+Defaults: `name` → `"CLI Key"`. `scopes` must be explicit and non-empty for
+new user-created keys; use `["query"]` for read-only search automation and add
+broader scopes only when the key needs sync or root management access.
 
 Response `201`:
 

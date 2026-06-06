@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ func TestOAuthStateRoundTrip(t *testing.T) {
 		Flow:        "cli",
 		RedirectURI: "http://127.0.0.1:49152/callback",
 		IssuedAt:    time.Now().Unix(),
+		Nonce:       "state-nonce",
 	}
 
 	raw := h.signOAuthState(state)
@@ -30,6 +34,7 @@ func TestOAuthStateRejectsTampering(t *testing.T) {
 		Flow:        "cli",
 		RedirectURI: "http://127.0.0.1:49152/callback",
 		IssuedAt:    time.Now().Unix(),
+		Nonce:       "state-nonce",
 	})
 
 	payload, sig, ok := strings.Cut(raw, ".")
@@ -43,6 +48,56 @@ func TestOAuthStateRejectsTampering(t *testing.T) {
 	tampered := replacement + payload[1:] + "." + sig
 	if _, err := h.parseOAuthState(tampered); err == nil {
 		t.Fatal("parseOAuthState accepted a tampered state")
+	}
+}
+
+func TestOAuthStateRejectsLegacyConstantState(t *testing.T) {
+	h := NewOAuthHandler(OAuthConfig{JWTSecret: []byte("test-secret")}, nil)
+	if _, err := h.parseOAuthState("pufferfs-oauth-state"); err == nil {
+		t.Fatal("parseOAuthState accepted legacy constant state")
+	}
+}
+
+func TestValidateOAuthStateRequiresMatchingCookie(t *testing.T) {
+	h := NewOAuthHandler(OAuthConfig{JWTSecret: []byte("test-secret")}, nil)
+	raw := h.signOAuthState(oauthState{
+		Flow:     "web",
+		IssuedAt: time.Now().Unix(),
+		Nonce:    "state-nonce",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(raw), nil)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: "state-nonce"})
+	rr := httptest.NewRecorder()
+	got, err := h.validateOAuthState(rr, req)
+	if err != nil {
+		t.Fatalf("validateOAuthState returned error: %v", err)
+	}
+	if got.Nonce != "state-nonce" {
+		t.Fatalf("nonce = %q, want state-nonce", got.Nonce)
+	}
+	if cookie := rr.Result().Cookies()[0]; cookie.Name != oauthStateCookieName || cookie.MaxAge != -1 {
+		t.Fatalf("state cookie was not cleared: %+v", cookie)
+	}
+}
+
+func TestValidateOAuthStateRejectsMissingOrMismatchedCookie(t *testing.T) {
+	h := NewOAuthHandler(OAuthConfig{JWTSecret: []byte("test-secret")}, nil)
+	raw := h.signOAuthState(oauthState{
+		Flow:     "web",
+		IssuedAt: time.Now().Unix(),
+		Nonce:    "state-nonce",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(raw), nil)
+	if _, err := h.validateOAuthState(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("validateOAuthState accepted missing state cookie")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/auth/callback?state="+url.QueryEscape(raw), nil)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: "other-nonce"})
+	if _, err := h.validateOAuthState(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("validateOAuthState accepted mismatched state cookie")
 	}
 }
 

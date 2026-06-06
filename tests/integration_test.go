@@ -111,9 +111,12 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		adminUpsertMember(t, serverURL, org.ID, memberB.ID, "viewer")
 
 		adminMemberKey := adminCreateMemberAPIKey(t, serverURL, org.ID, adminUser.ID, []string{"query", "root:delete"})
+		adminKeyWriteKey := adminCreateMemberAPIKey(t, serverURL, org.ID, adminUser.ID, []string{"api_keys:write", "api_keys:read"})
 		memberAKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query"})
 		memberASyncKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query", "sync"})
 		memberBKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberB.ID, []string{"query"})
+
+		assertSelfServiceAPIKeyScopes(t, serverURL, adminKeyWriteKey)
 
 		orgRoot := adminCreateRoot(t, serverURL, org.ID, map[string]any{
 			"name":        "shared-root-" + suffix,
@@ -968,6 +971,31 @@ func adminCreateRoot(t *testing.T, serverURL, orgID string, payload map[string]a
 		t.Fatalf("admin root creation returned empty root: %#v", root)
 	}
 	return root
+}
+
+func assertSelfServiceAPIKeyScopes(t *testing.T, serverURL, apiKey string) {
+	t.Helper()
+	status, body := jsonRequest(t, http.MethodPost, serverURL+"/auth/api-keys", apiKey, map[string]any{
+		"name":   "empty-scope-key",
+		"scopes": []string{},
+	}, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("POST /auth/api-keys with empty scopes: HTTP %d, want %d: %s", status, http.StatusBadRequest, string(body))
+	}
+
+	var resp struct {
+		Key string `json:"key"`
+	}
+	status, body = jsonRequest(t, http.MethodPost, serverURL+"/auth/api-keys", apiKey, map[string]any{
+		"name":   "query-only-key",
+		"scopes": []string{"query"},
+	}, &resp)
+	if status != http.StatusCreated {
+		t.Fatalf("POST /auth/api-keys with explicit scopes: HTTP %d, want %d: %s", status, http.StatusCreated, string(body))
+	}
+	if resp.Key == "" {
+		t.Fatal("POST /auth/api-keys with explicit scopes returned empty key")
+	}
 }
 
 func adminJSON(t *testing.T, method, serverURL, requestPath string, payload any, expectedStatus int, out any) {

@@ -247,11 +247,13 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	if req.Name == "" {
 		req.Name = "CLI Key"
 	}
-	if len(req.Scopes) == 0 {
-		req.Scopes = []string{"sync", "query", "root:delete"}
+	scopes, err := normalizeExplicitAPIKeyScopes(req.Scopes)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
 	}
 
-	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, req.Scopes)
+	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, scopes)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -260,6 +262,26 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"key": rawKey,
 	})
+}
+
+func normalizeExplicitAPIKeyScopes(scopes []string) ([]string, error) {
+	normalized := make([]string, 0, len(scopes))
+	seen := make(map[string]struct{}, len(scopes))
+	for _, scope := range scopes {
+		scope = strings.TrimSpace(scope)
+		if scope == "" {
+			continue
+		}
+		if _, ok := seen[scope]; ok {
+			continue
+		}
+		seen[scope] = struct{}{}
+		normalized = append(normalized, scope)
+	}
+	if len(normalized) == 0 {
+		return nil, fmt.Errorf("explicit scopes required; use [\"query\"] for read-only keys or [\"sync\", \"query\"] for sync keys")
+	}
+	return normalized, nil
 }
 
 func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {

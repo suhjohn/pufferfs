@@ -537,6 +537,15 @@ button:disabled {
   gap: 1rem;
 }
 
+.docs-security-roadmap {
+  display: grid;
+  gap: 0.7rem;
+  padding: 1rem;
+  margin-top: 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
 .docs-command,
 .docs-security-list article,
 .docs-openapi-operation {
@@ -552,9 +561,23 @@ button:disabled {
 
 .docs-command p,
 .docs-security-list p,
+.docs-security-roadmap p,
 .docs-openapi-operation p {
   margin: 0;
   font-size: 0.86rem;
+}
+
+.docs-security-roadmap h3 {
+  margin: 0;
+}
+
+.docs-security-roadmap ul {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding-left: 1.1rem;
+  color: var(--muted);
+  font-size: 0.84rem;
 }
 
 .docs-command code {
