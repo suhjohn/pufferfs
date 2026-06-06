@@ -1277,7 +1277,7 @@ func runPufferfs(t *testing.T, homeDir, serverURL, apiKey string, args ...string
 func initPufferFS(t *testing.T, env *e2eEnv, homeDir string) {
 	t.Helper()
 
-	stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "init")
+	stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "init", "--api-key", env.apiKey)
 	if err != nil {
 		t.Fatalf("init failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 	}
