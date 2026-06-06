@@ -137,7 +137,7 @@ Deleted 1,246 storage objects`,
     name: "upgrade",
     usage: "pufferfs upgrade",
     detail:
-      "Upgrades CLI installs from the server release manifest.",
+      "Upgrades CLI installs from the public release manifest.",
     flags: [
       "--manifest-url <url>: use a custom release manifest",
       "--version <version>: install a specific version",
@@ -482,7 +482,7 @@ pufferfs init`}</pre>
                 <span>terminal</span>
               </div>
               <pre className="code-pane solo">{`# download a specific version
-curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.0 sh
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 sh
 
 # non-interactive setup for CI or compute jobs
 pufferfs init --api-key pfs_...

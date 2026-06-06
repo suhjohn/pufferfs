@@ -97,7 +97,7 @@ func runUpgrade(cfg *appconfig.Config, options upgradeOptions) error {
 		return fmt.Errorf("self-upgrade is not supported on %s; install the new pufferfs binary manually", runtime.GOOS)
 	}
 
-	manifest, err := fetchCLIReleaseManifest(manifestURL(cfg, options.ManifestURL))
+	manifest, err := fetchCLIReleaseManifest(manifestURL(nil, options.ManifestURL))
 	if err != nil {
 		return err
 	}

@@ -34,7 +34,7 @@ The installer auto-detects your OS and architecture (`darwin`/`linux`, `amd64`/`
 Pin a version or override the install directory:
 
 ```bash
-PUFFERFS_VERSION=0.2.0 INSTALL_DIR=~/.local/bin curl -fsSL https://pufferfs.com/install.sh | sh
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 **From source (development)**
@@ -122,12 +122,13 @@ CLI installs upgrade with:
 pufferfs upgrade
 ```
 
-`pufferfs upgrade` reads the server's unauthenticated `GET /cli/version`
-manifest, downloads the matching GoReleaser archive, verifies its SHA-256
-checksum, replaces the current binary, and restarts installed user services.
-The CLI also checks this manifest at most once per day and prints an upgrade
-notice when a newer release is available. Set `PUFFERFS_NO_UPDATE_CHECK=1` to
-disable the passive check.
+`pufferfs upgrade` reads the public release manifest at
+`https://api.pufferfs.com/cli/version`, downloads the matching GoReleaser
+archive, verifies its SHA-256 checksum, replaces the current binary, and
+restarts installed user services. Pass `--manifest-url` to use a custom
+manifest. The CLI also checks the configured server's manifest at most once per
+day and prints an upgrade notice when a newer release is available. Set
+`PUFFERFS_NO_UPDATE_CHECK=1` to disable the passive check.
 
 The CLI SemVer and sync wire protocol are separate. CLI versions are injected at
 release build time, while sync compatibility is controlled by

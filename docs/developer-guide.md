@@ -18,7 +18,7 @@ curl -fsSL https://pufferfs.com/install.sh | sh
 Pin a version or change the install directory:
 
 ```sh
-PUFFERFS_VERSION=0.2.0 INSTALL_DIR=~/.local/bin curl -fsSL https://pufferfs.com/install.sh | sh
+curl -fsSL https://pufferfs.com/install.sh | PUFFERFS_VERSION=0.2.1 INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 ### Docker / CI
@@ -425,8 +425,8 @@ If a sync fails repeatedly:
 
 ## Upgrade Behavior
 
-The CLI can check the server's release manifest and print an upgrade notice at
-most once per day.
+The CLI can check the configured server's release manifest and print an upgrade
+notice at most once per day.
 
 Direct installs can run:
 
@@ -436,6 +436,8 @@ pufferfs upgrade
 
 What to expect:
 
+- Direct upgrades use the public `https://api.pufferfs.com/cli/version`
+  manifest unless `--manifest-url` is provided.
 - Direct upgrades download a platform archive.
 - The archive checksum is verified.
 - The current binary is replaced.
