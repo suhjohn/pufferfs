@@ -2746,11 +2746,7 @@ func selectAcmeCorpObjects(objects []objectEntry) []objectEntry {
 }
 
 func acmeCorpSmokeFixture(key string) bool {
-	base := strings.ToLower(filepath.Base(key))
 	ext := strings.ToLower(filepath.Ext(key))
-	if base == ".gitignore" {
-		return true
-	}
 	switch ext {
 	case ".md", ".txt", ".csv", ".tsv", ".html", ".eml", ".msg", ".ics", ".vcf", ".mp3", ".wav", ".mp4", ".mov":
 		return true
