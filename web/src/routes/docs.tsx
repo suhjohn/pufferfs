@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { PixelLogo } from "../components/PixelLogo";
 
@@ -328,91 +329,98 @@ const ENDPOINTS = [
 
 const SECURITY_SECTIONS = [
   {
-    title: "Hosting",
+    title: "Data handling",
     body: [
-      "PufferFS is not local-only search. Sync uploads source bytes and derived state to object storage, stores org/root/job metadata in Postgres, writes searchable content and vectors to Turbopuffer, and can send documents through Modal for extraction and embeddings.",
-      "The local folder remains the source of truth, but synced content leaves the user's machine.",
+      "PufferFS indexes files users choose to sync so teams and agents can search them. Synced files, extracted text, search metadata, and account metadata are processed only to provide the product.",
+      "Local folders remain under user control. PufferFS does not delete or modify source files during normal sync, query, or root deletion workflows.",
     ],
   },
   {
     title: "Encryption",
     body: [
-      "The bundled AWS deployment enables S3 server-side encryption with AES-256 for artifacts and encrypted EFS storage for NATS persistence.",
-      "CloudFront redirects the web app to HTTPS, and the API can serve HTTPS behind an ALB with a TLS 1.2/1.3 policy when a validated certificate is configured.",
+      "PufferFS uses HTTPS for data in transit and encrypted cloud storage for customer content and operational data at rest.",
+      "Credentials and session data are protected with standard controls such as one-time key display, hashed key storage, secure cookies, and scoped access.",
     ],
   },
   {
     title: "Authentication and access control",
     body: [
-      "Tenant API keys are generated as pfs_ values and stored only as SHA-256 hashes. New user-created API keys must include an explicit non-empty scope list. Browser sessions use an HS256 JWT in an httpOnly cookie, and OAuth callbacks require signed state bound to a short-lived httpOnly state cookie.",
-      "Every normal API request resolves to an org, user, role, and optional scope list. Root lookups are org-scoped; unreadable roots return 404 rather than revealing that the root exists.",
+      "Access is tied to organization membership, user role, root ownership, and API key scope. Users can create least-privilege API keys for automation and rotate them when needed.",
+      "Search and sync requests are checked against the caller's permissions before customer content is returned or updated.",
     ],
   },
   {
-    title: "Query isolation",
+    title: "Tenant isolation",
     body: [
-      "Queries are constrained to the root's visible committed generation. If the server cannot resolve that generation, it fails closed instead of returning unfiltered rows.",
-      "Deny-prefix ACLs are filtered out of results, and user-scoped roots add content-proof filtering for non-admin callers.",
+      "Customer content is scoped to the organization and root it belongs to. PufferFS does not expose unreadable roots in normal search or sync responses.",
+      "Queries run against completed syncs, so incomplete or failed sync jobs are not served as search results.",
     ],
   },
   {
-    title: "Secret-file handling",
+    title: "Sensitive file controls",
     body: [
-      "Before building sync state, the CLI excludes common secret filenames such as .env files, private keys, credentials.json, service-account JSON files, package registry credentials, and certificate bundles.",
-      "PufferFS also honors .gitignore, .tpfsignore, and ~/.tpfs/ignore.",
+      "The CLI excludes common secret filenames by default and respects project and user ignore rules, including .gitignore and PufferFS ignore files.",
+      "Teams can use folder access controls and ignore rules to keep sensitive paths out of synced roots.",
     ],
   },
   {
-    title: "Customer data access",
+    title: "Operations",
     body: [
-      "The application enforces tenant and root access before sync and query operations. Direct access to Postgres, object storage, Turbopuffer, Modal outputs, and server logs is privileged operational access that must be controlled by the deployment operator.",
+      "Operational access to production systems is limited to authorized personnel and should be used only for support, reliability, security, and compliance purposes.",
+      "Infrastructure and application events are logged to support monitoring, debugging, abuse prevention, and incident response.",
     ],
   },
   {
     title: "Deletion",
     body: [
-      "Root deletion removes PufferFS metadata, Turbopuffer namespaces, object-storage artifacts under files/, bundles/, states/, chunks/, and syncs/, plus local PufferFS cache. It does not delete source files from the user's machine.",
-      "Active sync jobs block root deletion with 409.",
+      "When a root is deleted, PufferFS removes associated indexed content, metadata, stored artifacts, and local PufferFS cache for that root.",
+      "Deletion does not remove original source files from the user's machine or records that must be retained for legal, billing, security, or operational reasons.",
     ],
   },
   {
     title: "Vulnerability disclosure",
     body: [
-      "Report security issues to security@pufferfs.com. Include affected routes or commands, reproduction steps, impact, and any relevant logs or request IDs.",
-      "Good-faith testing is in scope when it avoids data destruction, service disruption, spam, social engineering, and access to other users' data.",
+      "Report suspected vulnerabilities to security@pufferfs.com with reproduction steps, impact, and relevant logs or request IDs.",
+      "Good-faith security research is welcome when it avoids data destruction, service disruption, spam, social engineering, and access to other users' data.",
     ],
   },
 ];
 
 const SECURITY_SUBPROCESSORS = [
   {
-    name: "Object storage / AWS S3-compatible storage",
-    purpose: "Source file copies, bundles, state snapshots, sync artifacts, extracted chunks",
-    data: "Source bytes and derived artifacts",
+    name: "Cloud infrastructure",
+    purpose: "Hosting, storage, networking, and application operations",
+    data: "Customer content and operational metadata",
   },
   {
-    name: "PostgreSQL",
-    purpose: "Organizations, users, API key hashes, roots, ACLs, sync state, billing metadata",
-    data: "Control-plane metadata",
+    name: "Search infrastructure",
+    purpose: "Indexing and retrieving synced content",
+    data: "Extracted content, search metadata, and embeddings",
   },
   {
-    name: "Turbopuffer",
-    purpose: "Search index rows, extracted content, vectors, path metadata",
-    data: "Searchable document content and embeddings",
+    name: "Document processing",
+    purpose: "Parsing files, extracting text, OCR, and embeddings",
+    data: "Files and derived content required for processing",
   },
   {
-    name: "Modal",
-    purpose: "Document extraction, OCR/vision processing, embeddings",
-    data: "Documents and extracted content sent for processing",
-  },
-  {
-    name: "Google OAuth and Stripe",
+    name: "Identity and billing",
     purpose: "Identity and billing",
     data: "Identity profile data and billing events",
   },
 ];
 
 function Docs() {
+  useEffect(() => {
+    const scrollToHash = () => {
+      const id = decodeURIComponent(window.location.hash.slice(1));
+      if (id) document.getElementById(id)?.scrollIntoView();
+    };
+
+    scrollToHash();
+    window.addEventListener("hashchange", scrollToHash);
+    return () => window.removeEventListener("hashchange", scrollToHash);
+  }, []);
+
   return (
     <main className="docs-shell">
       <nav className="landing-nav" aria-label="primary">
@@ -594,9 +602,9 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
           <section id="security" className="docs-section">
             <h2>Security & Compliance</h2>
             <p>
-              PufferFS stores source copies, extracted content, metadata, and
-              vectors so users and agents can search synced folders. This
-              section describes the controls that exist today.
+              PufferFS is built to help teams make synced files searchable
+              while keeping access controlled, auditable, and bounded to the
+              data users choose to sync.
             </p>
             <div className="docs-security-list">
               {SECURITY_SECTIONS.map((section) => (
@@ -609,18 +617,18 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
               ))}
             </div>
             <div className="docs-security-subprocessors">
-              <h3>Subprocessors for customer data</h3>
+              <h3>Third-party services</h3>
               <p>
-                The exact production vendor list depends on deployment
-                configuration. The systems below are in scope for the current
-                PufferFS architecture and should be reviewed before syncing
-                sensitive folders.
+                PufferFS uses third-party providers for infrastructure,
+                identity, billing, search, and document processing. Provider
+                use depends on deployment configuration and customer use of the
+                product.
               </p>
               <div className="docs-security-table-wrap">
                 <table className="docs-security-table">
                   <thead>
                     <tr>
-                      <th>Subprocessor</th>
+                      <th>Service area</th>
                       <th>Purpose</th>
                       <th>Data</th>
                     </tr>
