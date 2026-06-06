@@ -59,6 +59,12 @@ pufferfs sync ./my-project --dry-run
 # Sync
 pufferfs sync ./my-project --name my-project
 
+# Start a sync in the background, then check/wait on the job
+pufferfs sync ./my-project --name my-project --background
+pufferfs sync status --root my-project
+pufferfs sync jobs --root my-project
+pufferfs sync wait --root my-project --job-id <sync-job-id>
+
 # Create a user-owned root instead of an org root
 pufferfs sync ./my-project --name my-project --scope user
 ```

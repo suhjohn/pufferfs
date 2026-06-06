@@ -130,6 +130,22 @@ Return machine-readable output:
 pufferfs sync ./workspace --json
 ```
 
+Start a sync job without waiting for it to commit:
+
+```sh
+pufferfs sync ./workspace --name workspace --background
+# --detach is an alias for --background
+```
+
+Inspect or wait for a sync job:
+
+```sh
+pufferfs sync status --root workspace
+pufferfs sync status --root workspace --job-id <sync-job-id> --json
+pufferfs sync jobs --root workspace
+pufferfs sync wait --root workspace --job-id <sync-job-id>
+```
+
 What to expect:
 
 - The CLI hashes the folder and builds a Merkle tree.
@@ -141,7 +157,10 @@ What to expect:
   uploaded individually.
 - The server creates a sync job and a new generation.
 - The index is not visible to queries until the generation commits.
-- The CLI polls async sync jobs until completion.
+- By default, the CLI polls async sync jobs until completion. With
+  `--background`/`--detach`, it prints the `sync_job_id` and exits; use
+  `pufferfs sync status`, `pufferfs sync jobs`, or `pufferfs sync wait` to
+  inspect completion.
 - If the server generation changed during sync, the CLI reloads state,
   recomputes the diff, and retries.
 
@@ -150,8 +169,8 @@ What to expect:
 PufferFS honors:
 
 - Built-in ignore rules.
-- `.gitignore` in the root.
-- `.tpfsignore` in the root.
+- `.gitignore` files, scoped to the directories where they appear.
+- `.tpfsignore` files, scoped to the directories where they appear.
 - Global ignore rules at `~/.tpfs/ignore`.
 
 Common ignored paths include dependency folders, virtual environments, build

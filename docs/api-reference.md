@@ -258,7 +258,9 @@ namespace cloning.
 
 Return a sync job's status. Without `job_id`, returns the latest job for the
 root. Jobs that exceed the server sync timeout are transitioned to `failed`.
-Returns a `SyncJob` object.
+Returns a `SyncJob` object. In-flight statuses include `queued`, `chunking`,
+`embedding`, `indexing`/`upserting`, and `committing`; terminal statuses are
+`completed` and `failed`.
 
 ### `GET /roots/{id}/sync/jobs`
 
@@ -308,6 +310,10 @@ Rules:
 - `?async=true`: returns `202 Accepted` immediately with the job/generation IDs;
   poll `GET /roots/{id}/sync/status?job_id=...` until `status` is `completed`
   or `failed`.
+
+Queries read only the latest committed visible generation. While an async sync
+job is still in flight, query results continue to come from the previous
+committed generation.
 
 `SyncResponse`:
 

@@ -60,6 +60,10 @@ The CLI root command is `pufferfs` and includes:
   submit a sync request, poll for async completion, and update local cache.
 - `sync --dry-run`: show changes, total upload size, and ignored patterns
   without uploading.
+- `sync --background` / `sync --detach`: submit the same server-side sync job
+  but return immediately with a `sync_job_id`.
+- `sync status`, `sync jobs`, and `sync wait`: inspect recent sync jobs, poll a
+  specific job, or block until it reaches `completed`/`failed`.
 - `sync --follow` and `watch`: run an initial sync, then use `fsnotify` to
   debounce filesystem changes and rerun sync.
 - `query`: search a synced root with `fts`, `vector`, or `hybrid` mode, optional

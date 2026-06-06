@@ -423,6 +423,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		}
 		return fmt.Errorf("cleaning failed generations before commit: %w", err)
 	}
+	if msg.SyncJobID != "" {
+		_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "committing", 0)
+	}
 	if err := d.server.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
 		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {

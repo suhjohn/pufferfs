@@ -1305,6 +1305,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		return nil, fmt.Errorf("cleaning failed generations before commit: %w", err)
 	}
 
+	if job != nil {
+		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "committing", resp.FilesProcessed)
+	}
 	if err := s.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
 		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {

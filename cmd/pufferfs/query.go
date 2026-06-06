@@ -72,6 +72,9 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK 
 		}
 		rootID = resolvedID
 	}
+	if !jsonOutput {
+		warnIfSyncRunning(client, rootID)
+	}
 
 	req := models.QueryRequest{
 		Query:  queryText,
@@ -97,6 +100,15 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK 
 
 	writeQueryResults(os.Stdout, resp)
 	return nil
+}
+
+func warnIfSyncRunning(client *apiClient, rootID string) {
+	job, _, err := getSyncJob(client, rootID, "")
+	if err != nil || syncJobTerminal(job.Status) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: latest sync job %s is still %s (%d/%d files); querying the previous committed generation\n",
+		job.ID, job.Status, job.Processed, job.TotalFiles)
 }
 
 func writeQueryResults(w io.Writer, resp models.QueryResponse) {

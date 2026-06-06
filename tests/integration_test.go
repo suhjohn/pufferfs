@@ -440,6 +440,90 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		cleanupDone = true
 	})
 
+	t.Run("background sync status jobs and wait CLI", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		projectDir := filepath.Join(homeDir, "background-workspace")
+		writeFile(t, projectDir, "docs/background.md", "# Background Sync\n\nDetached sync jobs can be inspected before querying committed generations.\n")
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName, "--background", "--json")
+		if err != nil {
+			t.Fatalf("background sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var started struct {
+			Status       string `json:"status"`
+			RootID       string `json:"root_id"`
+			SyncJobID    string `json:"sync_job_id"`
+			GenerationID string `json:"generation_id"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &started); err != nil {
+			t.Fatalf("parsing background sync JSON: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if started.Status != "started" || started.RootID == "" || started.SyncJobID == "" || started.GenerationID == "" {
+			t.Fatalf("unexpected background sync result: %#v\nstderr: %s", started, stderr)
+		}
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "status", "--root", env.rootName, "--job-id", started.SyncJobID, "--json")
+		if err != nil {
+			t.Fatalf("sync status failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var status models.SyncJob
+		if err := json.Unmarshal([]byte(stdout), &status); err != nil {
+			t.Fatalf("parsing sync status JSON: %v\nstdout: %s", err, stdout)
+		}
+		if status.ID != started.SyncJobID || status.RootID != started.RootID {
+			t.Fatalf("unexpected sync status: %#v", status)
+		}
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "wait", "--root", env.rootName, "--job-id", started.SyncJobID, "--json")
+		if err != nil {
+			t.Fatalf("sync wait failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var completed models.SyncJob
+		if err := json.Unmarshal([]byte(stdout), &completed); err != nil {
+			t.Fatalf("parsing sync wait JSON: %v\nstdout: %s", err, stdout)
+		}
+		if completed.ID != started.SyncJobID || completed.Status != "completed" {
+			t.Fatalf("unexpected completed sync job: %#v", completed)
+		}
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "jobs", "--root", env.rootName, "--json")
+		if err != nil {
+			t.Fatalf("sync jobs failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var jobs []models.SyncJob
+		if err := json.Unmarshal([]byte(stdout), &jobs); err != nil {
+			t.Fatalf("parsing sync jobs JSON: %v\nstdout: %s", err, stdout)
+		}
+		foundJob := false
+		for _, job := range jobs {
+			if job.ID == started.SyncJobID {
+				foundJob = true
+				break
+			}
+		}
+		if !foundJob {
+			t.Fatalf("sync jobs did not include %s: %#v", started.SyncJobID, jobs)
+		}
+
+		rootID := started.RootID
+		namespaces := rootIndexNamespaces(t, rootID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
+		})
+		assertHasTPRows(t, services, namespaces, "docs/background.md")
+		assertCLIQuery(t, homeDir, env, "detached sync jobs committed generations", env.rootName, "hybrid", "", "docs/background.md")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
 	t.Run("acme-corp R2 source corpus sync and query", func(t *testing.T) {
 		runAcmeCorpSync(t, services)
 	})
