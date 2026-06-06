@@ -1889,7 +1889,7 @@ var markdownLinkRE = regexp.MustCompile(`\[[^\]]+\]\(([^)]+)\)`)
 func looksLikeFixtureFile(name string) bool {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
-	case ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".md", ".txt":
+	case ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".md", ".txt", ".eml", ".msg", ".vcf", ".ics", ".mp3", ".wav", ".mp4", ".mov":
 		return true
 	default:
 		return false
@@ -1978,6 +1978,18 @@ func fixtureFileType(relPath string) string {
 		return "markdown"
 	case ".txt":
 		return "text"
+	case ".eml":
+		return "eml"
+	case ".msg":
+		return "msg"
+	case ".vcf":
+		return "vcf"
+	case ".ics":
+		return "ics"
+	case ".mp3", ".wav":
+		return "audio"
+	case ".mp4", ".mov":
+		return "video"
 	default:
 		return "text"
 	}
@@ -2740,7 +2752,7 @@ func acmeCorpSmokeFixture(key string) bool {
 		return true
 	}
 	switch ext {
-	case ".md", ".txt", ".csv", ".tsv", ".html", ".eml", ".ics", ".vcf":
+	case ".md", ".txt", ".csv", ".tsv", ".html", ".eml", ".msg", ".ics", ".vcf", ".mp3", ".wav", ".mp4", ".mov":
 		return true
 	default:
 		return false
@@ -2750,10 +2762,11 @@ func acmeCorpSmokeFixture(key string) bool {
 // runAcmeCorpSync downloads the acme-corp test directory from the
 // pufferfs-integration-test R2 bucket and syncs it through the full pipeline:
 // local MinIO (storage) + Postgres (DB) + dev Modal (embedding/query embedding).
-// By default it uses text-like fixtures from acme-corp so the deployed Modal app
-// does not need direct write access to local MinIO for generated image artifacts.
-// Set PUFFERFS_E2E_ACME_CORP_FULL_CORPUS=1 to include PDFs, Office documents,
-// images, audio, and video when Modal's S3 secret is configured for writable storage.
+// By default it uses text-like fixtures plus lightweight media from acme-corp so
+// the deployed Modal app does not need direct write access to local MinIO for
+// generated image artifacts. Set PUFFERFS_E2E_ACME_CORP_FULL_CORPUS=1 to include
+// PDFs, Office documents, images, and other large binary files when Modal's S3
+// secret is configured for writable storage.
 //
 // Required env vars:
 //   - PUFFERFS_INTEGRATION_TEST_S3_ENV: R2 credentials for the integration test bucket
@@ -2817,6 +2830,7 @@ func runAcmeCorpSync(t *testing.T, services realServices) {
 	for _, p := range samplePaths {
 		assertHasTPRows(t, services, namespaces, p)
 	}
+	assertAcmeCorpMediaRows(t, services, namespaces, relPaths)
 
 	assertAcmeCorpQueries(t, homeDir, env)
 
@@ -2930,6 +2944,49 @@ func assertAcmeCorpQueries(t *testing.T, homeDir string, env *e2eEnv) {
 		t.Run(tc.name, func(t *testing.T) {
 			assertCLIQuery(t, homeDir, env, tc.query, env.rootName, tc.mode, tc.glob, tc.expectedPath)
 		})
+	}
+}
+
+func assertAcmeCorpMediaRows(t *testing.T, services realServices, namespaces []string, relPaths []string) {
+	t.Helper()
+
+	checked := 0
+	for _, relPath := range relPaths {
+		fileType, ok := mediaFixtureFileType(relPath)
+		if !ok {
+			continue
+		}
+		rows := queryTPRowsForPath(t, services, namespaces, relPath)
+		if len(rows) == 0 {
+			t.Fatalf("expected Turbopuffer rows for ACME media fixture %s, got none", relPath)
+		}
+		for _, row := range rows {
+			if row["file_path"] != relPath {
+				t.Fatalf("expected file_path %s, got %#v", relPath, row["file_path"])
+			}
+			if row["file_type"] != fileType {
+				t.Fatalf("expected file_type %s for %s, got %#v", fileType, relPath, row["file_type"])
+			}
+			content, ok := row["content"].(string)
+			if !ok || !strings.HasPrefix(content, "[") {
+				t.Fatalf("expected timestamped media content for %s, got %#v", relPath, row["content"])
+			}
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Log("no ACME media fixtures selected; media row assertions skipped")
+	}
+}
+
+func mediaFixtureFileType(relPath string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(relPath)) {
+	case ".mp3", ".wav":
+		return "audio", true
+	case ".mp4", ".mov":
+		return "video", true
+	default:
+		return "", false
 	}
 }
 
