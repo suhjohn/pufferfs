@@ -23,12 +23,6 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 
 ### Install CLI
 
-**macOS (Homebrew)**
-
-```bash
-brew install --cask suhjohn/tap/pufferfs
-```
-
 **macOS / Linux (installer script)**
 
 ```bash
@@ -114,21 +108,15 @@ supervisor restarts it on failure and captures logs.
 ### CLI upgrades and versioning
 
 PufferFS CLI releases are SemVer git tags (`v0.3.0`, `v0.3.1`, ...). GoReleaser
-builds macOS and Linux archives for `amd64` and `arm64`, publishes them to
-GitHub Releases with `checksums.txt`, and can update the Homebrew tap.
+builds macOS and Linux archives for `amd64` and `arm64` and publishes them to
+GitHub Releases with `checksums.txt`.
 
 ```bash
 git tag v0.3.0
 git push origin v0.3.0
 ```
 
-Homebrew users upgrade with:
-
-```bash
-brew upgrade --cask pufferfs
-```
-
-Direct installs upgrade with:
+CLI installs upgrade with:
 
 ```bash
 pufferfs upgrade

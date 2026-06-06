@@ -137,12 +137,12 @@ Deleted 1,246 storage objects`,
     name: "upgrade",
     usage: "pufferfs upgrade",
     detail:
-      "Upgrades direct CLI installs from the server release manifest. Homebrew-managed installs should use brew upgrade.",
+      "Upgrades CLI installs from the server release manifest.",
     flags: [
       "--manifest-url <url>: use a custom release manifest",
       "--version <version>: install a specific version",
       "--restart-services: restart installed services after upgrade",
-      "--force: upgrade even if the install appears Homebrew-managed",
+      "--force: install even if the current version is already newer or equal",
     ],
     transcript: `$ pufferfs upgrade
 Downloading pufferfs 0.4.0 for darwin/arm64...
@@ -467,16 +467,7 @@ function Docs() {
               local CLI testing without that stack, use <code>--dry-run</code>{" "}
               to inspect filesystem changes before uploading.
             </p>
-            <h3>macOS (Homebrew)</h3>
-            <div className="code-window">
-              <div className="code-titlebar">
-                <span>terminal</span>
-              </div>
-              <pre className="code-pane solo">{`brew install --cask suhjohn/tap/pufferfs
-pufferfs init`}</pre>
-            </div>
-
-            <h3>macOS / Linux (installer script)</h3>
+            <h3>macOS / Linux</h3>
             <div className="code-window">
               <div className="code-titlebar">
                 <span>terminal</span>

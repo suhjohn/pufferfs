@@ -49,7 +49,7 @@ func upgradeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&options.ManifestURL, "manifest-url", "", "CLI release manifest URL")
 	cmd.Flags().StringVar(&options.TargetVersion, "version", "", "Version to install; defaults to latest")
 	cmd.Flags().BoolVar(&options.RestartServices, "restart-services", options.RestartServices, "Restart installed pufferfs services after upgrading")
-	cmd.Flags().BoolVar(&options.Force, "force", false, "Upgrade even when the install appears to be managed by Homebrew")
+	cmd.Flags().BoolVar(&options.Force, "force", false, "Install even when the current version is newer or equal")
 	return cmd
 }
 
@@ -70,11 +70,7 @@ func checkCLICompatibility(cmd *cobra.Command) error {
 		return fmt.Errorf("pufferfs %s is no longer supported by this server; upgrade to %s or newer", displayVersion(version), displayVersion(manifest.Minimum))
 	}
 	if shouldPrintUpdateNotice(manifest) {
-		fmt.Fprintf(os.Stderr, "pufferfs %s is available; run `pufferfs upgrade`", displayVersion(manifest.Latest))
-		if isHomebrewInstall() {
-			fmt.Fprint(os.Stderr, " or `brew upgrade --cask pufferfs`")
-		}
-		fmt.Fprintln(os.Stderr, ".")
+		fmt.Fprintf(os.Stderr, "pufferfs %s is available; run `pufferfs upgrade`.\n", displayVersion(manifest.Latest))
 		_ = writeUpdateCheckCache()
 	}
 	return nil
@@ -99,9 +95,6 @@ func shouldSkipUpdateCheck(cmd *cobra.Command) bool {
 func runUpgrade(cfg *appconfig.Config, options upgradeOptions) error {
 	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
 		return fmt.Errorf("self-upgrade is not supported on %s; install the new pufferfs binary manually", runtime.GOOS)
-	}
-	if isHomebrewInstall() && !options.Force {
-		return fmt.Errorf("this pufferfs install appears to be managed by Homebrew; run `brew upgrade --cask pufferfs` or pass --force")
 	}
 
 	manifest, err := fetchCLIReleaseManifest(manifestURL(cfg, options.ManifestURL))
@@ -433,20 +426,6 @@ func restartInstalledSystemdServices() error {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
-}
-
-func isHomebrewInstall() bool {
-	exe, err := os.Executable()
-	if err != nil {
-		return false
-	}
-	exe = filepath.Clean(exe)
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = filepath.Clean(resolved)
-	}
-	return strings.Contains(exe, "/Cellar/pufferfs/") ||
-		strings.Contains(exe, "/Homebrew/Cellar/pufferfs/") ||
-		strings.Contains(exe, "/Caskroom/pufferfs/")
 }
 
 func normalizeVersion(v string) string {

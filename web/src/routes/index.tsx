@@ -166,9 +166,9 @@ change: notes/standup-2026-06-05.md (added) → 3 chunks added`}</pre>
         </p>
         <div className="code-window cli-setup-window">
           <div className="code-titlebar">
-            <span>terminal — macOS</span>
+            <span>terminal — macOS / Linux</span>
           </div>
-          <pre className="code-pane solo">{`$ brew install --cask suhjohn/tap/pufferfs
+          <pre className="code-pane solo">{`$ curl -fsSL https://pufferfs.com/install.sh | sh
 $ pufferfs init
 Opening browser to connect your PufferFS account...
 Config written to ~/.tpfs/config.toml

@@ -7,12 +7,6 @@ AI-agent systems.
 
 ## Installation
 
-### macOS (Homebrew)
-
-```sh
-brew install --cask suhjohn/tap/pufferfs
-```
-
 ### macOS / Linux (installer script)
 
 Works on both macOS and Linux (`amd64` and `arm64`). Downloads the latest release, verifies checksums, and installs to `/usr/local/bin`:
@@ -442,7 +436,6 @@ pufferfs upgrade
 
 What to expect:
 
-- Homebrew-managed installs should use Homebrew upgrade instead.
 - Direct upgrades download a platform archive.
 - The archive checksum is verified.
 - The current binary is replaced.
