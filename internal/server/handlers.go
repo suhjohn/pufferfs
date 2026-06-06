@@ -2309,6 +2309,18 @@ func detectFileType(path string) string {
 		return "pptx"
 	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp":
 		return "image"
+	case ".eml":
+		return "eml"
+	case ".msg":
+		return "msg"
+	case ".vcf":
+		return "vcf"
+	case ".ics":
+		return "ics"
+	case ".mp3", ".wav":
+		return "audio"
+	case ".mp4", ".mov":
+		return "video"
 	default:
 		return "auto"
 	}

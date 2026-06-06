@@ -10,9 +10,9 @@ import (
 // localChunkable returns true if the file type can be chunked locally without Modal.
 func localChunkable(filePath string) bool {
 	ft := detectFileType(filePath)
-	// PDF, DOCX, PPTX, images require Modal (Gemini vision, LibreOffice, PyMuPDF)
+	// Binary and structured formats require Modal for specialized extraction.
 	switch ft {
-	case "pdf", "docx", "pptx", "image":
+	case "pdf", "docx", "pptx", "image", "eml", "msg", "vcf", "ics", "audio", "video":
 		return false
 	}
 	// Everything else (code, markdown, text) can be chunked locally.
