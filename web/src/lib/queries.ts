@@ -22,6 +22,14 @@ export interface Billing {
   currentPeriodEnd?: string;
 }
 
+export interface APIKey {
+  id: string;
+  name: string;
+  scopes: string[];
+  created_at: string;
+  expires_at?: string;
+}
+
 // The Go API returns JSON `null` for empty slices, so every list query coalesces
 // to [] to keep components total.
 export async function fetchRoots(): Promise<Root[]> {
@@ -34,6 +42,21 @@ export function fetchOrg(): Promise<Org> {
 
 export async function fetchMembers(): Promise<Member[]> {
   return (await api<Member[] | null>("/org/members")) ?? [];
+}
+
+export async function fetchAPIKeys(): Promise<APIKey[]> {
+  return (await api<APIKey[] | null>("/auth/api-keys")) ?? [];
+}
+
+export async function createCLIKey(): Promise<string> {
+  const { key } = await api<{ key: string }>("/auth/api-keys", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "CLI key",
+      scopes: ["sync", "query", "root:delete"],
+    }),
+  });
+  return key;
 }
 
 export async function fetchBilling(): Promise<Billing> {

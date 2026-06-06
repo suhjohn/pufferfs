@@ -116,6 +116,7 @@ func main() {
 			JWTSecret:          jwtSecret,
 			FrontendURL:        frontendURL,
 			Cookie:             cookieCfg,
+			CreateAPIKey:       db.CreateAPIKey,
 		}, db.UpsertUser)
 
 		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)

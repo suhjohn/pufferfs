@@ -37,7 +37,7 @@ var defaultIgnore = []string{
 	"*.class",
 }
 
-// secretPatterns are filename patterns that trigger secret warnings.
+// secretPatterns are filename patterns that are excluded from sync by default.
 var secretPatterns = []string{
 	".env",
 	".env.*",
@@ -92,6 +92,9 @@ func NewMatcher(rootDir string) *Matcher {
 
 // ShouldIgnore returns true if the given relative path should be excluded.
 func (m *Matcher) ShouldIgnore(relPath string, isDir bool) bool {
+	if IsSecretFile(relPath) {
+		return true
+	}
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
 	for _, p := range m.patterns {
 		if r := p.Match(parts, isDir); r == gitignore.Exclude {

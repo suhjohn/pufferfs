@@ -19,16 +19,19 @@ export const Route = createRootRoute({
       {
         name: "description",
         content:
-          "PufferFS — a synced, queryable filesystem for your organization.",
+          "PufferFS — hybrid search retrieval for your agents over a local filesystem or sandbox.",
       },
       { property: "og:title", content: "PufferFS" },
       {
         property: "og:description",
         content:
-          "PufferFS — a synced, queryable filesystem for your organization.",
+          "PufferFS — hybrid search retrieval for your agents over a local filesystem or sandbox.",
       },
     ],
-    links: [{ rel: "stylesheet", href: appCss }],
+    links: [
+      { rel: "icon", type: "image/svg+xml", href: "/favicon.svg" },
+      { rel: "stylesheet", href: appCss },
+    ],
   }),
   component: RootComponent,
 });
