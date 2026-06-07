@@ -34,6 +34,7 @@ type SyncGeneration struct {
 	ID                string
 	OrgID             string
 	RootID            string
+	SyncJobID         string
 	BaseGenerationID  string
 	Seq               int64
 	BaseGenerationSeq int64
@@ -1164,10 +1165,25 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 		ID:                generationID,
 		OrgID:             orgID,
 		RootID:            rootID,
+		SyncJobID:         syncJobID,
 		BaseGenerationID:  baseGenerationID,
 		Seq:               seq,
 		BaseGenerationSeq: baseSeq,
 	}, nil
+}
+
+func (db *DB) GetSyncGeneration(ctx context.Context, orgID, rootID, generationID string) (*SyncGeneration, error) {
+	var generation SyncGeneration
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, org_id, root_id, COALESCE(sync_job_id, ''), COALESCE(base_generation_id, ''), seq, base_generation_seq
+		 FROM sync_generations
+		 WHERE id = $1 AND org_id = $2 AND root_id = $3 AND status = 'building'`,
+		generationID, orgID, rootID,
+	).Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.SyncJobID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq)
+	if err != nil {
+		return nil, err
+	}
+	return &generation, nil
 }
 
 func validateSyncBase(clientBaseGenerationID string, clientBaseGenerationSeq int64, visibleGenerationID string, visibleGenerationSeq int64) error {

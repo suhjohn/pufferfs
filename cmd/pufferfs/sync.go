@@ -421,12 +421,18 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 			return nil, fmt.Errorf("loading remote root metadata: %w", err)
 		}
 	}
+	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
+	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
+	var hashCache map[string]models.FileState
+	if useLocalCache && rootID != "" {
+		hashCache, _ = loadLocalState(rootID)
+	}
 
 	// Build Merkle tree (parallel file hashing)
 	matcher := ignore.NewMatcher(dir)
 	fmt.Fprintf(log, "Building Merkle tree for %s...\n", dir)
 	start := time.Now()
-	currentTree, err := merkle.BuildTree(dir, matcher)
+	currentTree, err := merkle.BuildTreeWithStateCache(dir, matcher, hashCache)
 	if err != nil {
 		return nil, fmt.Errorf("building Merkle tree: %w", err)
 	}
@@ -435,8 +441,6 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 	// Extract flat state for backward compatibility with server
 	currentState := currentTree.ToFileStateMap()
 
-	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
-	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
 	if !useLocalCache {
 		fmt.Fprintln(log, "Remote generation changed; diffing against remote state.")
 		previousState, err := loadRemoteState(client, rootID)
@@ -524,10 +528,30 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	changeCount := countChanges(result)
 	fmt.Fprintf(log, "Syncing %d changes to root %s...\n", changeCount, rootID)
 
+	syncInit, err := initSyncSession(client, rootID, baseGenerationID, baseGenerationSeq, changeCount)
+	if err != nil {
+		if conflict, ok := syncConflictFromError(err); ok {
+			return nil, conflict
+		}
+		return nil, fmt.Errorf("initializing sync session: %w", err)
+	}
+	syncSubmitted := false
+	defer func() {
+		if !syncSubmitted {
+			_ = abortSyncSession(client, rootID, syncInit.GenerationID)
+		}
+	}()
+	baseGenerationID = syncInit.BaseGenerationID
+	baseGenerationSeq = syncInit.BaseGenerationSeq
+
 	changes := withAbsolutePaths(dir, filterChanges(result))
 	manifestRef, err := uploadChangedFiles(client, rootID, dir, changes)
 	if err != nil {
 		return nil, err
+	}
+	changeRefs, err := uploadChangeShards(client, rootID, syncInit.GenerationID, changes)
+	if err != nil {
+		return nil, fmt.Errorf("uploading change shards: %w", err)
 	}
 
 	// Build content proof from Merkle tree
@@ -537,7 +561,11 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		DirHashes:  proof.DirHashes,
 		RootHash:   proof.RootHash,
 	}
-	stateRef, err := uploadRootState(client, rootID, currentState)
+	contentProofRef, err := uploadContentProof(client, rootID, syncInit.GenerationID, contentProof)
+	if err != nil {
+		return nil, fmt.Errorf("uploading content proof: %w", err)
+	}
+	stateRef, err := uploadRootState(client, rootID, syncInit.GenerationID, currentState)
 	if err != nil {
 		return nil, fmt.Errorf("uploading root state: %w", err)
 	}
@@ -546,12 +574,14 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	syncReq := models.SyncRequest{
 		ProtocolVersion:   models.SyncProtocolVersion,
 		RootID:            rootID,
+		GenerationID:      syncInit.GenerationID,
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
-		Changes:           changes,
+		ChangeRefs:        changeRefs,
+		ChangeCount:       changeCount,
 		StateRef:          stateRef,
 		SimHash:           currentTree.SimHashHex(),
-		ContentProof:      contentProof,
+		ContentProofRef:   contentProofRef,
 		ManifestRef:       manifestRef,
 	}
 
@@ -562,6 +592,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		}
 		return nil, fmt.Errorf("sync request: %w", err)
 	}
+	syncSubmitted = true
 
 	var syncResp models.SyncResponse
 	if err := json.Unmarshal(respBody, &syncResp); err != nil {
@@ -1017,6 +1048,88 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 	return key, nil
 }
 
+func initSyncSession(client *apiClient, rootID, baseGenerationID string, baseGenerationSeq int64, totalFiles int) (*models.SyncInitResponse, error) {
+	req := models.SyncInitRequest{
+		ProtocolVersion:   models.SyncProtocolVersion,
+		BaseGenerationID:  baseGenerationID,
+		BaseGenerationSeq: baseGenerationSeq,
+		TotalFiles:        totalFiles,
+	}
+	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync/init", rootID), req)
+	if err != nil {
+		return nil, err
+	}
+	var resp models.SyncInitResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, err
+	}
+	if resp.GenerationID == "" || resp.SyncJobID == "" {
+		return nil, fmt.Errorf("sync init response missing generation or job id")
+	}
+	return &resp, nil
+}
+
+func uploadSyncArtifact(client *apiClient, rootID, generationID, kind, name string, data []byte, contentType string) (string, error) {
+	path := fmt.Sprintf("/roots/%s/sync/%s/upload?kind=%s&name=%s", rootID, generationID, url.QueryEscape(kind), url.QueryEscape(name))
+	respBody, err := client.postRaw(path, data, contentType)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return "", err
+	}
+	return resp.Key, nil
+}
+
+func abortSyncSession(client *apiClient, rootID, generationID string) error {
+	if client == nil || rootID == "" || generationID == "" {
+		return nil
+	}
+	_, err := client.delete(fmt.Sprintf("/roots/%s/sync/%s", rootID, generationID))
+	return err
+}
+
+func uploadChangeShards(client *apiClient, rootID, generationID string, changes []models.FileChange) ([]string, error) {
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	shardSize := uploadChangeShardMaxFiles()
+	refs := make([]string, 0, (len(changes)+shardSize-1)/shardSize)
+	for start := 0; start < len(changes); start += shardSize {
+		end := start + shardSize
+		if end > len(changes) {
+			end = len(changes)
+		}
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for _, change := range changes[start:end] {
+			if err := enc.Encode(change); err != nil {
+				return nil, err
+			}
+		}
+		key, err := uploadSyncArtifact(client, rootID, generationID, "manifest", fmt.Sprintf("%06d.jsonl", len(refs)), buf.Bytes(), "application/x-ndjson")
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, key)
+	}
+	return refs, nil
+}
+
+func uploadContentProof(client *apiClient, rootID, generationID string, proof *models.ContentProofData) (string, error) {
+	if proof == nil {
+		return "", nil
+	}
+	data, err := json.Marshal(proof)
+	if err != nil {
+		return "", err
+	}
+	return uploadSyncArtifact(client, rootID, generationID, "proof", "content-proof.json", data, "application/json")
+}
+
 func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
@@ -1052,7 +1165,7 @@ func uploadBundle(client *apiClient, rootID, bundleID string, data []byte, conte
 	return resp.Key, nil
 }
 
-func uploadRootState(client *apiClient, rootID string, state map[string]models.FileState) (string, error) {
+func uploadRootState(client *apiClient, rootID, generationID string, state map[string]models.FileState) (string, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	if err := json.NewEncoder(gz).Encode(state); err != nil {
@@ -1062,7 +1175,7 @@ func uploadRootState(client *apiClient, rootID string, state map[string]models.F
 	if err := gz.Close(); err != nil {
 		return "", err
 	}
-	return uploadBundle(client, rootID, fmt.Sprintf("state-%d.json.gz", time.Now().UnixNano()), buf.Bytes(), "application/gzip")
+	return uploadSyncArtifact(client, rootID, generationID, "state", "state.json.gz", buf.Bytes(), "application/gzip")
 }
 
 func uploadBundleSmallFileLimit() int64 {
@@ -1087,6 +1200,19 @@ func uploadBundleMaxBytes() int64 {
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < 1 {
 		return defaultBytes
+	}
+	return value
+}
+
+func uploadChangeShardMaxFiles() int {
+	const defaultFiles = 5000
+	raw := os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES")
+	if raw == "" {
+		return defaultFiles
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return defaultFiles
 	}
 	return value
 }

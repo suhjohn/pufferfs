@@ -112,6 +112,10 @@ func cleanupGenerationKeys(req *models.SyncRequest, msg queue.JobMessage) []stri
 		if req.ManifestRef != "" {
 			keys = append(keys, req.ManifestRef)
 		}
+		if req.ContentProofRef != "" {
+			keys = append(keys, req.ContentProofRef)
+		}
+		keys = append(keys, req.ChangeRefs...)
 		for _, change := range req.Changes {
 			if change.Status != models.StatusAdded && change.Status != models.StatusModified {
 				continue

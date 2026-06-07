@@ -251,8 +251,64 @@ Submit a sync. See [Sync](#sync) below.
 
 ### `POST /roots/{id}/sync/init`
 
-Retained for old clients only. Returns `{"can_reuse": false}`; performs no
-namespace cloning.
+Initialize a sync session. Creates a `SyncJob` and a building `SyncGeneration`
+server-side, returning IDs and a manifest prefix the client uses for subsequent
+artifact uploads. Requires scope `sync` / `write` and write access to the root.
+
+Request:
+
+```json
+{
+  "protocol_version": 1,
+  "base_generation_id": "<current-visible-generation-or-empty>",
+  "base_generation_seq": 7,
+  "total_files": 500
+}
+```
+
+Response `200`:
+
+```json
+{
+  "root_id": "...",
+  "sync_job_id": "...",
+  "generation_id": "...",
+  "generation_seq": 8,
+  "base_generation_id": "...",
+  "base_generation_seq": 7,
+  "manifest_prefix": "syncs/<generation_id>/manifests/"
+}
+```
+
+If `base_generation_id`/`seq` is stale, returns `409` with a sync conflict
+(same shape as [sync conflicts](#sync-conflicts)).
+
+### `POST /roots/{id}/sync/{generation_id}/upload`
+
+Upload a generation-scoped artifact. Requires scope `sync` / `write`. The
+artifact `kind` and `name` are specified as query parameters:
+
+```
+POST /roots/{id}/sync/{generation_id}/upload?kind=manifest&name=000000.jsonl
+POST /roots/{id}/sync/{generation_id}/upload?kind=proof&name=content-proof.json
+POST /roots/{id}/sync/{generation_id}/upload?kind=state&name=state.json.gz
+```
+
+Body is the raw artifact bytes (gzipped JSONL for manifests, gzipped JSON for
+state/proof). **Max 512 MiB.** Returns `200` with the stored object key:
+
+```json
+{ "ref": "syncs/<generation_id>/manifests/000000.jsonl" }
+```
+
+### `DELETE /roots/{id}/sync/{generation_id}`
+
+Abort an unsubmitted sync session. Marks the generation as `failed` and cleans
+up any artifacts already uploaded under `syncs/<generation_id>/`. Requires scope
+`sync` / `write`. Returns `200 {"status":"aborted"}`.
+
+Use this if the client encounters an upload error before calling
+`POST /roots/{id}/sync` to finalize.
 
 ### `GET /roots/{id}/sync/status[?job_id=<id>]`
 
@@ -278,18 +334,27 @@ every changed path. Request body is a `SyncRequest`:
 ```json
 {
   "protocol_version": 1,
+  "generation_id": "<from-sync-init>",
   "base_generation_id": "<id-or-empty>",
   "base_generation_seq": 7,
-  "changes": [
-    { "path": "docs/a.md", "status": "ADDED", "content_hash": "...", "size": 1234,
-      "source_key": "bundles/<root>/<bundle>", "source_offset": 0, "source_length": 1234 }
-  ],
-  "state_ref": "bundles/<root>/<stateBundle>",
+  "change_refs": ["syncs/<generation>/manifests/000000.jsonl", "..."],
+  "changes": [],
+  "state_ref": "syncs/<generation>/state/state.json.gz",
   "simhash": "...",
   "content_proof": { "root_hash": "...", "file_hashes": {}, "dir_hashes": {} },
   "manifest_ref": "..."
 }
 ```
+
+When using the manifest-session flow (recommended for large trees):
+
+1. Call `POST /roots/{id}/sync/init` to get a `generation_id`.
+2. Upload manifest shards and state via `POST /roots/{id}/sync/{generation_id}/upload`.
+3. Submit the finalize request with `generation_id` and `change_refs` pointing to
+   the uploaded manifest shards. `changes` can be empty when `change_refs` is provided.
+
+For backward compatibility, inline `changes` without a `generation_id` still works
+for small syncs.
 
 Rules:
 

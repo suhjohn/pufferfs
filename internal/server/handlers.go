@@ -111,6 +111,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
 	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
+	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/upload", s.handleSyncArtifactUpload)
+	s.mux.HandleFunc("DELETE /roots/{id}/sync/{generation_id}", s.handleSyncAbort)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
 	s.mux.HandleFunc("GET /roots/{id}/sync/status", s.handleSyncStatus)
 	s.mux.HandleFunc("GET /roots/{id}/sync/jobs", s.handleListSyncJobs)
@@ -1075,6 +1077,87 @@ func safeObjectName(name string) string {
 	return b.String()
 }
 
+func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	generationID := r.PathValue("generation_id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canWriteRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	if _, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+		return
+	}
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	name := safeObjectName(strings.TrimSpace(r.URL.Query().Get("name")))
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name query param required"})
+		return
+	}
+	var s3Key string
+	switch kind {
+	case "manifest":
+		s3Key = fmt.Sprintf("syncs/%s/manifests/%s", generationID, name)
+	case "proof":
+		s3Key = fmt.Sprintf("syncs/%s/proofs/%s", generationID, name)
+	case "state":
+		s3Key = stateObjectKey(rootID, generationID)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "kind must be manifest, proof, or state"})
+		return
+	}
+	const maxUploadSize = 1024 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
+}
+
+func (s *Server) handleSyncAbort(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	generationID := r.PathValue("generation_id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canWriteRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+		return
+	}
+	_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
+	if generation.SyncJobID != "" {
+		_ = s.db.CompleteSyncJob(r.Context(), generation.SyncJobID, "failed", []map[string]string{{"error": "sync aborted"}})
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
+}
+
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
@@ -1101,7 +1184,6 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
-// handleSyncInit is kept for old clients. Namespace cloning is disabled.
 func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
@@ -1119,11 +1201,58 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-
-	type initResponse struct {
-		CanReuse bool `json:"can_reuse"`
+	if r.Body == nil || r.ContentLength == 0 {
+		writeJSON(w, http.StatusOK, map[string]bool{"can_reuse": false})
+		return
 	}
-	writeJSON(w, http.StatusOK, initResponse{})
+
+	var req models.SyncInitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.ProtocolVersion != models.SyncProtocolVersion {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":            fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion),
+			"protocol_version": req.ProtocolVersion,
+			"required_version": models.SyncProtocolVersion,
+		})
+		return
+	}
+	if err := validateSyncBase(req.BaseGenerationID, req.BaseGenerationSeq, root.VisibleGenerationID, root.VisibleGenerationSeq); err != nil {
+		writeSyncConflict(w, err, &models.SyncRequest{BaseGenerationID: req.BaseGenerationID, BaseGenerationSeq: req.BaseGenerationSeq}, root.VisibleGenerationID, root.VisibleGenerationSeq)
+		return
+	}
+	job, err := s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, req.TotalFiles)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync job: " + err.Error()})
+		return
+	}
+	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, "", req.BaseGenerationID, req.BaseGenerationSeq)
+	if err != nil {
+		_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		if errors.Is(err, errStaleSyncBase) {
+			if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
+				writeSyncConflict(w, err, &models.SyncRequest{BaseGenerationID: req.BaseGenerationID, BaseGenerationSeq: req.BaseGenerationSeq}, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
+				return
+			}
+		}
+		status := http.StatusInternalServerError
+		if errors.Is(err, errSyncInProgress) {
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, models.SyncInitResponse{
+		RootID:            rootID,
+		SyncJobID:         job.ID,
+		GenerationID:      generation.ID,
+		GenerationSeq:     generation.Seq,
+		BaseGenerationID:  generation.BaseGenerationID,
+		BaseGenerationSeq: generation.BaseGenerationSeq,
+		ManifestPrefix:    fmt.Sprintf("syncs/%s/manifests/", generation.ID),
+	})
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
@@ -1167,6 +1296,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state or state_ref is required"})
 		return
 	}
+	if len(req.Changes) == 0 && len(req.ChangeRefs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "changes or change_refs is required"})
+		return
+	}
 	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
@@ -1191,33 +1324,52 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			actionableFiles++
 		}
 	}
+	if actionableFiles == 0 && req.ChangeCount > 0 {
+		actionableFiles = req.ChangeCount
+	}
 
-	// Create sync job
-	job, err := s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)
-	if err != nil {
-		log.Printf("warning: failed to create sync job: %v", err)
-	}
-	syncJobID := ""
-	if job != nil {
-		syncJobID = job.ID
-	}
-	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef, req.BaseGenerationID, req.BaseGenerationSeq)
-	if err != nil {
-		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+	var job *models.SyncJob
+	var generation *SyncGeneration
+	if req.GenerationID != "" {
+		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, req.GenerationID)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+			return
 		}
-		if errors.Is(err, errStaleSyncBase) {
-			if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
-				writeSyncConflict(w, err, &req, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
+		if generation.SyncJobID != "" {
+			job, err = s.db.GetSyncJob(r.Context(), id.OrgID, generation.SyncJobID)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "loading sync job: " + err.Error()})
 				return
 			}
 		}
-		status := http.StatusInternalServerError
-		if errors.Is(err, errSyncInProgress) {
-			status = http.StatusConflict
+	} else {
+		job, err = s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)
+		if err != nil {
+			log.Printf("warning: failed to create sync job: %v", err)
 		}
-		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
-		return
+		syncJobID := ""
+		if job != nil {
+			syncJobID = job.ID
+		}
+		generation, err = s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef, req.BaseGenerationID, req.BaseGenerationSeq)
+		if err != nil {
+			if job != nil {
+				_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
+			}
+			if errors.Is(err, errStaleSyncBase) {
+				if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
+					writeSyncConflict(w, err, &req, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
+					return
+				}
+			}
+			status := http.StatusInternalServerError
+			if errors.Is(err, errSyncInProgress) {
+				status = http.StatusConflict
+			}
+			writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
+			return
+		}
 	}
 	if err := s.ensureSyncStateRef(r.Context(), rootID, generation.ID, &req); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
@@ -1255,10 +1407,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest, currentGenerationID string, currentGenerationSeq int64) {
+	var clientBaseGenerationID string
+	var clientBaseGenerationSeq int64
+	if req != nil {
+		clientBaseGenerationID = req.BaseGenerationID
+		clientBaseGenerationSeq = req.BaseGenerationSeq
+	}
 	writeJSON(w, http.StatusConflict, models.SyncConflictResponse{
 		Error:                   err.Error(),
-		ClientBaseGenerationID:  req.BaseGenerationID,
-		ClientBaseGenerationSeq: req.BaseGenerationSeq,
+		ClientBaseGenerationID:  clientBaseGenerationID,
+		ClientBaseGenerationSeq: clientBaseGenerationSeq,
 		CurrentGenerationID:     currentGenerationID,
 		CurrentGenerationSeq:    currentGenerationSeq,
 	})
@@ -1281,18 +1439,15 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		return resp, nil
 	}
 
-	if req.ContentProof != nil {
-		proofBytes, _ := json.Marshal(req.ContentProof)
-		if err := s.db.UpsertContentProof(ctx, orgID, userID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
-			_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-			if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-				log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-			}
-			if job != nil {
-				_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-			}
-			return nil, fmt.Errorf("storing content proof: %w", err)
+	if err := s.storeSyncContentProof(ctx, orgID, userID, rootID, req); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
 		}
+		if job != nil {
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return nil, fmt.Errorf("storing content proof: %w", err)
 	}
 	if err := s.cleanupFailedGenerationRowsForRoot(ctx, orgID, rootID); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
@@ -1332,6 +1487,32 @@ func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, gene
 		return s.enqueueSync(ctx, orgID, userID, generation, req, job)
 	}
 	return s.processSync(ctx, orgID, generation, req, job)
+}
+
+func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootID string, req *models.SyncRequest) error {
+	if req == nil {
+		return nil
+	}
+	proof := req.ContentProof
+	var proofBytes []byte
+	if proof != nil {
+		proofBytes, _ = json.Marshal(proof)
+	} else if req.ContentProofRef != "" {
+		data, err := s.s3.Download(ctx, req.ContentProofRef)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", req.ContentProofRef, err)
+		}
+		var parsed models.ContentProofData
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			return fmt.Errorf("parsing %s: %w", req.ContentProofRef, err)
+		}
+		proof = &parsed
+		proofBytes = data
+	}
+	if proof == nil {
+		return nil
+	}
+	return s.db.UpsertContentProof(ctx, orgID, userID, rootID, proof.RootHash, proofBytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,7 +1747,11 @@ func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootI
 		return checkPermission(acls, filePath, "write")
 	}
 
-	for _, change := range req.Changes {
+	changes, err := s.syncRequestChangesForACL(ctx, req)
+	if err != nil {
+		return err
+	}
+	for _, change := range changes {
 		switch change.Status {
 		case models.StatusAdded, models.StatusModified, models.StatusRemoved:
 			if !canWrite(change.Path) {
@@ -1582,6 +1767,34 @@ func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootI
 		}
 	}
 	return nil
+}
+
+func (s *Server) syncRequestChangesForACL(ctx context.Context, req *models.SyncRequest) ([]models.FileChange, error) {
+	if req == nil {
+		return nil, nil
+	}
+	if len(req.ChangeRefs) == 0 || len(req.Changes) > 0 {
+		return req.Changes, nil
+	}
+	var changes []models.FileChange
+	for _, ref := range req.ChangeRefs {
+		data, err := s.s3.Download(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("downloading change ref %s: %w", ref, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(data))
+		for {
+			var change models.FileChange
+			if err := dec.Decode(&change); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("parsing change ref %s: %w", ref, err)
+			}
+			changes = append(changes, change)
+		}
+	}
+	return changes, nil
 }
 
 // checkReadACL checks if a user has read permission for a path in a root.

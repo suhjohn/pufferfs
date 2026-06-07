@@ -43,6 +43,10 @@ type Tree struct {
 // Files are hashed with SHA-256. Directory hashes are derived from sorted child hashes.
 // Uses a worker pool for parallel file hashing.
 func BuildTree(rootDir string, matcher *ignore.Matcher) (*Tree, error) {
+	return BuildTreeWithStateCache(rootDir, matcher, nil)
+}
+
+func BuildTreeWithStateCache(rootDir string, matcher *ignore.Matcher, stateCache map[string]models.FileState) (*Tree, error) {
 	rootDir = filepath.Clean(rootDir)
 	root := &Node{
 		Name:     filepath.Base(rootDir),
@@ -128,6 +132,10 @@ func BuildTree(rootDir string, matcher *ignore.Matcher) (*Tree, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			if cached, ok := stateCache[entry.relPath]; ok && cached.Size == entry.size && cached.Mtime == entry.mtime && cached.ContentHash != "" {
+				results[idx] = hashResult{index: idx, hash: cached.ContentHash}
+				return
+			}
 			hash, err := hashFile(entry.absPath)
 			results[idx] = hashResult{index: idx, hash: hash, err: err}
 		}(i, f)

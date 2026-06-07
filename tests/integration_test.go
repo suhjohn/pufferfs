@@ -440,6 +440,45 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		cleanupDone = true
 	})
 
+	t.Run("blocking sync with manifest-session shards remains queryable", func(t *testing.T) {
+		t.Setenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES", "1")
+		env := newE2EEnv(t, services, "")
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		projectDir := filepath.Join(homeDir, "sharded-workspace")
+		writeFile(t, projectDir, "docs/one.md", "# One\n\nAlpha sharded change reference content.\n")
+		writeFile(t, projectDir, "docs/two.md", "# Two\n\nBeta sharded change reference content.\n")
+		writeFile(t, projectDir, "docs/three.md", "# Three\n\nGamma sharded change reference content.\n")
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("sharded blocking sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+		assertMinioHasPrefix(t, "syncs/")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		namespaces := rootIndexNamespaces(t, rootID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
+		})
+		assertCLIQuery(t, homeDir, env, "Gamma sharded change reference", env.rootName, "hybrid", "", "docs/three.md")
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("sharded no-op sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "No changes detected")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
 	t.Run("background sync status jobs and wait CLI", func(t *testing.T) {
 		env := newE2EEnv(t, services, "")
 		homeDir := t.TempDir()

@@ -144,14 +144,13 @@ func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage
 	if _, err := p.loadIndexNamespaces(ctx); err != nil {
 		return nil, err
 	}
-	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
-	msgs := make([]queue.JobMessage, 0, len(shards))
-	for i, shard := range shards {
-		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
-		if err != nil {
-			return nil, err
-		}
-		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(shards)))
+	refs, err := p.inputShardRefs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	msgs := make([]queue.JobMessage, 0, len(refs))
+	for i, ref := range refs {
+		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(refs)))
 	}
 	return msgs, nil
 }
@@ -230,6 +229,10 @@ func syncInputShardKey(generationID string, shardIndex int) string {
 	return fmt.Sprintf("syncs/%s/inputs/shard-%06d.jsonl", generationID, shardIndex)
 }
 
+func syncManifestShardKey(generationID string, shardIndex int) string {
+	return fmt.Sprintf("syncs/%s/manifests/%06d.jsonl", generationID, shardIndex)
+}
+
 func chunkShardJobID(generationID string, shardIndex int) string {
 	return fmt.Sprintf("%s-chunk-%06d", generationID, shardIndex)
 }
@@ -265,7 +268,7 @@ func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
 	next := msg
 	next.JobID = chunkShardJobID(msg.GenerationID, nextIndex)
 	next.Stage = syncStageChunk
-	next.PayloadRef = syncInputShardKey(msg.GenerationID, nextIndex)
+	next.PayloadRef = syncManifestShardKey(msg.GenerationID, nextIndex)
 	next.CleanupKeys = nil
 	next.ShardIndex = nextIndex
 	next.EnqueuedAt = time.Now().UTC()
@@ -273,21 +276,42 @@ func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
 }
 
 func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
-	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
-	if len(shards) == 0 {
+	refs, err := p.inputShardRefs(ctx)
+	if err != nil {
+		return err
+	}
+	if len(refs) == 0 {
 		return nil
 	}
-	jobs := make([]objectQueueJob, 0, len(shards))
-	for i, shard := range shards {
-		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
-		if err != nil {
-			return err
-		}
+	jobs := make([]objectQueueJob, 0, len(refs))
+	for i, ref := range refs {
 		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref)
 		job.JobID = chunkShardJobID(p.generation.ID, i)
 		jobs = append(jobs, job)
 	}
 	return p.broker.Push(ctx, p.generation.ID, syncStageChunk, jobs...)
+}
+
+func (p *syncPipeline) inputShardRefs(ctx context.Context) ([]string, error) {
+	if len(p.req.ChangeRefs) > 0 {
+		refs := make([]string, 0, len(p.req.ChangeRefs))
+		for _, ref := range p.req.ChangeRefs {
+			if ref != "" {
+				refs = append(refs, ref)
+			}
+		}
+		return refs, nil
+	}
+	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
+	refs := make([]string, 0, len(shards))
+	for i, shard := range shards {
+		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
 }
 
 func (p *syncPipeline) runChunkStage(ctx context.Context) error {
