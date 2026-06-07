@@ -171,7 +171,7 @@ ignore rules. Anything matched by an ignore rule is excluded from the Merkle
 tree, the diff, the upload, and the search index.
 
 Ignore matching is **local CLI behavior**. The API server does not read
-`.gitignore`, `.tpfsignore`, or `~/.tpfs/ignore`, because those files live on
+`.gitignore`, `.tpfsignore`, or `~/.tpfs/.tpfsignore`, because those files live on
 the syncing machine and the server only receives the submitted sync request,
 state, and uploaded objects. Direct API clients must apply their own filtering
 before calling `POST /roots/{id}/sync`; the server still enforces authentication,
@@ -186,7 +186,7 @@ write ACLs, protocol validation, and upload limits.
 | **Secret-file patterns** | All projects | Filename glob (see below) |
 | **`.gitignore`** | Directory where the file lives (recursive) | [gitignore syntax](https://git-scm.com/docs/gitignore) |
 | **`.tpfsignore`** | Directory where the file lives (recursive) | gitignore syntax |
-| **`~/.tpfs/ignore`** | All projects for the current user | gitignore syntax |
+| **`~/.tpfs/.tpfsignore`** | All projects for the current user | gitignore syntax |
 
 A file is excluded if **any** source matches it. There is currently no negation
 or override mechanism across sources (though negation patterns such as `!keep`
@@ -221,14 +221,14 @@ You can place `.tpfsignore` files in subdirectories for scoped rules:
 *.arrow
 ```
 
-#### `~/.tpfs/ignore` (global)
+#### `~/.tpfs/.tpfsignore` (global)
 
-The global ignore file at `~/.tpfs/ignore` applies to **every** project synced
+The global ignore file at `~/.tpfs/.tpfsignore` applies to **every** project synced
 by the current user. Use it for machine-specific patterns that should never be
 synced regardless of project.
 
 ```text
-# ~/.tpfs/ignore
+# ~/.tpfs/.tpfsignore
 # Editor swap/backup files
 *.swp
 *.swo

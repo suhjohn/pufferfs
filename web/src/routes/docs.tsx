@@ -333,7 +333,7 @@ const IGNORE_RULE_SOURCES = [
   ["Secret-file patterns", "All projects", ".env, private keys, credentials.json, package-manager auth files"],
   [".gitignore", "Directory where the file lives, recursive", "Gitignore syntax"],
   [".tpfsignore", "Directory where the file lives, recursive", "Gitignore syntax"],
-  ["~/.tpfs/ignore", "All projects for the current user", "Gitignore syntax"],
+  ["~/.tpfs/.tpfsignore", "All projects for the current user", "Gitignore syntax"],
 ];
 
 const SECURITY_SECTIONS = [
@@ -528,7 +528,7 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
                 <p>
                   Add a <code>.tpfsignore</code> file anywhere in a synced
                   folder for project-specific rules. Add{" "}
-                  <code>~/.tpfs/ignore</code> for global user rules that apply
+                  <code>~/.tpfs/.tpfsignore</code> for global user rules that apply
                   to every project on the current machine. Both use gitignore
                   syntax.
                 </p>

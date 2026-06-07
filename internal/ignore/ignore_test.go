@@ -68,3 +68,24 @@ func TestMatcherScopesNestedGitignore(t *testing.T) {
 		}
 	}
 }
+
+func TestMatcherLoadsGlobalTpfsIgnore(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".tpfs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".tpfs", ".tpfsignore"), []byte("global-cache/\n*.local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher := NewMatcher(t.TempDir())
+	for _, path := range []string{
+		"global-cache/index.bin",
+		"settings.local",
+	} {
+		if !matcher.ShouldIgnore(path, false) {
+			t.Fatalf("ShouldIgnore(%q) = false, want true", path)
+		}
+	}
+}
