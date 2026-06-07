@@ -397,24 +397,16 @@ const SECURITY_SECTIONS = [
 
 const SECURITY_SUBPROCESSORS = [
   {
-    name: "Cloud infrastructure",
-    purpose: "Hosting, storage, networking, and application operations",
-    data: "Customer content and operational metadata",
+    name: "Persistence",
+    purpose:
+      "Stores synced content and the indexes/metadata needed to answer search. Deployments use S3-compatible object storage, PostgreSQL, and Turbopuffer.",
+    data: "Uploaded source files, packed bundles, rendered page/OCR images, root state snapshots, sync artifacts, org/user/root metadata, API-key hashes, ACLs, sync jobs/generations, content proofs, extracted text chunks, search metadata, and embedding vectors.",
   },
   {
-    name: "Search infrastructure",
-    purpose: "Indexing and retrieving synced content",
-    data: "Extracted content, search metadata, and embeddings",
-  },
-  {
-    name: "Document processing",
-    purpose: "Parsing files, extracting text, OCR, and embeddings",
-    data: "Files and derived content required for processing",
-  },
-  {
-    name: "Identity and billing",
-    purpose: "Identity and billing",
-    data: "Identity profile data and billing events",
+    name: "Processing",
+    purpose:
+      "Parses files, extracts text/OCR/images, and computes chunk/query embeddings. Deployments use Modal endpoints when configured.",
+    data: "Source files and derived processing artifacts needed to extract text/images, compute embeddings, and create index artifacts.",
   },
 ];
 
@@ -725,10 +717,9 @@ generated/client/
             <div className="docs-security-subprocessors">
               <h3>Third-party services</h3>
               <p>
-                PufferFS uses third-party providers for infrastructure,
-                identity, billing, search, and document processing. Provider
-                use depends on deployment configuration and customer use of the
-                product.
+                PufferFS uses third-party providers for persistence and
+                processing. Provider use depends on deployment configuration and
+                customer use of the product.
               </p>
               <div className="docs-security-table-wrap">
                 <table className="docs-security-table">
