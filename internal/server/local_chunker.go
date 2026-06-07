@@ -9,6 +9,9 @@ import (
 
 // localChunkable returns true if the file type can be chunked locally without Modal.
 func localChunkable(filePath string) bool {
+	if strings.EqualFold(extOf(filePath), ".svg") {
+		return true
+	}
 	ft := detectFileType(filePath)
 	// Binary and structured formats require Modal for specialized extraction.
 	switch ft {
@@ -191,6 +194,9 @@ func hashContent(content string) string {
 
 // detectLocalFileType returns a file_type string matching the Python chunkers convention.
 func detectLocalFileType(path string) string {
+	if strings.EqualFold(extOf(path), ".svg") {
+		return "svg"
+	}
 	ft := detectFileType(path)
 	if ft != "auto" {
 		return ft

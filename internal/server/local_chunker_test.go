@@ -13,6 +13,12 @@ func TestLocalChunkableSkipsModalOnlyForSimpleTextFormats(t *testing.T) {
 	if !localChunkable("src/main.go") {
 		t.Fatal("code should be chunked locally")
 	}
+	if !localChunkable("web/public/favicon.svg") {
+		t.Fatal("svg should be chunked locally as text")
+	}
+	if got := detectLocalFileType("web/public/favicon.svg"); got != "svg" {
+		t.Fatalf("detectLocalFileType(svg) = %q, want svg", got)
+	}
 	if localChunkable("docs/manual.pdf") {
 		t.Fatal("pdf should route to Modal")
 	}
