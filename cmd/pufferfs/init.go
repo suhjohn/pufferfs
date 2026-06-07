@@ -98,12 +98,6 @@ func defaultInitConfig(serverURL string) *appconfig.Config {
 		Server: appconfig.ServerConfig{
 			URL: serverURL,
 		},
-		Turbopuffer: appconfig.TurbopufferConfig{
-			Region: "gcp-us-central1",
-		},
-		Storage: appconfig.StorageConfig{
-			Bucket: "pufferfs",
-		},
 	}
 }
 

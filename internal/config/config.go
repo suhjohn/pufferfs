@@ -12,8 +12,8 @@ import (
 // Config is the top-level configuration.
 type Config struct {
 	Server      ServerConfig      `toml:"server"`
-	Turbopuffer TurbopufferConfig `toml:"turbopuffer"`
-	Storage     StorageConfig     `toml:"storage"`
+	Turbopuffer TurbopufferConfig `toml:"turbopuffer,omitempty"`
+	Storage     StorageConfig     `toml:"storage,omitempty"`
 }
 
 type ServerConfig struct {

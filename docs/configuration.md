@@ -22,12 +22,17 @@ Created by `pufferfs init`. The file is written with `0600` permissions in a
 
 ```toml
 [server]
-url     = "https://api.example.com"
+url     = "https://api.pufferfs.com"
 api_key = "pfs_sk_..."
+```
 
+Advanced direct/self-hosted setups may also provide Turbopuffer and
+S3-compatible storage settings:
+
+```toml
 [turbopuffer]
-api_key = ""          # only needed for direct-to-Turbopuffer setups
-region  = ""
+api_key = ""
+region  = "gcp-us-central1"
 
 [storage]
 endpoint_url      = ""   # S3-compatible endpoint (e.g. R2)
