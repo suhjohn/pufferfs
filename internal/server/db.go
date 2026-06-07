@@ -230,6 +230,17 @@ func (db *DB) migrateFallback() error {
 			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			finished_at  TIMESTAMPTZ
 		);
+		CREATE TABLE IF NOT EXISTS sync_job_shards (
+			job_id          TEXT NOT NULL REFERENCES sync_jobs(id) ON DELETE CASCADE,
+			stage           TEXT NOT NULL,
+			shard_index     INT NOT NULL,
+			status          TEXT NOT NULL DEFAULT 'completed',
+			files_processed INT NOT NULL DEFAULT 0,
+			started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			finished_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (job_id, stage, shard_index)
+		);
+		CREATE INDEX IF NOT EXISTS idx_sync_job_shards_job_stage_status ON sync_job_shards(job_id, stage, status);
 
 		CREATE TABLE IF NOT EXISTS sync_generations (
 			id                 TEXT PRIMARY KEY,
@@ -1610,13 +1621,52 @@ func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, t
 	return job, nil
 }
 
-// UpdateSyncJobStatus updates the status and progress of a sync job.
-func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string, processed int) error {
+// UpdateSyncJobStatus updates only the phase/status of a sync job.
+func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) error {
 	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1, processed = $2 WHERE id = $3`,
-		status, processed, jobID,
+		`UPDATE sync_jobs SET status = $1 WHERE id = $2`,
+		status, jobID,
 	)
 	return err
+}
+
+// RecordSyncJobShard stores idempotent progress for a completed shard and
+// refreshes the job-level processed count from completed index shards.
+func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shardIndex, filesProcessed int) error {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO sync_job_shards (job_id, stage, shard_index, status, files_processed, finished_at)
+		 VALUES ($1, $2, $3, 'completed', $4, NOW())
+		 ON CONFLICT (job_id, stage, shard_index) DO UPDATE SET
+			status = EXCLUDED.status,
+			files_processed = EXCLUDED.files_processed,
+			finished_at = EXCLUDED.finished_at`,
+		jobID, stage, shardIndex, filesProcessed,
+	); err != nil {
+		return err
+	}
+
+	if stage == syncStageIndex {
+		if _, err := tx.Exec(ctx,
+			`UPDATE sync_jobs
+			 SET processed = (
+				SELECT SUM(files_processed)
+				FROM sync_job_shards
+				WHERE job_id = $1 AND stage = $2 AND status = 'completed'
+			 )
+			 WHERE id = $1`,
+			jobID, syncStageIndex,
+		); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
 }
 
 // CompleteSyncJob marks a sync job as completed or failed.

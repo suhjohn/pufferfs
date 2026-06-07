@@ -1461,7 +1461,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 	}
 
 	if job != nil {
-		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "committing", resp.FilesProcessed)
+		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "committing")
 	}
 	if err := s.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)

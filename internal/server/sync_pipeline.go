@@ -127,7 +127,7 @@ func (s *Server) enqueueSync(ctx context.Context, orgID, userID string, generati
 		return nil, err
 	}
 	if job != nil {
-		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "queued", 0)
+		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "queued")
 	}
 	return p.resp, nil
 }
@@ -285,7 +285,7 @@ func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
 	}
 	jobs := make([]objectQueueJob, 0, len(refs))
 	for i, ref := range refs {
-		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref)
+		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref, i, len(refs))
 		job.JobID = chunkShardJobID(p.generation.ID, i)
 		jobs = append(jobs, job)
 	}
@@ -316,7 +316,7 @@ func (p *syncPipeline) inputShardRefs(ctx context.Context) ([]string, error) {
 
 func (p *syncPipeline) runChunkStage(ctx context.Context) error {
 	if p.job != nil {
-		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "chunking", p.resp.FilesProcessed)
+		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "chunking")
 	}
 	sourceCache := newSyncSourceCache(p.server.s3)
 	for {
@@ -333,7 +333,7 @@ func (p *syncPipeline) runChunkStage(ctx context.Context) error {
 				_ = p.broker.Fail(ctx, p.generation.ID, syncStageChunk, job.JobID, err.Error(), 3)
 				return err
 			}
-			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageEmbed, resultRef)
+			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageEmbed, resultRef, job.ShardIndex, job.TotalShards)
 			next.JobID = job.JobID + "-embed"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageChunk, job.JobID, resultRef, next); err != nil {
 				return err
@@ -464,7 +464,7 @@ func attachAbsolutePath(chunks []map[string]any, absolutePath string) {
 
 func (p *syncPipeline) runEmbedStage(ctx context.Context) error {
 	if p.job != nil {
-		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "embedding", p.resp.FilesProcessed)
+		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "embedding")
 	}
 	for {
 		jobs, err := p.broker.Claim(ctx, p.generation.ID, syncStageEmbed, "embed-worker", syncWorkerCount(), 10*time.Minute)
@@ -480,7 +480,7 @@ func (p *syncPipeline) runEmbedStage(ctx context.Context) error {
 				_ = p.broker.Fail(ctx, p.generation.ID, syncStageEmbed, job.JobID, err.Error(), 3)
 				return err
 			}
-			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageIndex, resultRef)
+			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageIndex, resultRef, job.ShardIndex, job.TotalShards)
 			next.JobID = job.JobID + "-index"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageEmbed, job.JobID, resultRef, next); err != nil {
 				return err
@@ -545,7 +545,7 @@ func (p *syncPipeline) processEmbedJob(ctx context.Context, job objectQueueJob) 
 
 func (p *syncPipeline) runIndexStage(ctx context.Context) error {
 	if p.job != nil {
-		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "upserting", p.resp.FilesProcessed)
+		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "upserting")
 	}
 	for {
 		jobs, err := p.broker.Claim(ctx, p.generation.ID, syncStageIndex, "index-worker", 1, 10*time.Minute)
@@ -556,9 +556,15 @@ func (p *syncPipeline) runIndexStage(ctx context.Context) error {
 			return p.ensureStageComplete(ctx, syncStageIndex)
 		}
 		for _, job := range jobs {
-			if err := p.processIndexJob(ctx, job); err != nil {
+			filesProcessed, err := p.processIndexJob(ctx, job)
+			if err != nil {
 				_ = p.broker.Fail(ctx, p.generation.ID, syncStageIndex, job.JobID, err.Error(), 3)
 				return err
+			}
+			if job.SyncID != "" {
+				if err := p.server.db.RecordSyncJobShard(ctx, job.SyncID, syncStageIndex, job.ShardIndex, filesProcessed); err != nil {
+					return err
+				}
 			}
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageIndex, job.JobID, job.PayloadRef); err != nil {
 				return err
@@ -567,50 +573,46 @@ func (p *syncPipeline) runIndexStage(ctx context.Context) error {
 	}
 }
 
-func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) error {
+func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) (int, error) {
 	var records []syncIndexArtifact
 	if err := p.readJSONL(ctx, job.PayloadRef, &records); err != nil {
-		return err
+		return 0, err
 	}
+	filesProcessed := countIndexArtifactFiles(records)
 	var upserts []map[string]any
 	closePaths := make(map[string]bool)
-	processedPaths := make(map[string]bool)
 	for _, record := range records {
 		switch record.Op {
 		case "upsert":
 			if record.Row != nil {
 				upserts = append(upserts, record.Row)
-				if path := strVal(record.Row, "file_path"); path != "" {
-					processedPaths[path] = true
-				}
 			}
 		case "close":
 			if record.ClosePath != "" {
 				closePaths[record.ClosePath] = true
-				processedPaths[record.ClosePath] = true
 			}
 		}
 	}
 	indexNamespaces, err := p.loadIndexNamespaces(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(upserts) > 0 {
 		if err := p.server.writeIndexRowsArtifact(ctx, p.generation.ID, "index-stage", upserts); err != nil {
-			return err
+			return 0, err
 		}
 		upsertsByNamespace := make(map[string][]map[string]any)
 		for _, row := range upserts {
 			filePath := strVal(row, "file_path")
 			ns, err := rootIndexNamespaceForPath(indexNamespaces, filePath)
 			if err != nil {
-				return fmt.Errorf("routing index row for %s: %w", filePath, err)
+				return 0, fmt.Errorf("routing index row for %s: %w", filePath, err)
 			}
 			upsertsByNamespace[ns.Namespace] = append(upsertsByNamespace[ns.Namespace], row)
 		}
 		for namespace, rows := range upsertsByNamespace {
 			if err := p.server.upsertRowsInBatches(namespace, rows); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		p.resp.ChunksAdded += len(upserts)
@@ -618,15 +620,39 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) 
 	for path := range closePaths {
 		closed, err := p.closeRowsForPath(ctx, path)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		p.resp.ChunksRemoved += closed
 	}
-	p.resp.FilesProcessed += len(processedPaths)
-	if p.job != nil {
-		_ = p.server.db.UpdateSyncJobStatus(ctx, p.job.ID, "upserting", p.resp.FilesProcessed)
+	p.resp.FilesProcessed += filesProcessed
+	return filesProcessed, nil
+}
+
+func (p *syncPipeline) countIndexJobFiles(ctx context.Context, job objectQueueJob) (int, error) {
+	var records []syncIndexArtifact
+	if err := p.readJSONL(ctx, job.PayloadRef, &records); err != nil {
+		return 0, err
 	}
-	return nil
+	return countIndexArtifactFiles(records), nil
+}
+
+func countIndexArtifactFiles(records []syncIndexArtifact) int {
+	processedPaths := make(map[string]bool)
+	for _, record := range records {
+		switch record.Op {
+		case "upsert":
+			if record.Row != nil {
+				if path := strVal(record.Row, "file_path"); path != "" {
+					processedPaths[path] = true
+				}
+			}
+		case "close":
+			if record.ClosePath != "" {
+				processedPaths[record.ClosePath] = true
+			}
+		}
+	}
+	return len(processedPaths)
 }
 
 func (p *syncPipeline) closeRowsForPath(ctx context.Context, path string) (int, error) {

@@ -223,7 +223,7 @@ func TestObjectQueuePushDedupesJobIDs(t *testing.T) {
 	ctx := context.Background()
 	store := newMemoryObjectStore()
 	broker := newObjectQueueBroker(store)
-	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageChunk, "syncs/gen-1/inputs/shard-000000.jsonl")
+	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageChunk, "syncs/gen-1/inputs/shard-000000.jsonl", 3, 9)
 	job.JobID = "job-1"
 	if err := broker.Push(ctx, "gen-1", syncStageChunk, job, job); err != nil {
 		t.Fatalf("push duplicate jobs: %v", err)
@@ -234,6 +234,27 @@ func TestObjectQueuePushDedupesJobIDs(t *testing.T) {
 	}
 	if summary.Queued != 1 {
 		t.Fatalf("queued = %d, want 1", summary.Queued)
+	}
+}
+
+func TestObjectQueueJobCarriesShardProgressMetadata(t *testing.T) {
+	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageIndex, "syncs/gen-1/index_rows/job.jsonl", 4, 12)
+	if job.ShardIndex != 4 || job.TotalShards != 12 {
+		t.Fatalf("shard metadata = %d/%d, want 4/12", job.ShardIndex, job.TotalShards)
+	}
+}
+
+func TestCountIndexArtifactFilesDedupesByPath(t *testing.T) {
+	records := []syncIndexArtifact{
+		{Op: "upsert", Row: map[string]any{"file_path": "a.txt"}},
+		{Op: "upsert", Row: map[string]any{"file_path": "a.txt"}},
+		{Op: "upsert", Row: map[string]any{"file_path": "b.txt"}},
+		{Op: "close", ClosePath: "b.txt"},
+		{Op: "close", ClosePath: "c.txt"},
+		{Op: "noop"},
+	}
+	if got := countIndexArtifactFiles(records); got != 3 {
+		t.Fatalf("countIndexArtifactFiles = %d, want 3", got)
 	}
 }
 

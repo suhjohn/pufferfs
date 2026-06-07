@@ -78,7 +78,7 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if indexMsg.Job.PayloadRef != "syncs/gen-1/index_rows/chunk-job-embed.jsonl" {
 		t.Fatalf("index payload ref = %q", indexMsg.Job.PayloadRef)
 	}
-	if err := store.Upload(ctx, indexMsg.Job.PayloadRef, []byte("index\n"), "application/x-ndjson"); err != nil {
+	if err := store.Upload(ctx, indexMsg.Job.PayloadRef, []byte("{\"op\":\"upsert\",\"row\":{\"file_path\":\"a.txt\"}}\n"), "application/x-ndjson"); err != nil {
 		t.Fatalf("upload index artifact: %v", err)
 	}
 	indexDispatcher := NewSyncDispatcher(srv, q, queue.StageIndex, 1)

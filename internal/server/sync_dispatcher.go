@@ -149,7 +149,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 	switch msg.Stage {
 	case syncStageChunk:
 		if msg.SyncJobID != "" {
-			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "chunking", 0)
+			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "chunking")
 		}
 		cleanupKeys := append([]string(nil), msg.CleanupKeys...)
 		if msg.PayloadRef != "" {
@@ -178,7 +178,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		return d.queue.Enqueue(ctx, syncStageEmbed, next)
 	case syncStageEmbed:
 		if msg.SyncJobID != "" {
-			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "embedding", 0)
+			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "embedding")
 		}
 		cleanupKeys := append([]string(nil), msg.CleanupKeys...)
 		if msg.PayloadRef != "" {
@@ -206,7 +206,12 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		return d.queue.Enqueue(ctx, syncStageIndex, next)
 	case syncStageIndex:
 		if msg.SyncJobID != "" {
-			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing", 0)
+			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing")
+		}
+		indexJob := objectQueueJobFromMessage(msg)
+		filesProcessed, err := p.countIndexJobFiles(ctx, indexJob)
+		if err != nil {
+			return err
 		}
 		if d.server.modal.HasIndexShardEndpoint() {
 			modalPayload, err := d.modalJob(ctx, msg)
@@ -217,7 +222,12 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 				return err
 			}
 		} else {
-			if err := p.processIndexJob(ctx, objectQueueJobFromMessage(msg)); err != nil {
+			if _, err := p.processIndexJob(ctx, indexJob); err != nil {
+				return err
+			}
+		}
+		if msg.SyncJobID != "" {
+			if err := d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, syncStageIndex, msg.ShardIndex, filesProcessed); err != nil {
 				return err
 			}
 		}
@@ -305,6 +315,8 @@ func objectQueueJobFromMessage(msg queue.JobMessage) objectQueueJob {
 		GenerationID:  msg.GenerationID,
 		GenerationSeq: msg.GenerationSeq,
 		Stage:         msg.Stage,
+		ShardIndex:    msg.ShardIndex,
+		TotalShards:   msg.TotalShards,
 		PayloadRef:    msg.PayloadRef,
 		Attempts:      1,
 		CreatedAt:     msg.EnqueuedAt,
@@ -421,7 +433,7 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		return fmt.Errorf("cleaning failed generations before commit: %w", err)
 	}
 	if msg.SyncJobID != "" {
-		_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "committing", 0)
+		_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "committing")
 	}
 	if err := d.server.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
 		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
