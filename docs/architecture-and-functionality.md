@@ -179,7 +179,7 @@ artifacts for known generations, and active Turbopuffer namespaces.
 
 The CLI builds a Merkle tree over the target directory using SHA-256 leaf hashes
 and deterministic directory hashes. It honors built-in ignores, `.gitignore`,
-`.tpfsignore`, and `~/.tpfs/ignore`. It skips matching Merkle subtrees and
+`.tpfsignore`, and `~/.tpfs/.tpfsignore`. It skips matching Merkle subtrees and
 falls back to flat state diffing when local tree cache is unavailable.
 
 The model defines statuses for added, removed, modified, moved, renamed,
@@ -421,7 +421,8 @@ PufferFS currently supports:
 - Incremental filesystem sync from CLI.
 - Merkle-based local diffing, move/rename detection, and conflict retry against
   remote generation changes.
-- Built-in ignore rules plus `.gitignore`, `.tpfsignore`, and global ignore.
+- Built-in ignore rules plus `.gitignore`, `.tpfsignore`, and global
+  `~/.tpfs/.tpfsignore`.
 - Default exclusion of likely secret filenames before sync state is built.
 - Small-file bundle uploads and standalone large-file uploads.
 - Gzip root state storage by object reference.

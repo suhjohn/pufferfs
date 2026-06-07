@@ -44,7 +44,12 @@ secret_access_key = ""
 | `storage.*` | S3-compatible storage endpoint and credentials. |
 
 Per-root local cache (root metadata, flat file state, Merkle snapshot) lives
-under `~/.tpfs/roots/<root-id>/`. Global ignore rules live at `~/.tpfs/ignore`.
+under `~/.tpfs/roots/<root-id>/`. Global ignore rules live at
+`~/.tpfs/.tpfsignore` (gitignore syntax, applies to all projects for the current
+user). Project-level ignore rules use `.tpfsignore` files placed anywhere in the
+synced tree.
+See [developer-guide.md § What Gets Synced](./developer-guide.md#what-gets-synced)
+for full ignore-rule documentation.
 
 ---
 

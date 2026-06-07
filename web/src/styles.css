@@ -624,10 +624,16 @@ button:disabled {
   padding-left: 1.25rem;
 }
 
-.docs-command code {
+.docs-command > code {
   display: block;
   margin: 0;
   color: var(--ink);
+  font-size: 0.78rem;
+}
+
+.docs-command p code {
+  color: var(--ink);
+  font-family: var(--font-mono);
   font-size: 0.78rem;
 }
 

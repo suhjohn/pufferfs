@@ -77,10 +77,10 @@ func NewMatcher(rootDir string) *Matcher {
 
 	m.loadIgnoreFiles(rootDir)
 
-	// Load global ignore from ~/.tpfs/ignore
+	// Load global ignore from ~/.tpfs/.tpfsignore
 	home, err := os.UserHomeDir()
 	if err == nil {
-		m.loadIgnoreFile(filepath.Join(home, ".tpfs", "ignore"), nil)
+		m.loadIgnoreFile(filepath.Join(home, ".tpfs", ".tpfsignore"), nil)
 	}
 
 	return m

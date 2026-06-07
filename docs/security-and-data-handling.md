@@ -125,7 +125,7 @@ credentials.json  service-account*.json
 > ACL deny prefixes for anything sensitive.
 
 PufferFS also honors built-in ignores plus `.gitignore`, `.tpfsignore` (root),
-and `~/.tpfs/ignore` (global) — useful for keeping caches, build outputs, and
+and `~/.tpfs/.tpfsignore` (global) — useful for keeping caches, build outputs, and
 dependency folders out of the index and reducing exposure surface.
 
 ## Query-result correctness and isolation

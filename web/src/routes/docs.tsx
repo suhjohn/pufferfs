@@ -327,6 +327,15 @@ const ENDPOINTS = [
   },
 ];
 
+const IGNORE_RULE_SOURCES = [
+  ["Always ignored", "All projects", ".git"],
+  ["Built-in defaults", "All projects", "node_modules, .venv, dist, build, caches, compiled artifacts"],
+  ["Secret-file patterns", "All projects", ".env, private keys, credentials.json, package-manager auth files"],
+  [".gitignore", "Directory where the file lives, recursive", "Gitignore syntax"],
+  [".tpfsignore", "Directory where the file lives, recursive", "Gitignore syntax"],
+  ["~/.tpfs/.tpfsignore", "All projects for the current user", "Gitignore syntax"],
+];
+
 const SECURITY_SECTIONS = [
   {
     title: "Data handling",
@@ -448,6 +457,7 @@ function Docs() {
       <div className="docs-layout">
         <aside className="docs-toc" aria-label="docs navigation">
           <a href="#setup">setup</a>
+          <a href="#ignore-rules">ignore rules</a>
           <a href="#commands">commands</a>
           <a href="#apis">APIs</a>
           <a href="#security">security</a>
@@ -497,6 +507,84 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
                 <span>terminal</span>
               </div>
               <pre className="code-pane solo">{`go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest`}</pre>
+            </div>
+          </section>
+
+          <section id="ignore-rules" className="docs-section">
+            <h2>ignore rules</h2>
+            <p>
+              PufferFS excludes ignored paths before building the Merkle tree,
+              diff, upload set, and search index. Ignored files are not sent to
+              the API.
+            </p>
+            <p>
+              This is local CLI behavior: the API server does not read ignore
+              files itself. Direct API clients should filter paths before
+              submitting a sync request.
+            </p>
+            <div className="docs-command-list">
+              <article className="docs-command">
+                <h3>user-defined ignore files</h3>
+                <p>
+                  Add a <code>.tpfsignore</code> file anywhere in a synced
+                  folder for project-specific rules. Add{" "}
+                  <code>~/.tpfs/.tpfsignore</code> for global user rules that apply
+                  to every project on the current machine. Both use gitignore
+                  syntax.
+                </p>
+                <div className="docs-command-detail">
+                  <strong>example .tpfsignore</strong>
+                  <pre>{`# ignore generated data in this project
+*.csv
+scratch/
+generated/client/
+
+# scoped .tpfsignore files can be placed in subdirectories too`}</pre>
+                </div>
+                <div className="docs-command-detail">
+                  <strong>verify before uploading</strong>
+                  <pre>{`pufferfs sync --dry-run .`}</pre>
+                </div>
+              </article>
+
+              <article className="docs-command">
+                <h3>rule sources</h3>
+                <p>
+                  A file is excluded if any ignore source matches it. The CLI
+                  also respects existing <code>.gitignore</code> files.
+                </p>
+                <div className="docs-security-table-wrap">
+                  <table className="docs-security-table">
+                    <thead>
+                      <tr>
+                        <th>Source</th>
+                        <th>Scope</th>
+                        <th>Format / examples</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {IGNORE_RULE_SOURCES.map(([source, scope, format]) => (
+                        <tr key={source}>
+                          <td>{source}</td>
+                          <td>{scope}</td>
+                          <td>{format}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article className="docs-command">
+                <h3>watch behavior</h3>
+                <p>
+                  <code>pufferfs watch</code> and{" "}
+                  <code>pufferfs sync --follow</code> use the same matcher.
+                  Ignored directories are not watched, which reduces filesystem
+                  noise from dependency installs, build outputs, caches, and
+                  local scratch folders.
+                </p>
+              </article>
             </div>
           </section>
 
