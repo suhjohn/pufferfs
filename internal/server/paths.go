@@ -37,7 +37,7 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 
 	for i := range req.ChangeRefs {
 		req.ChangeRefs[i] = strings.TrimSpace(strings.ReplaceAll(req.ChangeRefs[i], "\\", "/"))
-		if err := validateBundleObjectRef(req.RootID, req.ChangeRefs[i], "change_refs"); err != nil {
+		if err := validateChangeRef(req.RootID, req.GenerationID, req.ChangeRefs[i]); err != nil {
 			return err
 		}
 	}
@@ -58,7 +58,7 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 	}
 
 	req.ContentProofRef = strings.TrimSpace(strings.ReplaceAll(req.ContentProofRef, "\\", "/"))
-	if err := validateBundleObjectRef(req.RootID, req.ContentProofRef, "content_proof_ref"); err != nil {
+	if err := validateSyncArtifactRef(req.GenerationID, req.ContentProofRef, "proofs", "content_proof_ref"); err != nil {
 		return err
 	}
 	if req.ContentProof != nil {
@@ -98,6 +98,38 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 		return err
 	}
 
+	return nil
+}
+
+func validateChangeRef(rootID, generationID, ref string) error {
+	if ref == "" {
+		return nil
+	}
+	if strings.HasPrefix(ref, fmt.Sprintf("syncs/%s/manifests/", generationID)) {
+		return validateSyncArtifactRef(generationID, ref, "manifests", "change_refs")
+	}
+	return validateBundleObjectRef(rootID, ref, "change_refs")
+}
+
+func validateSyncArtifactRef(generationID, ref, dir, field string) error {
+	ref = strings.TrimSpace(strings.ReplaceAll(ref, "\\", "/"))
+	if ref == "" {
+		return nil
+	}
+	if generationID == "" {
+		return fmt.Errorf("%s requires generation_id", field)
+	}
+	if strings.Contains(ref, "\x00") {
+		return fmt.Errorf("%s contains NUL byte", field)
+	}
+	prefix := fmt.Sprintf("syncs/%s/%s/", generationID, dir)
+	if !strings.HasPrefix(ref, prefix) {
+		return fmt.Errorf("%s must reference this generation's sync artifact", field)
+	}
+	name := strings.TrimPrefix(ref, prefix)
+	if name == "" || name != safeObjectName(name) {
+		return fmt.Errorf("%s sync artifact key is invalid", field)
+	}
 	return nil
 }
 

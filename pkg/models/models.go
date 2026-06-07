@@ -211,6 +211,7 @@ type CLIDownload struct {
 type SyncRequest struct {
 	ProtocolVersion   int                  `json:"protocol_version"`
 	RootID            string               `json:"root_id"`
+	GenerationID      string               `json:"generation_id,omitempty"`
 	BaseGenerationID  string               `json:"base_generation_id"`
 	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
 	Changes           []FileChange         `json:"changes"`
@@ -222,6 +223,23 @@ type SyncRequest struct {
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
 	ContentProofRef   string               `json:"content_proof_ref,omitempty"`
 	ManifestRef       string               `json:"manifest_ref,omitempty"`
+}
+
+type SyncInitRequest struct {
+	ProtocolVersion   int    `json:"protocol_version"`
+	BaseGenerationID  string `json:"base_generation_id"`
+	BaseGenerationSeq int64  `json:"base_generation_seq,omitempty"`
+	TotalFiles        int    `json:"total_files,omitempty"`
+}
+
+type SyncInitResponse struct {
+	RootID            string `json:"root_id"`
+	SyncJobID         string `json:"sync_job_id"`
+	GenerationID      string `json:"generation_id"`
+	GenerationSeq     int64  `json:"generation_seq"`
+	BaseGenerationID  string `json:"base_generation_id"`
+	BaseGenerationSeq int64  `json:"base_generation_seq"`
+	ManifestPrefix    string `json:"manifest_prefix"`
 }
 
 type SyncConflictResponse struct {

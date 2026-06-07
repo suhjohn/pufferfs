@@ -150,9 +150,7 @@ func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage
 	}
 	msgs := make([]queue.JobMessage, 0, len(refs))
 	for i, ref := range refs {
-		msg := p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(refs))
-		msg.InputRefs = refs
-		msgs = append(msgs, msg)
+		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(refs)))
 	}
 	return msgs, nil
 }
@@ -231,6 +229,10 @@ func syncInputShardKey(generationID string, shardIndex int) string {
 	return fmt.Sprintf("syncs/%s/inputs/shard-%06d.jsonl", generationID, shardIndex)
 }
 
+func syncManifestShardKey(generationID string, shardIndex int) string {
+	return fmt.Sprintf("syncs/%s/manifests/%06d.jsonl", generationID, shardIndex)
+}
+
 func chunkShardJobID(generationID string, shardIndex int) string {
 	return fmt.Sprintf("%s-chunk-%06d", generationID, shardIndex)
 }
@@ -266,11 +268,7 @@ func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
 	next := msg
 	next.JobID = chunkShardJobID(msg.GenerationID, nextIndex)
 	next.Stage = syncStageChunk
-	if len(msg.InputRefs) > nextIndex {
-		next.PayloadRef = msg.InputRefs[nextIndex]
-	} else {
-		next.PayloadRef = syncInputShardKey(msg.GenerationID, nextIndex)
-	}
+	next.PayloadRef = syncManifestShardKey(msg.GenerationID, nextIndex)
 	next.CleanupKeys = nil
 	next.ShardIndex = nextIndex
 	next.EnqueuedAt = time.Now().UTC()

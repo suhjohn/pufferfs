@@ -59,9 +59,10 @@ func TestIndexedChunkCarriesAbsolutePath(t *testing.T) {
 
 func TestCleanupGenerationKeysIncludesTransientArtifactsOnly(t *testing.T) {
 	req := &models.SyncRequest{
+		GenerationID:    "gen-1",
 		ManifestRef:     "bundles/root-1/manifest.json",
-		ContentProofRef: "bundles/root-1/content-proof.json",
-		ChangeRefs:      []string{"bundles/root-1/changes-000000.jsonl", "bundles/root-1/changes-000001.jsonl"},
+		ContentProofRef: "syncs/gen-1/proofs/content-proof.json",
+		ChangeRefs:      []string{"syncs/gen-1/manifests/000000.jsonl", "syncs/gen-1/manifests/000001.jsonl"},
 		Changes: []models.FileChange{
 			{Path: "a.txt", Status: models.StatusAdded, SourceKey: "files/root-1/a.txt"},
 			{Path: "b.txt", Status: models.StatusModified, SourceKey: "bundles/root-1/bundle-1.bin"},
@@ -75,15 +76,15 @@ func TestCleanupGenerationKeysIncludesTransientArtifactsOnly(t *testing.T) {
 		TotalShards:  2,
 	})
 	want := map[string]bool{
-		"syncs/gen-1/request.json":            true,
-		"syncs/gen-1/done/shard-000000.done":  true,
-		"syncs/gen-1/done/shard-000001.done":  true,
-		"bundles/root-1/manifest.json":        true,
-		"bundles/root-1/content-proof.json":   true,
-		"bundles/root-1/changes-000000.jsonl": true,
-		"bundles/root-1/changes-000001.jsonl": true,
-		"files/root-1/a.txt":                  true,
-		"bundles/root-1/bundle-1.bin":         true,
+		"syncs/gen-1/request.json":              true,
+		"syncs/gen-1/done/shard-000000.done":    true,
+		"syncs/gen-1/done/shard-000001.done":    true,
+		"bundles/root-1/manifest.json":          true,
+		"syncs/gen-1/proofs/content-proof.json": true,
+		"syncs/gen-1/manifests/000000.jsonl":    true,
+		"syncs/gen-1/manifests/000001.jsonl":    true,
+		"files/root-1/a.txt":                    true,
+		"bundles/root-1/bundle-1.bin":           true,
 	}
 	if len(keys) != len(want) {
 		t.Fatalf("cleanup keys = %#v, want %d keys", keys, len(want))
@@ -139,13 +140,12 @@ func TestChunkShardBackpressureMessages(t *testing.T) {
 		BaseGenerationSeq: 6,
 		ShardIndex:        1,
 		TotalShards:       5,
-		InputRefs:         []string{"bundles/root-1/changes-0.jsonl", "bundles/root-1/changes-1.jsonl", "bundles/root-1/changes-2.jsonl", "bundles/root-1/changes-3.jsonl"},
 		CleanupKeys:       []string{"syncs/gen-1/index_rows/job.jsonl"},
 	})
 	if !ok {
 		t.Fatal("expected next shard")
 	}
-	if next.ShardIndex != 3 || next.Stage != syncStageChunk || next.PayloadRef != "bundles/root-1/changes-3.jsonl" {
+	if next.ShardIndex != 3 || next.Stage != syncStageChunk || next.PayloadRef != "syncs/gen-1/manifests/000003.jsonl" {
 		t.Fatalf("next shard = %#v", next)
 	}
 	if len(next.CleanupKeys) != 0 {
