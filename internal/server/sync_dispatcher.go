@@ -151,6 +151,11 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if msg.SyncJobID != "" {
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "chunking")
 		}
+		filesInShard, err := p.messageFileCount(ctx, msg)
+		if err != nil {
+			return err
+		}
+		msg.FilesInShard = filesInShard
 		cleanupKeys := append([]string(nil), msg.CleanupKeys...)
 		if msg.PayloadRef != "" {
 			cleanupKeys = append(cleanupKeys, msg.PayloadRef)
@@ -164,7 +169,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			if err != nil {
 				return err
 			}
-			next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resp.ResultRef, msg.ShardIndex, msg.TotalShards)
+			next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resp.ResultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
 			next.CleanupKeys = cleanupKeys
 			return d.queue.Enqueue(ctx, syncStageEmbed, next)
 		}
@@ -173,7 +178,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err != nil {
 			return err
 		}
-		next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resultRef, msg.ShardIndex, msg.TotalShards)
+		next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
 		next.CleanupKeys = cleanupKeys
 		return d.queue.Enqueue(ctx, syncStageEmbed, next)
 	case syncStageEmbed:
@@ -193,7 +198,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			if err != nil {
 				return err
 			}
-			next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resp.ResultRef, msg.ShardIndex, msg.TotalShards)
+			next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resp.ResultRef, msg.ShardIndex, msg.TotalShards, msg.FilesInShard)
 			next.CleanupKeys = cleanupKeys
 			return d.queue.Enqueue(ctx, syncStageIndex, next)
 		}
@@ -201,7 +206,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err != nil {
 			return err
 		}
-		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards)
+		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards, msg.FilesInShard)
 		next.CleanupKeys = cleanupKeys
 		return d.queue.Enqueue(ctx, syncStageIndex, next)
 	case syncStageIndex:
@@ -209,7 +214,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing")
 		}
 		indexJob := objectQueueJobFromMessage(msg)
-		filesProcessed, err := p.countIndexJobFiles(ctx, indexJob)
+		indexArtifactFiles, err := p.countIndexJobFiles(ctx, indexJob)
 		if err != nil {
 			return err
 		}
@@ -227,7 +232,11 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			}
 		}
 		if msg.SyncJobID != "" {
-			if err := d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, syncStageIndex, msg.ShardIndex, filesProcessed); err != nil {
+			progressFiles, err := p.progressFileCount(ctx, indexJob, indexArtifactFiles)
+			if err != nil {
+				return err
+			}
+			if err := d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, syncStageIndex, msg.ShardIndex, progressFiles); err != nil {
 				return err
 			}
 		}
@@ -240,7 +249,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err := enqueueCleanupBatches(ctx, d.queue, msg, cleanupShardKeys(msg)); err != nil {
 			return err
 		}
-		return d.queue.Enqueue(ctx, syncStageCommit, p.jobMessage(syncStageCommit, msg.JobID+"-commit", syncRequestKey(msg.GenerationID), msg.ShardIndex, msg.TotalShards))
+		return d.queue.Enqueue(ctx, syncStageCommit, p.jobMessage(syncStageCommit, msg.JobID+"-commit", syncRequestKey(msg.GenerationID), msg.ShardIndex, msg.TotalShards, 0))
 	case syncStageCommit:
 		return d.processCommit(ctx, msg)
 	case syncStageCleanup:
@@ -305,6 +314,12 @@ func (d *SyncDispatcher) enqueueNextChunkShard(ctx context.Context, msg queue.Jo
 	if !ok {
 		return nil
 	}
+	p := d.pipelineFor(next)
+	filesInShard, err := p.messageFileCount(ctx, next)
+	if err != nil {
+		return err
+	}
+	next.FilesInShard = filesInShard
 	return d.queue.Enqueue(ctx, syncStageChunk, next)
 }
 
@@ -317,6 +332,7 @@ func objectQueueJobFromMessage(msg queue.JobMessage) objectQueueJob {
 		Stage:         msg.Stage,
 		ShardIndex:    msg.ShardIndex,
 		TotalShards:   msg.TotalShards,
+		FilesInShard:  msg.FilesInShard,
 		PayloadRef:    msg.PayloadRef,
 		Attempts:      1,
 		CreatedAt:     msg.EnqueuedAt,
@@ -359,6 +375,7 @@ func modalJob(msg queue.JobMessage) map[string]any {
 		"index_namespaces":    msg.IndexNamespaces,
 		"shard_index":         msg.ShardIndex,
 		"total_shards":        msg.TotalShards,
+		"files_in_shard":      msg.FilesInShard,
 		"priority":            msg.Priority,
 		"enqueued_at":         msg.EnqueuedAt.Format(time.RFC3339Nano),
 	}

@@ -601,10 +601,13 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	if syncResp.RootID == "" {
 		syncResp.RootID = rootID
 	}
+	var completedJob *models.SyncJob
 	if syncResp.SyncJobID != "" && waitForCompletion {
-		if err := pollSyncJob(client, rootID, syncResp.SyncJobID, log); err != nil {
+		completedJob, err = pollSyncJob(client, rootID, syncResp.SyncJobID, log)
+		if err != nil {
 			return nil, err
 		}
+		syncResp.FilesProcessed = completedJob.Processed
 	}
 
 	saveLocalSyncCacheWarnings(rootID, name, dir, currentState, currentTree, syncResp.GenerationID, syncResp.GenerationSeq)
@@ -615,8 +618,12 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		return backgroundSyncResult(name, dir, changeCount, syncResp), nil
 	}
 
-	fmt.Fprintf(log, "Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
-		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
+	if completedJob != nil {
+		fmt.Fprintf(log, "Sync complete: %d/%d files processed\n", completedJob.Processed, completedJob.TotalFiles)
+	} else {
+		fmt.Fprintf(log, "Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
+			syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
+	}
 
 	return completedSyncResult(name, dir, changeCount, syncResp), nil
 }
@@ -675,26 +682,26 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, log)
 }
 
-func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) error {
+func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*models.SyncJob, error) {
 	fmt.Fprintf(log, "Sync job %s started; polling until committed...\n", jobID)
 	deadline := time.Now().Add(syncPollTimeout())
 	for {
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for sync job %s", jobID)
+			return nil, fmt.Errorf("timed out waiting for sync job %s", jobID)
 		}
 		body, err := client.get(fmt.Sprintf("/roots/%s/sync/status?job_id=%s", rootID, url.QueryEscape(jobID)))
 		if err != nil {
-			return fmt.Errorf("polling sync job: %w", err)
+			return nil, fmt.Errorf("polling sync job: %w", err)
 		}
 		var job models.SyncJob
 		if err := json.Unmarshal(body, &job); err != nil {
-			return fmt.Errorf("parsing sync job status: %w", err)
+			return nil, fmt.Errorf("parsing sync job status: %w", err)
 		}
 		switch job.Status {
 		case "completed":
-			return nil
+			return &job, nil
 		case "failed":
-			return fmt.Errorf("sync job failed: %s", string(job.Errors))
+			return &job, fmt.Errorf("sync job failed: %s", string(job.Errors))
 		default:
 			fmt.Fprintf(log, "Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
 			time.Sleep(2 * time.Second)

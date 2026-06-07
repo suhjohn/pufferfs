@@ -48,7 +48,7 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if err := q.Enqueue(ctx, queue.StageChunk, initial); err != nil {
 		t.Fatalf("enqueue chunk: %v", err)
 	}
-	if err := store.Upload(ctx, initial.PayloadRef, []byte("input\n"), "application/x-ndjson"); err != nil {
+	if err := store.Upload(ctx, initial.PayloadRef, []byte("{\"path\":\"a.txt\",\"status\":\"added\"}\n"), "application/x-ndjson"); err != nil {
 		t.Fatalf("upload input artifact: %v", err)
 	}
 
@@ -65,6 +65,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	if embedMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl" {
 		t.Fatalf("embed payload ref = %q", embedMsg.Job.PayloadRef)
 	}
+	if embedMsg.Job.FilesInShard != 1 {
+		t.Fatalf("embed files_in_shard = %d, want 1", embedMsg.Job.FilesInShard)
+	}
 	if err := store.Upload(ctx, embedMsg.Job.PayloadRef, []byte("chunks\n"), "application/x-ndjson"); err != nil {
 		t.Fatalf("upload chunk artifact: %v", err)
 	}
@@ -77,6 +80,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	indexMsg := pullOne(t, ctx, q, queue.StageIndex)
 	if indexMsg.Job.PayloadRef != "syncs/gen-1/index_rows/chunk-job-embed.jsonl" {
 		t.Fatalf("index payload ref = %q", indexMsg.Job.PayloadRef)
+	}
+	if indexMsg.Job.FilesInShard != 1 {
+		t.Fatalf("index files_in_shard = %d, want 1", indexMsg.Job.FilesInShard)
 	}
 	if err := store.Upload(ctx, indexMsg.Job.PayloadRef, []byte("{\"op\":\"upsert\",\"row\":{\"file_path\":\"a.txt\"}}\n"), "application/x-ndjson"); err != nil {
 		t.Fatalf("upload index artifact: %v", err)

@@ -140,6 +140,7 @@ func TestChunkShardBackpressureMessages(t *testing.T) {
 		BaseGenerationSeq: 6,
 		ShardIndex:        1,
 		TotalShards:       5,
+		FilesInShard:      99,
 		CleanupKeys:       []string{"syncs/gen-1/index_rows/job.jsonl"},
 	})
 	if !ok {
@@ -150,6 +151,9 @@ func TestChunkShardBackpressureMessages(t *testing.T) {
 	}
 	if len(next.CleanupKeys) != 0 {
 		t.Fatalf("next cleanup keys = %#v, want none", next.CleanupKeys)
+	}
+	if next.FilesInShard != 0 {
+		t.Fatalf("next files_in_shard = %d, want recalculation marker 0", next.FilesInShard)
 	}
 	if _, ok := nextChunkShardMessage(queue.JobMessage{GenerationID: "gen-1", ShardIndex: 3, TotalShards: 5}); ok {
 		t.Fatal("unexpected next shard past total")
@@ -223,7 +227,7 @@ func TestObjectQueuePushDedupesJobIDs(t *testing.T) {
 	ctx := context.Background()
 	store := newMemoryObjectStore()
 	broker := newObjectQueueBroker(store)
-	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageChunk, "syncs/gen-1/inputs/shard-000000.jsonl", 3, 9)
+	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageChunk, "syncs/gen-1/inputs/shard-000000.jsonl", 3, 9, 17)
 	job.JobID = "job-1"
 	if err := broker.Push(ctx, "gen-1", syncStageChunk, job, job); err != nil {
 		t.Fatalf("push duplicate jobs: %v", err)
@@ -238,9 +242,9 @@ func TestObjectQueuePushDedupesJobIDs(t *testing.T) {
 }
 
 func TestObjectQueueJobCarriesShardProgressMetadata(t *testing.T) {
-	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageIndex, "syncs/gen-1/index_rows/job.jsonl", 4, 12)
-	if job.ShardIndex != 4 || job.TotalShards != 12 {
-		t.Fatalf("shard metadata = %d/%d, want 4/12", job.ShardIndex, job.TotalShards)
+	job := newObjectQueueJob("sync-1", "gen-1", 1, syncStageIndex, "syncs/gen-1/index_rows/job.jsonl", 4, 12, 23)
+	if job.ShardIndex != 4 || job.TotalShards != 12 || job.FilesInShard != 23 {
+		t.Fatalf("shard metadata = %d/%d files=%d, want 4/12 files=23", job.ShardIndex, job.TotalShards, job.FilesInShard)
 	}
 }
 
@@ -255,6 +259,27 @@ func TestCountIndexArtifactFilesDedupesByPath(t *testing.T) {
 	}
 	if got := countIndexArtifactFiles(records); got != 3 {
 		t.Fatalf("countIndexArtifactFiles = %d, want 3", got)
+	}
+}
+
+func TestProgressFileCountFallsBackToInputShard(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	srv := NewWithStore(nil, store, &ModalClient{}, nil)
+	p := &syncPipeline{
+		server:     srv,
+		generation: &SyncGeneration{ID: "gen-1"},
+	}
+	input := []byte("{\"path\":\"empty.txt\",\"status\":\"added\"}\n{\"path\":\"skip.bin\",\"status\":\"added\"}\n")
+	if err := store.Upload(ctx, syncInputShardKey("gen-1", 0), input, "application/x-ndjson"); err != nil {
+		t.Fatalf("upload input shard: %v", err)
+	}
+	got, err := p.progressFileCount(ctx, objectQueueJob{GenerationID: "gen-1", ShardIndex: 0}, 0)
+	if err != nil {
+		t.Fatalf("progressFileCount: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("progressFileCount = %d, want 2", got)
 	}
 }
 

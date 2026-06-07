@@ -59,6 +59,11 @@ type syncIndexArtifact struct {
 	ClosePath string         `json:"close_path,omitempty"`
 }
 
+type syncInputShard struct {
+	Ref       string
+	FileCount int
+}
+
 func (s *Server) processSync(ctx context.Context, orgID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	p := &syncPipeline{
 		server:     s,
@@ -144,23 +149,23 @@ func (p *syncPipeline) prepareQueueJobs(ctx context.Context) ([]queue.JobMessage
 	if _, err := p.loadIndexNamespaces(ctx); err != nil {
 		return nil, err
 	}
-	refs, err := p.inputShardRefs(ctx)
+	shards, err := p.inputShards(ctx)
 	if err != nil {
 		return nil, err
 	}
-	msgs := make([]queue.JobMessage, 0, len(refs))
-	for i, ref := range refs {
-		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), ref, i, len(refs)))
+	msgs := make([]queue.JobMessage, 0, len(shards))
+	for i, shard := range shards {
+		msgs = append(msgs, p.jobMessage(syncStageChunk, chunkShardJobID(p.generation.ID, i), shard.Ref, i, len(shards), shard.FileCount))
 	}
 	return msgs, nil
 }
 
 func (p *syncPipeline) enqueueCommit(ctx context.Context, totalShards int) error {
-	msg := p.jobMessage(syncStageCommit, uuid.NewString(), syncRequestKey(p.generation.ID), 0, totalShards)
+	msg := p.jobMessage(syncStageCommit, uuid.NewString(), syncRequestKey(p.generation.ID), 0, totalShards, 0)
 	return p.server.queue.Enqueue(ctx, syncStageCommit, msg)
 }
 
-func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, totalShards int) queue.JobMessage {
+func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, totalShards, filesInShard int) queue.JobMessage {
 	return queue.JobMessage{
 		JobID:             jobID,
 		SyncJobID:         syncJobIdentifier(p.job),
@@ -176,6 +181,7 @@ func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, t
 		IndexNamespaces:   queueIndexNamespaces(p.indexNamespaces),
 		ShardIndex:        shardIndex,
 		TotalShards:       totalShards,
+		FilesInShard:      filesInShard,
 		EnqueuedAt:        time.Now().UTC(),
 	}
 }
@@ -271,47 +277,52 @@ func nextChunkShardMessage(msg queue.JobMessage) (queue.JobMessage, bool) {
 	next.PayloadRef = syncManifestShardKey(msg.GenerationID, nextIndex)
 	next.CleanupKeys = nil
 	next.ShardIndex = nextIndex
+	next.FilesInShard = 0
 	next.EnqueuedAt = time.Now().UTC()
 	return next, true
 }
 
 func (p *syncPipeline) prepareInputJobs(ctx context.Context) error {
-	refs, err := p.inputShardRefs(ctx)
+	shards, err := p.inputShards(ctx)
 	if err != nil {
 		return err
 	}
-	if len(refs) == 0 {
+	if len(shards) == 0 {
 		return nil
 	}
-	jobs := make([]objectQueueJob, 0, len(refs))
-	for i, ref := range refs {
-		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, ref, i, len(refs))
+	jobs := make([]objectQueueJob, 0, len(shards))
+	for i, shard := range shards {
+		job := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageChunk, shard.Ref, i, len(shards), shard.FileCount)
 		job.JobID = chunkShardJobID(p.generation.ID, i)
 		jobs = append(jobs, job)
 	}
 	return p.broker.Push(ctx, p.generation.ID, syncStageChunk, jobs...)
 }
 
-func (p *syncPipeline) inputShardRefs(ctx context.Context) ([]string, error) {
+func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error) {
 	if len(p.req.ChangeRefs) > 0 {
-		refs := make([]string, 0, len(p.req.ChangeRefs))
+		shards := make([]syncInputShard, 0, len(p.req.ChangeRefs))
 		for _, ref := range p.req.ChangeRefs {
 			if ref != "" {
-				refs = append(refs, ref)
+				fileCount, err := p.countInputShardFiles(ctx, ref)
+				if err != nil {
+					return nil, err
+				}
+				shards = append(shards, syncInputShard{Ref: ref, FileCount: fileCount})
 			}
 		}
-		return refs, nil
+		return shards, nil
 	}
-	shards := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
-	refs := make([]string, 0, len(shards))
-	for i, shard := range shards {
+	changesByShard := shardChanges(p.req.Changes, defaultSyncShardMaxFiles, defaultSyncShardMaxBytes)
+	shards := make([]syncInputShard, 0, len(changesByShard))
+	for i, shard := range changesByShard {
 		ref, err := p.writeJSONL(ctx, "inputs", fmt.Sprintf("shard-%06d", i), shard)
 		if err != nil {
 			return nil, err
 		}
-		refs = append(refs, ref)
+		shards = append(shards, syncInputShard{Ref: ref, FileCount: len(shard)})
 	}
-	return refs, nil
+	return shards, nil
 }
 
 func (p *syncPipeline) runChunkStage(ctx context.Context) error {
@@ -333,7 +344,7 @@ func (p *syncPipeline) runChunkStage(ctx context.Context) error {
 				_ = p.broker.Fail(ctx, p.generation.ID, syncStageChunk, job.JobID, err.Error(), 3)
 				return err
 			}
-			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageEmbed, resultRef, job.ShardIndex, job.TotalShards)
+			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageEmbed, resultRef, job.ShardIndex, job.TotalShards, job.FilesInShard)
 			next.JobID = job.JobID + "-embed"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageChunk, job.JobID, resultRef, next); err != nil {
 				return err
@@ -480,7 +491,7 @@ func (p *syncPipeline) runEmbedStage(ctx context.Context) error {
 				_ = p.broker.Fail(ctx, p.generation.ID, syncStageEmbed, job.JobID, err.Error(), 3)
 				return err
 			}
-			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageIndex, resultRef, job.ShardIndex, job.TotalShards)
+			next := newObjectQueueJob(syncJobIdentifier(p.job), p.generation.ID, p.generation.Seq, syncStageIndex, resultRef, job.ShardIndex, job.TotalShards, job.FilesInShard)
 			next.JobID = job.JobID + "-index"
 			if err := p.broker.Complete(ctx, p.generation.ID, syncStageEmbed, job.JobID, resultRef, next); err != nil {
 				return err
@@ -562,7 +573,11 @@ func (p *syncPipeline) runIndexStage(ctx context.Context) error {
 				return err
 			}
 			if job.SyncID != "" {
-				if err := p.server.db.RecordSyncJobShard(ctx, job.SyncID, syncStageIndex, job.ShardIndex, filesProcessed); err != nil {
+				progressFiles, err := p.progressFileCount(ctx, job, filesProcessed)
+				if err != nil {
+					return err
+				}
+				if err := p.server.db.RecordSyncJobShard(ctx, job.SyncID, syncStageIndex, job.ShardIndex, progressFiles); err != nil {
 					return err
 				}
 			}
@@ -634,6 +649,63 @@ func (p *syncPipeline) countIndexJobFiles(ctx context.Context, job objectQueueJo
 		return 0, err
 	}
 	return countIndexArtifactFiles(records), nil
+}
+
+func (p *syncPipeline) progressFileCount(ctx context.Context, job objectQueueJob, indexArtifactFiles int) (int, error) {
+	if job.FilesInShard > 0 {
+		return job.FilesInShard, nil
+	}
+	count, err := p.countOriginalShardFiles(ctx, job.ShardIndex)
+	if err == nil {
+		return count, nil
+	}
+	if indexArtifactFiles > 0 {
+		return indexArtifactFiles, nil
+	}
+	return 0, err
+}
+
+func (p *syncPipeline) messageFileCount(ctx context.Context, msg queue.JobMessage) (int, error) {
+	if msg.FilesInShard > 0 {
+		return msg.FilesInShard, nil
+	}
+	if msg.Stage == syncStageChunk && msg.PayloadRef != "" {
+		return p.countInputShardFiles(ctx, msg.PayloadRef)
+	}
+	return p.countOriginalShardFiles(ctx, msg.ShardIndex)
+}
+
+func (p *syncPipeline) countOriginalShardFiles(ctx context.Context, shardIndex int) (int, error) {
+	keys := []string{
+		syncManifestShardKey(p.generation.ID, shardIndex),
+		syncInputShardKey(p.generation.ID, shardIndex),
+	}
+	var lastErr error
+	for _, key := range keys {
+		count, err := p.countInputShardFiles(ctx, key)
+		if err == nil {
+			return count, nil
+		}
+		lastErr = err
+		if !isObjectNotFound(err) {
+			return 0, err
+		}
+	}
+	return 0, lastErr
+}
+
+func (p *syncPipeline) countInputShardFiles(ctx context.Context, ref string) (int, error) {
+	var changes []models.FileChange
+	if err := p.readJSONL(ctx, ref, &changes); err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, change := range changes {
+		if change.Status != models.StatusUnchanged {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func countIndexArtifactFiles(records []syncIndexArtifact) int {

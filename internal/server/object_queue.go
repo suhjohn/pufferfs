@@ -29,6 +29,7 @@ type objectQueueJob struct {
 	Stage         string         `json:"stage"`
 	ShardIndex    int            `json:"shard_index,omitempty"`
 	TotalShards   int            `json:"total_shards,omitempty"`
+	FilesInShard  int            `json:"files_in_shard,omitempty"`
 	PayloadRef    string         `json:"payload_ref"`
 	ResultRef     string         `json:"result_ref,omitempty"`
 	Status        queueJobStatus `json:"status"`
@@ -65,7 +66,7 @@ func newObjectQueueBroker(s3 objectStore) *objectQueueBroker {
 	return &objectQueueBroker{s3: s3}
 }
 
-func newObjectQueueJob(syncID, generationID string, generationSeq int64, stage, payloadRef string, shardIndex, totalShards int) objectQueueJob {
+func newObjectQueueJob(syncID, generationID string, generationSeq int64, stage, payloadRef string, shardIndex, totalShards, filesInShard int) objectQueueJob {
 	now := time.Now().UTC()
 	return objectQueueJob{
 		JobID:         uuid.New().String(),
@@ -75,6 +76,7 @@ func newObjectQueueJob(syncID, generationID string, generationSeq int64, stage, 
 		Stage:         stage,
 		ShardIndex:    shardIndex,
 		TotalShards:   totalShards,
+		FilesInShard:  filesInShard,
 		PayloadRef:    payloadRef,
 		Status:        queueJobQueued,
 		CreatedAt:     now,

@@ -37,6 +37,7 @@ type JobMessage struct {
 	IndexNamespaces   []IndexNamespace `json:"index_namespaces,omitempty"`
 	ShardIndex        int              `json:"shard_index"`
 	TotalShards       int              `json:"total_shards"`
+	FilesInShard      int              `json:"files_in_shard,omitempty"`
 	Priority          int              `json:"priority,omitempty"`
 	EnqueuedAt        time.Time        `json:"enqueued_at"`
 }
