@@ -166,19 +166,132 @@ What to expect:
 
 ## What Gets Synced
 
-PufferFS honors:
+PufferFS decides which files to sync (and index) by evaluating a layered set of
+ignore rules. Anything matched by an ignore rule is excluded from the Merkle
+tree, the diff, the upload, and the search index.
 
-- Built-in ignore rules.
-- `.gitignore` files, scoped to the directories where they appear.
-- `.tpfsignore` files, scoped to the directories where they appear.
-- Global ignore rules at `~/.tpfs/ignore`.
+### Ignore rule sources (in evaluation order)
 
-Common ignored paths include dependency folders, virtual environments, build
-outputs, caches, and `.git`.
+| Source | Scope | Format |
+| --- | --- | --- |
+| **Always ignored** | All projects | Hard-coded (`.git`) |
+| **Built-in defaults** | All projects | Hard-coded list (see below) |
+| **Secret-file patterns** | All projects | Filename glob (see below) |
+| **`.gitignore`** | Directory where the file lives (recursive) | [gitignore syntax](https://git-scm.com/docs/gitignore) |
+| **`.tpfsignore`** | Directory where the file lives (recursive) | gitignore syntax |
+| **`~/.tpfs/ignore`** | All projects for the current user | gitignore syntax |
 
-Likely secret filenames such as `.env`, `.env.*`, private keys, npm/pypi config
-files, and credential JSON files are excluded from sync state by default. Treat
-this as filename-based protection, not a full content secret scanner.
+A file is excluded if **any** source matches it. There is currently no negation
+or override mechanism across sources (though negation patterns such as `!keep`
+work within a single gitignore-syntax file).
+
+### User-defined ignore files
+
+#### `.tpfsignore` (project-level)
+
+Place a `.tpfsignore` file in any directory of your project. Patterns in that
+file apply to the directory tree rooted at the file's location, using standard
+[gitignore pattern syntax](https://git-scm.com/docs/gitignore#_pattern_format).
+
+```text
+# my-project/.tpfsignore
+# Ignore all CSV data files in this directory tree
+*.csv
+
+# Ignore the local scratch folder
+scratch/
+
+# Ignore generated API client
+generated/client/
+```
+
+You can place `.tpfsignore` files in subdirectories for scoped rules:
+
+```text
+# my-project/data/.tpfsignore
+# Only applies inside my-project/data/
+*.parquet
+*.arrow
+```
+
+#### `~/.tpfs/ignore` (global)
+
+The global ignore file at `~/.tpfs/ignore` applies to **every** project synced
+by the current user. Use it for machine-specific patterns that should never be
+synced regardless of project.
+
+```text
+# ~/.tpfs/ignore
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+
+# OS metadata
+.Spotlight-V100
+.Trashes
+```
+
+#### `.gitignore` (project-level, also respected)
+
+PufferFS loads `.gitignore` files from every directory in the tree. Patterns are
+scoped to the directory where the file lives, same as Git. If your project
+already has a comprehensive `.gitignore`, PufferFS inherits those rules
+automatically — no extra configuration needed.
+
+### Built-in default ignores
+
+These paths are always excluded without any configuration:
+
+| Pattern | Reason |
+| --- | --- |
+| `.git` | Version control internals (always hard-excluded) |
+| `node_modules` | JavaScript dependencies |
+| `__pycache__` | Python bytecode cache |
+| `.venv` / `venv` | Python virtual environments |
+| `dist` / `build` | Build outputs |
+| `.tpfs` | PufferFS local state |
+| `.next` / `.nuxt` | Framework build caches |
+| `.cache` | Generic cache directory |
+| `.DS_Store` / `Thumbs.db` | OS metadata |
+| `*.pyc` / `*.pyo` | Python compiled files |
+| `*.o` / `*.so` / `*.dylib` | Native object files / shared libraries |
+| `*.class` | Java class files |
+
+### Secret-file patterns
+
+These filenames are unconditionally excluded to prevent accidental sync of
+credentials. This is a guardrail, not a full secret scanner — secrets embedded
+inside non-matching files (e.g. a token in `config.yaml`) will still sync.
+
+| Pattern | Examples matched |
+| --- | --- |
+| `.env` / `.env.*` | `.env`, `.env.local`, `.env.production` |
+| `*.pem` / `*.key` | `server.pem`, `private.key` |
+| `*_rsa` / `id_rsa` / `id_ed25519` / `id_ecdsa` | SSH private keys |
+| `credentials.json` | GCP service account |
+| `service-account*.json` | `service-account-prod.json` |
+| `*.p12` / `*.pfx` | Certificate bundles |
+| `.npmrc` / `.pypirc` | Package-manager auth configs |
+
+### Verifying ignored patterns
+
+Use `--dry-run` to preview what would be synced and see which patterns are
+active:
+
+```sh
+pufferfs sync --dry-run .
+```
+
+The dry-run output lists detected secret files and active ignore patterns
+without uploading anything.
+
+### Interaction with `watch` / `sync --follow`
+
+The `watch` command and `sync --follow` apply the same ignore matcher when
+setting up filesystem watchers. Directories matching ignore rules are not
+watched, reducing system resource usage and eliminating noise from dependency
+installs or build outputs.
 
 ## File Changes
 
