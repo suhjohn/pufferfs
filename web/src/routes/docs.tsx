@@ -517,6 +517,11 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
               diff, upload set, and search index. Ignored files are not sent to
               the API.
             </p>
+            <p>
+              This is local CLI behavior: the API server does not read ignore
+              files itself. Direct API clients should filter paths before
+              submitting a sync request.
+            </p>
             <div className="docs-command-list">
               <article className="docs-command">
                 <h3>user-defined ignore files</h3>

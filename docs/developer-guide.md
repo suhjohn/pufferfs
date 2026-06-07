@@ -170,6 +170,13 @@ PufferFS decides which files to sync (and index) by evaluating a layered set of
 ignore rules. Anything matched by an ignore rule is excluded from the Merkle
 tree, the diff, the upload, and the search index.
 
+Ignore matching is **local CLI behavior**. The API server does not read
+`.gitignore`, `.tpfsignore`, or `~/.tpfs/ignore`, because those files live on
+the syncing machine and the server only receives the submitted sync request,
+state, and uploaded objects. Direct API clients must apply their own filtering
+before calling `POST /roots/{id}/sync`; the server still enforces authentication,
+write ACLs, protocol validation, and upload limits.
+
 ### Ignore rule sources (in evaluation order)
 
 | Source | Scope | Format |
