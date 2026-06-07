@@ -102,8 +102,8 @@ Important API surfaces:
 - Platform admin: provision/delete orgs and users, upsert org membership,
   create member API keys, create/delete roots.
 - Roots: create, list accessible roots, get metadata, delete, upload file,
-  upload bundle, sync, sync init compatibility endpoint, get state, sync status,
-  list sync jobs.
+  upload bundle, sync init (create sync session), sync artifact upload,
+  sync abort, sync finalize, get state, sync status, list sync jobs.
 - ACLs: create/list/delete path-prefix ACLs.
 - Query: `POST /query`.
 - Billing: get subscription, create Stripe checkout session, receive Stripe
@@ -155,8 +155,14 @@ Object storage carries the high-volume data plane:
 - `states/<rootID>/<generationID>.json.gz`: compressed root state snapshots
   written by the server when a sync request carries inline state instead of a
   state ref.
+- `syncs/<generationID>/manifests/*.jsonl`: manifest shards uploaded by the
+  client during the manifest-session flow.
+- `syncs/<generationID>/proofs/content-proof.json`: generation-scoped content
+  proof artifact.
+- `syncs/<generationID>/state/state.json.gz`: generation-scoped compressed state.
 - `syncs/<generationID>/request.json`: queued sync request payload.
-- `syncs/<generationID>/inputs/*.jsonl`: file-change shards.
+- `syncs/<generationID>/inputs/*.jsonl`: file-change shards (derived from
+  manifests or inline changes).
 - `syncs/<generationID>/chunks/*.jsonl`: chunk-stage artifacts.
 - `syncs/<generationID>/index_rows/*.jsonl`: embed-stage/index-row artifacts.
 - `syncs/<generationID>/queues/*.queue.json`: in-process object-queue state.
@@ -196,10 +202,23 @@ server:
 - The complete root state is gzip-compressed and uploaded through the bundle
   endpoint as a `state_ref`.
 
-The sync request includes protocol version, base generation ID/sequence,
-changes, state ref, SimHash, content proof, and source manifest ref. If the
-server reports a stale base generation, the CLI reloads remote state, recomputes
-the diff, and retries once against the latest generation.
+For large trees, the CLI uses the manifest-session flow:
+
+1. Call `POST /roots/{id}/sync/init` to create a sync generation and obtain a
+   `generation_id` and `manifest_prefix`.
+2. Upload file-change manifest shards (JSONL) under the generation's artifact
+   namespace via `POST /roots/{id}/sync/{generation_id}/upload`.
+3. Upload the content proof and compressed state via the same artifact endpoint.
+4. Submit a small finalize request (`POST /roots/{id}/sync`) with `generation_id`
+   and `change_refs` pointing to the uploaded shards — no inline `changes` needed.
+
+If client upload fails before finalize, `DELETE /roots/{id}/sync/{generation_id}`
+aborts the session and cleans up artifacts.
+
+For backward compatibility the sync request still accepts inline changes without
+a prior `sync/init` call. If the server reports a stale base generation, the CLI
+reloads remote state, recomputes the diff, and retries once against the latest
+generation.
 
 ### Server-Side Sync
 

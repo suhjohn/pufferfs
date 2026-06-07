@@ -589,3 +589,42 @@ We started with “sync is too slow,” then made it faster, then asked what wou
 - flip visibility atomically only when the sync is complete.
 
 That is the architecture now implemented in PR #2.
+
+---
+
+## 17. Manifest-session sync (PR #17)
+
+PR #17 introduces explicit sync sessions to move large control-plane payloads
+out of the `POST /sync` request body:
+
+```text
+Client                              Server
+  |                                    |
+  |-- POST /sync/init ---------------->|  create SyncJob + SyncGeneration
+  |<-- {generation_id, manifest_prefix}|
+  |                                    |
+  |-- POST /sync/{gen}/upload -------->|  store manifest shard
+  |-- POST /sync/{gen}/upload -------->|  store content proof
+  |-- POST /sync/{gen}/upload -------->|  store compressed state
+  |                                    |
+  |-- POST /sync (finalize) ---------->|  small request: gen_id + change_refs
+  |<-- SyncResponse -----------------  |  after commit
+```
+
+Key properties:
+
+- **Generation-scoped artifact namespace**: transient sync artifacts live under
+  `syncs/<generation_id>/manifests/`, `syncs/<generation_id>/proofs/`, etc. —
+  separate from source bundles under `bundles/<root>/`.
+- **Small finalize request**: the sync POST carries only a `generation_id` and
+  a list of `change_refs` pointing to manifest shards, not inline file changes.
+- **Abort semantics**: if the client fails before finalize, it calls
+  `DELETE /sync/{generation_id}` to mark the generation failed and clean up.
+- **Backward compatible**: inline `changes` without `generation_id` still works
+  for small syncs or old clients.
+- **Scalability contract**: the final sync request size is bounded by shard
+  count, not file count. At 1M files with 5000 files/shard, the finalize request
+  carries ~200 refs instead of 1M inline change records.
+
+This is the recommended path for any sync exceeding a few thousand files. The
+CLI uses this flow by default.
