@@ -33,6 +33,7 @@ type JobMessage struct {
 	BaseGenerationSeq int64            `json:"base_generation_seq"`
 	Stage             string           `json:"stage"`
 	PayloadRef        string           `json:"payload_ref,omitempty"`
+	InputRefs         []string         `json:"input_refs,omitempty"`
 	CleanupKeys       []string         `json:"cleanup_keys,omitempty"`
 	IndexNamespaces   []IndexNamespace `json:"index_namespaces,omitempty"`
 	ShardIndex        int              `json:"shard_index"`

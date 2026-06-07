@@ -35,6 +35,13 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 		}
 	}
 
+	for i := range req.ChangeRefs {
+		req.ChangeRefs[i] = strings.TrimSpace(strings.ReplaceAll(req.ChangeRefs[i], "\\", "/"))
+		if err := validateBundleObjectRef(req.RootID, req.ChangeRefs[i], "change_refs"); err != nil {
+			return err
+		}
+	}
+
 	if req.State != nil {
 		state := make(map[string]models.FileState, len(req.State))
 		for rawPath, fileState := range req.State {
@@ -50,6 +57,10 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 		req.State = state
 	}
 
+	req.ContentProofRef = strings.TrimSpace(strings.ReplaceAll(req.ContentProofRef, "\\", "/"))
+	if err := validateBundleObjectRef(req.RootID, req.ContentProofRef, "content_proof_ref"); err != nil {
+		return err
+	}
 	if req.ContentProof != nil {
 		fileHashes := make(map[string]string, len(req.ContentProof.FileHashes))
 		for rawPath, hash := range req.ContentProof.FileHashes {

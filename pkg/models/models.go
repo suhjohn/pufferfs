@@ -214,10 +214,13 @@ type SyncRequest struct {
 	BaseGenerationID  string               `json:"base_generation_id"`
 	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
 	Changes           []FileChange         `json:"changes"`
+	ChangeRefs        []string             `json:"change_refs,omitempty"`
+	ChangeCount       int                  `json:"change_count,omitempty"`
 	State             map[string]FileState `json:"state,omitempty"`
 	StateRef          string               `json:"state_ref,omitempty"`
 	SimHash           string               `json:"simhash,omitempty"`
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
+	ContentProofRef   string               `json:"content_proof_ref,omitempty"`
 	ManifestRef       string               `json:"manifest_ref,omitempty"`
 }
 

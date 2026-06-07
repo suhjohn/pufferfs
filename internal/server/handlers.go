@@ -1167,6 +1167,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state or state_ref is required"})
 		return
 	}
+	if len(req.Changes) == 0 && len(req.ChangeRefs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "changes or change_refs is required"})
+		return
+	}
 	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
@@ -1190,6 +1194,9 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		if c.Status != models.StatusUnchanged {
 			actionableFiles++
 		}
+	}
+	if actionableFiles == 0 && req.ChangeCount > 0 {
+		actionableFiles = req.ChangeCount
 	}
 
 	// Create sync job
@@ -1281,18 +1288,15 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		return resp, nil
 	}
 
-	if req.ContentProof != nil {
-		proofBytes, _ := json.Marshal(req.ContentProof)
-		if err := s.db.UpsertContentProof(ctx, orgID, userID, rootID, req.ContentProof.RootHash, proofBytes); err != nil {
-			_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-			if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-				log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-			}
-			if job != nil {
-				_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-			}
-			return nil, fmt.Errorf("storing content proof: %w", err)
+	if err := s.storeSyncContentProof(ctx, orgID, userID, rootID, req); err != nil {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
 		}
+		if job != nil {
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return nil, fmt.Errorf("storing content proof: %w", err)
 	}
 	if err := s.cleanupFailedGenerationRowsForRoot(ctx, orgID, rootID); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
@@ -1332,6 +1336,32 @@ func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, gene
 		return s.enqueueSync(ctx, orgID, userID, generation, req, job)
 	}
 	return s.processSync(ctx, orgID, generation, req, job)
+}
+
+func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootID string, req *models.SyncRequest) error {
+	if req == nil {
+		return nil
+	}
+	proof := req.ContentProof
+	var proofBytes []byte
+	if proof != nil {
+		proofBytes, _ = json.Marshal(proof)
+	} else if req.ContentProofRef != "" {
+		data, err := s.s3.Download(ctx, req.ContentProofRef)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", req.ContentProofRef, err)
+		}
+		var parsed models.ContentProofData
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			return fmt.Errorf("parsing %s: %w", req.ContentProofRef, err)
+		}
+		proof = &parsed
+		proofBytes = data
+	}
+	if proof == nil {
+		return nil
+	}
+	return s.db.UpsertContentProof(ctx, orgID, userID, rootID, proof.RootHash, proofBytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1566,7 +1596,11 @@ func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootI
 		return checkPermission(acls, filePath, "write")
 	}
 
-	for _, change := range req.Changes {
+	changes, err := s.syncRequestChangesForACL(ctx, req)
+	if err != nil {
+		return err
+	}
+	for _, change := range changes {
 		switch change.Status {
 		case models.StatusAdded, models.StatusModified, models.StatusRemoved:
 			if !canWrite(change.Path) {
@@ -1582,6 +1616,34 @@ func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootI
 		}
 	}
 	return nil
+}
+
+func (s *Server) syncRequestChangesForACL(ctx context.Context, req *models.SyncRequest) ([]models.FileChange, error) {
+	if req == nil {
+		return nil, nil
+	}
+	if len(req.ChangeRefs) == 0 || len(req.Changes) > 0 {
+		return req.Changes, nil
+	}
+	var changes []models.FileChange
+	for _, ref := range req.ChangeRefs {
+		data, err := s.s3.Download(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("downloading change ref %s: %w", ref, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(data))
+		for {
+			var change models.FileChange
+			if err := dec.Decode(&change); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("parsing change ref %s: %w", ref, err)
+			}
+			changes = append(changes, change)
+		}
+	}
+	return changes, nil
 }
 
 // checkReadACL checks if a user has read permission for a path in a root.

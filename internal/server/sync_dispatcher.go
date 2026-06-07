@@ -390,18 +390,15 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		Seq:               msg.GenerationSeq,
 		BaseGenerationSeq: msg.BaseGenerationSeq,
 	}
-	if req.ContentProof != nil {
-		proofBytes, _ := json.Marshal(req.ContentProof)
-		if err := d.server.db.UpsertContentProof(ctx, msg.OrgID, msg.UserID, msg.RootID, req.ContentProof.RootHash, proofBytes); err != nil {
-			_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
-			if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
-				log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
-			}
-			if msg.SyncJobID != "" {
-				_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
-			}
-			return fmt.Errorf("storing content proof: %w", err)
+	if err := d.server.storeSyncContentProof(ctx, msg.OrgID, msg.UserID, msg.RootID, req); err != nil {
+		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)
+		if cleanupErr := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); cleanupErr != nil {
+			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
 		}
+		if msg.SyncJobID != "" {
+			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		return fmt.Errorf("storing content proof: %w", err)
 	}
 	if err := d.server.ensureSyncStateRef(ctx, msg.RootID, msg.GenerationID, req); err != nil {
 		_ = d.server.db.MarkSyncGenerationFailed(ctx, msg.GenerationID)

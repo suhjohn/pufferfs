@@ -421,12 +421,18 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 			return nil, fmt.Errorf("loading remote root metadata: %w", err)
 		}
 	}
+	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
+	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
+	var hashCache map[string]models.FileState
+	if useLocalCache && rootID != "" {
+		hashCache, _ = loadLocalState(rootID)
+	}
 
 	// Build Merkle tree (parallel file hashing)
 	matcher := ignore.NewMatcher(dir)
 	fmt.Fprintf(log, "Building Merkle tree for %s...\n", dir)
 	start := time.Now()
-	currentTree, err := merkle.BuildTree(dir, matcher)
+	currentTree, err := merkle.BuildTreeWithStateCache(dir, matcher, hashCache)
 	if err != nil {
 		return nil, fmt.Errorf("building Merkle tree: %w", err)
 	}
@@ -435,8 +441,6 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 	// Extract flat state for backward compatibility with server
 	currentState := currentTree.ToFileStateMap()
 
-	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
-	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
 	if !useLocalCache {
 		fmt.Fprintln(log, "Remote generation changed; diffing against remote state.")
 		previousState, err := loadRemoteState(client, rootID)
@@ -529,6 +533,10 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	if err != nil {
 		return nil, err
 	}
+	changeRefs, err := uploadChangeShards(client, rootID, changes)
+	if err != nil {
+		return nil, fmt.Errorf("uploading change shards: %w", err)
+	}
 
 	// Build content proof from Merkle tree
 	proof := currentTree.BuildContentProof()
@@ -536,6 +544,10 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		FileHashes: proof.FileHashes,
 		DirHashes:  proof.DirHashes,
 		RootHash:   proof.RootHash,
+	}
+	contentProofRef, err := uploadContentProof(client, rootID, contentProof)
+	if err != nil {
+		return nil, fmt.Errorf("uploading content proof: %w", err)
 	}
 	stateRef, err := uploadRootState(client, rootID, currentState)
 	if err != nil {
@@ -548,10 +560,11 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		RootID:            rootID,
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
-		Changes:           changes,
+		ChangeRefs:        changeRefs,
+		ChangeCount:       changeCount,
 		StateRef:          stateRef,
 		SimHash:           currentTree.SimHashHex(),
-		ContentProof:      contentProof,
+		ContentProofRef:   contentProofRef,
 		ManifestRef:       manifestRef,
 	}
 
@@ -1017,6 +1030,45 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 	return key, nil
 }
 
+func uploadChangeShards(client *apiClient, rootID string, changes []models.FileChange) ([]string, error) {
+	if len(changes) == 0 {
+		return nil, nil
+	}
+	shardSize := uploadChangeShardMaxFiles()
+	refs := make([]string, 0, (len(changes)+shardSize-1)/shardSize)
+	batchID := fmt.Sprintf("%d", time.Now().UnixNano())
+	for start := 0; start < len(changes); start += shardSize {
+		end := start + shardSize
+		if end > len(changes) {
+			end = len(changes)
+		}
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		for _, change := range changes[start:end] {
+			if err := enc.Encode(change); err != nil {
+				return nil, err
+			}
+		}
+		key, err := uploadBundle(client, rootID, fmt.Sprintf("%s-changes-%06d", batchID, len(refs)), buf.Bytes(), "application/x-ndjson")
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, key)
+	}
+	return refs, nil
+}
+
+func uploadContentProof(client *apiClient, rootID string, proof *models.ContentProofData) (string, error) {
+	if proof == nil {
+		return "", nil
+	}
+	data, err := json.Marshal(proof)
+	if err != nil {
+		return "", err
+	}
+	return uploadBundle(client, rootID, fmt.Sprintf("%d-content-proof", time.Now().UnixNano()), data, "application/json")
+}
+
 func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
@@ -1087,6 +1139,19 @@ func uploadBundleMaxBytes() int64 {
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < 1 {
 		return defaultBytes
+	}
+	return value
+}
+
+func uploadChangeShardMaxFiles() int {
+	const defaultFiles = 5000
+	raw := os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES")
+	if raw == "" {
+		return defaultFiles
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return defaultFiles
 	}
 	return value
 }
