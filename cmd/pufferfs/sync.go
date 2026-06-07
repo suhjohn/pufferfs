@@ -25,13 +25,15 @@ import (
 
 func syncCmd() *cobra.Command {
 	var (
-		dryRun  bool
-		name    string
-		rootID  string
-		scope   string
-		follow  bool
-		jsonOut bool
-		options followOptions
+		dryRun     bool
+		name       string
+		rootID     string
+		scope      string
+		follow     bool
+		jsonOut    bool
+		background bool
+		detach     bool
+		options    followOptions
 	)
 
 	cmd := &cobra.Command{
@@ -60,13 +62,19 @@ func syncCmd() *cobra.Command {
 				if dryRun {
 					return fmt.Errorf("--follow cannot be combined with --dry-run")
 				}
+				if background || detach {
+					return fmt.Errorf("--background/--detach cannot be combined with --follow")
+				}
 				if cfg.Server.URL == "" {
 					return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 				}
 				return runFollow(cfg, absDir, name, rootID, options)
 			}
+			if dryRun && (background || detach) {
+				return fmt.Errorf("--background/--detach cannot be combined with --dry-run")
+			}
 			log := syncLogWriter(jsonOut)
-			result, err := runSync(cfg, absDir, name, rootID, scope, dryRun, log)
+			result, err := runSync(cfg, absDir, name, rootID, scope, dryRun, !background && !detach, log)
 			if err != nil {
 				return err
 			}
@@ -80,10 +88,13 @@ func syncCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be synced without syncing")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Continuously sync when files change")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print sync result as JSON")
+	cmd.Flags().BoolVar(&background, "background", false, "Start sync and return immediately with a sync job ID")
+	cmd.Flags().BoolVar(&detach, "detach", false, "Alias for --background")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
 	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
 	addFollowFlags(cmd, &options)
+	cmd.AddCommand(syncStatusCmd(), syncJobsCmd(), syncWaitCmd())
 
 	return cmd
 }
@@ -115,7 +126,262 @@ func syncLogWriter(jsonOutput bool) io.Writer {
 	return os.Stdout
 }
 
-func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, log io.Writer) (*syncCommandResult, error) {
+func syncStatusCmd() *cobra.Command {
+	var (
+		rootRef  string
+		jobID    string
+		jsonOut  bool
+		watch    bool
+		interval time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "status [root-id-or-name]",
+		Short: "Show sync job status",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := appconfig.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
+			if err != nil {
+				return err
+			}
+			if watch {
+				return watchSyncStatus(client, rootID, jobID, interval, jsonOut)
+			}
+			job, raw, err := getSyncJob(client, rootID, jobID)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writeRawJSONLine(os.Stdout, raw)
+			}
+			printSyncJob(os.Stdout, job)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
+	cmd.Flags().StringVar(&jobID, "job-id", "", "Specific sync job ID (defaults to latest)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print raw sync job JSON")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Poll until the sync job completes or fails")
+	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval for --watch")
+	return cmd
+}
+
+func syncJobsCmd() *cobra.Command {
+	var (
+		rootRef string
+		jsonOut bool
+	)
+	cmd := &cobra.Command{
+		Use:   "jobs [root-id-or-name]",
+		Short: "List recent sync jobs for a root",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := appconfig.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
+			if err != nil {
+				return err
+			}
+			raw, err := client.get(fmt.Sprintf("/roots/%s/sync/jobs", url.PathEscape(rootID)))
+			if err != nil {
+				return fmt.Errorf("listing sync jobs: %w", err)
+			}
+			if jsonOut {
+				return writeRawJSONLine(os.Stdout, raw)
+			}
+			var jobs []models.SyncJob
+			if err := json.Unmarshal(raw, &jobs); err != nil {
+				return fmt.Errorf("parsing sync jobs: %w", err)
+			}
+			printSyncJobs(os.Stdout, jobs)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print raw sync jobs JSON")
+	return cmd
+}
+
+func syncWaitCmd() *cobra.Command {
+	var (
+		rootRef  string
+		jobID    string
+		jsonOut  bool
+		interval time.Duration
+	)
+	cmd := &cobra.Command{
+		Use:   "wait [root-id-or-name]",
+		Short: "Wait for a sync job to complete",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := appconfig.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
+			if err != nil {
+				return err
+			}
+			job, err := waitForSyncJob(client, rootID, jobID, interval, !jsonOut)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				return writePrettyJSON(os.Stdout, job)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
+	cmd.Flags().StringVar(&jobID, "job-id", "", "Specific sync job ID (defaults to latest)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print final sync job JSON")
+	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval")
+	return cmd
+}
+
+func syncCommandClientAndRoot(cfg *appconfig.Config, rootRef string, args []string) (*apiClient, string, error) {
+	if cfg.Server.URL == "" {
+		return nil, "", fmt.Errorf("server URL not configured; run 'pufferfs init' first")
+	}
+	if rootRef != "" && len(args) > 0 {
+		return nil, "", fmt.Errorf("root specified both as argument and --root")
+	}
+	if rootRef == "" && len(args) > 0 {
+		rootRef = args[0]
+	}
+	if rootRef == "" {
+		var err error
+		rootRef, err = detectRootFromCwd()
+		if err != nil {
+			return nil, "", fmt.Errorf("could not detect root from cwd; use --root to specify: %w", err)
+		}
+	}
+	client := newAPIClient(cfg)
+	rootID := rootRef
+	if !isUUID(rootID) {
+		resolvedID, err := resolveRootName(client, rootID)
+		if err != nil {
+			return nil, "", fmt.Errorf("resolving root %q: %w", rootRef, err)
+		}
+		rootID = resolvedID
+	}
+	return client, rootID, nil
+}
+
+func getSyncJob(client *apiClient, rootID, jobID string) (*models.SyncJob, []byte, error) {
+	path := fmt.Sprintf("/roots/%s/sync/status", url.PathEscape(rootID))
+	if jobID != "" {
+		path += "?job_id=" + url.QueryEscape(jobID)
+	}
+	raw, err := client.get(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("getting sync status: %w", err)
+	}
+	var job models.SyncJob
+	if err := json.Unmarshal(raw, &job); err != nil {
+		return nil, nil, fmt.Errorf("parsing sync status: %w", err)
+	}
+	return &job, raw, nil
+}
+
+func watchSyncStatus(client *apiClient, rootID, jobID string, interval time.Duration, jsonOut bool) error {
+	deadline := time.Now().Add(syncPollTimeout())
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for sync job status")
+		}
+		job, raw, err := getSyncJob(client, rootID, jobID)
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			if err := writeRawJSONLine(os.Stdout, raw); err != nil {
+				return err
+			}
+		} else {
+			printSyncJob(os.Stdout, job)
+		}
+		if syncJobTerminal(job.Status) {
+			if job.Status == "failed" {
+				return fmt.Errorf("sync job failed: %s", string(job.Errors))
+			}
+			return nil
+		}
+		time.Sleep(normalizeSyncPollInterval(interval))
+	}
+}
+
+func waitForSyncJob(client *apiClient, rootID, jobID string, interval time.Duration, logProgress bool) (*models.SyncJob, error) {
+	deadline := time.Now().Add(syncPollTimeout())
+	for {
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for sync job")
+		}
+		job, _, err := getSyncJob(client, rootID, jobID)
+		if err != nil {
+			return nil, err
+		}
+		switch job.Status {
+		case "completed":
+			if logProgress {
+				fmt.Fprintf(os.Stdout, "Sync job %s completed (%d/%d files).\n", job.ID, job.Processed, job.TotalFiles)
+			}
+			return job, nil
+		case "failed":
+			return job, fmt.Errorf("sync job failed: %s", string(job.Errors))
+		default:
+			if logProgress {
+				fmt.Fprintf(os.Stdout, "Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
+			}
+			time.Sleep(normalizeSyncPollInterval(interval))
+		}
+	}
+}
+
+func syncJobTerminal(status string) bool {
+	return status == "completed" || status == "failed"
+}
+
+func normalizeSyncPollInterval(interval time.Duration) time.Duration {
+	if interval < 100*time.Millisecond {
+		return 2 * time.Second
+	}
+	return interval
+}
+
+func printSyncJob(w io.Writer, job *models.SyncJob) {
+	fmt.Fprintf(w, "sync_job_id: %s\n", job.ID)
+	fmt.Fprintf(w, "root_id: %s\n", job.RootID)
+	fmt.Fprintf(w, "status: %s\n", job.Status)
+	fmt.Fprintf(w, "progress: %d/%d files\n", job.Processed, job.TotalFiles)
+	fmt.Fprintf(w, "started_at: %s\n", job.StartedAt.Format(time.RFC3339))
+	if job.FinishedAt != nil {
+		fmt.Fprintf(w, "finished_at: %s\n", job.FinishedAt.Format(time.RFC3339))
+	}
+	if len(job.Errors) > 0 && string(job.Errors) != "null" {
+		fmt.Fprintf(w, "errors: %s\n", string(job.Errors))
+	}
+}
+
+func printSyncJobs(w io.Writer, jobs []models.SyncJob) {
+	if len(jobs) == 0 {
+		fmt.Fprintln(w, "No sync jobs found.")
+		return
+	}
+	for i := range jobs {
+		if i > 0 {
+			fmt.Fprintln(w)
+		}
+		printSyncJob(w, &jobs[i])
+	}
+}
+
+func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
 	if log == nil {
 		log = os.Stdout
 	}
@@ -185,7 +451,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 			}
 			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
 		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -203,7 +469,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -221,11 +487,11 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun 
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
 	var err error
 
 	// Detect secrets
@@ -304,13 +570,19 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	if syncResp.RootID == "" {
 		syncResp.RootID = rootID
 	}
-	if syncResp.SyncJobID != "" {
+	if syncResp.SyncJobID != "" && waitForCompletion {
 		if err := pollSyncJob(client, rootID, syncResp.SyncJobID, log); err != nil {
 			return nil, err
 		}
 	}
 
 	saveLocalSyncCacheWarnings(rootID, name, dir, currentState, currentTree, syncResp.GenerationID, syncResp.GenerationSeq)
+
+	if !waitForCompletion {
+		fmt.Fprintf(log, "Sync job %s started for root %s. Check status with: pufferfs sync status --root %s --job-id %s\n",
+			syncResp.SyncJobID, rootID, rootID, syncResp.SyncJobID)
+		return backgroundSyncResult(name, dir, changeCount, syncResp), nil
+	}
 
 	fmt.Fprintf(log, "Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
 		syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
@@ -345,8 +617,8 @@ func syncConflictFromError(err error) (*syncConflictError, bool) {
 	return &syncConflictError{SyncConflictResponse: resp}, true
 }
 
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
-	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
+	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return syncResult, err
@@ -369,7 +641,7 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 		}
 		return unchangedSyncResult(rootID, name, dir, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq), nil
 	}
-	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, log)
+	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, log)
 }
 
 func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) error {
@@ -454,6 +726,19 @@ func completedSyncResult(name, dir string, changes int, resp models.SyncResponse
 		ChunksRemoved:  resp.ChunksRemoved,
 		ChunksMoved:    resp.ChunksMoved,
 		FilesProcessed: resp.FilesProcessed,
+	}
+}
+
+func backgroundSyncResult(name, dir string, changes int, resp models.SyncResponse) *syncCommandResult {
+	return &syncCommandResult{
+		Status:        "started",
+		RootID:        resp.RootID,
+		RootName:      name,
+		SourcePath:    dir,
+		Changes:       changes,
+		SyncJobID:     resp.SyncJobID,
+		GenerationID:  resp.GenerationID,
+		GenerationSeq: resp.GenerationSeq,
 	}
 }
 

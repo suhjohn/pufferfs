@@ -19,6 +19,38 @@ func TestLocalChunkableSkipsModalOnlyForSimpleTextFormats(t *testing.T) {
 	if localChunkable("slides/deck.pptx") {
 		t.Fatal("pptx should route to Modal")
 	}
+	for _, path := range []string{
+		"mail/message.eml",
+		"mail/message.msg",
+		"contacts/team.vcf",
+		"calendar/launch.ics",
+		"media/call.mp3",
+		"media/call.wav",
+		"media/demo.mp4",
+		"media/demo.mov",
+	} {
+		if localChunkable(path) {
+			t.Fatalf("%s should route to Modal", path)
+		}
+	}
+}
+
+func TestDetectFileTypeRecognizesStructuredAndMediaFiles(t *testing.T) {
+	cases := map[string]string{
+		"mail/message.eml":  "eml",
+		"mail/message.msg":  "msg",
+		"contacts/team.vcf": "vcf",
+		"calendar/demo.ics": "ics",
+		"media/call.mp3":    "audio",
+		"media/call.wav":    "audio",
+		"media/demo.mp4":    "video",
+		"media/demo.mov":    "video",
+	}
+	for path, want := range cases {
+		if got := detectFileType(path); got != want {
+			t.Fatalf("detectFileType(%q) = %q, want %q", path, got, want)
+		}
+	}
 }
 
 func TestChunkMarkdownUsesSlidingOverlap(t *testing.T) {

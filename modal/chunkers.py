@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
+import email
+from email import policy
+from html.parser import HTMLParser
+import os
+import quopri
 import random
 import re
+import subprocess
+import tempfile
+import time
 
 from models import Chunk
 
@@ -33,6 +41,56 @@ def image_to_text(image_bytes: bytes, gemini_api_key: str, mime_type: str = "ima
         ],
     )
     return response.text or ""
+
+
+def media_segment_to_text(
+    segment_path: str,
+    gemini_api_key: str,
+    media_type: str,
+    start_seconds: float,
+    end_seconds: float,
+    mime_type: str,
+) -> str:
+    """Call Gemini to describe an audio/video segment for retrieval."""
+    from google import genai
+
+    client = genai.Client(api_key=gemini_api_key)
+    uploaded = client.files.upload(file=segment_path, config={"mime_type": mime_type})
+    uploaded = _wait_for_file(uploaded, client)
+
+    time_range = f"{_format_timestamp(start_seconds)}-{_format_timestamp(end_seconds)}"
+    prompt = (
+        f"This is a segment from a larger {media_type} file, covering {time_range}.\n\n"
+        "Describe the important content in this segment for semantic search indexing.\n"
+        "Include enough detail that someone searching later can find this file and decide whether to open it.\n"
+        "Do not transcribe verbatim. Ignore filler and unimportant chatter.\n"
+        "Return only the text to index."
+    )
+    if media_type == "video":
+        prompt += "\nInclude visible content if it helps explain what the segment is about."
+
+    model = random.choice(GEMINI_MODELS)
+    response = client.models.generate_content(model=model, contents=[uploaded, prompt])
+    return response.text or ""
+
+
+def _wait_for_file(uploaded, client):
+    deadline = time.time() + 300
+    while True:
+        state = None
+        try:
+            if uploaded.state is not None:
+                state = uploaded.state.name
+        except AttributeError:
+            state = None
+        if state in (None, "ACTIVE"):
+            return uploaded
+        if state == "FAILED":
+            raise RuntimeError(f"Gemini file processing failed for {uploaded.name}")
+        if time.time() >= deadline:
+            raise TimeoutError(f"timed out waiting for Gemini file processing for {uploaded.name}")
+        time.sleep(5)
+        uploaded = client.files.get(name=uploaded.name)
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +470,529 @@ def chunk_image(
 
 
 # ---------------------------------------------------------------------------
+# Email / calendar / contact chunking
+# ---------------------------------------------------------------------------
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        if data.strip():
+            self.parts.append(data.strip())
+
+    def text(self) -> str:
+        return "\n".join(self.parts)
+
+
+def chunk_structured_file(
+    file_bytes: bytes,
+    root_id: str,
+    file_path: str,
+    file_type: str,
+) -> list[Chunk]:
+    if file_type == "eml":
+        headers, body = _extract_eml_parts(file_bytes)
+        return _chunk_email_parts(headers, body, root_id, file_path, file_type)
+    elif file_type == "msg":
+        headers, body = _extract_msg_parts(file_bytes)
+        return _chunk_email_parts(headers, body, root_id, file_path, file_type)
+    elif file_type == "vcf":
+        return _chunk_record_texts(_vcf_record_texts(file_bytes), root_id, file_path, file_type)
+    elif file_type == "ics":
+        return _chunk_record_texts(_ics_record_texts(file_bytes), root_id, file_path, file_type)
+    else:
+        text = file_bytes.decode("utf-8", errors="replace")
+        return chunk_markdown(text, root_id, file_path, file_type)
+
+
+def _extract_eml_text(file_bytes: bytes) -> str:
+    headers, body = _extract_eml_parts(file_bytes)
+    return "\n".join(part for part in ("\n".join(headers), body) if part).strip()
+
+
+def _extract_eml_parts(file_bytes: bytes) -> tuple[list[str], str]:
+    msg = email.message_from_bytes(file_bytes, policy=policy.default)
+    return _email_header_lines(msg), _email_body_text(msg)
+
+
+def _email_header_lines(msg) -> list[str]:
+    lines: list[str] = []
+    for name in ("Subject", "From", "To", "Cc", "Date"):
+        value = msg.get(name)
+        if value:
+            lines.append(f"{name}: {value}")
+    return lines
+
+
+def _email_body_text(msg) -> str:
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    for part in msg.walk() if msg.is_multipart() else [msg]:
+        if part.is_multipart():
+            continue
+        disposition = part.get_content_disposition()
+        if disposition == "attachment":
+            continue
+        content_type = part.get_content_type()
+        try:
+            content = part.get_content()
+        except LookupError:
+            payload = part.get_payload(decode=True) or b""
+            content = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+        if content_type == "text/plain":
+            plain_parts.append(str(content).strip())
+        elif content_type == "text/html":
+            html_parts.append(_html_to_text(str(content)).strip())
+    return "\n\n".join(part for part in plain_parts if part) or "\n\n".join(part for part in html_parts if part)
+
+
+def _html_to_text(html: str) -> str:
+    extractor = _TextExtractor()
+    extractor.feed(html)
+    return extractor.text()
+
+
+def _extract_msg_text(file_bytes: bytes) -> str:
+    headers, body = _extract_msg_parts(file_bytes)
+    return "\n".join(part for part in ("\n".join(headers), body) if part).strip()
+
+
+def _extract_msg_parts(file_bytes: bytes) -> tuple[list[str], str]:
+    import extract_msg
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "message.msg")
+        with open(path, "wb") as f:
+            f.write(file_bytes)
+        msg = extract_msg.Message(path)
+        headers: list[str] = []
+        for name, value in (
+            ("Subject", msg.subject),
+            ("From", msg.sender),
+            ("To", msg.to),
+            ("Cc", msg.cc),
+            ("Date", msg.date),
+        ):
+            if value:
+                headers.append(f"{name}: {value}")
+        body = msg.body or msg.htmlBody or ""
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", errors="replace")
+        if msg.htmlBody and not msg.body:
+            body = _html_to_text(str(body))
+        msg.close()
+    return headers, str(body).strip()
+
+
+def _extract_vcf_text(file_bytes: bytes) -> str:
+    return "\n\n".join(_vcf_record_texts(file_bytes)).strip()
+
+
+def _vcf_record_texts(file_bytes: bytes) -> list[str]:
+    cards = _split_records(_decode_text_file(file_bytes), "BEGIN:VCARD", "END:VCARD")
+    if not cards:
+        cards = [_decode_text_file(file_bytes)]
+    out: list[str] = []
+    for idx, card in enumerate(cards, start=1):
+        fields = _parse_structured_lines(card)
+        lines = [f"Contact {idx}"]
+        for key in ("FN", "N", "ORG", "TITLE", "EMAIL", "TEL", "ADR", "URL", "NOTE", "CATEGORIES"):
+            for value in fields.get(key, []):
+                lines.append(f"{_friendly_vcf_name(key)}: {value}")
+        out.append("\n".join(lines))
+    return out
+
+
+def _extract_ics_text(file_bytes: bytes) -> str:
+    return "\n\n".join(_ics_record_texts(file_bytes)).strip()
+
+
+def _ics_record_texts(file_bytes: bytes) -> list[str]:
+    text = _decode_text_file(file_bytes)
+    events = _split_records(text, "BEGIN:VEVENT", "END:VEVENT")
+    if not events:
+        events = _split_records(text, "BEGIN:VTODO", "END:VTODO")
+    if not events:
+        events = [text]
+    out: list[str] = []
+    for idx, event in enumerate(events, start=1):
+        fields = _parse_structured_lines(event)
+        lines = [f"Calendar item {idx}"]
+        for key in ("SUMMARY", "DTSTART", "DTEND", "DUE", "LOCATION", "DESCRIPTION", "ORGANIZER", "ATTENDEE", "STATUS", "URL"):
+            for value in fields.get(key, []):
+                lines.append(f"{_friendly_ics_name(key)}: {value}")
+        out.append("\n".join(lines))
+    return out
+
+
+def _chunk_email_parts(
+    headers: list[str],
+    body: str,
+    root_id: str,
+    file_path: str,
+    file_type: str,
+) -> list[Chunk]:
+    prelude = "\n".join(headers).strip()
+    body = body.strip()
+    if not body:
+        return _chunks_from_texts([prelude], root_id, file_path, file_type)
+
+    max_body_chars = max(MAX_SECTION_CHARS - len(prelude) - 2, MAX_SECTION_CHARS // 2)
+    pieces = _split_large(body, max_body_chars, min(SECTION_OVERLAP_CHARS, max_body_chars // 4))
+    texts = [f"{prelude}\n\n{piece}".strip() if prelude else piece for piece in pieces]
+    return _chunks_from_texts(texts, root_id, file_path, file_type)
+
+
+def _chunk_record_texts(
+    records: list[str],
+    root_id: str,
+    file_path: str,
+    file_type: str,
+) -> list[Chunk]:
+    texts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush_current() -> None:
+        nonlocal current, current_len
+        if current:
+            texts.append("\n\n".join(current))
+            current = []
+            current_len = 0
+
+    for record in records:
+        record = record.strip()
+        if not record:
+            continue
+        if len(record) > MAX_SECTION_CHARS:
+            flush_current()
+            texts.extend(_split_large(record, MAX_SECTION_CHARS, SECTION_OVERLAP_CHARS))
+            continue
+        projected = current_len + len(record) + (2 if current else 0)
+        if current and projected > MAX_SECTION_CHARS:
+            flush_current()
+        current.append(record)
+        current_len += len(record) + (2 if current_len else 0)
+    flush_current()
+    return _chunks_from_texts(texts, root_id, file_path, file_type)
+
+
+def _chunks_from_texts(texts: list[str], root_id: str, file_path: str, file_type: str) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    for idx, text in enumerate(text for text in texts if text.strip()):
+        content = text.strip()
+        chunks.append(
+            Chunk(
+                id=Chunk.make_id(root_id, file_path, idx),
+                root_id=root_id,
+                file_path=file_path,
+                chunk_index=idx,
+                content=content,
+                content_hash=Chunk.hash_content(content),
+                file_type=file_type,
+            )
+        )
+    return chunks
+
+
+def _decode_text_file(file_bytes: bytes) -> str:
+    return file_bytes.decode("utf-8-sig", errors="replace")
+
+
+def _split_records(text: str, begin: str, end: str) -> list[str]:
+    records: list[str] = []
+    current: list[str] = []
+    in_record = False
+    for line in _unfold_ical_lines(text):
+        upper = line.upper()
+        if upper == begin:
+            current = [line]
+            in_record = True
+        elif upper == end and in_record:
+            current.append(line)
+            records.append("\n".join(current))
+            current = []
+            in_record = False
+        elif in_record:
+            current.append(line)
+    return records
+
+
+def _unfold_ical_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if raw.startswith((" ", "\t")) and lines:
+            lines[-1] += raw[1:]
+        else:
+            lines.append(raw)
+    return lines
+
+
+def _parse_structured_lines(text: str) -> dict[str, list[str]]:
+    fields: dict[str, list[str]] = {}
+    for line in _unfold_ical_lines(text):
+        if ":" not in line:
+            continue
+        raw_key, raw_value = line.split(":", 1)
+        key = raw_key.split(";", 1)[0].upper()
+        value = _clean_structured_value(raw_value)
+        if value:
+            fields.setdefault(key, []).append(value)
+    return fields
+
+
+def _clean_structured_value(value: str) -> str:
+    value = quopri.decodestring(value).decode("utf-8", errors="replace")
+    value = value.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";")
+    value = value.replace(";", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _friendly_vcf_name(key: str) -> str:
+    return {
+        "FN": "Name",
+        "N": "Name",
+        "ORG": "Organization",
+        "TITLE": "Title",
+        "EMAIL": "Email",
+        "TEL": "Phone",
+        "ADR": "Address",
+        "URL": "URL",
+        "NOTE": "Note",
+        "CATEGORIES": "Categories",
+    }.get(key, key.title())
+
+
+def _friendly_ics_name(key: str) -> str:
+    return {
+        "SUMMARY": "Title",
+        "DTSTART": "Start",
+        "DTEND": "End",
+        "DUE": "Due",
+        "LOCATION": "Location",
+        "DESCRIPTION": "Description",
+        "ORGANIZER": "Organizer",
+        "ATTENDEE": "Attendee",
+        "STATUS": "Status",
+        "URL": "URL",
+    }.get(key, key.title())
+
+
+# ---------------------------------------------------------------------------
+# Audio / video chunking
+# ---------------------------------------------------------------------------
+
+
+MEDIA_WINDOW_SECONDS = 6 * 60
+MEDIA_OVERLAP_SECONDS = 60
+
+
+def chunk_media(
+    file_bytes: bytes,
+    root_id: str,
+    file_path: str,
+    file_type: str,
+    gemini_api_key: str,
+) -> list[Chunk]:
+    if not gemini_api_key:
+        return [_placeholder_media_chunk(root_id, file_path, file_type)]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, f"input{_media_input_extension(file_path, file_type)}")
+        with open(input_path, "wb") as f:
+            f.write(file_bytes)
+        duration = _ffprobe_duration(input_path)
+        chunks: list[Chunk] = []
+        for idx, start, end in _media_time_ranges(duration):
+            segment_path = _ffmpeg_extract_segment(input_path, tmpdir, idx, start, end, file_path, file_type)
+            mime_type = _media_mime_type(segment_path, file_type)
+            text = media_segment_to_text(segment_path, gemini_api_key, file_type, start, end, mime_type).strip()
+            if not text:
+                continue
+            time_range = f"{_format_timestamp(start)}-{_format_timestamp(end)}"
+            content = f"[{time_range}] {text}"
+            chunks.append(
+                Chunk(
+                    id=Chunk.make_id(root_id, file_path, idx),
+                    root_id=root_id,
+                    file_path=file_path,
+                    chunk_index=idx,
+                    content=content,
+                    content_hash=Chunk.hash_content(content),
+                    file_type=file_type,
+                )
+            )
+    if chunks:
+        return chunks
+    return [_placeholder_media_chunk(root_id, file_path, file_type)]
+
+
+def _placeholder_media_chunk(root_id: str, file_path: str, file_type: str) -> Chunk:
+    content = f"[{file_type.capitalize()} file: {file_path}]"
+    return Chunk(
+        id=Chunk.make_id(root_id, file_path, 0),
+        root_id=root_id,
+        file_path=file_path,
+        chunk_index=0,
+        content=content,
+        content_hash=Chunk.hash_content(content),
+        file_type=file_type,
+    )
+
+
+def _media_input_extension(file_path: str, file_type: str) -> str:
+    _, ext = os.path.splitext(file_path.lower())
+    if ext in (".mp3", ".wav", ".mp4", ".mov"):
+        return ext
+    return ".mp4" if file_type == "video" else ".mp3"
+
+
+def _media_time_ranges(duration: float) -> list[tuple[int, float, float]]:
+    if duration <= 0:
+        return [(0, 0.0, float(MEDIA_WINDOW_SECONDS))]
+    ranges: list[tuple[int, float, float]] = []
+    start = 0.0
+    idx = 0
+    stride = MEDIA_WINDOW_SECONDS - MEDIA_OVERLAP_SECONDS
+    while start < duration:
+        end = min(start + MEDIA_WINDOW_SECONDS, duration)
+        ranges.append((idx, start, end))
+        if end >= duration:
+            break
+        start += stride
+        idx += 1
+    return ranges
+
+
+def _ffprobe_duration(input_path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input_path,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    try:
+        return max(float(result.stdout.strip()), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def _ffmpeg_extract_segment(
+    input_path: str,
+    tmpdir: str,
+    idx: int,
+    start: float,
+    end: float,
+    file_path: str,
+    file_type: str,
+) -> str:
+    ext = _media_input_extension(file_path, file_type)
+    output_path = os.path.join(tmpdir, f"segment-{idx:04d}{ext}")
+    duration = max(end - start, 0.1)
+    copy_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        str(start),
+        "-t",
+        str(duration),
+        "-i",
+        input_path,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        output_path,
+    ]
+    if _run_ffmpeg(copy_cmd, output_path):
+        return output_path
+
+    if file_type == "video":
+        output_path = os.path.join(tmpdir, f"segment-{idx:04d}.mp4")
+        fallback_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(start),
+            "-t",
+            str(duration),
+            "-i",
+            input_path,
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+    else:
+        output_path = os.path.join(tmpdir, f"segment-{idx:04d}.wav")
+        fallback_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(start),
+            "-t",
+            str(duration),
+            "-i",
+            input_path,
+            "-vn",
+            "-c:a",
+            "pcm_s16le",
+            output_path,
+        ]
+    subprocess.run(fallback_cmd, check=True, capture_output=True, timeout=180)
+    return output_path
+
+
+def _run_ffmpeg(cmd: list[str], output_path: str) -> bool:
+    result = subprocess.run(cmd, capture_output=True, timeout=180)
+    return result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+
+def _media_mime_type(path: str, file_type: str) -> str:
+    _, ext = os.path.splitext(path.lower())
+    if file_type == "audio":
+        return "audio/wav" if ext == ".wav" else "audio/mp3"
+    if ext == ".mov":
+        return "video/quicktime"
+    return "video/mp4"
+
+
+def _format_timestamp(seconds: float) -> str:
+    total = max(int(round(seconds)), 0)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -436,6 +1017,9 @@ FILE_TYPE_MAP: dict[str, str] = {
     ".png": "image", ".jpg": "image", ".jpeg": "image",
     ".gif": "image", ".svg": "image", ".webp": "image",
     ".bmp": "image",
+    ".eml": "eml", ".msg": "msg", ".vcf": "vcf", ".ics": "ics",
+    ".mp3": "audio", ".wav": "audio",
+    ".mp4": "video", ".mov": "video",
 }
 
 

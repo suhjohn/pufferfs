@@ -24,9 +24,10 @@ app = modal.App(os.getenv("PUFFERFS_MODAL_APP_NAME", "pufferfs"))
 
 chunking_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("libreoffice-core", "libreoffice-writer", "libreoffice-impress")
+    .apt_install("ffmpeg", "libreoffice-core", "libreoffice-writer", "libreoffice-impress")
     .pip_install(
         "boto3>=1.34.0",
+        "extract-msg>=0.50.0",
         "pymupdf>=1.24.0",
         "Pillow>=10.0.0",
         "google-genai>=1.0.0",
@@ -265,7 +266,7 @@ def chunk_document_with_stage_functions(
 @app.function(
     image=chunking_image,
     secrets=[s3_secret, gemini_secret],
-    timeout=600,
+    timeout=3600,
     memory=2048,
 )
 def file_to_chunks(
@@ -285,6 +286,8 @@ def file_to_chunks(
         chunk_code,
         chunk_image,
         chunk_markdown,
+        chunk_media,
+        chunk_structured_file,
         detect_file_type,
     )
 
@@ -333,6 +336,10 @@ def file_to_chunks(
         chunks = chunk_document_with_stage_functions(file_bytes, root_id, file_path, file_type, s3c, bkt)
     elif file_type == "image":
         chunks = chunk_image(file_bytes, root_id, file_path, s3c, bkt, gemini_key)
+    elif file_type in ("audio", "video"):
+        chunks = chunk_media(file_bytes, root_id, file_path, file_type, gemini_key)
+    elif file_type in ("eml", "msg", "vcf", "ics"):
+        chunks = chunk_structured_file(file_bytes, root_id, file_path, file_type)
     elif file_type in CODE_EXTENSIONS:
         text = file_bytes.decode("utf-8", errors="replace")
         chunks = chunk_code(text, root_id, file_path, file_type)
@@ -596,7 +603,7 @@ def _modal_can_read_source_directly(s3_key: str, change: dict) -> bool:
 @app.function(
     image=chunking_image,
     secrets=[s3_secret, gemini_secret, turbopuffer_secret],
-    timeout=900,
+    timeout=3600,
     memory=2048,
 )
 @modal.fastapi_endpoint(method="POST", label="pufferfs-chunk-shard-endpoint")
@@ -861,7 +868,7 @@ def index_shard_endpoint(item: dict) -> dict:
 @app.function(
     image=chunking_image,
     secrets=[s3_secret, gemini_secret],
-    timeout=600,
+    timeout=3600,
     memory=2048,
 )
 @modal.fastapi_endpoint(method="POST")

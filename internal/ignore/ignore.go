@@ -75,11 +75,7 @@ func NewMatcher(rootDir string) *Matcher {
 		m.patterns = append(m.patterns, gitignore.ParsePattern(p, nil))
 	}
 
-	// Load .gitignore from root
-	m.loadIgnoreFile(filepath.Join(rootDir, ".gitignore"), nil)
-
-	// Load .tpfsignore from root
-	m.loadIgnoreFile(filepath.Join(rootDir, ".tpfsignore"), nil)
+	m.loadIgnoreFiles(rootDir)
 
 	// Load global ignore from ~/.tpfs/ignore
 	home, err := os.UserHomeDir()
@@ -130,4 +126,27 @@ func (m *Matcher) loadIgnoreFile(path string, pathParts []string) {
 		}
 		m.patterns = append(m.patterns, gitignore.ParsePattern(line, pathParts))
 	}
+}
+
+func (m *Matcher) loadIgnoreFiles(rootDir string) {
+	rootDir = filepath.Clean(rootDir)
+	_ = filepath.WalkDir(rootDir, func(filePath string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		if name != ".gitignore" && name != ".tpfsignore" {
+			return nil
+		}
+		relDir, err := filepath.Rel(rootDir, filepath.Dir(filePath))
+		if err != nil {
+			return nil
+		}
+		var pathParts []string
+		if relDir != "." {
+			pathParts = strings.Split(filepath.ToSlash(relDir), "/")
+		}
+		m.loadIgnoreFile(filePath, pathParts)
+		return nil
+	})
 }
