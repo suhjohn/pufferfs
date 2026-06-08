@@ -1117,6 +1117,10 @@ button:disabled {
   grid-template-columns: minmax(160px, 1.1fr) minmax(72px, 0.45fr) minmax(130px, 0.75fr) minmax(92px, 0.55fr);
 }
 
+.root-data-row {
+  grid-template-columns: minmax(160px, 1.1fr) minmax(72px, 0.42fr) minmax(130px, 0.72fr) minmax(92px, 0.5fr) auto;
+}
+
 .key-data-row,
 .member-data-row,
 .invite-data-row {

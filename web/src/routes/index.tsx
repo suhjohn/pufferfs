@@ -132,16 +132,16 @@ pufferfs service install ./handbook --name handbook && pufferfs service start ha
               sync once, then let the agent query the workspace
             </p>
             <div className="code-window workflow-window">
-              <div className="code-grid workflow-grid">
-                <pre className="code-pane">{`$ cd ~/Documents/handbook
+              <pre className="code-pane solo">{`$ cd ~/Documents/handbook
 $ pufferfs sync . --name handbook
 Created root: handbook (root_8z7m)
 Building Merkle tree for /Users/me/Documents/handbook...
 Merkle diff found 1,284 changed files
 Sync job sync_2bd3 started; polling until committed...
 Sync status: indexing (912/1,284 files)
-Sync complete: 1,284 files processed, 14,602 chunks added`}</pre>
-                <pre className="code-pane">{`$ pufferfs query "how much paid time off do we get" --root handbook --top-k 2
+Sync complete: 1,284 files processed, 14,602 chunks added
+
+$ pufferfs query "how much paid time off do we get" --root handbook --top-k 2
 1.
 score: 0.8124
 file: /Users/me/Documents/handbook/policies/time-off.pdf
@@ -154,7 +154,6 @@ score: 0.7741
 file: /Users/me/Documents/handbook/onboarding/benefits.docx
 content: Parental leave provides 12 weeks paid for the primary caregiver and
 6 weeks for secondary caregivers.`}</pre>
-              </div>
             </div>
           </section>
 

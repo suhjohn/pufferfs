@@ -232,7 +232,7 @@ func (db *DB) migrateFallback() error {
 		CREATE TABLE IF NOT EXISTS sync_jobs (
 			id           TEXT PRIMARY KEY,
 			org_id       TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			root_id      TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			root_id      TEXT REFERENCES roots(id) ON DELETE SET NULL,
 			user_id      TEXT NOT NULL REFERENCES users(id),
 			status       TEXT NOT NULL DEFAULT 'pending',
 			total_files  INT NOT NULL DEFAULT 0,
@@ -241,6 +241,16 @@ func (db *DB) migrateFallback() error {
 			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			finished_at  TIMESTAMPTZ
 		);
+		ALTER TABLE sync_jobs ALTER COLUMN root_id DROP NOT NULL;
+		DO $$
+		BEGIN
+			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_jobs_root_id_fkey') THEN
+				ALTER TABLE sync_jobs DROP CONSTRAINT sync_jobs_root_id_fkey;
+			END IF;
+			ALTER TABLE sync_jobs
+				ADD CONSTRAINT sync_jobs_root_id_fkey
+				FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE SET NULL;
+		END $$;
 		CREATE TABLE IF NOT EXISTS sync_job_shards (
 			job_id          TEXT NOT NULL REFERENCES sync_jobs(id) ON DELETE CASCADE,
 			stage           TEXT NOT NULL,
@@ -1843,7 +1853,7 @@ func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors 
 func (db *DB) GetSyncJob(ctx context.Context, orgID, jobID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
 		 FROM sync_jobs WHERE id = $1 AND org_id = $2`, jobID, orgID,
 	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
 		&job.Processed, &job.Errors, &job.StartedAt, &job.FinishedAt)
@@ -1859,7 +1869,7 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 		limit = 20
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT $3`,
 		orgID, rootID, limit,
@@ -1885,7 +1895,7 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, root_id, user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT 1`,
 		orgID, rootID,

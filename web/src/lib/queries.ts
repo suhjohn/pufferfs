@@ -73,6 +73,10 @@ export async function fetchRoots(): Promise<Root[]> {
   return (await api<Root[] | null>("/roots")) ?? [];
 }
 
+export async function deleteRoot(rootId: string): Promise<void> {
+  await api(`/roots/${rootId}`, { method: "DELETE" });
+}
+
 export async function fetchSyncJobs(rootId: string): Promise<SyncJob[]> {
   return (await api<SyncJob[] | null>(`/roots/${rootId}/sync/jobs`)) ?? [];
 }

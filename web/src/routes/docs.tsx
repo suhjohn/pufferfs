@@ -126,13 +126,13 @@ change: contracts/acme-msa.pdf (added)      -> 24 chunks added`,
     name: "root delete",
     usage: "pufferfs root delete handbook --yes",
     detail:
-      "Deletes PufferFS metadata, index rows, storage artifacts, and local PufferFS cache for a root. It does not delete source files on disk.",
+      "Deletes PufferFS metadata, index rows, storage artifacts, and local PufferFS cache for a root. It does not delete source files on disk or historical sync job records.",
     flags: ["--yes: skip confirmation prompt"],
     transcript: `$ pufferfs root delete handbook --yes
 Deleted root handbook (root_8z7m)
 Deleted Turbopuffer namespace: org_acme_root_8z7m
 Deleted 1,246 storage objects`,
-    note: "Deletion can return 409 if a sync is active. Stop background services before deleting a root.",
+    note: "Deletion can return 409 if a sync is active. Stop background services before deleting a root. Historical sync jobs are retained for accounting with root_id set to null.",
   },
   {
     name: "upgrade",
@@ -174,6 +174,153 @@ const ENDPOINTS = [
 }`],
       ["403", "Caller lacks key-write scope.", `{
   "error": "api key write scope required"
+}`],
+    ],
+  },
+  {
+    operationId: "listApiKeys",
+    method: "GET",
+    path: "/auth/api-keys",
+    summary: "List API keys for the current user.",
+    auth: "Session cookie, JWT, or key with api_keys:read/api_keys:write/admin/read/write.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Key metadata. Raw key values are never returned after creation.", `[
+  {
+    "id": "key_123",
+    "name": "CI query key",
+    "scopes": ["query"],
+    "created_at": "2026-06-08T05:00:00Z"
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "deleteApiKey",
+    method: "DELETE",
+    path: "/auth/api-keys/{id}",
+    summary: "Revoke an API key.",
+    auth: "Session cookie, JWT, or key with api_keys:write/admin/write.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "The key was revoked.", `{
+  "status": "deleted"
+}`],
+      ["403", "Caller lacks key-write scope.", `{
+  "error": "api key write scope required"
+}`],
+    ],
+  },
+  {
+    operationId: "listOrgMembers",
+    method: "GET",
+    path: "/org/members",
+    summary: "List members in the current organization.",
+    auth: "Session cookie, JWT, or user API key.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Organization members and roles.", `[
+  {
+    "user_id": "user_123",
+    "email": "teammate@example.com",
+    "name": "Ada Lovelace",
+    "avatar_url": "",
+    "role": "editor",
+    "joined_at": "2026-06-08T05:00:00Z"
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "createOrgInvite",
+    method: "POST",
+    path: "/org/invites",
+    summary: "Invite a teammate by email.",
+    auth: "Session cookie, JWT, or key with org:admin/admin/write. Caller must be owner or admin.",
+    requestBody: `{
+  "email": "teammate@example.com",
+  "role": "editor"
+}`,
+    requestFields: [
+      ["email", "string", "required", "Email address that can accept the invite on next OAuth sign-in."],
+      ["role", "\"owner\" | \"admin\" | \"editor\" | \"viewer\"", "required", "Starting role. Owners can invite any role; admins can invite only editor or viewer."],
+    ],
+    responses: [
+      ["201", "Pending invite.", `{
+  "id": "invite_123",
+  "email": "teammate@example.com",
+  "role": "editor",
+  "invited_by_user_id": "user_owner",
+  "created_at": "2026-06-08T05:00:00Z"
+}`],
+      ["403", "Caller cannot manage this role.", `{
+  "error": "cannot invite that role"
+}`],
+    ],
+  },
+  {
+    operationId: "listOrgInvites",
+    method: "GET",
+    path: "/org/invites",
+    summary: "List pending organization invites.",
+    auth: "Session cookie, JWT, or user API key.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Pending invites.", `[
+  {
+    "id": "invite_123",
+    "email": "teammate@example.com",
+    "role": "editor",
+    "invited_by_user_id": "user_owner",
+    "created_at": "2026-06-08T05:00:00Z"
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "updateOrgMemberRole",
+    method: "PUT",
+    path: "/org/members/{userId}",
+    summary: "Change a member's organization role.",
+    auth: "Session cookie, JWT, or key with org:admin/admin/write. Caller must be owner or admin.",
+    requestBody: `{
+  "role": "viewer"
+}`,
+    requestFields: [
+      ["role", "\"owner\" | \"admin\" | \"editor\" | \"viewer\"", "required", "New member role. Users cannot change their own role. Admins can manage only editor/viewer members and can assign only editor/viewer."],
+    ],
+    responses: [
+      ["200", "Updated member.", `{
+  "user_id": "user_123",
+  "email": "teammate@example.com",
+  "name": "Ada Lovelace",
+  "avatar_url": "",
+  "role": "viewer",
+  "joined_at": "2026-06-08T05:00:00Z"
+}`],
+      ["403", "Role change is not allowed.", `{
+  "error": "cannot change that member role"
+}`],
+    ],
+  },
+  {
+    operationId: "deleteOrgInvite",
+    method: "DELETE",
+    path: "/org/invites/{id}",
+    summary: "Revoke a pending organization invite.",
+    auth: "Session cookie, JWT, or key with org:admin/admin/write. Caller must be able to manage the invited role.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "The invite was revoked.", `{
+  "status": "deleted"
+}`],
+      ["403", "Caller cannot revoke this invite.", `{
+  "error": "cannot revoke that invite"
 }`],
     ],
   },
@@ -337,6 +484,23 @@ const IGNORE_RULE_SOURCES = [
   ["~/.tpfs/.tpfsignore", "All projects for the current user", "Gitignore syntax"],
 ];
 
+const API_KEY_SCOPES = [
+  ["query", "Search committed roots."],
+  ["sync", "Create or update sync jobs for roots the caller can write."],
+  ["root:delete", "Delete roots the caller is allowed to manage."],
+  ["api_keys:read", "List the caller's API key metadata."],
+  ["api_keys:write", "Create or revoke the caller's API keys."],
+  ["org:admin", "Invite members, revoke invites, and manage eligible member roles."],
+  ["read / write / admin / *", "Compatibility aliases for broader trusted automation."],
+];
+
+const ROLE_RULES = [
+  ["owner", "Can invite any role, assign any role, and manage every member except their own role/removal. The organization must keep at least one owner."],
+  ["admin", "Can invite, change, or remove editor and viewer members only. Admins cannot grant owner/admin or manage owner/admin members."],
+  ["editor", "Can create and update org roots, depending on root ACLs and API key scopes."],
+  ["viewer", "Can read and query accessible org roots."],
+];
+
 const SECURITY_SECTIONS = [
   {
     title: "Data handling",
@@ -355,7 +519,7 @@ const SECURITY_SECTIONS = [
   {
     title: "Authentication and access control",
     body: [
-      "Access is tied to organization membership, user role, root ownership, and API key scope. Users can create least-privilege API keys for automation and rotate them when needed.",
+      "Access is tied to organization membership, pending invites, user role, root ownership, and API key scope. Users can create least-privilege API keys for automation and rotate or revoke them when needed.",
       "Search and sync requests are checked against the caller's permissions before customer content is returned or updated.",
     ],
   },
@@ -401,7 +565,7 @@ const SECURITY_SUBPROCESSORS = [
     name: "Persistence",
     purpose:
       "Stores synced content and the indexes/metadata needed to answer search. Deployments use S3-compatible object storage, PostgreSQL, and Turbopuffer.",
-    data: "Uploaded source files, packed bundles, rendered page/OCR images, root state snapshots, sync artifacts, org/user/root metadata, API-key hashes, ACLs, sync jobs/generations, content proofs, extracted text chunks, search metadata, and embedding vectors.",
+    data: "Uploaded source files, packed bundles, rendered page/OCR images, root state snapshots, sync artifacts, org/user/root metadata, org invites, API-key hashes and key metadata, ACLs, sync jobs/generations, content proofs, extracted text chunks, search metadata, and embedding vectors.",
   },
   {
     name: "Processing",
@@ -451,6 +615,7 @@ function Docs() {
       <div className="docs-layout">
         <aside className="docs-toc" aria-label="docs navigation">
           <a href="#setup">setup</a>
+          <a href="#console">console</a>
           <a href="#ignore-rules">ignore rules</a>
           <a href="#commands">commands</a>
           <a href="#apis">APIs</a>
@@ -501,6 +666,70 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
                 <span>terminal</span>
               </div>
               <pre className="code-pane solo">{`go install github.com/pufferfs/pufferfs/cmd/pufferfs@latest`}</pre>
+            </div>
+          </section>
+
+          <section id="console" className="docs-section">
+            <h2>console</h2>
+            <p>
+              The console is for account-level operations: viewing synced
+              roots, creating and revoking API keys, inviting organization
+              members, and changing roles when your role allows it.
+            </p>
+            <div className="docs-command-list">
+              <article className="docs-command">
+                <h3>API keys</h3>
+                <p>
+                  API keys are shown only once, immediately after creation. The
+                  server stores a hash and later displays only key metadata:
+                  name, scopes, creation time, and revoke controls.
+                </p>
+                <div className="docs-security-table-wrap">
+                  <table className="docs-security-table">
+                    <thead>
+                      <tr>
+                        <th>Scope</th>
+                        <th>Allows</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {API_KEY_SCOPES.map(([scope, allows]) => (
+                        <tr key={scope}>
+                          <td>{scope}</td>
+                          <td>{allows}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article className="docs-command">
+                <h3>organization roles</h3>
+                <p>
+                  Invites are email-based. When the invited person signs in with
+                  that email, PufferFS adds them to the organization with the
+                  invited role and clears the pending invite.
+                </p>
+                <div className="docs-security-table-wrap">
+                  <table className="docs-security-table">
+                    <thead>
+                      <tr>
+                        <th>Role</th>
+                        <th>Behavior</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ROLE_RULES.map(([role, behavior]) => (
+                        <tr key={role}>
+                          <td>{role}</td>
+                          <td>{behavior}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
             </div>
           </section>
 

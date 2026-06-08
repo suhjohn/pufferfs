@@ -3,9 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import {
   createAPIKey,
+  deleteRoot,
   fetchAPIKeys,
   fetchRoots,
   fetchRootSyncSummaries,
+  type Root,
   revokeAPIKey,
 } from "../../lib/queries";
 
@@ -51,6 +53,20 @@ function Dashboard() {
       queryClient.invalidateQueries({ queryKey: ["api-keys"] });
     },
   });
+  const deleteRootMutation = useMutation({
+    mutationFn: deleteRoot,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["roots"] });
+      queryClient.invalidateQueries({ queryKey: ["root-sync-summaries"] });
+    },
+  });
+
+  function confirmDeleteRoot(root: Root) {
+    const ok = window.confirm(
+      `Delete root "${root.name}"?\n\nThis removes indexed content and stored sync artifacts for the root. Sync job history is retained for accounting.`,
+    );
+    if (ok) deleteRootMutation.mutate(root.id);
+  }
 
   const rootCount = roots?.length ?? 0;
   const keyCount = keysQuery.data?.length ?? 0;
@@ -209,11 +225,12 @@ pufferfs init --api-key ${newKey}`}</pre>
         )}
         {roots && roots.length > 0 && (
           <div className="data-list">
-            <div className="data-row data-row-head">
+            <div className="data-row data-row-head root-data-row">
               <span>name</span>
               <span>scope</span>
               <span>last synced</span>
               <span>status</span>
+              <span />
             </div>
             {rootSummaries.map(({ root, latestJob }) => (
               <div key={root.id} className="data-row root-data-row">
@@ -223,9 +240,19 @@ pufferfs init --api-key ${newKey}`}</pre>
                   {formatDateTime(latestJob?.finished_at ?? latestJob?.started_at)}
                 </span>
                 <span className="status-text">{rootStatus(root.visible_generation_id, latestJob?.status)}</span>
+                <button
+                  className="btn btn-sm btn-danger"
+                  disabled={deleteRootMutation.isPending}
+                  onClick={() => confirmDeleteRoot(root)}
+                >
+                  delete
+                </button>
               </div>
             ))}
           </div>
+        )}
+        {deleteRootMutation.isError && (
+          <p className="muted">error: {(deleteRootMutation.error as Error).message}</p>
         )}
       </section>
 
