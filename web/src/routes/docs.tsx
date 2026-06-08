@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { PixelLogo } from "../components/PixelLogo";
+import { ThemeToggle } from "../components/ThemeToggle";
 
 export const Route = createFileRoute("/docs")({
   component: Docs,
@@ -426,20 +427,21 @@ function Docs() {
     <main className="docs-shell">
       <nav className="landing-nav" aria-label="primary">
         <Link to="/" className="nav-brand">
-          <PixelLogo size={24} />
           <span>pufferfs</span>
         </Link>
         <div className="nav-actions">
-          <Link className="pill pill-muted" to="/">
-            Home
-          </Link>
-          <Link className="pill pill-muted" to="/login">
-            Sign in
-          </Link>
+          <Link to="/login">console</Link>
+          <Link to="/docs">docs</Link>
+          <a href="https://github.com/suhjohn/pufferfs">github</a>
+          <ThemeToggle />
         </div>
       </nav>
 
       <section className="docs-hero">
+        <div className="hero-mark" aria-hidden="true">
+          <PixelLogo size={44} />
+          <span>pufferfs</span>
+        </div>
         <h1>docs</h1>
         <p className="muted">
           Setup, CLI commands, API reference, and security behavior for PufferFS.

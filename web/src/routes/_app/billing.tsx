@@ -29,14 +29,26 @@ function BillingPage() {
   });
 
   return (
-    <main className="container">
-      <div className="page-heading">
-        <h1>billing</h1>
-      </div>
+    <main className="console-page">
+      <header className="console-header">
+        <div>
+          <p className="eyebrow">billing</p>
+          <h1>plan</h1>
+          <p className="muted">
+            View subscription state and manage the current organization plan.
+          </p>
+        </div>
+      </header>
       {isPending ? (
         <p className="muted">loading</p>
       ) : (
-        <div className="card">
+        <section className="console-section">
+          <div className="section-heading">
+            <div>
+              <h2>subscription</h2>
+              <p>Current billing state for this organization.</p>
+            </div>
+          </div>
           <div className="meta-row">
             <span className="muted">plan</span>
             <strong>{billing?.plan}</strong>
@@ -50,7 +62,7 @@ function BillingPage() {
               <span className="muted">renews</span> {billing.currentPeriodEnd}
             </div>
           )}
-        </div>
+        </section>
       )}
       <button
         className="btn"
