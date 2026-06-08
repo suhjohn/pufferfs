@@ -160,6 +160,27 @@ After a successful release, update the deploy environment variable
 `PUFFERFS_CLI_LATEST_VERSION` and run the `backend` deploy component so
 `GET /cli/version` advertises the new release.
 
+## Local GitHub Actions
+
+Use `act` through the repo wrapper to reproduce workflow dispatch and CI behavior
+locally:
+
+```sh
+brew install act
+scripts/actions-local.sh list
+scripts/actions-local.sh ci
+scripts/actions-local.sh deploy-backend-dryrun
+scripts/actions-local.sh release-dryrun
+```
+
+The wrapper reads optional `.env.act` and `.secrets.act` files; both are ignored
+by git through the local config ignore rules. The deploy command is guarded
+because it can touch real infrastructure:
+
+```sh
+PUFFERFS_ACT_RUN_DEPLOY=1 scripts/actions-local.sh deploy-backend
+```
+
 ## Local Deploy Equivalents
 
 Populate Pulumi config from local `.env`:

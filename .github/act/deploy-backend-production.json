@@ -1,0 +1,9 @@
+{
+  "inputs": {
+    "environment": "production",
+    "pulumi_stack": "",
+    "component": "backend",
+    "image_tag": "",
+    "cli_release_version": ""
+  }
+}
