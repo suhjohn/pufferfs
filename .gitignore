@@ -4,6 +4,7 @@
 /pufferfs-server
 /pufferfs-worker
 bin/
+dist/
 *.exe
 *.test
 

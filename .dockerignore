@@ -16,6 +16,7 @@ data
 infra/pulumi/node_modules
 infra/pulumi/dist
 node_modules
+dist
 
 **/.DS_Store
 **/__pycache__
