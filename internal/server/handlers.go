@@ -90,7 +90,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /org", s.handleGetOrg)
 	s.mux.HandleFunc("GET /org/members", s.handleListMembers)
 	s.mux.HandleFunc("POST /org/members", s.handleAddMember)
+	s.mux.HandleFunc("PUT /org/members/{userId}", s.handleUpdateMemberRole)
 	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleRemoveMember)
+	s.mux.HandleFunc("GET /org/invites", s.handleListInvites)
+	s.mux.HandleFunc("POST /org/invites", s.handleCreateInvite)
+	s.mux.HandleFunc("DELETE /org/invites/{id}", s.handleDeleteInvite)
 
 	// Platform admin
 	s.mux.HandleFunc("POST /admin/orgs", s.handleAdminProvisionOrg)
@@ -267,12 +271,27 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func normalizeExplicitAPIKeyScopes(scopes []string) ([]string, error) {
+	allowedScopes := map[string]struct{}{
+		"query":          {},
+		"sync":           {},
+		"root:delete":    {},
+		"api_keys:read":  {},
+		"api_keys:write": {},
+		"org:admin":      {},
+		"read":           {},
+		"write":          {},
+		"admin":          {},
+		"*":              {},
+	}
 	normalized := make([]string, 0, len(scopes))
 	seen := make(map[string]struct{}, len(scopes))
 	for _, scope := range scopes {
 		scope = strings.TrimSpace(scope)
 		if scope == "" {
 			continue
+		}
+		if _, ok := allowedScopes[scope]; !ok {
+			return nil, fmt.Errorf("unsupported scope %q", scope)
 		}
 		if _, ok := seen[scope]; ok {
 			continue
@@ -355,13 +374,8 @@ func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
-		return
-	}
-	if !auth.HasScope(id, "org:admin", "admin", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required"})
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
 		return
 	}
 
@@ -373,29 +387,184 @@ func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	if err := s.db.AddOrgMember(r.Context(), id.OrgID, req.UserID, auth.Role(req.Role)); err != nil {
+	role, err := parseRole(req.Role, auth.RoleViewer)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !canAssignRole(id.Role, role) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot assign that role"})
+		return
+	}
+	if strings.TrimSpace(req.UserID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id required"})
+		return
+	}
+	if err := s.db.AddOrgMember(r.Context(), id.OrgID, strings.TrimSpace(req.UserID), role); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
 }
 
-func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
-		return
-	}
-	if !auth.HasScope(id, "org:admin", "admin", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required"})
+func (s *Server) handleUpdateMemberRole(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
 		return
 	}
 	userID := r.PathValue("userId")
+	if userID == id.UserID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot change your own role"})
+		return
+	}
+	member, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
+		return
+	}
+
+	var req struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	role, err := parseRole(req.Role, auth.RoleViewer)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !canAssignRole(id.Role, role) || !canManageMemberRole(id.Role, auth.Role(member.Role)) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot change that member role"})
+		return
+	}
+	if auth.Role(member.Role) == auth.RoleOwner && role != auth.RoleOwner {
+		if ok, err := s.canRemoveOwner(r.Context(), id.OrgID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		} else if !ok {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "organization must keep at least one owner"})
+			return
+		}
+	}
+	if err := s.db.UpdateOrgMemberRole(r.Context(), id.OrgID, userID, role); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	updated, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
+		return
+	}
+	userID := r.PathValue("userId")
+	if userID == id.UserID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot remove yourself"})
+		return
+	}
+	member, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
+		return
+	}
+	memberRole := auth.Role(member.Role)
+	if !canManageMemberRole(id.Role, memberRole) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot remove that member"})
+		return
+	}
+	if memberRole == auth.RoleOwner {
+		if ok, err := s.canRemoveOwner(r.Context(), id.OrgID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		} else if !ok {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "organization must keep at least one owner"})
+			return
+		}
+	}
 	if err := s.db.RemoveOrgMember(r.Context(), id.OrgID, userID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+}
+
+func (s *Server) handleListInvites(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	invites, err := s.db.ListOrgInvites(r.Context(), id.OrgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, invites)
+}
+
+func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Email string `json:"email"`
+		Role  string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	email := normalizeEmail(req.Email)
+	if email == "" || !strings.Contains(email, "@") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "valid email required"})
+		return
+	}
+	role, err := parseRole(req.Role, auth.RoleViewer)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if !canAssignRole(id.Role, role) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot invite that role"})
+		return
+	}
+	invite, err := s.db.InviteOrgMember(r.Context(), id.OrgID, email, role, id.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, invite)
+}
+
+func (s *Server) handleDeleteInvite(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
+		return
+	}
+	inviteID := r.PathValue("id")
+	invite, err := s.db.GetOrgInvite(r.Context(), id.OrgID, inviteID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "invite not found"})
+		return
+	}
+	if !canManageMemberRole(id.Role, auth.Role(invite.Role)) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot revoke that invite"})
+		return
+	}
+	if err := s.db.DeleteOrgInvite(r.Context(), id.OrgID, inviteID); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 // ---------------------------------------------------------------------------
@@ -540,11 +709,16 @@ func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request)
 	if len(req.Scopes) == 0 {
 		req.Scopes = []string{"query"}
 	}
+	scopes, err := normalizeExplicitAPIKeyScopes(req.Scopes)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if _, err := s.db.GetOrgMember(r.Context(), orgID, userID); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
 		return
 	}
-	rawKey, err := s.db.CreateAPIKey(r.Context(), orgID, userID, req.Name, req.Scopes)
+	rawKey, err := s.db.CreateAPIKey(r.Context(), orgID, userID, req.Name, scopes)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -553,7 +727,7 @@ func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request)
 		"key":     rawKey,
 		"org_id":  orgID,
 		"user_id": userID,
-		"scopes":  req.Scopes,
+		"scopes":  scopes,
 	})
 }
 
@@ -2433,6 +2607,52 @@ func parseRole(raw string, defaultRole auth.Role) (auth.Role, error) {
 	default:
 		return "", fmt.Errorf("role must be owner, admin, editor, or viewer")
 	}
+}
+
+func requireOrgAdmin(w http.ResponseWriter, r *http.Request) (*auth.Identity, bool) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil || !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required"})
+		return nil, false
+	}
+	if !auth.HasScope(id, "org:admin", "admin", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required"})
+		return nil, false
+	}
+	return id, true
+}
+
+func canAssignRole(actorRole, targetRole auth.Role) bool {
+	switch actorRole {
+	case auth.RoleOwner:
+		return targetRole == auth.RoleOwner ||
+			targetRole == auth.RoleAdmin ||
+			targetRole == auth.RoleEditor ||
+			targetRole == auth.RoleViewer
+	case auth.RoleAdmin:
+		return targetRole == auth.RoleEditor || targetRole == auth.RoleViewer
+	default:
+		return false
+	}
+}
+
+func canManageMemberRole(actorRole, targetRole auth.Role) bool {
+	switch actorRole {
+	case auth.RoleOwner:
+		return true
+	case auth.RoleAdmin:
+		return targetRole == auth.RoleEditor || targetRole == auth.RoleViewer
+	default:
+		return false
+	}
+}
+
+func (s *Server) canRemoveOwner(ctx context.Context, orgID string) (bool, error) {
+	count, err := s.db.CountOrgMembersByRole(ctx, orgID, auth.RoleOwner)
+	if err != nil {
+		return false, err
+	}
+	return count > 1, nil
 }
 
 func parseRootScope(raw string) (string, error) {

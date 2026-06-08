@@ -427,6 +427,18 @@ button:disabled {
   font-size: 0.86rem;
 }
 
+.btn-danger {
+  color: var(--button-ink);
+  background: transparent;
+  border-color: var(--line);
+}
+
+.btn-danger:hover {
+  color: var(--selection-ink);
+  background: #b42318;
+  border-color: #b42318;
+}
+
 .landing-rule {
   height: 1px;
   margin-top: 37px;
@@ -1033,6 +1045,59 @@ button:disabled {
   font-size: 0.94rem;
 }
 
+.settings-grid {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(240px, 1.2fr) auto;
+  gap: 14px;
+  align-items: end;
+  margin-bottom: 18px;
+}
+
+.field-label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: lowercase;
+}
+
+.field-label input,
+.field-label select,
+.data-row select {
+  width: 100%;
+  min-height: 2.4rem;
+  padding: 0.45rem 0.65rem;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 0;
+}
+
+.checkbox-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  min-height: 2.4rem;
+  align-items: center;
+}
+
+.check-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--body-text);
+  font-size: 0.88rem;
+  font-weight: 500;
+  text-transform: none;
+}
+
+.check-row input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+}
+
 .data-list {
   border-top: 1px solid var(--line);
 }
@@ -1050,6 +1115,18 @@ button:disabled {
 .root-data-row,
 .sync-data-row {
   grid-template-columns: minmax(160px, 1.1fr) minmax(72px, 0.45fr) minmax(130px, 0.75fr) minmax(92px, 0.55fr);
+}
+
+.key-data-row,
+.member-data-row,
+.invite-data-row {
+  grid-template-columns: minmax(170px, 0.9fr) minmax(180px, 1fr) minmax(120px, 0.65fr) auto;
+}
+
+.scope-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .data-row strong,
@@ -1186,7 +1263,8 @@ button:disabled {
   .docs-openapi-meta div,
   .meta-row,
   .console-header,
-  .section-heading {
+  .section-heading,
+  .settings-grid {
     grid-template-columns: 1fr;
     gap: 6px;
   }
@@ -1202,7 +1280,10 @@ button:disabled {
   }
 
   .root-data-row,
-  .sync-data-row {
+  .sync-data-row,
+  .key-data-row,
+  .member-data-row,
+  .invite-data-row {
     grid-template-columns: 1fr;
   }
 

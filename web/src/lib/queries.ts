@@ -19,9 +19,20 @@ export interface Org {
 }
 
 export interface Member {
-  userId: string;
+  user_id: string;
+  email: string;
+  name: string;
+  avatar_url: string;
+  role: string;
+  joined_at: string;
+}
+
+export interface OrgInvite {
+  id: string;
   email: string;
   role: string;
+  invited_by_user_id: string;
+  created_at: string;
 }
 
 export interface Billing {
@@ -90,19 +101,62 @@ export async function fetchMembers(): Promise<Member[]> {
   return (await api<Member[] | null>("/org/members")) ?? [];
 }
 
+export async function fetchOrgInvites(): Promise<OrgInvite[]> {
+  return (await api<OrgInvite[] | null>("/org/invites")) ?? [];
+}
+
+export async function inviteOrgMember(input: {
+  email: string;
+  role: string;
+}): Promise<OrgInvite> {
+  return api<OrgInvite>("/org/invites", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function deleteOrgInvite(id: string): Promise<void> {
+  await api(`/org/invites/${id}`, { method: "DELETE" });
+}
+
+export async function updateMemberRole(input: {
+  userId: string;
+  role: string;
+}): Promise<Member> {
+  return api<Member>(`/org/members/${input.userId}`, {
+    method: "PUT",
+    body: JSON.stringify({ role: input.role }),
+  });
+}
+
+export async function removeOrgMember(userId: string): Promise<void> {
+  await api(`/org/members/${userId}`, { method: "DELETE" });
+}
+
 export async function fetchAPIKeys(): Promise<APIKey[]> {
   return (await api<APIKey[] | null>("/auth/api-keys")) ?? [];
 }
 
-export async function createCLIKey(): Promise<string> {
+export async function createAPIKey(input: {
+  name: string;
+  scopes: string[];
+}): Promise<string> {
   const { key } = await api<{ key: string }>("/auth/api-keys", {
     method: "POST",
-    body: JSON.stringify({
-      name: "CLI key",
-      scopes: ["sync", "query", "root:delete"],
-    }),
+    body: JSON.stringify(input),
   });
   return key;
+}
+
+export function createCLIKey(): Promise<string> {
+  return createAPIKey({
+    name: "CLI key",
+    scopes: ["sync", "query", "root:delete"],
+  });
+}
+
+export async function revokeAPIKey(id: string): Promise<void> {
+  await api(`/auth/api-keys/${id}`, { method: "DELETE" });
 }
 
 export async function fetchBilling(): Promise<Billing> {

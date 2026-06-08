@@ -2,10 +2,11 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import {
-  createCLIKey,
+  createAPIKey,
   fetchAPIKeys,
   fetchRoots,
   fetchRootSyncSummaries,
+  revokeAPIKey,
 } from "../../lib/queries";
 
 export const Route = createFileRoute("/_app/dashboard")({
@@ -15,6 +16,11 @@ export const Route = createFileRoute("/_app/dashboard")({
 function Dashboard() {
   const queryClient = useQueryClient();
   const [newKey, setNewKey] = useState("");
+  const [keyName, setKeyName] = useState("CLI key");
+  const [selectedScopes, setSelectedScopes] = useState<string[]>([
+    "sync",
+    "query",
+  ]);
   const { data: roots, isPending, isError, error } = useQuery({
     queryKey: ["roots"],
     queryFn: fetchRoots,
@@ -29,9 +35,19 @@ function Dashboard() {
     queryFn: fetchAPIKeys,
   });
   const createKey = useMutation({
-    mutationFn: createCLIKey,
+    mutationFn: () =>
+      createAPIKey({
+        name: keyName.trim() || "API key",
+        scopes: selectedScopes,
+      }),
     onSuccess: (key) => {
       setNewKey(key);
+      queryClient.invalidateQueries({ queryKey: ["api-keys"] });
+    },
+  });
+  const revokeKey = useMutation({
+    mutationFn: revokeAPIKey,
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["api-keys"] });
     },
   });
@@ -76,23 +92,56 @@ function Dashboard() {
         </div>
       </header>
 
-      <section className="console-section" aria-label="CLI setup">
+      <section className="console-section" aria-label="API keys">
         <div className="section-heading">
           <div>
-            <h2>CLI setup</h2>
+            <h2>API keys</h2>
             <p>
-              Run init to sign in in your browser and auto-create a scoped CLI
-              key. Create a manual key only for CI or secret-manager injection.
+              Create scoped keys for the CLI, CI, and local agents. The raw key
+              is shown once after creation.
             </p>
+          </div>
+        </div>
+
+        <div className="settings-grid">
+          <label className="field-label">
+            <span>name</span>
+            <input
+              value={keyName}
+              onChange={(event) => setKeyName(event.target.value)}
+              placeholder="CI deploy key"
+            />
+          </label>
+          <div className="field-label">
+            <span>permissions</span>
+            <div className="checkbox-grid" role="group" aria-label="API key permissions">
+              {API_KEY_SCOPES.map((scope) => (
+                <label key={scope.value} className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={selectedScopes.includes(scope.value)}
+                    onChange={() =>
+                      setSelectedScopes((current) =>
+                        current.includes(scope.value)
+                          ? current.filter((value) => value !== scope.value)
+                          : [...current, scope.value],
+                      )
+                    }
+                  />
+                  <span>{scope.label}</span>
+                </label>
+              ))}
+            </div>
           </div>
           <button
             className="btn btn-sm"
-            disabled={createKey.isPending}
+            disabled={createKey.isPending || selectedScopes.length === 0}
             onClick={() => createKey.mutate()}
           >
-            {createKey.isPending ? "creating" : "create CLI key"}
+            {createKey.isPending ? "creating" : "create key"}
           </button>
         </div>
+
         {createKey.isError && (
           <p className="muted">error: {(createKey.error as Error).message}</p>
         )}
@@ -109,19 +158,40 @@ curl -fsSL https://pufferfs.com/install.sh | sh
 pufferfs init --api-key ${newKey}`}</pre>
           </>
         )}
-        {!newKey && (
-          <pre className="setup-code">{`# macOS / Linux
-curl -fsSL https://pufferfs.com/install.sh | sh
 
-# then configure
-pufferfs init`}</pre>
+        {keysQuery.isPending && <p className="muted">loading keys</p>}
+        {keysQuery.data && keysQuery.data.length === 0 && (
+          <div className="empty-state">no API keys yet</div>
         )}
         {keysQuery.data && keysQuery.data.length > 0 && (
-          <p className="muted">
-            {keysQuery.data.length} API key
-            {keysQuery.data.length === 1 ? "" : "s"} already created for this
-            account.
-          </p>
+          <div className="data-list">
+            <div className="data-row data-row-head key-data-row">
+              <span>name</span>
+              <span>permissions</span>
+              <span>created</span>
+              <span />
+            </div>
+            {keysQuery.data.map((key) => (
+              <div key={key.id} className="data-row key-data-row">
+                <strong>{key.name || "API key"}</strong>
+                <span className="scope-list">
+                  {key.scopes.map((scope) => (
+                    <span key={scope} className="tag">
+                      {scope}
+                    </span>
+                  ))}
+                </span>
+                <span className="muted">{formatDateTime(key.created_at)}</span>
+                <button
+                  className="btn btn-sm btn-danger"
+                  disabled={revokeKey.isPending}
+                  onClick={() => revokeKey.mutate(key.id)}
+                >
+                  revoke
+                </button>
+              </div>
+            ))}
+          </div>
         )}
       </section>
 
@@ -196,6 +266,15 @@ pufferfs init`}</pre>
     </main>
   );
 }
+
+const API_KEY_SCOPES = [
+  { value: "query", label: "query" },
+  { value: "sync", label: "sync" },
+  { value: "root:delete", label: "delete roots" },
+  { value: "api_keys:read", label: "read keys" },
+  { value: "api_keys:write", label: "write keys" },
+  { value: "org:admin", label: "manage org" },
+];
 
 function rootStatus(hasVisibleGeneration: string, latestStatus?: string) {
   if (latestStatus && latestStatus !== "completed") return latestStatus;

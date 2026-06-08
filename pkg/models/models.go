@@ -61,6 +61,15 @@ type OrgMember struct {
 	JoinedAt  time.Time `json:"joined_at"`
 }
 
+// OrgInvite is a pending email invitation to join an org.
+type OrgInvite struct {
+	ID              string    `json:"id"`
+	Email           string    `json:"email"`
+	Role            string    `json:"role"`
+	InvitedByUserID string    `json:"invited_by_user_id"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
 // ---------------------------------------------------------------------------
 // API Keys
 // ---------------------------------------------------------------------------

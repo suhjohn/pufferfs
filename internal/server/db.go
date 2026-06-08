@@ -125,6 +125,17 @@ func (db *DB) migrateFallback() error {
 			PRIMARY KEY (org_id, user_id)
 		);
 
+		CREATE TABLE IF NOT EXISTS org_invites (
+			id                 TEXT PRIMARY KEY,
+			org_id             TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			email              TEXT NOT NULL,
+			role               TEXT NOT NULL DEFAULT 'viewer',
+			invited_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invites_org_email ON org_invites(org_id, email);
+		CREATE INDEX IF NOT EXISTS idx_org_invites_email ON org_invites(email);
+
 		CREATE TABLE IF NOT EXISTS api_keys (
 			id         TEXT PRIMARY KEY,
 			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -366,6 +377,8 @@ func (db *DB) ProvisionOrganization(ctx context.Context, id, name, slug, externa
 // UpsertUser creates or updates a user from OAuth info, returning the user ID.
 // Also creates a personal org if the user is new.
 func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider string) (userID, orgID string, role auth.Role, err error) {
+	info.Email = normalizeEmail(info.Email)
+
 	// Check if user exists
 	var existingID string
 	err = db.pool.QueryRow(ctx,
@@ -380,6 +393,14 @@ func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider strin
 		)
 		if err != nil {
 			return "", "", "", fmt.Errorf("updating user: %w", err)
+		}
+
+		invitedOrgID, invitedRole, accepted, err := db.acceptPendingOrgInvite(ctx, existingID, info.Email)
+		if err != nil {
+			return "", "", "", fmt.Errorf("accepting org invite: %w", err)
+		}
+		if accepted {
+			return existingID, invitedOrgID, invitedRole, nil
 		}
 
 		// Find their org membership (pick first org)
@@ -403,6 +424,14 @@ func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider strin
 		return "", "", "", fmt.Errorf("creating user: %w", err)
 	}
 
+	invitedOrgID, invitedRole, accepted, err := db.acceptPendingOrgInvite(ctx, userID, info.Email)
+	if err != nil {
+		return "", "", "", fmt.Errorf("accepting org invite: %w", err)
+	}
+	if accepted {
+		return userID, invitedOrgID, invitedRole, nil
+	}
+
 	// Create a personal org
 	slug := strings.Split(info.Email, "@")[0]
 	org, err := db.CreateOrganization(ctx, info.Name+"'s Workspace", slug)
@@ -420,6 +449,51 @@ func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider strin
 	}
 
 	return userID, org.ID, auth.RoleOwner, nil
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func (db *DB) acceptPendingOrgInvite(ctx context.Context, userID, email string) (orgID string, role auth.Role, accepted bool, err error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return "", "", false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var inviteID string
+	var rawRole string
+	err = tx.QueryRow(ctx,
+		`SELECT id, org_id, role
+		 FROM org_invites
+		 WHERE email = $1
+		 ORDER BY created_at
+		 LIMIT 1`,
+		normalizeEmail(email),
+	).Scan(&inviteID, &orgID, &rawRole)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO org_members (org_id, user_id, role)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
+		orgID, userID, rawRole,
+	); err != nil {
+		return "", "", false, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM org_invites WHERE id = $1`, inviteID); err != nil {
+		return "", "", false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", "", false, err
+	}
+	return orgID, auth.Role(rawRole), true, nil
 }
 
 // GetUser retrieves a user by ID.
@@ -580,6 +654,81 @@ func (db *DB) AddOrgMember(ctx context.Context, orgID, userID string, role auth.
 	return err
 }
 
+func (db *DB) InviteOrgMember(ctx context.Context, orgID, email string, role auth.Role, invitedByUserID string) (*models.OrgInvite, error) {
+	invite := &models.OrgInvite{
+		ID:              uuid.New().String(),
+		Email:           normalizeEmail(email),
+		Role:            string(role),
+		InvitedByUserID: invitedByUserID,
+		CreatedAt:       time.Now(),
+	}
+	err := db.pool.QueryRow(ctx,
+		`INSERT INTO org_invites (id, org_id, email, role, invited_by_user_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (org_id, email)
+		 DO UPDATE SET role = EXCLUDED.role,
+		               invited_by_user_id = EXCLUDED.invited_by_user_id,
+		               created_at = EXCLUDED.created_at
+		 RETURNING id, email, role, invited_by_user_id, created_at`,
+		invite.ID, orgID, invite.Email, invite.Role, invitedByUserID, invite.CreatedAt,
+	).Scan(&invite.ID, &invite.Email, &invite.Role, &invite.InvitedByUserID, &invite.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return invite, nil
+}
+
+func (db *DB) ListOrgInvites(ctx context.Context, orgID string) ([]models.OrgInvite, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, email, role, invited_by_user_id, created_at
+		 FROM org_invites
+		 WHERE org_id = $1
+		 ORDER BY created_at DESC`,
+		orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var invites []models.OrgInvite
+	for rows.Next() {
+		var invite models.OrgInvite
+		if err := rows.Scan(&invite.ID, &invite.Email, &invite.Role, &invite.InvitedByUserID, &invite.CreatedAt); err != nil {
+			return nil, err
+		}
+		invites = append(invites, invite)
+	}
+	return invites, rows.Err()
+}
+
+func (db *DB) GetOrgInvite(ctx context.Context, orgID, inviteID string) (*models.OrgInvite, error) {
+	var invite models.OrgInvite
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, email, role, invited_by_user_id, created_at
+		 FROM org_invites
+		 WHERE org_id = $1 AND id = $2`,
+		orgID, inviteID,
+	).Scan(&invite.ID, &invite.Email, &invite.Role, &invite.InvitedByUserID, &invite.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &invite, nil
+}
+
+func (db *DB) DeleteOrgInvite(ctx context.Context, orgID, inviteID string) error {
+	_, err := db.pool.Exec(ctx, `DELETE FROM org_invites WHERE org_id = $1 AND id = $2`, orgID, inviteID)
+	return err
+}
+
+func (db *DB) UpdateOrgMemberRole(ctx context.Context, orgID, userID string, role auth.Role) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2`,
+		orgID, userID, string(role),
+	)
+	return err
+}
+
 func (db *DB) GetOrgMember(ctx context.Context, orgID, userID string) (*models.OrgMember, error) {
 	var m models.OrgMember
 	err := db.pool.QueryRow(ctx,
@@ -616,6 +765,15 @@ func (db *DB) ListOrgMembers(ctx context.Context, orgID string) ([]models.OrgMem
 		members = append(members, m)
 	}
 	return members, nil
+}
+
+func (db *DB) CountOrgMembersByRole(ctx context.Context, orgID string, role auth.Role) (int, error) {
+	var count int
+	err := db.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND role = $2`,
+		orgID, string(role),
+	).Scan(&count)
+	return count, err
 }
 
 // RemoveOrgMember removes a user from an org.
