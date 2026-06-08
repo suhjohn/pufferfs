@@ -204,7 +204,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		cleanupDone = true
 	})
 
-	t.Run("cli sync query modify move remove and watch with nested project", func(t *testing.T) {
+	t.Run("cli sync query modify move remove and follow with nested project", func(t *testing.T) {
 		env := newE2EEnv(t, services, "")
 		homeDir := t.TempDir()
 		initPufferFS(t, env, homeDir)
@@ -297,13 +297,13 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertNoTPRows(t, services, namespaces, removedPath)
 		assertClosedTPRows(t, services, namespaces, removedPath)
 
-		watchPath := fixtures.watchPath
-		beforeWatch := rowsDigest(queryTPRowsForPath(t, services, namespaces, watchPath))
-		watch := startPufferfsWatch(t, homeDir, env, projectDir, env.rootName, 300*time.Millisecond)
-		watch.waitForOutput(t, "Following", 30*time.Second)
-		appendFile(t, projectDir, watchPath, "\n3. Verify invoice webhooks and search indexing.\n")
-		waitForRowDigestChange(t, services, namespaces, watchPath, beforeWatch, 90*time.Second)
-		watch.stop(t)
+		followPath := fixtures.watchPath
+		beforeFollow := rowsDigest(queryTPRowsForPath(t, services, namespaces, followPath))
+		follow := startPufferfsFollow(t, homeDir, env, projectDir, env.rootName, 300*time.Millisecond)
+		follow.waitForOutput(t, "Following", 30*time.Second)
+		appendFile(t, projectDir, followPath, "\n3. Verify invoice webhooks and search indexing.\n")
+		waitForRowDigestChange(t, services, namespaces, followPath, beforeFollow, 90*time.Second)
+		follow.stop(t)
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 		cleanupDone = true
@@ -2618,15 +2618,15 @@ func numericAttr(value any) (int, bool) {
 	}
 }
 
-type runningWatch struct {
+type runningFollow struct {
 	cmd    *exec.Cmd
 	output *safeBuffer
 }
 
-func startPufferfsWatch(t *testing.T, homeDir string, env *e2eEnv, projectDir, rootName string, debounce time.Duration) *runningWatch {
+func startPufferfsFollow(t *testing.T, homeDir string, env *e2eEnv, projectDir, rootName string, debounce time.Duration) *runningFollow {
 	t.Helper()
 
-	cmd := exec.Command(e2eCLIBinPath, "watch", projectDir, "--name", rootName, "--debounce", debounce.String())
+	cmd := exec.Command(e2eCLIBinPath, "sync", projectDir, "--follow", "--name", rootName, "--debounce", debounce.String())
 	cmd.Env = append(os.Environ(),
 		"HOME="+homeDir,
 		"PUFFERFS_SERVER_URL="+env.serverURL,
@@ -2636,16 +2636,16 @@ func startPufferfsWatch(t *testing.T, homeDir string, env *e2eEnv, projectDir, r
 	cmd.Stdout = out
 	cmd.Stderr = out
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting watch: %v", err)
+		t.Fatalf("starting follow: %v", err)
 	}
-	w := &runningWatch{cmd: cmd, output: out}
+	w := &runningFollow{cmd: cmd, output: out}
 	t.Cleanup(func() {
 		w.stop(t)
 	})
 	return w
 }
 
-func (w *runningWatch) waitForOutput(t *testing.T, needle string, timeout time.Duration) {
+func (w *runningFollow) waitForOutput(t *testing.T, needle string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
@@ -2655,10 +2655,10 @@ func (w *runningWatch) waitForOutput(t *testing.T, needle string, timeout time.D
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("watch output did not contain %q within %v; output:\n%s", needle, timeout, w.output.String())
+	t.Fatalf("follow output did not contain %q within %v; output:\n%s", needle, timeout, w.output.String())
 }
 
-func (w *runningWatch) stop(t *testing.T) {
+func (w *runningFollow) stop(t *testing.T) {
 	t.Helper()
 	if w == nil || w.cmd == nil || w.cmd.Process == nil {
 		return

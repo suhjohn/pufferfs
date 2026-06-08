@@ -27,9 +27,11 @@ func watchCmd() *cobra.Command {
 	)
 
 	cmd := &cobra.Command{
-		Use:   "watch [path]",
-		Short: "Continuously watch and sync a directory",
-		Args:  cobra.MaximumNArgs(1),
+		Use:        "watch [path]",
+		Short:      "Continuously watch and sync a directory",
+		Hidden:     true,
+		Deprecated: "use `pufferfs sync --follow` for foreground watching or `pufferfs service` for background sync",
+		Args:       cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dir := "."
 			if len(args) > 0 {
@@ -82,12 +84,6 @@ func addFollowFlags(cmd *cobra.Command, options *followOptions) {
 	cmd.Flags().DurationVar(&options.MaxBackoff, "max-backoff", options.MaxBackoff, "Maximum retry backoff while following")
 	cmd.Flags().IntVar(&options.MaxSameFailures, "max-same-failures", options.MaxSameFailures, "Exit after this many consecutive identical sync failures")
 	cmd.Flags().DurationVar(&options.MaxSameFailureWindow, "max-same-failure-window", options.MaxSameFailureWindow, "Exit after identical sync failures persist for this long")
-}
-
-func runWatch(cfg *appconfig.Config, dir, name, rootID string, debounce time.Duration) error {
-	options := defaultFollowOptions()
-	options.Debounce = debounce
-	return runFollow(cfg, dir, name, rootID, options)
 }
 
 func runFollow(cfg *appconfig.Config, dir, name, rootID string, options followOptions) error {

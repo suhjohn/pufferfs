@@ -61,3 +61,16 @@ func TestNormalizeErrorString(t *testing.T) {
 		t.Fatalf("long normalized error len = %d, want 180", len(long))
 	}
 }
+
+func TestWatchCommandIsHiddenDeprecatedAlias(t *testing.T) {
+	cmd := watchCmd()
+	if !cmd.Hidden {
+		t.Fatal("watch command should be hidden from help")
+	}
+	if cmd.Deprecated == "" {
+		t.Fatal("watch command should be marked deprecated")
+	}
+	if !strings.Contains(cmd.Deprecated, "sync --follow") {
+		t.Fatalf("deprecation should point to sync --follow, got %q", cmd.Deprecated)
+	}
+}

@@ -568,13 +568,12 @@ generated/client/
               </article>
 
               <article className="docs-command">
-                <h3>watch behavior</h3>
+                <h3>follow behavior</h3>
                 <p>
-                  <code>pufferfs watch</code> and{" "}
-                  <code>pufferfs sync --follow</code> use the same matcher.
-                  Ignored directories are not watched, which reduces filesystem
-                  noise from dependency installs, build outputs, caches, and
-                  local scratch folders.
+                  <code>pufferfs sync --follow</code> uses the same matcher as
+                  one-shot sync. Ignored directories are not watched, which
+                  reduces filesystem noise from dependency installs, build
+                  outputs, caches, and local scratch folders.
                 </p>
               </article>
             </div>

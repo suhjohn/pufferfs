@@ -9,7 +9,7 @@ layout, access model, and supported product functionality.
 PufferFS indexes a local filesystem root so users and agents can search it with
 hybrid text/vector retrieval. The system is split into:
 
-- A Go CLI for syncing, querying, watching, root management, service
+- A Go CLI for syncing, querying, root management, service
   supervision, and direct-install upgrades.
 - A Go API server that owns authentication, tenancy, root metadata, sync
   orchestration, query proxying, billing, and administrative provisioning.
@@ -64,8 +64,8 @@ The CLI root command is `pufferfs` and includes:
   but return immediately with a `sync_job_id`.
 - `sync status`, `sync jobs`, and `sync wait`: inspect recent sync jobs, poll a
   specific job, or block until it reaches `completed`/`failed`.
-- `sync --follow` and `watch`: run an initial sync, then use `fsnotify` to
-  debounce filesystem changes and rerun sync.
+- `sync --follow`: run an initial sync, then use `fsnotify` to debounce
+  filesystem changes and rerun sync.
 - `query`: search a synced root with `fts`, `vector`, or `hybrid` mode, optional
   path glob, and `top-k` control.
 - `root delete`: delete PufferFS metadata, object storage artifacts,

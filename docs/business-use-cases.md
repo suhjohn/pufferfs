@@ -243,7 +243,7 @@ Customers can use PufferFS in a way that fits their workflow.
 What this enables:
 
 - Run sync and search from the command line.
-- Keep selected folders current with continuous watch mode.
+- Keep selected folders current with `sync --follow`.
 - Install background sync services on macOS or Linux.
 - Use a web console for lightweight visibility into available roots, members,
   and billing.

@@ -501,7 +501,7 @@ The real integration test exercised:
 - modify,
 - move,
 - remove,
-- watch,
+- sync --follow,
 - failed-index retry behavior,
 - closed validity-window rows for moved/deleted paths.
 

@@ -63,7 +63,7 @@ The usual flow is:
 1. Configure the CLI with a PufferFS server URL and API key.
 2. Sync a local folder.
 3. Query the indexed contents by natural language, keyword, or hybrid search.
-4. Optionally keep the folder current with watch mode or a background service.
+4. Optionally keep the folder current with `sync --follow` or a background service.
 
 A root is the durable unit of sync and access control. The local folder remains
 the source of truth. PufferFS stores uploaded copies, extracted chunks,
@@ -293,12 +293,11 @@ pufferfs sync --dry-run .
 The dry-run output lists detected secret files and active ignore patterns
 without uploading anything.
 
-### Interaction with `watch` / `sync --follow`
+### Interaction With `sync --follow`
 
-The `watch` command and `sync --follow` apply the same ignore matcher when
-setting up filesystem watchers. Directories matching ignore rules are not
-watched, reducing system resource usage and eliminating noise from dependency
-installs or build outputs.
+`sync --follow` applies the same ignore matcher when setting up filesystem
+watchers. Directories matching ignore rules are not watched, reducing system
+resource usage and eliminating noise from dependency installs or build outputs.
 
 ## File Changes
 
@@ -385,12 +384,6 @@ Page-based document results may include page numbers and image artifact paths.
 ## Continuous Sync
 
 Run a foreground watcher:
-
-```sh
-pufferfs watch ./workspace --name workspace
-```
-
-Or:
 
 ```sh
 pufferfs sync ./workspace --name workspace --follow
@@ -549,11 +542,11 @@ If query returns no results:
 - Confirm the API key has query/read access.
 - Confirm the caller can read the root and path.
 
-If watch does not pick up files:
+If `sync --follow` does not pick up files:
 
 - Confirm the files are not ignored.
-- Confirm the watched directory still exists.
-- Restart the watcher after large directory moves.
+- Confirm the followed directory still exists.
+- Restart `sync --follow` after large directory moves.
 
 If a sync fails repeatedly:
 

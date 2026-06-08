@@ -1,4 +1,4 @@
-// PufferFs CLI — sync, query, and watch your filesystem.
+// PufferFs CLI - sync, query, and search your filesystem.
 package main
 
 import (

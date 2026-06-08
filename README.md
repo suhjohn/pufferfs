@@ -4,7 +4,7 @@ Hybrid search for your filesystem that agents can use. Sync a folder, then searc
 
 ## Architecture
 
-- **CLI** (Go) — `pufferfs sync`, `pufferfs query`, `pufferfs watch`
+- **CLI** (Go) - `pufferfs sync`, `pufferfs query`, `pufferfs service`
 - **Server** (Go) — API gateway for sync orchestration and query proxy
 - **Compute** (Python/Modal) — file→chunks and chunks→embeddings on GPU
 - **Search** (Turbopuffer) — hybrid BM25 + vector search, with one or more physical namespaces per synced root
@@ -88,14 +88,14 @@ pufferfs root delete my-project --yes
 This deletes PufferFS metadata, storage artifacts, and all Turbopuffer namespaces
 for the synced root. It does not delete the original source files.
 
-### Watch (continuous sync)
+### Continuous sync
 
 ```bash
-pufferfs watch ./my-project
+pufferfs sync ./my-project --name my-project --follow
 ```
 
 For a supervised background sync, install a user service instead of running
-`watch` with `&`:
+`sync --follow` in a shell:
 
 ```bash
 pufferfs service install ./my-project --name my-project
@@ -357,7 +357,7 @@ PUFFERFS_API_KEY="pfs_sk_member_..."
 
 1. **Sync**: CLI scans directory → computes diff against previous state → uploads changed files to S3 → server calls Modal to chunk and embed → routes rows by `file_path` hash → upserts to the root's Turbopuffer namespace shards
 2. **Query**: CLI sends query to server → server embeds query via Modal → fans out hybrid search (BM25 + vector ANN) across the root's Turbopuffer namespace shards → reciprocal rank fusion → results returned to CLI
-3. **Watch**: OS file watcher (fsnotify) → debounced incremental syncs
+3. **Continuous sync**: OS file watcher (fsnotify) → debounced incremental syncs through `sync --follow` or an installed service
 
 ## File Type Support
 

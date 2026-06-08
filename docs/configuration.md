@@ -89,7 +89,7 @@ plain integers (bytes).
 > Server enforced upload caps are separate: 512 MiB per single file, 1024 MiB
 > per bundle (see [api-reference.md](./api-reference.md#limits)).
 
-### `watch` / `sync --follow` flags
+### `sync --follow` flags
 
 These are command flags, not env vars, but belong with sync tuning:
 
