@@ -390,3 +390,7 @@ PUFFERFS_API_KEY="pfs_sk_member_..."
 └── pkg/
     └── models/        # Shared Go data types
 ```
+
+## License
+
+PufferFS is licensed under the MIT License. See [LICENSE](./LICENSE).
