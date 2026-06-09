@@ -7,6 +7,8 @@ console, scripts, or agents.
 It is built around roots: named filesystem snapshots with access control,
 generation tracking, and hybrid BM25/vector retrieval.
 
+Try it at [pufferfs.com](https://pufferfs.com).
+
 ## What It Does
 
 - Sync local folders into object storage and a searchable index.
