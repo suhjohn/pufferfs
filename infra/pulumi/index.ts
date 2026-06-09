@@ -38,6 +38,32 @@ const tags = {
 
 const deployRegion = aws.config.region ?? "us-west-2";
 const regionalBucketPrefix = (suffix: string) => `${name(suffix)}-${deployRegion}-`;
+const inviteEmailFrom = cfg.get("inviteEmailFrom");
+const inviteEmailFromName = cfg.get("inviteEmailFromName");
+const inviteEmailReplyTo = cfg.get("inviteEmailReplyTo");
+const inviteEmailAppUrl = cfg.get("inviteEmailAppUrl") ?? frontendUrl;
+const inviteEmailSesRegion = cfg.get("inviteEmailSesRegion") ?? deployRegion;
+const inviteEmailConfigurationSet = cfg.get("inviteEmailConfigurationSet");
+const inviteEmailIdentityName = cfg.get("inviteEmailIdentity");
+const inviteEmailExistingIdentityArn = cfg.get("inviteEmailIdentityArn");
+const inviteEmailFeedbackEmail = cfg.get("inviteEmailFeedbackEmail");
+const inviteEmailFeedbackIdentityArn = cfg.get("inviteEmailFeedbackIdentityArn");
+const inviteEmailSesEndpointUrl = cfg.get("inviteEmailSesEndpointUrl");
+
+let inviteEmailIdentity: aws.sesv2.EmailIdentity | undefined;
+if (inviteEmailIdentityName) {
+  inviteEmailIdentity = new aws.sesv2.EmailIdentity(name("invite-email-identity"), {
+    emailIdentity: inviteEmailIdentityName,
+    configurationSetName: inviteEmailConfigurationSet || undefined,
+    region: inviteEmailSesRegion,
+    tags,
+  });
+}
+const inviteEmailIdentityArn: pulumi.Input<string> | undefined =
+  inviteEmailExistingIdentityArn ?? inviteEmailIdentity?.arn;
+const sesSendResource: pulumi.Input<string> | undefined = inviteEmailFrom
+  ? inviteEmailIdentityArn ?? "*"
+  : undefined;
 
 const vpc = new aws.ec2.Vpc(name("vpc"), {
   cidrBlock: vpcCidr,
@@ -321,24 +347,32 @@ const taskRole = new aws.iam.Role(name("ecs-task-role"), {
 new aws.iam.RolePolicy(name("ecs-task-policy"), {
   role: taskRole.id,
   policy: pulumi
-    .all([bucket.arn])
-    .apply(([bucketArn]) =>
-      JSON.stringify({
+    .all([bucket.arn, sesSendResource ?? ""])
+    .apply(([bucketArn, sesResource]) => {
+      const statements: Record<string, unknown>[] = [
+        {
+          Effect: "Allow",
+          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          Resource: [bucketArn, `${bucketArn}/*`],
+        },
+        {
+          Effect: "Allow",
+          Action: ["secretsmanager:GetSecretValue"],
+          Resource: "*",
+        },
+      ];
+      if (sesResource) {
+        statements.push({
+          Effect: "Allow",
+          Action: ["ses:SendEmail", "ses:SendRawEmail"],
+          Resource: sesResource,
+        });
+      }
+      return JSON.stringify({
         Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-            Resource: [bucketArn, `${bucketArn}/*`],
-          },
-          {
-            Effect: "Allow",
-            Action: ["secretsmanager:GetSecretValue"],
-            Resource: "*",
-          },
-        ],
-      }),
-    ),
+        Statement: statements,
+      });
+    }),
 });
 
 new aws.iam.RolePolicy(name("ecs-execution-secrets-policy"), {
@@ -550,7 +584,7 @@ const secrets = Object.entries(secretValues).map(([key, value]) => {
   return { name: key, valueFrom: secret.arn };
 });
 
-const appEnv = [
+const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "PORT", value: containerPort.toString() },
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
   { name: "AWS_REGION", value: deployRegion },
@@ -581,6 +615,37 @@ if (cliDownloadBaseUrl) {
 
 if (frontendUrl) {
   appEnv.push({ name: "FRONTEND_URL", value: frontendUrl });
+}
+
+if (inviteEmailFrom) {
+  appEnv.push(
+    { name: "INVITE_EMAIL_FROM", value: inviteEmailFrom },
+    { name: "SES_REGION", value: inviteEmailSesRegion },
+  );
+  if (inviteEmailFromName) {
+    appEnv.push({ name: "INVITE_EMAIL_FROM_NAME", value: inviteEmailFromName });
+  }
+  if (inviteEmailReplyTo) {
+    appEnv.push({ name: "INVITE_EMAIL_REPLY_TO", value: inviteEmailReplyTo });
+  }
+  if (inviteEmailAppUrl) {
+    appEnv.push({ name: "INVITE_EMAIL_APP_URL", value: inviteEmailAppUrl });
+  }
+  if (inviteEmailConfigurationSet) {
+    appEnv.push({ name: "SES_CONFIGURATION_SET", value: inviteEmailConfigurationSet });
+  }
+  if (inviteEmailIdentityArn) {
+    appEnv.push({ name: "SES_FROM_IDENTITY_ARN", value: inviteEmailIdentityArn });
+  }
+  if (inviteEmailFeedbackEmail) {
+    appEnv.push({ name: "SES_FEEDBACK_EMAIL", value: inviteEmailFeedbackEmail });
+  }
+  if (inviteEmailFeedbackIdentityArn) {
+    appEnv.push({ name: "SES_FEEDBACK_IDENTITY_ARN", value: inviteEmailFeedbackIdentityArn });
+  }
+  if (inviteEmailSesEndpointUrl) {
+    appEnv.push({ name: "SES_ENDPOINT_URL", value: inviteEmailSesEndpointUrl });
+  }
 }
 
 // Session cookie domain (e.g. ".pufferfs.com") so the app + api subdomains
@@ -881,6 +946,18 @@ function certValidationRecord(cert: aws.acm.Certificate) {
   }));
 }
 
+function inviteEmailDkimRecords(identity: aws.sesv2.EmailIdentity) {
+  return pulumi
+    .all([identity.emailIdentity, identity.dkimSigningAttributes])
+    .apply(([emailIdentity, dkim]) =>
+      dkim.tokens.map((token) => ({
+        name: `${token}._domainkey.${emailIdentity}`,
+        type: "CNAME",
+        value: `${token}.dkim.amazonses.com`,
+      })),
+    );
+}
+
 export const apiUrl = apiDomain
   ? `https://${apiDomain}`
   : pulumi.interpolate`http://${alb.dnsName}`;
@@ -899,6 +976,14 @@ export const webUrl = useWebCustomCert
   ? `https://${webDomain}`
   : pulumi.interpolate`https://${webDistribution.domainName}`;
 export const billingEnabled = enableBilling;
+export const inviteEmailEnabled = Boolean(inviteEmailFrom);
+export const inviteEmailIdentityNameOutput = inviteEmailIdentityName;
+export const inviteEmailIdentityVerificationStatus = inviteEmailIdentity
+  ? inviteEmailIdentity.verificationStatus
+  : undefined;
+export const inviteEmailDkimValidationRecords = inviteEmailIdentity
+  ? inviteEmailDkimRecords(inviteEmailIdentity)
+  : undefined;
 export const artifactBucket = bucket.bucket;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;

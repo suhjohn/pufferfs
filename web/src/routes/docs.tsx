@@ -254,7 +254,8 @@ const ENDPOINTS = [
   "email": "teammate@example.com",
   "role": "editor",
   "invited_by_user_id": "user_owner",
-  "created_at": "2026-06-08T05:00:00Z"
+  "created_at": "2026-06-08T05:00:00Z",
+  "email_sent": true
 }`],
       ["403", "Caller cannot manage this role.", `{
   "error": "cannot invite that role"

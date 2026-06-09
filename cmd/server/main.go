@@ -92,6 +92,13 @@ func main() {
 		}
 	}
 
+	if inviteSender, err := server.NewInviteEmailSenderFromEnv(context.Background()); err != nil {
+		log.Printf("Invite email disabled: %v", err)
+	} else if inviteSender != nil {
+		srv.SetInviteEmailSender(inviteSender)
+		log.Println("Invite email (SES) enabled")
+	}
+
 	// Auth middleware: supports both JWT and tenant API key for normal routes.
 	appHandler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
 	adminHandler := auth.AdminMiddleware(adminKeyHash())(srv.Handler())

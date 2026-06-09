@@ -83,6 +83,18 @@ set_config_if_present pufferfs:oauthRedirectUrl "${OAUTH_REDIRECT_URL:-}"
 set_config_if_present pufferfs:googleClientId "${GOOGLE_CLIENT_ID:-}"
 set_secret_if_present pufferfs:googleClientSecret "${GOOGLE_CLIENT_SECRET:-}"
 
+set_config_if_present pufferfs:inviteEmailFrom "${INVITE_EMAIL_FROM:-}"
+set_config_if_present pufferfs:inviteEmailFromName "${INVITE_EMAIL_FROM_NAME:-}"
+set_config_if_present pufferfs:inviteEmailReplyTo "${INVITE_EMAIL_REPLY_TO:-}"
+set_config_if_present pufferfs:inviteEmailAppUrl "${INVITE_EMAIL_APP_URL:-}"
+set_config_if_present pufferfs:inviteEmailSesRegion "${INVITE_EMAIL_SES_REGION:-${SES_REGION:-}}"
+set_config_if_present pufferfs:inviteEmailConfigurationSet "${SES_CONFIGURATION_SET:-}"
+set_config_if_present pufferfs:inviteEmailIdentity "${INVITE_EMAIL_IDENTITY:-}"
+set_config_if_present pufferfs:inviteEmailIdentityArn "${INVITE_EMAIL_IDENTITY_ARN:-}"
+set_config_if_present pufferfs:inviteEmailFeedbackEmail "${SES_FEEDBACK_EMAIL:-}"
+set_config_if_present pufferfs:inviteEmailFeedbackIdentityArn "${SES_FEEDBACK_IDENTITY_ARN:-}"
+set_config_if_present pufferfs:inviteEmailSesEndpointUrl "${SES_ENDPOINT_URL:-}"
+
 set_config_if_present pufferfs:apiHttpsReady "${API_HTTPS_READY:-}"
 set_config_if_present pufferfs:webHttpsReady "${WEB_HTTPS_READY:-}"
 

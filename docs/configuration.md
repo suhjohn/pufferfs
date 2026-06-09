@@ -163,6 +163,25 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). |
 | `PUFFERFS_EMBEDDING_MODEL_VERSION` | Embedding cache version; must be bumped when the Modal embedding model changes. | — |
 
+### Invite email (AWS SES, optional)
+
+Invites work without email: `POST /org/invites` stores a pending invite, and
+the invited address accepts it on the next OAuth sign-in. Set
+`INVITE_EMAIL_FROM` to additionally send invite notifications through AWS SES.
+
+| Variable | Meaning |
+| --- | --- |
+| `INVITE_EMAIL_FROM` | Verified SES sender email address. Enables invite email when set. |
+| `INVITE_EMAIL_FROM_NAME` | Optional display name for the sender. |
+| `INVITE_EMAIL_REPLY_TO` | Optional comma-separated reply-to addresses. |
+| `INVITE_EMAIL_APP_URL` | Web app URL used for invite links. Defaults to `FRONTEND_URL`. |
+| `SES_REGION` | SES region. Defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`. |
+| `SES_CONFIGURATION_SET` | Optional SES configuration set. |
+| `SES_FROM_IDENTITY_ARN` | Optional SES identity ARN for least-privilege/sending authorization. |
+| `SES_FEEDBACK_EMAIL` | Optional bounce/complaint forwarding address. |
+| `SES_FEEDBACK_IDENTITY_ARN` | Optional identity ARN for the feedback address. |
+| `SES_ENDPOINT_URL` | Optional SES-compatible endpoint override, mainly for local testing. |
+
 ### Sync pipeline tuning
 
 | Variable | Meaning | Default |

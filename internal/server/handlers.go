@@ -42,6 +42,7 @@ type Server struct {
 	tp      *TPClient
 	queue   queue.Queue
 	billing *StripeClient
+	invites InviteEmailSender
 	mux     *http.ServeMux
 }
 
@@ -66,6 +67,11 @@ func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Ser
 // keeps using the legacy in-process sync pipeline.
 func (s *Server) SetQueue(q queue.Queue) {
 	s.queue = q
+}
+
+// SetInviteEmailSender enables best-effort email notifications for org invites.
+func (s *Server) SetInviteEmailSender(sender InviteEmailSender) {
+	s.invites = sender
 }
 
 // Handler returns the HTTP handler.
@@ -542,7 +548,28 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, invite)
+
+	resp := orgInviteResponse{OrgInvite: *invite}
+	if s.invites != nil {
+		org, err := s.db.GetOrganization(r.Context(), id.OrgID)
+		if err != nil {
+			resp.EmailError = "invite email was not sent: " + err.Error()
+		} else if err := s.invites.SendOrgInvite(r.Context(), OrgInviteEmail{
+			To:           invite.Email,
+			Role:         invite.Role,
+			OrgName:      org.Name,
+			InviterID:    id.UserID,
+			InviterEmail: id.Email,
+		}); err != nil {
+			resp.EmailError = "invite email was not sent: " + err.Error()
+		} else {
+			resp.EmailSent = true
+		}
+	}
+	if resp.EmailError != "" {
+		log.Printf("org invite email failed for org=%s invite=%s email=%s: %s", id.OrgID, invite.ID, invite.Email, resp.EmailError)
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 func (s *Server) handleDeleteInvite(w http.ResponseWriter, r *http.Request) {

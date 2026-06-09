@@ -82,9 +82,8 @@ function Landing() {
       <div className="landing-layout">
         <aside className="landing-toc" aria-label="page navigation">
           <a href="#about">about</a>
-          <a href="#cli-setup">install + usage</a>
-          <a href="#sandboxes">use this for</a>
-          <a href="#product">workflow</a>
+          <a href="#install-usage">install + usage</a>
+          <a href="#use-cases">use this for</a>
         </aside>
 
         <div className="landing-content">
@@ -103,7 +102,7 @@ function Landing() {
             </ol>
           </section>
 
-          <section className="cli-setup" id="cli-setup" aria-label="CLI setup">
+          <section className="cli-setup" id="install-usage" aria-label="install and usage">
             <h2>install + usage</h2>
             <div className="code-window cli-setup-window">
               <pre className="code-pane solo">{`# install (macOS + Linux)
@@ -157,11 +156,7 @@ content: Parental leave provides 12 weeks paid for the primary caregiver and
             </div>
           </section>
 
-          <section
-            className="use-cases"
-            id="sandboxes"
-            aria-label="built for any compute environment"
-          >
+          <section className="use-cases" id="use-cases" aria-label="use cases">
             <h2>use this for</h2>
             <div className="use-case-grid">
               {SANDBOX_POINTS.map((point) => (

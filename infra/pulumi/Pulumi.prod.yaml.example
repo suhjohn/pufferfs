@@ -42,6 +42,18 @@ config:
   pufferfs:webHttpsReady: false
   pufferfs:apiHttpsReady: false
 
+  # Invite email through AWS SES (optional). Leave inviteEmailFrom unset to keep
+  # invites database-only. Set inviteEmailIdentity to have Pulumi create the SES
+  # identity and output DKIM CNAMEs; omit it if using an already-verified identity.
+  # pufferfs:inviteEmailFrom: "team@example.com"
+  # pufferfs:inviteEmailFromName: "PufferFS"
+  # pufferfs:inviteEmailReplyTo: "support@example.com"
+  # pufferfs:inviteEmailAppUrl: "https://example.com"
+  # pufferfs:inviteEmailSesRegion: "us-west-2"
+  # pufferfs:inviteEmailIdentity: "example.com"
+  # pufferfs:inviteEmailIdentityArn: "arn:aws:ses:us-west-2:123456789012:identity/example.com"
+  # pufferfs:inviteEmailConfigurationSet: "optional-ses-config-set"
+
   # Billing (optional). Leave disabled to deploy without payments.
   pufferfs:enableBilling: false
   # pufferfs:stripePriceId: "price_xxx"
