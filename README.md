@@ -70,6 +70,8 @@ pufferfs sync ./handbook --name handbook --background
 pufferfs sync status --root handbook
 pufferfs sync jobs --root handbook
 pufferfs sync wait --root handbook --job-id <sync-job-id>
+pufferfs root current
+pufferfs root delete --yes
 pufferfs root delete handbook --yes
 ```
 

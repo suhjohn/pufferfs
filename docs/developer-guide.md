@@ -445,20 +445,38 @@ What to expect:
 
 ## Root Management
 
-Delete a root:
+Show the root for your current directory:
+
+```sh
+pufferfs root current
+```
+
+Delete the root for your current directory:
+
+```sh
+pufferfs root delete
+```
+
+Delete a specific root by name or ID:
 
 ```sh
 pufferfs root delete workspace
 ```
 
-Skip confirmation:
+Skip confirmation. With no root argument this deletes the current directory's
+root; with an argument it deletes that specific root:
 
 ```sh
+pufferfs root delete --yes
 pufferfs root delete workspace --yes
 ```
 
 What to expect:
 
+- When no root is supplied, the CLI detects the root containing the current
+  working directory from the local `.tpfs` metadata.
+- Without `--yes`, the confirmation prompt requires the root ID even when the
+  root was detected from the current directory.
 - Root deletion removes PufferFS metadata, stored source copies, sync artifacts,
   chunk/page artifacts, and Turbopuffer namespaces.
 - Root deletion removes the local PufferFS cache for that root.

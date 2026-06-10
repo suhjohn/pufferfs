@@ -124,15 +124,19 @@ change: contracts/acme-msa.pdf (added)      -> 24 chunks added`,
   },
   {
     name: "root delete",
-    usage: "pufferfs root delete handbook --yes",
+    usage: "pufferfs root delete",
     detail:
-      "Deletes PufferFS metadata, index rows, storage artifacts, and local PufferFS cache for a root. It does not delete source files on disk or historical sync job records.",
+      "Deletes the current directory's root, or a specific root by name or ID. Deletion removes PufferFS metadata, index rows, storage artifacts, and local PufferFS cache, but it does not delete source files on disk or historical sync job records.",
     flags: ["--yes: skip confirmation prompt"],
-    transcript: `$ pufferfs root delete handbook --yes
+    transcript: `$ cd /Users/me/Documents/handbook
+$ pufferfs root delete --yes
 Deleted root handbook (root_8z7m)
 Deleted Turbopuffer namespace: org_acme_root_8z7m
-Deleted 1,246 storage objects`,
-    note: "Deletion can return 409 if a sync is active. Stop background services before deleting a root. Historical sync jobs are retained for accounting with root_id set to null.",
+Deleted 1,246 storage objects
+
+$ pufferfs root delete handbook --yes
+Deleted root handbook (root_8z7m)`,
+    note: "With no root argument, the CLI detects the root containing the current working directory. Without --yes, confirmation requires the root ID. Deletion can return 409 if a sync is active, so stop background services before deleting a root.",
   },
   {
     name: "upgrade",

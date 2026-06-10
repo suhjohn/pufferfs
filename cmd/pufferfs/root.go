@@ -133,15 +133,32 @@ func formatGeneration(id string, seq int64) string {
 func rootDeleteCmd() *cobra.Command {
 	var yes bool
 	cmd := &cobra.Command{
-		Use:   "delete <root-id-or-name>",
+		Use:   "delete [root-id-or-name]",
 		Short: "Delete a synced root and its PufferFS artifacts",
-		Args:  cobra.ExactArgs(1),
+		Long: strings.TrimSpace(`Delete a synced root and its PufferFS artifacts.
+
+When ROOT is omitted, PufferFS deletes the root that contains the current
+working directory. The confirmation prompt still requires the root ID unless
+--yes is passed.
+
+Root deletion removes PufferFS metadata, stored source copies, sync artifacts,
+chunk/page artifacts, Turbopuffer namespaces, and the local PufferFS cache. It
+does not delete the original source files.`),
+		Example: strings.TrimSpace(`  pufferfs root delete
+  pufferfs root delete --yes
+  pufferfs root delete workspace
+  pufferfs root delete 11111111-1111-1111-1111-111111111111`),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := appconfig.Load()
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
-			return runRootDelete(cfg, args[0], yes)
+			rootRef := ""
+			if len(args) > 0 {
+				rootRef = args[0]
+			}
+			return runRootDelete(cfg, rootRef, yes)
 		},
 	}
 	cmd.Flags().BoolVar(&yes, "yes", false, "Skip confirmation prompt")
@@ -160,10 +177,20 @@ func runRootDelete(cfg *appconfig.Config, rootRef string, yes bool) error {
 	if cfg.Server.URL == "" {
 		return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 	}
+	rootRef = strings.TrimSpace(rootRef)
+	detectedCurrentRoot := false
+	if rootRef == "" {
+		detectedRootID, err := detectRootFromCwd()
+		if err != nil {
+			return fmt.Errorf("could not detect root from cwd; specify a root id or name: %w", err)
+		}
+		rootRef = detectedRootID
+		detectedCurrentRoot = true
+	}
 	client := newAPIClient(cfg)
 
 	rootID := rootRef
-	if !isUUID(rootRef) {
+	if !detectedCurrentRoot && !isUUID(rootRef) {
 		resolvedID, err := resolveRootName(client, rootRef)
 		if err != nil {
 			return fmt.Errorf("resolving root %q: %w", rootRef, err)
