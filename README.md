@@ -91,19 +91,16 @@ See [Configuration](docs/configuration.md) for environment variables.
 
 ## Deployment Options
 
-PufferFS can run in a few shapes:
+Use PufferFS in one of two ways:
 
-- **Hosted production stack**: AWS ECS/Fargate, ALB, S3, CloudFront, EFS-backed
-  NATS, Pulumi, and GitHub Actions.
-- **Self-hosted API**: run the Go server with PostgreSQL, object storage,
-  Turbopuffer, and Modal endpoints.
-- **Queued workers**: add NATS JetStream and run stage workers for chunk, embed,
-  index, commit, and cleanup.
-- **Static web console**: build `web/` and serve the generated static assets.
-- **CLI-only clients**: distribute `pufferfs` plus a server URL and scoped API
-  key.
+- **Hosted version**: use the managed service at
+  [pufferfs.com](https://pufferfs.com). Install the CLI, run `pufferfs init`,
+  and sync/query roots without operating the backend.
+- **Self-hosted**: run the Go API server with PostgreSQL, S3-compatible object
+  storage, Turbopuffer, Modal endpoints, and optional NATS workers. The web
+  console, installer, and workers can be deployed alongside the API when needed.
 
-Production setup is documented in
+Self-hosted production setup is documented in
 [Production Deployment](docs/production-deployment.md). Architecture details are
 in [Architecture and Functionality](docs/architecture-and-functionality.md).
 
