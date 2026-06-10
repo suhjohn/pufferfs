@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
+	"github.com/pufferfs/pufferfs/pkg/models"
 	"github.com/spf13/cobra"
 )
 
@@ -17,8 +20,114 @@ func rootCmd() *cobra.Command {
 		Use:   "root",
 		Short: "Manage synced roots",
 	}
-	cmd.AddCommand(rootDeleteCmd())
+	cmd.AddCommand(rootListCmd(), rootCurrentCmd(), rootDeleteCmd())
 	return cmd
+}
+
+func rootListCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "List accessible synced roots",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := appconfig.Load()
+			if err != nil {
+				return fmt.Errorf("loading config: %w", err)
+			}
+			return runRootList(cfg, jsonOut)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print raw roots JSON")
+	return cmd
+}
+
+func rootCurrentCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "current",
+		Short: "Show the root for the current directory",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runRootCurrent(jsonOut)
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print current root metadata as JSON")
+	return cmd
+}
+
+func runRootList(cfg *appconfig.Config, jsonOut bool) error {
+	if cfg.Server.URL == "" {
+		return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
+	}
+	client := newAPIClient(cfg)
+	raw, err := client.get("/roots")
+	if err != nil {
+		return fmt.Errorf("listing roots: %w", err)
+	}
+	if jsonOut {
+		return writeRawJSONLine(os.Stdout, raw)
+	}
+
+	var roots []models.RootMetadata
+	if err := json.Unmarshal(raw, &roots); err != nil {
+		return fmt.Errorf("parsing roots: %w", err)
+	}
+	writeRootList(os.Stdout, roots)
+	return nil
+}
+
+func runRootCurrent(jsonOut bool) error {
+	rootID, err := detectRootFromCwd()
+	if err != nil {
+		return fmt.Errorf("detecting current root: %w", err)
+	}
+	meta, err := loadRootMeta(rootID)
+	if err != nil {
+		return fmt.Errorf("loading current root metadata: %w", err)
+	}
+	if jsonOut {
+		return writePrettyJSON(os.Stdout, meta)
+	}
+	writeRootMeta(os.Stdout, meta)
+	return nil
+}
+
+func writeRootList(w io.Writer, roots []models.RootMetadata) {
+	if len(roots) == 0 {
+		fmt.Fprintln(w, "No roots found.")
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tID\tSCOPE\tGENERATION\tSOURCE_PATH")
+	for _, root := range roots {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			root.Name,
+			root.ID,
+			root.Scope,
+			formatGeneration(root.VisibleGenerationID, root.VisibleGenerationSeq),
+			root.SourcePath,
+		)
+	}
+	_ = tw.Flush()
+}
+
+func writeRootMeta(w io.Writer, meta *rootMeta) {
+	writeKV(w, "id", meta.ID)
+	writeKV(w, "name", meta.Name)
+	writeKV(w, "source_path", meta.SourcePath)
+	writeKV(w, "generation", formatGeneration(meta.GenerationID, meta.GenerationSeq))
+}
+
+func formatGeneration(id string, seq int64) string {
+	if id == "" {
+		return "-"
+	}
+	if seq == 0 {
+		return id
+	}
+	return fmt.Sprintf("%s/%d", id, seq)
 }
 
 func rootDeleteCmd() *cobra.Command {
