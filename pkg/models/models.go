@@ -284,15 +284,19 @@ type SyncResponse struct {
 
 // QueryRequest is sent from CLI to server to query indexed content.
 type QueryRequest struct {
-	Query  string `json:"query"`
-	Mode   string `json:"mode"`
-	RootID string `json:"root_id"`
-	Glob   string `json:"glob,omitempty"`
-	TopK   int    `json:"top_k"`
+	Query    string   `json:"query"`
+	Mode     string   `json:"mode"`
+	RootID   string   `json:"root_id,omitempty"`
+	RootIDs  []string `json:"root_ids,omitempty"`
+	AllRoots bool     `json:"all_roots,omitempty"`
+	Glob     string   `json:"glob,omitempty"`
+	TopK     int      `json:"top_k"`
 }
 
 // QueryResult is a single search result returned to the user.
 type QueryResult struct {
+	RootID       string  `json:"root_id,omitempty"`
+	RootName     string  `json:"root_name,omitempty"`
 	FilePath     string  `json:"file_path"`
 	AbsolutePath string  `json:"absolute_path,omitempty"`
 	ChunkIndex   int     `json:"chunk_index"`
@@ -305,9 +309,10 @@ type QueryResult struct {
 
 // QueryResponse wraps query results.
 type QueryResponse struct {
-	Results []QueryResult `json:"results"`
-	Query   string        `json:"query"`
-	Mode    string        `json:"mode"`
+	Results       []QueryResult `json:"results"`
+	Query         string        `json:"query"`
+	Mode          string        `json:"mode"`
+	RootsSearched int           `json:"roots_searched,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

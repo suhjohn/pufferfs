@@ -309,6 +309,60 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		cleanupDone = true
 	})
 
+	t.Run("cli query searches selected and all accessible roots", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		projectA := filepath.Join(homeDir, "workspace-a")
+		projectB := filepath.Join(homeDir, "workspace-b")
+		rootAName := env.rootName + "-a"
+		rootBName := env.rootName + "-b"
+		writeFile(t, projectA, "docs/contracts.md", "sharedneedle alpha contract renewal terms live in root A.\n")
+		writeFile(t, projectB, "docs/handbook.md", "sharedneedle beta handbook onboarding notes live in root B.\n")
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectA, "--name", rootAName)
+		if err != nil {
+			t.Fatalf("sync root A failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectB, "--name", rootBName)
+		if err != nil {
+			t.Fatalf("sync root B failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootAID := resolveRootID(t, env.serverURL, env.apiKey, rootAName)
+		rootBID := resolveRootID(t, env.serverURL, env.apiKey, rootBName)
+		namespacesA := rootIndexNamespaces(t, rootAID)
+		namespacesB := rootIndexNamespaces(t, rootBID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, append(namespacesA, namespacesB...))
+			}
+		})
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"query", "sharedneedle", "--mode", "fts", "--top-k", "20", "--json",
+			"--root", rootAName, "--root", rootBName)
+		if err != nil {
+			t.Fatalf("multi-root query failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		assertMultiRootQueryResponse(t, stdout, []string{rootAName, rootBName}, []string{"docs/contracts.md", "docs/handbook.md"})
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"query", "sharedneedle", "--mode", "fts", "--top-k", "20", "--json", "--all-roots")
+		if err != nil {
+			t.Fatalf("all-roots query failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		assertMultiRootQueryResponse(t, stdout, []string{rootAName, rootBName}, []string{"docs/contracts.md", "docs/handbook.md"})
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootAID, rootBID})
+		cleanupDone = true
+	})
+
 	t.Run("failed indexing does not save local state and clean retry indexes incrementally from scratch", func(t *testing.T) {
 		env := newE2EEnv(t, services, "definitely-invalid-turbopuffer-key")
 		homeDir := t.TempDir()
@@ -2322,6 +2376,33 @@ func assertCLIQuery(t *testing.T, homeDir string, env *e2eEnv, query, rootName, 
 	}
 	if expectedPath != "" && !strings.Contains(stdout, expectedPath) {
 		t.Fatalf("expected query output to contain %s, got: %s", expectedPath, stdout)
+	}
+}
+
+func assertMultiRootQueryResponse(t *testing.T, raw string, expectedRootNames, expectedPaths []string) {
+	t.Helper()
+	var resp models.QueryResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &resp); err != nil {
+		t.Fatalf("decoding multi-root query response: %v\nstdout: %s", err, raw)
+	}
+	if resp.RootsSearched < len(expectedRootNames) {
+		t.Fatalf("roots_searched = %d, want at least %d in %#v", resp.RootsSearched, len(expectedRootNames), resp)
+	}
+	rootNames := make(map[string]bool)
+	paths := make(map[string]bool)
+	for _, result := range resp.Results {
+		rootNames[result.RootName] = true
+		paths[result.FilePath] = true
+	}
+	for _, name := range expectedRootNames {
+		if !rootNames[name] {
+			t.Fatalf("query response missing root %q; roots=%#v results=%#v", name, rootNames, resp.Results)
+		}
+	}
+	for _, expectedPath := range expectedPaths {
+		if !paths[expectedPath] {
+			t.Fatalf("query response missing path %q; paths=%#v results=%#v", expectedPath, paths, resp.Results)
+		}
 	}
 }
 

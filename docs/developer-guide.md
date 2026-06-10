@@ -328,6 +328,13 @@ Search a specific root by name or ID:
 pufferfs query "pricing assumptions" --root workspace
 ```
 
+Search selected roots or every accessible root:
+
+```sh
+pufferfs query "renewal notice" --root contracts --root handbook
+pufferfs query "renewal notice" --all-roots
+```
+
 Choose search mode:
 
 ```sh

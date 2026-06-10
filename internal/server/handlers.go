@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2532,10 +2533,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query is required"})
 		return
 	}
-	if req.RootID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "root_id is required"})
-		return
-	}
 	if req.TopK <= 0 {
 		req.TopK = 10
 	}
@@ -2544,81 +2541,226 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	queryLimit := filteredQueryLimit(req.TopK)
 
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, req.RootID)
-	if err != nil || !canReadRoot(id, root) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+	selection, err := s.resolveQueryRoots(r.Context(), id, &req)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errQueryRootNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
-	indexNamespaces, err := s.db.ListRootIndexNamespaces(r.Context(), id.OrgID, req.RootID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing root index namespaces: " + err.Error()})
+	switch req.Mode {
+	case "fts", "vector", "hybrid":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
 		return
 	}
+	if len(selection.roots) == 0 {
+		s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
+			"mode":             req.Mode,
+			"top_k":            req.TopK,
+			"has_glob":         req.Glob != "",
+			"query_scope":      selection.scope,
+			"roots_searched":   0,
+			"namespace_count":  0,
+			"raw_result_count": 0,
+			"result_count":     0,
+		})
+		writeJSON(w, http.StatusOK, models.QueryResponse{
+			Results:       []models.QueryResult{},
+			Query:         req.Query,
+			Mode:          req.Mode,
+			RootsSearched: 0,
+		})
+		return
+	}
+
+	var embedding []float64
+	if req.Mode == "vector" || req.Mode == "hybrid" {
+		var embedErr error
+		embedding, embedErr = s.modal.EmbedQuery(req.Query)
+		if embedErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
+			return
+		}
+	}
+
+	allResults := make([]models.QueryResult, 0)
+	totalNamespaces := 0
+	rawResultCount := 0
+	for _, root := range selection.roots {
+		rootResults, stats, err := s.queryOneRoot(r.Context(), id, &req, root, embedding, queryLimit)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		totalNamespaces += stats.namespaceCount
+		rawResultCount += stats.rawResultCount
+		allResults = append(allResults, rootResults...)
+	}
+
+	if len(selection.roots) > 1 {
+		sort.SliceStable(allResults, func(i, j int) bool {
+			return allResults[i].Score > allResults[j].Score
+		})
+	}
+	if len(allResults) > req.TopK {
+		allResults = allResults[:req.TopK]
+	}
+
+	s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
+		"mode":             req.Mode,
+		"top_k":            req.TopK,
+		"has_glob":         req.Glob != "",
+		"query_scope":      selection.scope,
+		"roots_searched":   len(selection.roots),
+		"namespace_count":  totalNamespaces,
+		"raw_result_count": rawResultCount,
+		"result_count":     len(allResults),
+	})
+
+	writeJSON(w, http.StatusOK, models.QueryResponse{
+		Results:       allResults,
+		Query:         req.Query,
+		Mode:          req.Mode,
+		RootsSearched: len(selection.roots),
+	})
+}
+
+var errQueryRootNotFound = errors.New("root not found")
+
+type queryRootSelection struct {
+	roots []models.RootMetadata
+	scope string
+}
+
+func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest) (queryRootSelection, error) {
+	selectorCount := 0
+	if strings.TrimSpace(req.RootID) != "" {
+		selectorCount++
+	}
+	if len(req.RootIDs) > 0 {
+		selectorCount++
+	}
+	if req.AllRoots {
+		selectorCount++
+	}
+	if selectorCount == 0 {
+		return queryRootSelection{}, fmt.Errorf("root_id, root_ids, or all_roots is required")
+	}
+	if selectorCount > 1 {
+		return queryRootSelection{}, fmt.Errorf("use exactly one of root_id, root_ids, or all_roots")
+	}
+
+	if req.AllRoots {
+		roots, err := s.db.ListAccessibleRoots(ctx, id.OrgID, id.UserID, id.Role)
+		if err != nil {
+			return queryRootSelection{}, fmt.Errorf("listing accessible roots: %w", err)
+		}
+		return queryRootSelection{roots: roots, scope: "all_roots"}, nil
+	}
+
+	if strings.TrimSpace(req.RootID) != "" {
+		root, err := s.db.GetRoot(ctx, id.OrgID, strings.TrimSpace(req.RootID))
+		if err != nil || !canReadRoot(id, root) {
+			return queryRootSelection{}, errQueryRootNotFound
+		}
+		return queryRootSelection{roots: []models.RootMetadata{*root}, scope: "single_root"}, nil
+	}
+
+	seen := make(map[string]struct{}, len(req.RootIDs))
+	roots := make([]models.RootMetadata, 0, len(req.RootIDs))
+	for _, rawRootID := range req.RootIDs {
+		rootID := strings.TrimSpace(rawRootID)
+		if rootID == "" {
+			continue
+		}
+		if _, ok := seen[rootID]; ok {
+			continue
+		}
+		seen[rootID] = struct{}{}
+		root, err := s.db.GetRoot(ctx, id.OrgID, rootID)
+		if err != nil || !canReadRoot(id, root) {
+			return queryRootSelection{}, errQueryRootNotFound
+		}
+		roots = append(roots, *root)
+	}
+	if len(roots) == 0 {
+		return queryRootSelection{}, fmt.Errorf("root_ids must include at least one non-empty root id")
+	}
+	return queryRootSelection{roots: roots, scope: "selected_roots"}, nil
+}
+
+type queryRootStats struct {
+	namespaceCount int
+	rawResultCount int
+}
+
+func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *models.QueryRequest, root models.RootMetadata, embedding []float64, queryLimit int) ([]models.QueryResult, queryRootStats, error) {
+	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, id.OrgID, root.ID)
+	if err != nil {
+		return nil, queryRootStats{}, fmt.Errorf("listing root index namespaces: %w", err)
+	}
+	activeNamespaces := activeRootIndexNamespaces(indexNamespaces)
+	stats := queryRootStats{namespaceCount: len(activeNamespaces)}
+	if len(activeNamespaces) == 0 {
+		return nil, stats, nil
+	}
+
 	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	var filters []any
 	if req.Glob != "" {
 		filters = append(filters, []any{"file_path", "Glob", req.Glob})
 	}
-	// Always constrain results to the visible generation's active window. If we
-	// cannot resolve it, fail closed (return an error) rather than returning
-	// unfiltered rows. When the root has no committed generation yet
-	// (visibleSeq == 0), activeGenerationFilter matches no rows, so
-	// uncommitted/in-flight rows from a building or failed sync are never served.
-	visibleSeq, vErr := s.db.GetVisibleGenerationSeq(r.Context(), req.RootID)
-	if vErr != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "resolving visible generation: " + vErr.Error()})
-		return
+	visibleSeq, err := s.db.GetVisibleGenerationSeq(ctx, root.ID)
+	if err != nil {
+		return nil, stats, fmt.Errorf("resolving visible generation: %w", err)
 	}
 	filters = append(filters, activeGenerationFilter(visibleSeq))
 
-	// Get denied paths from ACLs and filter results post-query
-	deniedPrefixes := s.buildACLFilter(r.Context(), id, req.RootID)
-
 	var rows []map[string]any
-	var queryErr error
-
 	switch req.Mode {
 	case "fts":
 		rankBy := []any{"content", "BM25", req.Query}
-		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
 			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 		})
-
 	case "vector":
-		embedding, embedErr := s.modal.EmbedQuery(req.Query)
-		if embedErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
-			return
-		}
 		rankBy := []any{"vector", "ANN", embedding}
-		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
 			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 		})
-
 	case "hybrid":
-		embedding, embedErr := s.modal.EmbedQuery(req.Query)
-		if embedErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
-			return
-		}
-		rows, queryErr = queryRootIndexNamespaces(indexNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
 			return s.tp.HybridSearch(namespace, req.Query, embedding, queryLimit, tpAndFilter(filters))
 		})
-
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
-		return
+		return nil, stats, fmt.Errorf("mode must be fts, vector, or hybrid")
 	}
-
-	if queryErr != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": queryErr.Error()})
-		return
+	if err != nil {
+		return nil, stats, err
 	}
+	stats.rawResultCount = len(rows)
 
-	// Filter out denied paths (ACL enforcement)
-	var filteredRows []map[string]any
+	deniedPrefixes := s.buildACLFilter(ctx, id, root.ID)
+	filteredRows := filterDeniedQueryRows(rows, deniedPrefixes)
+	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		filteredRows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, filteredRows)
+	}
+	if len(filteredRows) > req.TopK {
+		filteredRows = filteredRows[:req.TopK]
+	}
+	return queryResultsFromRows(root, filteredRows), stats, nil
+}
+
+func filterDeniedQueryRows(rows []map[string]any, deniedPrefixes []string) []map[string]any {
+	if len(deniedPrefixes) == 0 {
+		return rows
+	}
+	filteredRows := make([]map[string]any, 0, len(rows))
 	for _, row := range rows {
 		fp := strVal(row, "file_path")
 		denied := false
@@ -2632,29 +2774,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			filteredRows = append(filteredRows, row)
 		}
 	}
+	return filteredRows
+}
 
-	// Content proof filtering is only needed for user-owned roots. Org roots are
-	// shared by membership plus ACL; applying per-user proofs there would hide
-	// shared results from members who did not run the sync.
-	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		filteredRows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, req.RootID, filteredRows)
-	}
-	if len(filteredRows) > req.TopK {
-		filteredRows = filteredRows[:req.TopK]
-	}
-
-	s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
-		"mode":             req.Mode,
-		"top_k":            req.TopK,
-		"has_glob":         req.Glob != "",
-		"root_scope":       rootScopeProperty(root),
-		"namespace_count":  len(indexNamespaces),
-		"raw_result_count": len(rows),
-		"result_count":     len(filteredRows),
-	})
-	results := make([]models.QueryResult, len(filteredRows))
-	for i, row := range filteredRows {
+func queryResultsFromRows(root models.RootMetadata, rows []map[string]any) []models.QueryResult {
+	results := make([]models.QueryResult, len(rows))
+	for i, row := range rows {
 		results[i] = models.QueryResult{
+			RootID:       root.ID,
+			RootName:     root.Name,
 			FilePath:     strVal(row, "file_path"),
 			AbsolutePath: strVal(row, "absolute_path"),
 			Content:      strVal(row, "content"),
@@ -2678,12 +2806,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-
-	writeJSON(w, http.StatusOK, models.QueryResponse{
-		Results: results,
-		Query:   req.Query,
-		Mode:    req.Mode,
-	})
+	return results
 }
 
 // ---------------------------------------------------------------------------

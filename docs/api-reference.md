@@ -440,7 +440,8 @@ Delete an ACL. Returns `{"status":"deleted"}`.
 
 ### `POST /query`
 
-Search a root. Requires scope `query` / `read` and read access to the root.
+Search one or more roots. Requires scope `query` / `read` and read access to
+every explicitly requested root.
 
 Request (`QueryRequest`):
 
@@ -448,7 +449,11 @@ Request (`QueryRequest`):
 { "query": "renewal notice terms", "root_id": "<id>", "mode": "hybrid", "glob": "*.pdf", "top_k": 10 }
 ```
 
-- `query` and `root_id` are required.
+- `query` is required.
+- Exactly one root selector is required:
+  - `root_id`: search one root.
+  - `root_ids`: search selected roots.
+  - `all_roots: true`: search every root the caller can access.
 - `mode`: `hybrid` (default), `fts`, or `vector`. Invalid values → `400`.
 - `top_k` defaults to `10`. `glob` is optional and filters on `file_path`.
 
@@ -457,12 +462,14 @@ Behavior:
 - Results are always constrained to the root's **visible (committed)
   generation**. A root with no committed generation returns no rows. In-flight
   or failed syncs are never exposed.
-- Sharded roots are queried across all active namespaces concurrently and merged
-  via reciprocal rank fusion (for `hybrid`).
-- Denied ACL prefixes are filtered out post-query.
+- Sharded roots are queried across all active namespaces concurrently. Multi-root
+  queries repeat that process per root, then merge and truncate globally.
+- Denied ACL prefixes are filtered out post-query for each root.
 - For `user`-scoped roots, non-admin callers are additionally filtered through
   their stored content proof, so they only receive rows for files they can prove
   they possess.
+- Explicitly requested inaccessible roots return `404`. `all_roots` only selects
+  roots the caller can access.
 
 Response (`QueryResponse`):
 
@@ -470,8 +477,11 @@ Response (`QueryResponse`):
 {
   "query": "renewal notice terms",
   "mode": "hybrid",
+  "roots_searched": 2,
   "results": [
     {
+      "root_id": "<id>",
+      "root_name": "contracts",
       "file_path": "contracts/acme.pdf",
       "absolute_path": "/Users/me/workspace/contracts/acme.pdf",
       "chunk_index": 4,

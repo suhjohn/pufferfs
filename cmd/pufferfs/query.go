@@ -19,7 +19,8 @@ func queryCmd() *cobra.Command {
 	var (
 		mode       string
 		glob       string
-		rootID     string
+		rootIDs    []string
+		allRoots   bool
 		topK       int
 		jsonOutput bool
 	)
@@ -40,48 +41,72 @@ func queryCmd() *cobra.Command {
 				return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 			}
 
-			// Auto-detect root if not specified
-			if rootID == "" {
-				rootID, err = detectRootFromCwd()
-				if err != nil {
-					return fmt.Errorf("could not detect root from cwd; use --root to specify: %w", err)
-				}
+			if allRoots && len(rootIDs) > 0 {
+				return fmt.Errorf("--root and --all-roots are mutually exclusive")
 			}
 
-			return runQuery(cfg, queryText, mode, glob, rootID, topK, jsonOutput)
+			// Auto-detect root if not specified
+			if !allRoots && len(rootIDs) == 0 {
+				rootID, err := detectRootFromCwd()
+				if err != nil {
+					return fmt.Errorf("could not detect root from cwd; use --root or --all-roots to specify: %w", err)
+				}
+				rootIDs = []string{rootID}
+			}
+
+			return runQuery(cfg, queryText, mode, glob, rootIDs, allRoots, topK, jsonOutput)
 		},
 	}
 
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Print raw query response as JSON")
 	cmd.Flags().StringVar(&mode, "mode", "hybrid", "Search mode: fts, vector, or hybrid")
 	cmd.Flags().StringVar(&glob, "glob", "", "Filter results by file path glob")
-	cmd.Flags().StringVar(&rootID, "root", "", "Root ID or name to search")
+	cmd.Flags().StringArrayVar(&rootIDs, "root", nil, "Root ID or name to search; repeat to search multiple roots")
+	cmd.Flags().BoolVar(&allRoots, "all-roots", false, "Search all roots you can access")
 	cmd.Flags().IntVar(&topK, "top-k", 10, "Number of results to return")
 
 	return cmd
 }
 
-func runQuery(cfg *appconfig.Config, queryText, mode, glob, rootID string, topK int, jsonOutput bool) error {
+func runQuery(cfg *appconfig.Config, queryText, mode, glob string, rootIDs []string, allRoots bool, topK int, jsonOutput bool) error {
 	client := newAPIClient(cfg)
 
-	// Resolve root name to ID if it's not a UUID
-	if rootID != "" && !isUUID(rootID) {
-		resolvedID, err := resolveRootName(client, rootID)
-		if err != nil {
-			return fmt.Errorf("resolving root %q: %w", rootID, err)
+	resolvedRootIDs := make([]string, 0, len(rootIDs))
+	for _, rootID := range rootIDs {
+		rootID = strings.TrimSpace(rootID)
+		if rootID == "" {
+			continue
 		}
-		rootID = resolvedID
+		// Resolve root name to ID if it's not a UUID.
+		if !isUUID(rootID) {
+			resolvedID, err := resolveRootName(client, rootID)
+			if err != nil {
+				return fmt.Errorf("resolving root %q: %w", rootID, err)
+			}
+			rootID = resolvedID
+		}
+		resolvedRootIDs = append(resolvedRootIDs, rootID)
 	}
-	if !jsonOutput {
-		warnIfSyncRunning(client, rootID)
+	if !allRoots && len(resolvedRootIDs) == 0 {
+		return fmt.Errorf("at least one root is required")
+	}
+	if !jsonOutput && len(resolvedRootIDs) == 1 {
+		warnIfSyncRunning(client, resolvedRootIDs[0])
 	}
 
 	req := models.QueryRequest{
-		Query:  queryText,
-		Mode:   mode,
-		RootID: rootID,
-		Glob:   glob,
-		TopK:   topK,
+		Query:    queryText,
+		Mode:     mode,
+		AllRoots: allRoots,
+		Glob:     glob,
+		TopK:     topK,
+	}
+	switch len(resolvedRootIDs) {
+	case 0:
+	case 1:
+		req.RootID = resolvedRootIDs[0]
+	default:
+		req.RootIDs = resolvedRootIDs
 	}
 
 	respBody, err := client.post("/query", req)
@@ -117,6 +142,7 @@ func writeQueryResults(w io.Writer, resp models.QueryResponse) {
 		return
 	}
 
+	showRoot := resp.RootsSearched > 1
 	for i, r := range resp.Results {
 		if i > 0 {
 			fmt.Fprintln(w)
@@ -127,6 +153,13 @@ func writeQueryResults(w io.Writer, resp models.QueryResponse) {
 			displayPath = r.AbsolutePath
 		}
 		writeKV(w, "score", fmt.Sprintf("%.4f", r.Score))
+		if showRoot {
+			rootLabel := r.RootName
+			if rootLabel == "" {
+				rootLabel = r.RootID
+			}
+			writeKV(w, "root", rootLabel)
+		}
 		writeKV(w, "file", displayPath)
 		if r.PageNumber != nil {
 			writeKV(w, "page_number", *r.PageNumber)

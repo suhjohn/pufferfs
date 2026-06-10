@@ -138,6 +138,8 @@ dependency folders out of the index and reducing exposure surface.
 - Tenancy is enforced by org scoping on every root lookup
   (`id.OrgID == root.OrgID`); cross-org reads are not possible through the normal
   API.
+- Multi-root query applies the same visible-generation, ACL, and content-proof
+  filters independently to each selected root before globally merging results.
 - **Any new query path must reapply the visible-generation filter and the ACL /
   content-proof filters** — these are the load-bearing isolation controls.
 
