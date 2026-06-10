@@ -124,14 +124,19 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 | --- | --- |
 | Code | Line-based chunks |
 | Markdown / text | Section-based chunks |
-| PDF | Page rendering and OCR/text extraction |
-| DOCX | Paragraph-based chunks |
-| PPTX | Slide-based chunks |
+| PDF | Page rendering and Gemini vision extraction |
+| DOCX / PPTX | Convert to PDF, then page rendering and Gemini vision extraction |
 | Images | Captioning/OCR pipeline |
+| Email / calendar / contacts | Structured text extraction |
+| Audio / video | Overlapping time-window descriptions |
+
+See [File Ingestion and Chunking](docs/file-ingestion-and-chunking.md) for the
+full format, extraction, and chunking process.
 
 ## Further Reading
 
 - [Developer Guide](docs/developer-guide.md)
+- [File Ingestion and Chunking](docs/file-ingestion-and-chunking.md)
 - [API Reference](docs/api-reference.md)
 - [Security and Data Handling](docs/security-and-data-handling.md)
 - [Production Deployment](docs/production-deployment.md)

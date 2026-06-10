@@ -430,7 +430,8 @@ PufferFS currently supports:
 - Optional NATS-backed queue workers for chunk/embed/index/commit/cleanup.
 - In-process object-storage queue fallback.
 - Local Go chunking for text/code/markdown-like files.
-- Modal chunking for PDFs, Office docs, presentations, and images.
+- Modal chunking for PDFs, Office docs, presentations, images, structured
+  files, and media files.
 - Modal embeddings for chunks and query text.
 - Embedding cache keyed by org, model version, and content hash.
 - Turbopuffer hybrid, vector, and full-text search.

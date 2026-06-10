@@ -368,16 +368,21 @@ What to expect:
 ## File Type Behavior
 
 Text-like files can be chunked locally by the Go server. PDFs, Office files,
-presentations, and images use Modal compute when configured.
+presentations, images, structured files, and media files use Modal compute when
+configured. The full extraction and chunking process is documented in
+[File Ingestion and Chunking](file-ingestion-and-chunking.md).
 
 Expected extraction behavior:
 
 - Code and config files are split into overlapping text chunks.
 - Markdown and text are split by headings and text boundaries where possible.
-- PDFs are rendered by page; native PDF text is used when it appears reliable.
-- Scanned or image-heavy pages can use vision extraction when available.
+- PDFs are rendered by page and sent through vision extraction by default.
+- Native PDF text is retained only as a no-vision fallback.
 - Word and PowerPoint files are converted to PDF first, then processed by page.
 - Images can be captioned or text-extracted when vision extraction is available.
+- Email, calendar, and contact files are parsed into searchable text records.
+- Audio and video are split into overlapping time windows and described for
+  semantic search.
 
 Page-based document results may include page numbers and image artifact paths.
 

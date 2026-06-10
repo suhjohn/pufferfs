@@ -105,11 +105,10 @@ def office_to_pdf(file_bytes: bytes, file_type: str, file_path: str) -> bytes:
     memory=2048,
 )
 def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
-    """Render PDF bytes to per-page JPEG images plus fallback text."""
+    """Render PDF bytes to per-page JPEG images plus fallback native text."""
     import time
 
     import fitz
-    from chunkers import _page_text_coverage, extracted_text_is_usable
 
     render_start = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -118,14 +117,11 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
         page = doc[page_num]
         pix = page.get_pixmap(dpi=200)
         extracted_text = page.get_text("text")
-        text_coverage = _page_text_coverage(page)
         pages.append(
             {
                 "page_num": page_num,
                 "image_bytes": pix.tobytes("jpeg"),
-                "extracted_text": extracted_text,
-                "text_coverage": text_coverage,
-                "text_is_usable": extracted_text_is_usable(extracted_text, text_coverage),
+                "fallback_text": extracted_text,
             }
         )
     doc.close()
@@ -146,7 +142,7 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     scaledown_window=900,
 )
 def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallback_text: str) -> str:
-    """Extract text from one rendered page image, falling back to native text without Gemini."""
+    """Extract text from one rendered page image, falling back to native text without a Gemini key."""
     import time
 
     from chunkers import image_to_text
@@ -200,8 +196,7 @@ def chunk_document_with_stage_functions(
         page_start = time.perf_counter()
         page_num = int(page_data["page_num"])
         img_bytes = page_data["image_bytes"]
-        extracted_text = page_data.get("extracted_text") or page_data.get("fallback_text") or ""
-        text_is_usable = bool(page_data.get("text_is_usable"))
+        fallback_text = page_data.get("fallback_text") or ""
         image_key = _page_image_key(root_id, file_path, page_num)
         if s3_client and bucket:
             upload_start = time.perf_counter()
@@ -217,15 +212,7 @@ def chunk_document_with_stage_functions(
                 flush=True,
             )
 
-        if text_is_usable:
-            text = extracted_text
-            print(
-                f"timing file={file_path} page={page_num} stage=image_to_text "
-                f"source=native_text chars={len(text)} elapsed=0.000s",
-                flush=True,
-            )
-        else:
-            text = page_image_to_text.remote(file_path, page_num, img_bytes, extracted_text)
+        text = page_image_to_text.remote(file_path, page_num, img_bytes, fallback_text)
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
