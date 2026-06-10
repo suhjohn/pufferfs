@@ -227,6 +227,9 @@ func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
 		return
 	}
+	s.captureBackendEvent(r.Context(), id, "billing_checkout_created", map[string]any{
+		"plan": "pro",
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"url": checkoutURL})
 }
 
@@ -276,11 +279,19 @@ func (s *Server) applyStripeEvent(ctx context.Context, event *stripeEvent) error
 		if orgID == "" {
 			return nil
 		}
-		return s.db.UpsertSubscription(ctx, Subscription{
+		if err := s.db.UpsertSubscription(ctx, Subscription{
 			OrgID:  orgID,
 			Plan:   "pro",
 			Status: "active",
-		}, obj.Customer, obj.Subscription, nil)
+		}, obj.Customer, obj.Subscription, nil); err != nil {
+			return err
+		}
+		s.captureOrgBackendEvent(ctx, orgID, "", "billing_subscription_updated", map[string]any{
+			"plan":       "pro",
+			"status":     "active",
+			"event_type": event.Type,
+		})
+		return nil
 
 	case "customer.subscription.updated", "customer.subscription.deleted":
 		var obj struct {
@@ -305,7 +316,17 @@ func (s *Server) applyStripeEvent(ctx context.Context, event *stripeEvent) error
 			status = "canceled"
 			plan = "free"
 		}
-		return s.db.UpdateSubscriptionByCustomer(ctx, obj.Customer, obj.Metadata.OrgID, plan, status, periodEnd)
+		if err := s.db.UpdateSubscriptionByCustomer(ctx, obj.Customer, obj.Metadata.OrgID, plan, status, periodEnd); err != nil {
+			return err
+		}
+		if obj.Metadata.OrgID != "" {
+			s.captureOrgBackendEvent(ctx, obj.Metadata.OrgID, "", "billing_subscription_updated", map[string]any{
+				"plan":       plan,
+				"status":     status,
+				"event_type": event.Type,
+			})
+		}
+		return nil
 	}
 	return nil
 }

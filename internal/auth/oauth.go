@@ -32,9 +32,10 @@ type OAuthConfig struct {
 	// FrontendURL, when set, switches the callback from returning the JWT in the
 	// response body (legacy CLI flow) to setting an httpOnly session cookie and
 	// redirecting the browser to FrontendURL + "/auth/callback".
-	FrontendURL  string
-	Cookie       CookieConfig
-	CreateAPIKey APIKeyCreateFunc
+	FrontendURL    string
+	Cookie         CookieConfig
+	CreateAPIKey   APIKeyCreateFunc
+	LoginSucceeded OAuthLoginSucceededFunc
 }
 
 // UserInfo is the profile returned by Google's userinfo endpoint.
@@ -53,14 +54,28 @@ type UserUpsertFunc func(ctx context.Context, info UserInfo, provider string) (u
 // browser login flow after OAuth succeeds.
 type APIKeyCreateFunc func(ctx context.Context, orgID, userID, name string, scopes []string) (rawKey string, err error)
 
+// OAuthLoginEvent describes a successful OAuth login.
+type OAuthLoginEvent struct {
+	UserID   string
+	OrgID    string
+	Email    string
+	Role     Role
+	Flow     string
+	Provider string
+}
+
+// OAuthLoginSucceededFunc is called after OAuth succeeds.
+type OAuthLoginSucceededFunc func(ctx context.Context, event OAuthLoginEvent)
+
 // OAuthHandler handles the Google OAuth2 flow.
 type OAuthHandler struct {
-	oauthCfg     *oauth2.Config
-	jwtSecret    []byte
-	upsertUser   UserUpsertFunc
-	createAPIKey APIKeyCreateFunc
-	frontendURL  string
-	cookie       CookieConfig
+	oauthCfg       *oauth2.Config
+	jwtSecret      []byte
+	upsertUser     UserUpsertFunc
+	createAPIKey   APIKeyCreateFunc
+	loginSucceeded OAuthLoginSucceededFunc
+	frontendURL    string
+	cookie         CookieConfig
 }
 
 // NewOAuthHandler creates a handler for Google OAuth2.
@@ -73,11 +88,12 @@ func NewOAuthHandler(cfg OAuthConfig, upsertUser UserUpsertFunc) *OAuthHandler {
 			Scopes:       []string{"openid", "email", "profile"},
 			Endpoint:     google.Endpoint,
 		},
-		jwtSecret:    cfg.JWTSecret,
-		upsertUser:   upsertUser,
-		createAPIKey: cfg.CreateAPIKey,
-		frontendURL:  strings.TrimRight(cfg.FrontendURL, "/"),
-		cookie:       cfg.Cookie,
+		jwtSecret:      cfg.JWTSecret,
+		upsertUser:     upsertUser,
+		createAPIKey:   cfg.CreateAPIKey,
+		loginSucceeded: cfg.LoginSucceeded,
+		frontendURL:    strings.TrimRight(cfg.FrontendURL, "/"),
+		cookie:         cfg.Cookie,
 	}
 }
 
@@ -155,6 +171,17 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, `{"error":"generating token"}`, http.StatusInternalServerError)
 		return
+	}
+
+	if h.loginSucceeded != nil {
+		h.loginSucceeded(r.Context(), OAuthLoginEvent{
+			UserID:   userID,
+			OrgID:    orgID,
+			Email:    info.Email,
+			Role:     role,
+			Flow:     state.Flow,
+			Provider: "google",
+		})
 	}
 
 	if state.Flow == "cli" {

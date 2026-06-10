@@ -386,7 +386,16 @@ func (d *SyncDispatcher) writeShardDone(ctx context.Context, msg queue.JobMessag
 	return d.server.s3.Upload(ctx, key, []byte("done\n"), "text/plain")
 }
 
-func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage) error {
+func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage) (err error) {
+	var req *models.SyncRequest
+	root, _ := d.server.db.GetRoot(ctx, msg.OrgID, msg.RootID)
+	job := &models.SyncJob{ID: msg.SyncJobID}
+	defer func() {
+		if err != nil && !errors.Is(err, errSyncCommitNotReady) {
+			d.server.captureSyncFailed(ctx, msg.OrgID, msg.UserID, root, req, job, "commit_worker")
+		}
+	}()
+
 	status, err := d.server.db.GetSyncGenerationStatus(ctx, msg.GenerationID)
 	if err == nil && status == "visible" {
 		req, readErr := d.readSyncRequest(ctx, msg.GenerationID)
@@ -408,7 +417,7 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 			return errSyncCommitNotReady
 		}
 	}
-	req, err := d.readSyncRequest(ctx, msg.GenerationID)
+	req, err = d.readSyncRequest(ctx, msg.GenerationID)
 	if err != nil {
 		return err
 	}
@@ -467,6 +476,7 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 			return err
 		}
 	}
+	d.server.captureSyncCompleted(ctx, msg.OrgID, msg.UserID, root, req, job, nil)
 	return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
 }
 

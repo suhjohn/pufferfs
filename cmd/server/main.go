@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
 	"github.com/pufferfs/pufferfs/internal/queue"
@@ -49,6 +50,20 @@ func main() {
 
 	// Server
 	srv := server.New(db, s3Client, modalClient, tpClient)
+	posthogEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("POSTHOG_ENABLED")), "true")
+	posthogKey := strings.TrimSpace(os.Getenv("POSTHOG_KEY"))
+	analyticsClient := productanalytics.New(productanalytics.Config{
+		Enabled:    posthogEnabled,
+		ProjectKey: posthogKey,
+		Host:       strings.TrimSpace(os.Getenv("POSTHOG_HOST")),
+	})
+	srv.SetAnalytics(analyticsClient)
+	if posthogEnabled && posthogKey != "" {
+		log.Println("PostHog analytics enabled")
+	} else if posthogEnabled {
+		log.Println("POSTHOG_ENABLED is set but POSTHOG_KEY is missing; analytics disabled")
+	}
+
 	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
 		q, err := queue.NewNATSQueue(natsURL)
 		if err != nil {
@@ -124,6 +139,22 @@ func main() {
 			FrontendURL:        frontendURL,
 			Cookie:             cookieCfg,
 			CreateAPIKey:       db.CreateAPIKey,
+			LoginSucceeded: func(ctx context.Context, event auth.OAuthLoginEvent) {
+				analyticsClient.Capture(ctx, productanalytics.Event{
+					DistinctID: event.UserID,
+					Name:       "user_signed_in",
+					Properties: map[string]any{
+						"event_source": "backend",
+						"org_id":       event.OrgID,
+						"user_id":      event.UserID,
+						"role":         string(event.Role),
+						"flow":         event.Flow,
+						"provider":     event.Provider,
+						"email_domain": emailDomain(event.Email),
+						"$groups":      map[string]string{"organization": event.OrgID},
+					},
+				})
+			},
 		}, db.UpsertUser)
 
 		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)
@@ -195,4 +226,12 @@ func listenAddr() string {
 		return ":" + port
 	}
 	return ":8080"
+}
+
+func emailDomain(email string) string {
+	_, domain, ok := strings.Cut(strings.ToLower(strings.TrimSpace(email)), "@")
+	if !ok {
+		return ""
+	}
+	return domain
 }

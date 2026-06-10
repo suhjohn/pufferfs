@@ -103,6 +103,10 @@ set_secret_if_present pufferfs:stripeSecretKey "${STRIPE_SECRET_KEY:-}"
 set_secret_if_present pufferfs:stripeWebhookSecret "${STRIPE_WEBHOOK_SECRET:-}"
 set_config_if_present pufferfs:stripePriceId "${STRIPE_PRICE_ID:-}"
 
+set_config_if_present pufferfs:posthogEnabled "${POSTHOG_ENABLED:-}"
+set_secret_if_present pufferfs:posthogKey "${POSTHOG_KEY:-}"
+set_config_if_present pufferfs:posthogHost "${POSTHOG_HOST:-}"
+
 set_config_if_present pufferfs:cliLatestVersion "${PUFFERFS_CLI_LATEST_VERSION:-}"
 set_config_if_present pufferfs:cliMinVersion "${PUFFERFS_CLI_MIN_VERSION:-}"
 set_config_if_present pufferfs:cliDownloadBaseUrl "${PUFFERFS_CLI_DOWNLOAD_BASE_URL:-}"

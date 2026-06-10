@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
@@ -36,14 +37,15 @@ type objectStore interface {
 
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
-	db      *DB
-	s3      objectStore
-	modal   *ModalClient
-	tp      *TPClient
-	queue   queue.Queue
-	billing *StripeClient
-	invites InviteEmailSender
-	mux     *http.ServeMux
+	db        *DB
+	s3        objectStore
+	modal     *ModalClient
+	tp        *TPClient
+	queue     queue.Queue
+	billing   *StripeClient
+	invites   InviteEmailSender
+	analytics productanalytics.Capturer
+	mux       *http.ServeMux
 }
 
 // New creates a new Server with all dependencies.
@@ -53,11 +55,12 @@ func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
 
 func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Server {
 	s := &Server{
-		db:    db,
-		s3:    s3,
-		modal: modal,
-		tp:    tp,
-		mux:   http.NewServeMux(),
+		db:        db,
+		s3:        s3,
+		modal:     modal,
+		tp:        tp,
+		analytics: productanalytics.Noop{},
+		mux:       http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -72,6 +75,15 @@ func (s *Server) SetQueue(q queue.Queue) {
 // SetInviteEmailSender enables best-effort email notifications for org invites.
 func (s *Server) SetInviteEmailSender(sender InviteEmailSender) {
 	s.invites = sender
+}
+
+// SetAnalytics enables best-effort product analytics.
+func (s *Server) SetAnalytics(c productanalytics.Capturer) {
+	if c == nil {
+		s.analytics = productanalytics.Noop{}
+		return
+	}
+	s.analytics = c
 }
 
 // Handler returns the HTTP handler.
@@ -271,6 +283,13 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.captureBackendEvent(r.Context(), id, "api_key_created", map[string]any{
+		"scope_count":      len(scopes),
+		"has_query_scope":  hasScope(scopes, "query"),
+		"has_sync_scope":   hasScope(scopes, "sync"),
+		"has_delete_scope": hasScope(scopes, "root:delete"),
+		"has_admin_scope":  hasScope(scopes, "admin") || hasScope(scopes, "org:admin"),
+	})
 	writeJSON(w, http.StatusCreated, map[string]string{
 		"key": rawKey,
 	})
@@ -344,6 +363,7 @@ func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.captureBackendEvent(r.Context(), id, "api_key_revoked", nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -463,6 +483,9 @@ func (s *Server) handleUpdateMemberRole(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.captureBackendEvent(r.Context(), id, "org_member_role_updated", map[string]any{
+		"target_role": updated.Role,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -499,6 +522,9 @@ func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.captureBackendEvent(r.Context(), id, "org_member_removed", map[string]any{
+		"target_role": string(memberRole),
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
@@ -569,6 +595,11 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	if resp.EmailError != "" {
 		log.Printf("org invite email failed for org=%s invite=%s email=%s: %s", id.OrgID, invite.ID, invite.Email, resp.EmailError)
 	}
+	s.captureBackendEvent(r.Context(), id, "org_invite_created", map[string]any{
+		"target_role":  invite.Role,
+		"email_domain": emailDomain(invite.Email),
+		"email_sent":   resp.EmailSent,
+	})
 	writeJSON(w, http.StatusCreated, resp)
 }
 
@@ -591,6 +622,10 @@ func (s *Server) handleDeleteInvite(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.captureBackendEvent(r.Context(), id, "org_invite_revoked", map[string]any{
+		"target_role":  invite.Role,
+		"email_domain": emailDomain(invite.Email),
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -1028,6 +1063,10 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.captureBackendEvent(r.Context(), id, "root_created", map[string]any{
+		"root_scope":     rootScopeProperty(root),
+		"owned_by_actor": root.OwnerUserID == "" || root.OwnerUserID == id.UserID,
+	})
 	writeJSON(w, http.StatusCreated, root)
 }
 
@@ -1105,6 +1144,12 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.captureBackendEvent(r.Context(), id, "root_deleted", map[string]any{
+		"root_scope":             rootScopeProperty(root),
+		"had_visible_generation": root.VisibleGenerationID != "" || root.VisibleGenerationSeq > 0,
+		"turbopuffer_namespaces": result.TurbopufferNamespaces,
+		"s3_objects_deleted":     result.S3ObjectsDeleted,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                 "deleted",
 		"root_id":                root.ID,
@@ -1445,6 +1490,11 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
 		return
 	}
+	s.captureSyncStarted(r.Context(), id, root, &models.SyncRequest{
+		BaseGenerationID:  req.BaseGenerationID,
+		BaseGenerationSeq: req.BaseGenerationSeq,
+		ProtocolVersion:   req.ProtocolVersion,
+	}, job, req.TotalFiles)
 	writeJSON(w, http.StatusOK, models.SyncInitResponse{
 		RootID:            rootID,
 		SyncJobID:         job.ID,
@@ -1571,12 +1621,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
 			return
 		}
+		s.captureSyncStarted(r.Context(), id, root, &req, job, actionableFiles)
 	}
 	if err := s.ensureSyncStateRef(r.Context(), rootID, generation.ID, &req); err != nil {
 		_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		s.captureSyncFailed(r.Context(), id.OrgID, id.UserID, root, &req, job, "prepare_state")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing sync state: " + err.Error()})
 		return
 	}
@@ -1624,6 +1676,7 @@ func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest
 }
 
 func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
+	root, _ := s.db.GetRoot(ctx, orgID, rootID)
 	resp, err := s.runSyncPipeline(ctx, orgID, userID, generation, req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
@@ -1634,6 +1687,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "pipeline")
 		return nil, err
 	}
 	if s.queue != nil {
@@ -1648,6 +1702,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "content_proof")
 		return nil, fmt.Errorf("storing content proof: %w", err)
 	}
 	if err := s.cleanupFailedGenerationRowsForRoot(ctx, orgID, rootID); err != nil {
@@ -1658,6 +1713,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "cleanup")
 		return nil, fmt.Errorf("cleaning failed generations before commit: %w", err)
 	}
 
@@ -1672,6 +1728,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		if job != nil {
 			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "commit")
 		return nil, fmt.Errorf("committing generation: %w", err)
 	}
 	if job != nil {
@@ -1680,6 +1737,7 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		}
 		resp.SyncJobID = job.ID
 	}
+	s.captureSyncCompleted(ctx, orgID, userID, root, req, job, resp)
 	return resp, nil
 }
 
@@ -2585,6 +2643,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		filteredRows = filteredRows[:req.TopK]
 	}
 
+	s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
+		"mode":             req.Mode,
+		"top_k":            req.TopK,
+		"has_glob":         req.Glob != "",
+		"root_scope":       rootScopeProperty(root),
+		"namespace_count":  len(indexNamespaces),
+		"raw_result_count": len(rows),
+		"result_count":     len(filteredRows),
+	})
 	results := make([]models.QueryResult, len(filteredRows))
 	for i, row := range filteredRows {
 		results[i] = models.QueryResult{

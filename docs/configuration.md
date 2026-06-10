@@ -223,6 +223,14 @@ attached. Workers always require NATS.
 | `STRIPE_PRICE_ID` | Subscription price ID for checkout. |
 | `STRIPE_WEBHOOK_SECRET` | Webhook signing secret (HMAC-SHA256 verification). |
 
+### Product analytics (PostHog)
+
+| Variable | Meaning |
+| --- | --- |
+| `POSTHOG_ENABLED` | Set to `true` to emit backend product events. |
+| `POSTHOG_KEY` | PostHog project token used by the backend capture API. This can match `VITE_POSTHOG_KEY` when web and backend events should land in one PostHog project. |
+| `POSTHOG_HOST` | Optional PostHog ingestion host. Defaults to `https://us.i.posthog.com`. |
+
 ### CLI release manifest (served by `GET /cli/version`)
 
 | Variable | Meaning |

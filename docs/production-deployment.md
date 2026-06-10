@@ -42,6 +42,7 @@ Optional secrets:
 
 ```text
 PUFFERFS_ADMIN_KEY_HASH
+POSTHOG_KEY
 STRIPE_SECRET_KEY
 STRIPE_WEBHOOK_SECRET
 MODAL_CHUNK_ENDPOINT
@@ -69,6 +70,8 @@ GOOGLE_CLIENT_ID=<oauth-client-id>
 VITE_API_URL=https://api.pufferfs.com
 VITE_POSTHOG_KEY=<posthog-project-token>
 VITE_POSTHOG_HOST=https://us.i.posthog.com
+POSTHOG_ENABLED=true
+POSTHOG_HOST=https://us.i.posthog.com
 API_HTTPS_READY=true
 WEB_HTTPS_READY=true
 ENABLE_BILLING=false

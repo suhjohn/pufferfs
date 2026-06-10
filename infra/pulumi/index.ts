@@ -23,6 +23,8 @@ const imageTag = cfg.get("imageTag") ?? process.env.GITHUB_SHA ?? stack;
 const enableBilling = cfg.getBoolean("enableBilling") ?? false;
 // Public URL of the web app; passed to the API for OAuth redirects + CORS.
 const frontendUrl = cfg.get("frontendUrl");
+const posthogEnabled = cfg.getBoolean("posthogEnabled") ?? false;
+const posthogHost = cfg.get("posthogHost");
 const natsImage = cfg.get("natsImage") ?? "nats:2-alpine";
 const natsClusterName = cfg.get("natsClusterName") ?? "pufferfs";
 const natsNodes = ["nats-1", "nats-2", "nats-3"] as const;
@@ -561,6 +563,11 @@ if (adminKeyHash) {
   secretValues.PUFFERFS_ADMIN_KEY_HASH = adminKeyHash;
 }
 
+const posthogKey = cfg.getSecret("posthogKey");
+if (posthogKey) {
+  secretValues.POSTHOG_KEY = posthogKey;
+}
+
 // Google OAuth client secret (paired with the googleClientId plain config).
 const googleClientSecret = cfg.getSecret("googleClientSecret");
 if (googleClientSecret) {
@@ -598,7 +605,12 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "MODAL_EMBED_SHARD_ENDPOINT", value: cfg.require("modalEmbedShardEndpoint") },
   { name: "MODAL_INDEX_SHARD_ENDPOINT", value: cfg.require("modalIndexShardEndpoint") },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
+  { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
 ];
+
+if (posthogHost) {
+  appEnv.push({ name: "POSTHOG_HOST", value: posthogHost });
+}
 
 const cliLatestVersion = cfg.get("cliLatestVersion");
 if (cliLatestVersion) {
