@@ -1,7 +1,9 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { createCheckoutSession, fetchBilling } from "../../lib/queries";
 import { BILLING_ENABLED } from "../../lib/config";
+import { capture } from "../../lib/analytics";
 
 // Optional surface: when this deployment ships without payments
 // (VITE_ENABLE_BILLING !== "true") the route is unreachable and bounces back to
@@ -16,6 +18,7 @@ export const Route = createFileRoute("/_app/billing")({
 });
 
 function BillingPage() {
+  const trackedView = useRef(false);
   const { data: billing, isPending } = useQuery({
     queryKey: ["billing"],
     queryFn: fetchBilling,
@@ -24,9 +27,22 @@ function BillingPage() {
   const checkout = useMutation({
     mutationFn: createCheckoutSession,
     onSuccess: (url) => {
+      capture("billing_checkout_redirected", {
+        plan: billing?.plan,
+        status: billing?.status,
+      });
       window.location.href = url;
     },
   });
+
+  useEffect(() => {
+    if (trackedView.current || !billing) return;
+    trackedView.current = true;
+    capture("billing_viewed", {
+      plan: billing.plan,
+      status: billing.status,
+    });
+  }, [billing]);
 
   return (
     <main className="console-page">
@@ -66,7 +82,13 @@ function BillingPage() {
       )}
       <button
         className="btn"
-        onClick={() => checkout.mutate()}
+        onClick={() => {
+          capture("billing_checkout_started", {
+            plan: billing?.plan,
+            status: billing?.status,
+          });
+          checkout.mutate();
+        }}
         disabled={checkout.isPending}
       >
         {billing?.status === "active"

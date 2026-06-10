@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { capture } from "../../lib/analytics";
 import {
   createAPIKey,
   deleteRoot,
@@ -17,6 +18,7 @@ export const Route = createFileRoute("/_app/dashboard")({
 
 function Dashboard() {
   const queryClient = useQueryClient();
+  const trackedView = useRef(false);
   const [newKey, setNewKey] = useState("");
   const [keyName, setKeyName] = useState("CLI key");
   const [selectedScopes, setSelectedScopes] = useState<string[]>([
@@ -44,18 +46,30 @@ function Dashboard() {
       }),
     onSuccess: (key) => {
       setNewKey(key);
+      capture("api_key_created", {
+        scope_count: selectedScopes.length,
+        has_query_scope: selectedScopes.includes("query"),
+        has_sync_scope: selectedScopes.includes("sync"),
+        has_delete_scope: selectedScopes.includes("root:delete"),
+      });
       queryClient.invalidateQueries({ queryKey: ["api-keys"] });
     },
   });
   const revokeKey = useMutation({
     mutationFn: revokeAPIKey,
     onSuccess: () => {
+      capture("api_key_revoked");
       queryClient.invalidateQueries({ queryKey: ["api-keys"] });
     },
   });
   const deleteRootMutation = useMutation({
     mutationFn: deleteRoot,
-    onSuccess: () => {
+    onSuccess: (_data, rootId) => {
+      const deletedRoot = roots?.find((root) => root.id === rootId);
+      capture("root_deleted", {
+        root_scope: deletedRoot?.scope,
+        had_visible_generation: Boolean(deletedRoot?.visible_generation_id),
+      });
       queryClient.invalidateQueries({ queryKey: ["roots"] });
       queryClient.invalidateQueries({ queryKey: ["root-sync-summaries"] });
     },
@@ -85,6 +99,17 @@ function Dashboard() {
       return bStarted.localeCompare(aStarted);
     })
     .slice(0, 5);
+
+  useEffect(() => {
+    if (trackedView.current || !roots || !keysQuery.data) return;
+    trackedView.current = true;
+    capture("dashboard_viewed", {
+      root_count: roots.length,
+      api_key_count: keysQuery.data.length,
+      has_roots: roots.length > 0,
+      has_api_keys: keysQuery.data.length > 0,
+    });
+  }, [roots, keysQuery.data]);
 
   return (
     <main className="console-page">

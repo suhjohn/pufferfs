@@ -9,3 +9,10 @@ export const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8080";
  * configuration is required anywhere in the stack.
  */
 export const BILLING_ENABLED = import.meta.env.VITE_ENABLE_BILLING === "true";
+
+/** Browser-safe PostHog project token. Empty disables analytics. */
+export const POSTHOG_KEY = import.meta.env.VITE_POSTHOG_KEY ?? "";
+
+/** PostHog ingestion host. The production project is in the US region. */
+export const POSTHOG_HOST =
+  import.meta.env.VITE_POSTHOG_HOST ?? "https://us.i.posthog.com";

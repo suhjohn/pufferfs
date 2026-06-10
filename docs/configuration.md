@@ -240,6 +240,8 @@ These are baked into the static web build (Vite), not read at runtime by Go:
 | --- | --- |
 | `VITE_API_URL` | API base URL the web console calls. |
 | `VITE_ENABLE_BILLING` | Show the billing route in the web console. |
+| `VITE_POSTHOG_KEY` | Optional browser-safe PostHog project token for web analytics and frontend product events. |
+| `VITE_POSTHOG_HOST` | Optional PostHog ingestion host. Defaults to `https://us.i.posthog.com`. |
 
 ---
 

@@ -1,6 +1,7 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { PixelLogo } from "../components/PixelLogo";
 import { ThemeToggle } from "../components/ThemeToggle";
+import { capture } from "../lib/analytics";
 
 // Landing page. SEO meta lives on the root route (so the SPA shell carries it);
 // this route just renders the marketing body.
@@ -48,9 +49,24 @@ function Landing() {
           <span>pufferfs</span>
         </Link>
         <div className="nav-actions">
-          <Link to="/login">console</Link>
-          <Link to="/docs">docs</Link>
-          <a href="https://github.com/suhjohn/pufferfs">github</a>
+          <Link
+            to="/login"
+            onClick={() => capture("landing_cta_clicked", { target: "console" })}
+          >
+            console
+          </Link>
+          <Link
+            to="/docs"
+            onClick={() => capture("landing_cta_clicked", { target: "docs_nav" })}
+          >
+            docs
+          </Link>
+          <a
+            href="https://github.com/suhjohn/pufferfs"
+            onClick={() => capture("landing_cta_clicked", { target: "github_nav" })}
+          >
+            github
+          </a>
           <ThemeToggle />
         </div>
       </nav>
@@ -67,10 +83,22 @@ function Landing() {
             default.
           </p>
           <div className="hero-actions">
-            <Link className="pill pill-primary" to="/docs">
+            <Link
+              className="pill pill-primary"
+              to="/docs"
+              onClick={() =>
+                capture("landing_cta_clicked", { target: "docs_hero" })
+              }
+            >
               Docs
             </Link>
-            <a className="pill pill-muted" href="https://github.com/suhjohn/pufferfs">
+            <a
+              className="pill pill-muted"
+              href="https://github.com/suhjohn/pufferfs"
+              onClick={() =>
+                capture("landing_cta_clicked", { target: "github_hero" })
+              }
+            >
               GitHub
             </a>
           </div>

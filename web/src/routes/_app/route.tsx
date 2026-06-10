@@ -5,8 +5,10 @@ import {
   redirect,
   useRouter,
 } from "@tanstack/react-router";
+import { useEffect } from "react";
 import { fetchSession, logout } from "../../lib/auth";
 import { BILLING_ENABLED } from "../../lib/config";
+import { capture, identifySession, resetAnalytics } from "../../lib/analytics";
 import { PixelLogo } from "../../components/PixelLogo";
 import { ThemeToggle } from "../../components/ThemeToggle";
 
@@ -28,8 +30,14 @@ function AppLayout() {
   const { session } = Route.useRouteContext();
   const router = useRouter();
 
+  useEffect(() => {
+    identifySession(session);
+  }, [session]);
+
   async function handleLogout() {
+    capture("logout_clicked");
     await logout();
+    resetAnalytics();
     router.navigate({ to: "/login" });
   }
 

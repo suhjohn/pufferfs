@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { capture } from "../../lib/analytics";
 import {
   deleteOrgInvite,
   fetchMembers,
@@ -18,6 +19,7 @@ export const Route = createFileRoute("/_app/organization")({
 function Organization() {
   const { session } = Route.useRouteContext();
   const queryClient = useQueryClient();
+  const trackedView = useRef(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState(defaultInviteRole(session.role));
   const orgQuery = useQuery({ queryKey: ["org"], queryFn: fetchOrg });
@@ -31,32 +33,51 @@ function Organization() {
   });
   const inviteMember = useMutation({
     mutationFn: inviteOrgMember,
-    onSuccess: () => {
+    onSuccess: (invite) => {
+      capture("invite_created", {
+        role: invite.role,
+        email_domain: emailDomain(invite.email),
+      });
       setInviteEmail("");
       queryClient.invalidateQueries({ queryKey: ["org-invites"] });
     },
   });
   const changeRole = useMutation({
     mutationFn: updateMemberRole,
-    onSuccess: () => {
+    onSuccess: (member) => {
+      capture("org_member_role_updated", {
+        role: member.role,
+      });
       queryClient.invalidateQueries({ queryKey: ["members"] });
     },
   });
   const removeMember = useMutation({
     mutationFn: removeOrgMember,
     onSuccess: () => {
+      capture("org_member_removed");
       queryClient.invalidateQueries({ queryKey: ["members"] });
     },
   });
   const revokeInvite = useMutation({
     mutationFn: deleteOrgInvite,
     onSuccess: () => {
+      capture("invite_revoked");
       queryClient.invalidateQueries({ queryKey: ["org-invites"] });
     },
   });
 
   const manageableRoles = assignableRoles(session.role);
   const canManageOrg = manageableRoles.length > 0;
+
+  useEffect(() => {
+    if (trackedView.current || !membersQuery.data || !invitesQuery.data) return;
+    trackedView.current = true;
+    capture("organization_viewed", {
+      member_count: membersQuery.data.length,
+      pending_invite_count: invitesQuery.data.length,
+      can_manage_org: canManageOrg,
+    });
+  }, [membersQuery.data, invitesQuery.data, canManageOrg]);
 
   return (
     <main className="console-page">
@@ -255,4 +276,9 @@ function formatDateTime(value?: string) {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function emailDomain(email: string) {
+  const [, domain] = email.split("@");
+  return domain || "unknown";
 }
