@@ -106,3 +106,36 @@ func TestChunkCodeUsesLineBoundarySlidingOverlap(t *testing.T) {
 		t.Fatal("expected code chunk to preserve line boundary")
 	}
 }
+
+func TestChunkCodeAddsLineSpanMetadata(t *testing.T) {
+	chunks := chunkCode("line 1\nline 2\nline 3\n", "root", "src/main.go", "go")
+	if len(chunks) != 1 {
+		t.Fatalf("chunks = %d, want 1", len(chunks))
+	}
+	if got := chunks[0]["line_start"]; got != 1 {
+		t.Fatalf("line_start = %#v, want 1", got)
+	}
+	if got := chunks[0]["line_end"]; got != 3 {
+		t.Fatalf("line_end = %#v, want 3", got)
+	}
+}
+
+func TestChunkMarkdownAddsLineSpanMetadata(t *testing.T) {
+	text := "# Intro\nline 2\n\n# Next\nline 5\n"
+	chunks := chunkMarkdown(text, "root", "docs/readme.md", "markdown")
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(chunks))
+	}
+	if got := chunks[0]["line_start"]; got != 1 {
+		t.Fatalf("first line_start = %#v, want 1", got)
+	}
+	if got := chunks[0]["line_end"]; got != 3 {
+		t.Fatalf("first line_end = %#v, want 3", got)
+	}
+	if got := chunks[1]["line_start"]; got != 4 {
+		t.Fatalf("second line_start = %#v, want 4", got)
+	}
+	if got := chunks[1]["line_end"]; got != 5 {
+		t.Fatalf("second line_end = %#v, want 5", got)
+	}
+}

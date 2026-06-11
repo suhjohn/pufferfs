@@ -135,6 +135,8 @@ def chunk_code(
                 content=content,
                 content_hash=Chunk.hash_content(content),
                 file_type=file_type,
+                line_start=start + 1,
+                line_end=end,
             )
             chunks.append(chunk)
             idx += 1

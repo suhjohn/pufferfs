@@ -30,6 +30,8 @@ class Chunk:
     absolute_path: str = ""
     page_number: int | None = None
     image_path: str | None = None  # S3 key for rendered page image
+    line_start: int | None = None
+    line_end: int | None = None
 
     @staticmethod
     def make_id(root_id: str, file_path: str, chunk_index: int) -> str:

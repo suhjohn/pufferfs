@@ -94,6 +94,8 @@ func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric s
 			"file_type":                 map[string]any{"type": "string"},
 			"page_number":               map[string]any{"type": "uint"},
 			"image_path":                map[string]any{"type": "string"},
+			"line_start":                map[string]any{"type": "uint"},
+			"line_end":                  map[string]any{"type": "uint"},
 			"root_id":                   map[string]any{"type": "string"},
 			"generation_id":             map[string]any{"type": "string"},
 			"valid_from_generation":     map[string]any{"type": "string"},
@@ -314,7 +316,7 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 
 // HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
 func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, filters any) ([]map[string]any, error) {
-	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
+	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	queries := []map[string]any{
 		{

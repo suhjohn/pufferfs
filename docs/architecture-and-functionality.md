@@ -68,6 +68,8 @@ The CLI root command is `pufferfs` and includes:
   filesystem changes and rerun sync.
 - `query`: search a synced root with `fts`, `vector`, or `hybrid` mode, optional
   path glob, and `top-k` control.
+- `read`: retrieve deterministic page or line ranges from a known indexed file;
+  page reads can return/download rendered page images.
 - `root delete`: delete PufferFS metadata, object storage artifacts,
   Turbopuffer namespaces, and local cache for a root.
 - `service`: install/start/stop/restart/status/logs/uninstall a user-level
@@ -105,7 +107,8 @@ Important API surfaces:
   upload bundle, sync init (create sync session), sync artifact upload,
   sync abort, sync finalize, get state, sync status, list sync jobs.
 - ACLs: create/list/delete path-prefix ACLs.
-- Query: `POST /query`.
+- Query/read: `POST /query`, `POST /roots/{id}/read`, and authenticated
+  `GET /roots/{id}/assets` for returned page/image artifacts.
 - Billing: get subscription, create Stripe checkout session, receive Stripe
   webhook when billing is enabled.
 

@@ -245,6 +245,71 @@ Return the root's current committed file-state map
 (`{ "<path>": { "size", "content_hash", "mtime" } }`). Requires read access.
 Used by the CLI to diff against the server when local cache is stale.
 
+### `POST /roots/{id}/read`
+
+Read a deterministic slice from one known file. Requires scope `query` / `read`
+and read access to the root/path. This is not search; use it when the caller
+already knows the file path and wants a page or line range.
+
+Request:
+
+```json
+{
+  "path": "docs/manual.pdf",
+  "pages": { "start": 10, "end": 12 },
+  "include_images": true
+}
+```
+
+or:
+
+```json
+{
+  "path": "src/main.go",
+  "lines": { "start": 200, "end": 400 }
+}
+```
+
+Exactly one of `pages` or `lines` is required. Ranges are 1-based inclusive and
+may include at most 1000 items.
+
+Behavior:
+
+- Page reads use indexed document chunks with `page_number` / `image_path`.
+- When `include_images` is true, page results include an authenticated
+  `image_url` for `GET /roots/{id}/assets`.
+- Line reads require chunks indexed with `line_start` / `line_end`; files synced
+  before that metadata existed may need to be resynced.
+- ACL, visible-generation, and user-root content-proof filtering match query
+  behavior.
+
+Response:
+
+```json
+{
+  "root_id": "...",
+  "root_name": "handbook",
+  "file_path": "docs/manual.pdf",
+  "mode": "pages",
+  "pages": [
+    {
+      "page": 10,
+      "page_number": 9,
+      "chunk_index": 9,
+      "content": "...page text...",
+      "image_path": "chunks/<root>/docs/manual.pdf.9.jpg",
+      "image_url": "/roots/<root>/assets?key=chunks%2F..."
+    }
+  ]
+}
+```
+
+### `GET /roots/{id}/assets?key=<storage-key>`
+
+Download a returned page/image asset. Requires scope `query` / `read`. The key
+must be an active indexed `image_path` under `chunks/<rootID>/`, and the caller
+must be allowed to read the row that references it.
+
 ### `POST /roots/{id}/sync`
 
 Submit a sync. See [Sync](#sync) below.

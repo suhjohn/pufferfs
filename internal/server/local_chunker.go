@@ -64,7 +64,11 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 		}
 		piece := strings.Join(lines[start:end], "")
 		if strings.TrimSpace(piece) != "" {
-			chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece, fileType))
+			lineEnd := end
+			if end == len(lines) && lines[end-1] == "" {
+				lineEnd--
+			}
+			chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece, fileType, start+1, lineEnd))
 			idx++
 		}
 		if end >= len(lines) {
@@ -87,14 +91,15 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 
 // chunkMarkdown splits by headings, then uses a boundary-aware sliding window with overlap.
 func chunkMarkdown(text, rootID, filePath, fileType string) []map[string]any {
-	sections := splitByHeadings(text)
+	sections := splitByHeadingsWithOffsets(text)
 	var chunks []map[string]any
 	idx := 0
 
 	for _, section := range sections {
-		for _, piece := range splitTextWithOverlap(section, textChunkChars, textOverlapChars) {
-			if strings.TrimSpace(piece) != "" {
-				chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece, fileType))
+		for _, piece := range splitTextWithOverlapOffsets(section.text, section.start, textChunkChars, textOverlapChars) {
+			if strings.TrimSpace(piece.text) != "" {
+				lineStart, lineEnd := lineSpanForByteRange(text, piece.start, piece.end)
+				chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece.text, fileType, lineStart, lineEnd))
 				idx++
 			}
 		}
@@ -104,34 +109,63 @@ func chunkMarkdown(text, rootID, filePath, fileType string) []map[string]any {
 
 var headingRE = regexp.MustCompile(`(?m)^#{1,6}\s`)
 
+type textSection struct {
+	text  string
+	start int
+}
+
+type textPiece struct {
+	text  string
+	start int
+	end   int
+}
+
 func splitByHeadings(text string) []string {
+	sections := splitByHeadingsWithOffsets(text)
+	out := make([]string, 0, len(sections))
+	for _, section := range sections {
+		out = append(out, section.text)
+	}
+	return out
+}
+
+func splitByHeadingsWithOffsets(text string) []textSection {
 	locs := headingRE.FindAllStringIndex(text, -1)
 	if len(locs) == 0 {
 		if strings.TrimSpace(text) == "" {
 			return nil
 		}
-		return []string{text}
+		return []textSection{{text: text, start: 0}}
 	}
-	var sections []string
+	var sections []textSection
 	if locs[0][0] > 0 {
-		sections = append(sections, text[:locs[0][0]])
+		sections = append(sections, textSection{text: text[:locs[0][0]], start: 0})
 	}
 	for i, loc := range locs {
 		end := len(text)
 		if i+1 < len(locs) {
 			end = locs[i+1][0]
 		}
-		sections = append(sections, text[loc[0]:end])
+		sections = append(sections, textSection{text: text[loc[0]:end], start: loc[0]})
 	}
 	return sections
 }
 
 func splitTextWithOverlap(text string, targetChars, overlapChars int) []string {
+	pieces := splitTextWithOverlapOffsets(text, 0, targetChars, overlapChars)
+	out := make([]string, 0, len(pieces))
+	for _, piece := range pieces {
+		out = append(out, piece.text)
+	}
+	return out
+}
+
+func splitTextWithOverlapOffsets(text string, baseOffset, targetChars, overlapChars int) []textPiece {
 	if len(text) <= targetChars {
-		return []string{text}
+		return []textPiece{{text: text, start: baseOffset, end: baseOffset + len(text)}}
 	}
 
-	var pieces []string
+	var pieces []textPiece
 	start := 0
 	for start < len(text) {
 		end := start + targetChars
@@ -140,7 +174,7 @@ func splitTextWithOverlap(text string, targetChars, overlapChars int) []string {
 		} else {
 			end = bestTextBoundary(text, start, end, targetChars/2)
 		}
-		pieces = append(pieces, text[start:end])
+		pieces = append(pieces, textPiece{text: text[start:end], start: baseOffset + start, end: baseOffset + end})
 		if end >= len(text) {
 			break
 		}
@@ -151,6 +185,27 @@ func splitTextWithOverlap(text string, targetChars, overlapChars int) []string {
 		start = nextStart
 	}
 	return pieces
+}
+
+func lineSpanForByteRange(text string, start, end int) (int, int) {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(text) {
+		end = len(text)
+	}
+	lineStart := 1 + strings.Count(text[:start], "\n")
+	lineEnd := lineStart
+	if end > start {
+		lineEnd = lineStart + strings.Count(text[start:end], "\n")
+		if strings.HasSuffix(text[start:end], "\n") {
+			lineEnd--
+		}
+	}
+	if lineEnd < lineStart {
+		lineEnd = lineStart
+	}
+	return lineStart, lineEnd
 }
 
 func bestTextBoundary(text string, start, hardEnd, minSize int) int {
@@ -170,7 +225,7 @@ func bestTextBoundary(text string, start, hardEnd, minSize int) int {
 	return hardEnd
 }
 
-func makeChunkMap(rootID, filePath string, chunkIndex int, content, fileType string) map[string]any {
+func makeChunkMap(rootID, filePath string, chunkIndex int, content, fileType string, lineStart, lineEnd int) map[string]any {
 	return map[string]any{
 		"id":           makeChunkID(rootID, filePath, chunkIndex),
 		"root_id":      rootID,
@@ -179,6 +234,8 @@ func makeChunkMap(rootID, filePath string, chunkIndex int, content, fileType str
 		"content":      content,
 		"content_hash": hashContent(content),
 		"file_type":    fileType,
+		"line_start":   lineStart,
+		"line_end":     lineEnd,
 	}
 }
 

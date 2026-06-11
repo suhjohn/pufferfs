@@ -185,6 +185,8 @@ type Chunk struct {
 	FileType     string  `json:"file_type"`
 	PageNumber   *int    `json:"page_number,omitempty"`
 	ImagePath    *string `json:"image_path,omitempty"`
+	LineStart    *int    `json:"line_start,omitempty"`
+	LineEnd      *int    `json:"line_end,omitempty"`
 }
 
 // ChunkWithEmbedding is a Chunk plus its embedding vector.
@@ -313,6 +315,49 @@ type QueryResponse struct {
 	Query         string        `json:"query"`
 	Mode          string        `json:"mode"`
 	RootsSearched int           `json:"roots_searched,omitempty"`
+}
+
+// ReadRange is a 1-based inclusive range for deterministic file reads.
+type ReadRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+// ReadFileRequest asks the server for a deterministic slice of a known file.
+type ReadFileRequest struct {
+	Path          string     `json:"path"`
+	Pages         *ReadRange `json:"pages,omitempty"`
+	Lines         *ReadRange `json:"lines,omitempty"`
+	IncludeImages bool       `json:"include_images,omitempty"`
+}
+
+// ReadPageResult is one document page returned by a read request.
+type ReadPageResult struct {
+	Page         int     `json:"page"`
+	PageNumber   int     `json:"page_number"`
+	ChunkIndex   int     `json:"chunk_index"`
+	Content      string  `json:"content"`
+	ImagePath    *string `json:"image_path,omitempty"`
+	ImageURL     *string `json:"image_url,omitempty"`
+	AbsolutePath string  `json:"absolute_path,omitempty"`
+	FileType     string  `json:"file_type,omitempty"`
+}
+
+// ReadLineResult is one source line returned by a read request.
+type ReadLineResult struct {
+	LineNumber int    `json:"line_number"`
+	Content    string `json:"content"`
+}
+
+// ReadFileResponse wraps deterministic file-slice results.
+type ReadFileResponse struct {
+	RootID       string           `json:"root_id"`
+	RootName     string           `json:"root_name,omitempty"`
+	FilePath     string           `json:"file_path"`
+	AbsolutePath string           `json:"absolute_path,omitempty"`
+	Mode         string           `json:"mode"`
+	Pages        []ReadPageResult `json:"pages,omitempty"`
+	Lines        []ReadLineResult `json:"lines,omitempty"`
 }
 
 // ---------------------------------------------------------------------------

@@ -552,6 +552,10 @@ def _row_from_chunk(job: dict, file_hash: str, chunk: dict) -> dict:
         row["page_number"] = chunk["page_number"]
     if chunk.get("image_path") is not None:
         row["image_path"] = chunk["image_path"]
+    if chunk.get("line_start") is not None:
+        row["line_start"] = chunk["line_start"]
+    if chunk.get("line_end") is not None:
+        row["line_end"] = chunk["line_end"]
     return row
 
 
@@ -578,6 +582,10 @@ def _row_from_existing(job: dict, file_path: str, absolute_path: str, file_hash:
         out["page_number"] = row["page_number"]
     if row.get("image_path") is not None:
         out["image_path"] = row["image_path"]
+    if row.get("line_start") is not None:
+        out["line_start"] = row["line_start"]
+    if row.get("line_end") is not None:
+        out["line_end"] = row["line_end"]
     if row.get("vector") is not None:
         out["vector"] = row["vector"]
     return out
@@ -759,6 +767,8 @@ class Embedder:
                                 "absolute_path": row.get("absolute_path", ""),
                                 "page_number": row.get("page_number"),
                                 "image_path": row.get("image_path"),
+                                "line_start": row.get("line_start"),
+                                "line_end": row.get("line_end"),
                             },
                             row,
                         )
@@ -796,6 +806,8 @@ def _tp_upsert_rows(namespace: str, rows: list[dict]) -> None:
             "file_type": {"type": "string"},
             "page_number": {"type": "uint"},
             "image_path": {"type": "string"},
+            "line_start": {"type": "uint"},
+            "line_end": {"type": "uint"},
             "root_id": {"type": "string"},
             "generation_id": {"type": "string"},
             "valid_from_generation": {"type": "string"},

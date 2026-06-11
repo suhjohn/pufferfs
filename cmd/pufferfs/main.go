@@ -24,6 +24,7 @@ func main() {
 
 	root.AddCommand(syncCmd())
 	root.AddCommand(queryCmd())
+	root.AddCommand(readCmd())
 	root.AddCommand(watchCmd())
 	root.AddCommand(rootCmd())
 	root.AddCommand(serviceCmd())

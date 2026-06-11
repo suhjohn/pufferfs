@@ -18,6 +18,8 @@ type indexedChunk struct {
 	ValidToGenerationSeq int64
 	PageNumber           any
 	ImagePath            any
+	LineStart            any
+	LineEnd              any
 	Vector               any
 }
 
@@ -38,6 +40,8 @@ func indexedChunkFromModal(rootID, generationID string, generationSeq int64, fil
 		GenerationSeq: generationSeq,
 		PageNumber:    chunk["page_number"],
 		ImagePath:     chunk["image_path"],
+		LineStart:     chunk["line_start"],
+		LineEnd:       chunk["line_end"],
 	}
 }
 
@@ -56,6 +60,8 @@ func indexedChunkFromExisting(rootID, generationID string, generationSeq int64, 
 		GenerationSeq: generationSeq,
 		PageNumber:    row["page_number"],
 		ImagePath:     row["image_path"],
+		LineStart:     row["line_start"],
+		LineEnd:       row["line_end"],
 		Vector:        row["vector"],
 	}
 }
@@ -84,6 +90,12 @@ func (c indexedChunk) mapRow() map[string]any {
 	}
 	if c.ImagePath != nil {
 		row["image_path"] = c.ImagePath
+	}
+	if c.LineStart != nil {
+		row["line_start"] = c.LineStart
+	}
+	if c.LineEnd != nil {
+		row["line_end"] = c.LineEnd
 	}
 	if c.Vector != nil {
 		row["vector"] = c.Vector

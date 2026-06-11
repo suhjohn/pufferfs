@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -137,6 +138,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/upload", s.handleSyncArtifactUpload)
 	s.mux.HandleFunc("DELETE /roots/{id}/sync/{generation_id}", s.handleSyncAbort)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
+	s.mux.HandleFunc("POST /roots/{id}/read", s.handleReadFile)
+	s.mux.HandleFunc("GET /roots/{id}/assets", s.handleGetRootAsset)
 	s.mux.HandleFunc("GET /roots/{id}/sync/status", s.handleSyncStatus)
 	s.mux.HandleFunc("GET /roots/{id}/sync/jobs", s.handleListSyncJobs)
 
@@ -1978,6 +1981,344 @@ func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic file reads
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "query", "read") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query scope required"})
+		return
+	}
+
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+
+	var req models.ReadFileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	req.Path, err = cleanFilePath(req.Path)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if (req.Pages == nil) == (req.Lines == nil) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "exactly one of pages or lines is required"})
+		return
+	}
+	if !s.checkReadACL(r.Context(), id, rootID, req.Path) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+
+	if req.Pages != nil {
+		resp, err := s.readFilePages(r.Context(), id, root, &req, r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp, err := s.readFileLines(r.Context(), id, root, &req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleGetRootAsset(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "query", "read") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query scope required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
+	if err != nil || !canReadRoot(id, root) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key query param required"})
+		return
+	}
+	if !strings.HasPrefix(key, fmt.Sprintf("chunks/%s/", rootID)) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+		return
+	}
+	rows, err := s.readRows(r.Context(), root, []any{"image_path", "Eq", key}, 10, []string{"file_path", "file_hash", "image_path"})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	rows = filterDeniedQueryRows(rows, s.buildACLFilter(r.Context(), id, root.ID))
+	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		rows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, root.ID, rows)
+	}
+	if len(rows) == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+		return
+	}
+	data, err := s.s3.Download(r.Context(), key)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
+		return
+	}
+	w.Header().Set("Content-Type", http.DetectContentType(data))
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	_, _ = w.Write(data)
+}
+
+func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest, r *http.Request) (models.ReadFileResponse, error) {
+	if err := validateReadRange(req.Pages); err != nil {
+		return models.ReadFileResponse{}, err
+	}
+	startPage := req.Pages.Start - 1
+	endPage := req.Pages.End - 1
+	pageFilters := []any{
+		[]any{"file_path", "Eq", req.Path},
+		[]any{"page_number", "Lte", endPage},
+	}
+	if startPage > 0 {
+		pageFilters = append(pageFilters, []any{"page_number", "Gt", startPage - 1})
+	}
+	filters := []any{"And", pageFilters}
+	rows, err := s.readRows(ctx, root, filters, req.Pages.End-req.Pages.Start+1, readIncludeAttrs())
+	if err != nil {
+		return models.ReadFileResponse{}, err
+	}
+	rows = s.filterReadRows(ctx, id, root, rows)
+	sort.SliceStable(rows, func(i, j int) bool {
+		return intFromAny(rows[i]["page_number"], 0) < intFromAny(rows[j]["page_number"], 0)
+	})
+	resp := models.ReadFileResponse{
+		RootID:   root.ID,
+		RootName: root.Name,
+		FilePath: req.Path,
+		Mode:     "pages",
+		Pages:    []models.ReadPageResult{},
+	}
+	for _, row := range rows {
+		pageNumber := intFromAny(row["page_number"], -1)
+		if pageNumber < startPage || pageNumber > endPage {
+			continue
+		}
+		if resp.AbsolutePath == "" {
+			resp.AbsolutePath = strVal(row, "absolute_path")
+		}
+		page := models.ReadPageResult{
+			Page:         pageNumber + 1,
+			PageNumber:   pageNumber,
+			ChunkIndex:   intFromAny(row["chunk_index"], 0),
+			Content:      strVal(row, "content"),
+			AbsolutePath: strVal(row, "absolute_path"),
+			FileType:     strVal(row, "file_type"),
+		}
+		if imagePath := strVal(row, "image_path"); imagePath != "" {
+			page.ImagePath = &imagePath
+			if req.IncludeImages {
+				imageURL := rootAssetURL(r, root.ID, imagePath)
+				page.ImageURL = &imageURL
+			}
+		}
+		resp.Pages = append(resp.Pages, page)
+	}
+	return resp, nil
+}
+
+func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest) (models.ReadFileResponse, error) {
+	if err := validateReadRange(req.Lines); err != nil {
+		return models.ReadFileResponse{}, err
+	}
+	filters := []any{"And", []any{
+		[]any{"file_path", "Eq", req.Path},
+		[]any{"line_end", "Gt", req.Lines.Start - 1},
+		[]any{"line_start", "Lte", req.Lines.End},
+	}}
+	rows, err := s.readRows(ctx, root, filters, 1000, readIncludeAttrs())
+	if err != nil {
+		return models.ReadFileResponse{}, err
+	}
+	rows = s.filterReadRows(ctx, id, root, rows)
+	if len(rows) == 0 {
+		metadataRows, metaErr := s.readRows(ctx, root, []any{"file_path", "Eq", req.Path}, 1000, readIncludeAttrs())
+		if metaErr != nil {
+			return models.ReadFileResponse{}, fmt.Errorf("line range %d:%d unavailable for %s; could not inspect indexed file metadata: %w", req.Lines.Start, req.Lines.End, req.Path, metaErr)
+		}
+		metadataRows = s.filterReadRows(ctx, id, root, metadataRows)
+		return models.ReadFileResponse{}, readLineRangeUnavailableError(req.Path, req.Lines, metadataRows)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return intFromAny(rows[i]["line_start"], 0) < intFromAny(rows[j]["line_start"], 0)
+	})
+
+	byLine := make(map[int]string)
+	resp := models.ReadFileResponse{
+		RootID:   root.ID,
+		RootName: root.Name,
+		FilePath: req.Path,
+		Mode:     "lines",
+		Lines:    []models.ReadLineResult{},
+	}
+	for _, row := range rows {
+		lineStart := intFromAny(row["line_start"], 0)
+		lineEnd := intFromAny(row["line_end"], 0)
+		if lineStart == 0 || lineEnd == 0 {
+			continue
+		}
+		if resp.AbsolutePath == "" {
+			resp.AbsolutePath = strVal(row, "absolute_path")
+		}
+		lines := strings.SplitAfter(strVal(row, "content"), "\n")
+		for i, line := range lines {
+			lineNumber := lineStart + i
+			if lineNumber > lineEnd {
+				break
+			}
+			if lineNumber < req.Lines.Start || lineNumber > req.Lines.End {
+				continue
+			}
+			if _, exists := byLine[lineNumber]; !exists {
+				byLine[lineNumber] = strings.TrimSuffix(line, "\n")
+			}
+		}
+	}
+	for lineNumber := req.Lines.Start; lineNumber <= req.Lines.End; lineNumber++ {
+		line, ok := byLine[lineNumber]
+		if !ok {
+			continue
+		}
+		resp.Lines = append(resp.Lines, models.ReadLineResult{LineNumber: lineNumber, Content: line})
+	}
+	if len(resp.Lines) == 0 {
+		return models.ReadFileResponse{}, readLineRangeUnavailableError(req.Path, req.Lines, rows)
+	}
+	return resp, nil
+}
+
+func readLineRangeUnavailableError(filePath string, requested *models.ReadRange, rows []map[string]any) error {
+	if requested == nil {
+		return fmt.Errorf("line range unavailable for %s", filePath)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("line range %d:%d unavailable for %s; no indexed chunks found for this file", requested.Start, requested.End, filePath)
+	}
+
+	fileType := ""
+	hasPages := false
+	minPage, maxPage := 0, 0
+	hasLines := false
+	minLine, maxLine := 0, 0
+	for _, row := range rows {
+		if fileType == "" {
+			fileType = strVal(row, "file_type")
+		}
+		if raw, ok := row["page_number"]; ok && raw != nil {
+			page := intFromAny(raw, 0) + 1
+			if !hasPages || page < minPage {
+				minPage = page
+			}
+			if !hasPages || page > maxPage {
+				maxPage = page
+			}
+			hasPages = true
+		}
+		lineStartRaw, hasLineStart := row["line_start"]
+		lineEndRaw, hasLineEnd := row["line_end"]
+		if hasLineStart && hasLineEnd && lineStartRaw != nil && lineEndRaw != nil {
+			lineStart := intFromAny(lineStartRaw, 0)
+			lineEnd := intFromAny(lineEndRaw, 0)
+			if lineStart <= 0 || lineEnd <= 0 {
+				continue
+			}
+			if !hasLines || lineStart < minLine {
+				minLine = lineStart
+			}
+			if !hasLines || lineEnd > maxLine {
+				maxLine = lineEnd
+			}
+			hasLines = true
+		}
+	}
+
+	fileTypePart := ""
+	if fileType != "" {
+		fileTypePart = " file_type=" + fileType + ";"
+	}
+	if hasLines {
+		return fmt.Errorf("line range %d:%d unavailable for %s;%s indexed line range is %d:%d", requested.Start, requested.End, filePath, fileTypePart, minLine, maxLine)
+	}
+	if hasPages {
+		return fmt.Errorf("line ranges unavailable for %s;%s supports page reads instead (available pages %d:%d, use --pages %d:%d)", filePath, fileTypePart, minPage, maxPage, minPage, maxPage)
+	}
+	if fileType != "" {
+		return fmt.Errorf("line ranges unavailable for %s; file_type=%s was indexed without line metadata; resync this file or root and retry --lines", filePath, fileType)
+	}
+	return fmt.Errorf("line ranges unavailable for %s; indexed chunks do not include line metadata; resync this file or root and retry --lines", filePath)
+}
+
+func (s *Server) readRows(ctx context.Context, root *models.RootMetadata, filters any, limit int, includeAttrs []string) ([]map[string]any, error) {
+	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, root.OrgID, root.ID)
+	if err != nil {
+		return nil, fmt.Errorf("listing root index namespaces: %w", err)
+	}
+	visibleSeq, err := s.db.GetVisibleGenerationSeq(ctx, root.ID)
+	if err != nil {
+		return nil, fmt.Errorf("resolving visible generation: %w", err)
+	}
+	combinedFilters := []any{filters, activeGenerationFilter(visibleSeq)}
+	return queryRootIndexNamespaces(indexNamespaces, limit, func(namespace string) ([]map[string]any, error) {
+		return s.tp.Query(namespace, []any{"file_path", "asc"}, limit, tpAndFilter(combinedFilters), includeAttrs)
+	})
+}
+
+func (s *Server) filterReadRows(ctx context.Context, id *auth.Identity, root *models.RootMetadata, rows []map[string]any) []map[string]any {
+	rows = filterDeniedQueryRows(rows, s.buildACLFilter(ctx, id, root.ID))
+	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
+		rows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, rows)
+	}
+	return rows
+}
+
+func validateReadRange(r *models.ReadRange) error {
+	if r == nil || r.Start <= 0 || r.End <= 0 {
+		return fmt.Errorf("range start and end must be positive")
+	}
+	if r.End < r.Start {
+		return fmt.Errorf("range end must be greater than or equal to start")
+	}
+	if r.End-r.Start > 999 {
+		return fmt.Errorf("range cannot include more than 1000 items")
+	}
+	return nil
+}
+
+func readIncludeAttrs() []string {
+	return []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
+}
+
+func rootAssetURL(r *http.Request, rootID, key string) string {
+	return fmt.Sprintf("/roots/%s/assets?key=%s", url.PathEscape(rootID), url.QueryEscape(key))
+}
+
+// ---------------------------------------------------------------------------
 // ACL helpers
 // ---------------------------------------------------------------------------
 
@@ -2425,6 +2766,12 @@ func modalChunkPayload(row map[string]any) map[string]any {
 	if imagePath, ok := row["image_path"]; ok && imagePath != nil {
 		chunk["image_path"] = imagePath
 	}
+	if lineStart, ok := row["line_start"]; ok && lineStart != nil {
+		chunk["line_start"] = lineStart
+	}
+	if lineEnd, ok := row["line_end"]; ok && lineEnd != nil {
+		chunk["line_end"] = lineEnd
+	}
 	return chunk
 }
 
@@ -2709,7 +3056,7 @@ func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *model
 		return nil, stats, nil
 	}
 
-	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
+	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
 
 	var filters []any
 	if req.Glob != "" {

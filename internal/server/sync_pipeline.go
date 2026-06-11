@@ -442,7 +442,7 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 	case models.StatusRemoved:
 		return []syncChunkArtifact{{Op: "close", Change: change}}, nil
 	case models.StatusMoved, models.StatusRenamed:
-		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "vector"})
+		rows, err := p.queryActiveRows(ctx, change.OldPath, []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "vector"})
 		if err != nil {
 			return nil, err
 		}

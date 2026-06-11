@@ -49,6 +49,13 @@ Query the latest committed generation:
 pufferfs query "paid time off" --root handbook --top-k 2
 ```
 
+Read a known file slice:
+
+```sh
+pufferfs read docs/policy.pdf --root handbook --pages 10:12 --output-dir ./pages
+pufferfs read src/main.go --root repo --lines 200:400
+```
+
 Keep a folder current in the foreground:
 
 ```sh
