@@ -123,12 +123,14 @@ credentials.json  service-account*.json
 > **This is filename-based protection, not a content secret scanner.** A secret
 > embedded inside a non-matching file (e.g. a hard-coded token in
 > `config.yaml`) will be synced and indexed. Treat it as a guardrail, not a
-> guarantee, and pair it with `.gitignore`/`.tpfsignore`/global-ignore rules and
-> ACL deny prefixes for anything sensitive.
+> guarantee, and pair it with server-managed org/user ignore policies,
+> `.gitignore`/`.tpfsignore`/global-ignore rules, and ACL deny prefixes for
+> anything sensitive.
 
-PufferFS also honors built-in ignores plus `.gitignore`, `.tpfsignore` (root),
-and `~/.tpfs/.tpfsignore` (global) — useful for keeping caches, build outputs, and
-dependency folders out of the index and reducing exposure surface.
+PufferFS also honors built-in ignores, server-managed org/user ignore policies,
+`.gitignore`, `.tpfsignore` (root), and `~/.tpfs/.tpfsignore` (global). Org/user
+policies are enforced by the server during sync finalize; local ignore files are
+CLI-side filtering for the syncing machine.
 
 ## Query-result correctness and isolation
 

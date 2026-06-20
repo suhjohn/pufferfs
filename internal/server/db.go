@@ -136,6 +136,21 @@ func (db *DB) migrateFallback() error {
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invites_org_email ON org_invites(org_id, email);
 		CREATE INDEX IF NOT EXISTS idx_org_invites_email ON org_invites(email);
 
+		CREATE TABLE IF NOT EXISTS org_ignore_policies (
+			org_id             TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+			patterns           TEXT NOT NULL DEFAULT '',
+			updated_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+			updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS user_ignore_policies (
+			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			patterns   TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, user_id)
+		);
+
 		CREATE TABLE IF NOT EXISTS api_keys (
 			id         TEXT PRIMARY KEY,
 			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -647,6 +662,92 @@ func (db *DB) DeleteAPIKey(ctx context.Context, orgID, keyID string) error {
 		`DELETE FROM api_keys WHERE id = $1 AND org_id = $2`, keyID, orgID,
 	)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Ignore Policies
+// ---------------------------------------------------------------------------
+
+func (db *DB) GetEffectiveIgnorePolicy(ctx context.Context, orgID, userID string) (*models.EffectiveIgnorePolicy, error) {
+	orgPolicy, err := db.GetOrgIgnorePolicy(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	userPolicy, err := db.GetUserIgnorePolicy(ctx, orgID, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &models.EffectiveIgnorePolicy{
+		OrgPatterns:  orgPolicy.Patterns,
+		UserPatterns: userPolicy.Patterns,
+	}, nil
+}
+
+func (db *DB) GetOrgIgnorePolicy(ctx context.Context, orgID string) (*models.IgnorePolicy, error) {
+	policy := &models.IgnorePolicy{OrgID: orgID}
+	err := db.pool.QueryRow(ctx,
+		`SELECT org_id, patterns, COALESCE(updated_by_user_id, ''), updated_at
+		 FROM org_ignore_policies WHERE org_id = $1`,
+		orgID,
+	).Scan(&policy.OrgID, &policy.Patterns, &policy.UpdatedByUserID, &policy.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return policy, nil
+		}
+		return nil, err
+	}
+	return policy, nil
+}
+
+func (db *DB) SetOrgIgnorePolicy(ctx context.Context, orgID, updatedByUserID, patterns string) (*models.IgnorePolicy, error) {
+	policy := &models.IgnorePolicy{}
+	err := db.pool.QueryRow(ctx,
+		`INSERT INTO org_ignore_policies (org_id, patterns, updated_by_user_id, updated_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (org_id) DO UPDATE SET
+			patterns = EXCLUDED.patterns,
+			updated_by_user_id = EXCLUDED.updated_by_user_id,
+			updated_at = NOW()
+		 RETURNING org_id, patterns, COALESCE(updated_by_user_id, ''), updated_at`,
+		orgID, patterns, updatedByUserID,
+	).Scan(&policy.OrgID, &policy.Patterns, &policy.UpdatedByUserID, &policy.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return policy, nil
+}
+
+func (db *DB) GetUserIgnorePolicy(ctx context.Context, orgID, userID string) (*models.IgnorePolicy, error) {
+	policy := &models.IgnorePolicy{OrgID: orgID, UserID: userID}
+	err := db.pool.QueryRow(ctx,
+		`SELECT org_id, user_id, patterns, updated_at
+		 FROM user_ignore_policies WHERE org_id = $1 AND user_id = $2`,
+		orgID, userID,
+	).Scan(&policy.OrgID, &policy.UserID, &policy.Patterns, &policy.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return policy, nil
+		}
+		return nil, err
+	}
+	return policy, nil
+}
+
+func (db *DB) SetUserIgnorePolicy(ctx context.Context, orgID, userID, patterns string) (*models.IgnorePolicy, error) {
+	policy := &models.IgnorePolicy{}
+	err := db.pool.QueryRow(ctx,
+		`INSERT INTO user_ignore_policies (org_id, user_id, patterns, updated_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (org_id, user_id) DO UPDATE SET
+			patterns = EXCLUDED.patterns,
+			updated_at = NOW()
+		 RETURNING org_id, user_id, patterns, updated_at`,
+		orgID, userID, patterns,
+	).Scan(&policy.OrgID, &policy.UserID, &policy.Patterns, &policy.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return policy, nil
 }
 
 // ---------------------------------------------------------------------------

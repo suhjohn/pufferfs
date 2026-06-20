@@ -57,13 +57,25 @@ var secretPatterns = []string{
 
 // Matcher decides whether to ignore a path.
 type Matcher struct {
-	patterns []gitignore.Pattern
+	patterns     []gitignore.Pattern
+	checkSecrets bool
+}
+
+// PolicyPatternSet contains centrally managed ignore rules.
+type PolicyPatternSet struct {
+	OrgPatterns  string
+	UserPatterns string
 }
 
 // NewMatcher builds a Matcher from the root directory.
 // It loads .gitignore files, .tpfsignore, and global ignore config.
 func NewMatcher(rootDir string) *Matcher {
-	m := &Matcher{}
+	return NewMatcherWithPolicy(rootDir, PolicyPatternSet{})
+}
+
+// NewMatcherWithPolicy builds a Matcher from central, global, and project rules.
+func NewMatcherWithPolicy(rootDir string, policy PolicyPatternSet) *Matcher {
+	m := &Matcher{checkSecrets: true}
 
 	// Always-ignore
 	for _, p := range alwaysIgnore {
@@ -75,7 +87,8 @@ func NewMatcher(rootDir string) *Matcher {
 		m.patterns = append(m.patterns, gitignore.ParsePattern(p, nil))
 	}
 
-	m.loadIgnoreFiles(rootDir)
+	m.loadPatternText(policy.OrgPatterns, nil)
+	m.loadPatternText(policy.UserPatterns, nil)
 
 	// Load global ignore from ~/.tpfs/.tpfsignore
 	home, err := os.UserHomeDir()
@@ -83,12 +96,22 @@ func NewMatcher(rootDir string) *Matcher {
 		m.loadIgnoreFile(filepath.Join(home, ".tpfs", ".tpfsignore"), nil)
 	}
 
+	m.loadIgnoreFiles(rootDir)
+
+	return m
+}
+
+// NewPolicyMatcher builds a matcher for centrally managed policy only.
+func NewPolicyMatcher(policy PolicyPatternSet) *Matcher {
+	m := &Matcher{}
+	m.loadPatternText(policy.OrgPatterns, nil)
+	m.loadPatternText(policy.UserPatterns, nil)
 	return m
 }
 
 // ShouldIgnore returns true if the given relative path should be excluded.
 func (m *Matcher) ShouldIgnore(relPath string, isDir bool) bool {
-	if IsSecretFile(relPath) {
+	if m.checkSecrets && IsSecretFile(relPath) {
 		return true
 	}
 	parts := strings.Split(filepath.ToSlash(relPath), "/")
@@ -118,7 +141,14 @@ func (m *Matcher) loadIgnoreFile(path string, pathParts []string) {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	m.loadPatternScanner(bufio.NewScanner(f), pathParts)
+}
+
+func (m *Matcher) loadPatternText(text string, pathParts []string) {
+	m.loadPatternScanner(bufio.NewScanner(strings.NewReader(text)), pathParts)
+}
+
+func (m *Matcher) loadPatternScanner(scanner *bufio.Scanner, pathParts []string) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {

@@ -39,6 +39,10 @@ func (c *apiClient) post(path string, body any) ([]byte, error) {
 	return c.request("POST", path, body)
 }
 
+func (c *apiClient) put(path string, body any) ([]byte, error) {
+	return c.request("PUT", path, body)
+}
+
 func (c *apiClient) get(path string) ([]byte, error) {
 	return c.request("GET", path, nil)
 }

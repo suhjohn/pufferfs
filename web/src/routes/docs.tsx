@@ -486,9 +486,11 @@ const IGNORE_RULE_SOURCES = [
   ["Always ignored", "All projects", ".git"],
   ["Built-in defaults", "All projects", "node_modules, .venv, dist, build, caches, compiled artifacts"],
   ["Secret-file patterns", "All projects", ".env, private keys, credentials.json, package-manager auth files"],
+  ["Org ignore policy", "Every root in the org", "Gitignore syntax, server-managed"],
+  ["User ignore policy", "Syncs by the current user", "Gitignore syntax, server-managed"],
+  ["~/.tpfs/.tpfsignore", "All projects for the current local user", "Gitignore syntax"],
   [".gitignore", "Directory where the file lives, recursive", "Gitignore syntax"],
   [".tpfsignore", "Directory where the file lives, recursive", "Gitignore syntax"],
-  ["~/.tpfs/.tpfsignore", "All projects for the current user", "Gitignore syntax"],
 ];
 
 const API_KEY_SCOPES = [
@@ -748,11 +750,25 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
               the API.
             </p>
             <p>
-              This is local CLI behavior: the API server does not read ignore
-              files itself. Direct API clients should filter paths before
-              submitting a sync request.
+              Server-managed org and user policies are fetched by the CLI before
+              scanning and enforced again during sync finalize. Local ignore
+              files are CLI-side rules for the syncing machine.
             </p>
             <div className="docs-command-list">
+              <article className="docs-command">
+                <h3>server-managed policy</h3>
+                <p>
+                  Use org policy for rules that apply to every root in the org,
+                  and user policy for rules that apply to syncs by the current
+                  user. Both use gitignore syntax.
+                </p>
+                <div className="docs-command-detail">
+                  <strong>commands</strong>
+                  <pre>{`pufferfs ignore get --level effective
+pufferfs ignore set --level user --file ~/.tpfs/user.tpfsignore
+pufferfs ignore edit --level org`}</pre>
+                </div>
+              </article>
               <article className="docs-command">
                 <h3>user-defined ignore files</h3>
                 <p>

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 func TestNormalizeExplicitAPIKeyScopes(t *testing.T) {
@@ -48,5 +50,35 @@ func TestRoleManagementRules(t *testing.T) {
 	}
 	if canManageMemberRole(auth.RoleAdmin, auth.RoleAdmin) {
 		t.Fatal("admin should not be able to manage another admin")
+	}
+}
+
+func TestNormalizeIgnorePolicyPatterns(t *testing.T) {
+	got, err := normalizeIgnorePolicyPatterns("a\r\nb\rc\n")
+	if err != nil {
+		t.Fatalf("normalizeIgnorePolicyPatterns: %v", err)
+	}
+	if got != "a\nb\nc\n" {
+		t.Fatalf("patterns = %q", got)
+	}
+	if _, err := normalizeIgnorePolicyPatterns("bad\x00pattern"); err == nil {
+		t.Fatal("normalizeIgnorePolicyPatterns accepted NUL byte")
+	}
+	if _, err := normalizeIgnorePolicyPatterns(strings.Repeat("x", 257<<10)); err == nil {
+		t.Fatal("normalizeIgnorePolicyPatterns accepted oversized policy")
+	}
+}
+
+func TestSyncChangePolicyPathsAllowsRemovals(t *testing.T) {
+	if paths := syncChangePolicyPaths(models.FileChange{Path: "blocked/a.txt", Status: models.StatusRemoved}); len(paths) != 0 {
+		t.Fatalf("removed paths = %#v, want no policy check", paths)
+	}
+	paths := syncChangePolicyPaths(models.FileChange{
+		Path:    "blocked/new.txt",
+		OldPath: "blocked/old.txt",
+		Status:  models.StatusMoved,
+	})
+	if len(paths) != 1 || paths[0] != "blocked/new.txt" {
+		t.Fatalf("moved paths = %#v, want destination only", paths)
 	}
 }

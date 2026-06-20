@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
@@ -428,8 +429,25 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 		hashCache, _ = loadLocalState(rootID)
 	}
 
+	policy := ignore.PolicyPatternSet{}
+	if cfg.Server.URL != "" && rootID != "" {
+		if client == nil {
+			client = newAPIClient(cfg)
+		}
+		effectivePolicy, err := fetchEffectiveIgnorePolicy(client)
+		if err != nil {
+			if !dryRun {
+				return nil, fmt.Errorf("loading ignore policy: %w", err)
+			}
+			fmt.Fprintf(log, "Warning: could not load server ignore policy: %v\n", err)
+		} else {
+			policy.OrgPatterns = effectivePolicy.OrgPatterns
+			policy.UserPatterns = effectivePolicy.UserPatterns
+		}
+	}
+
 	// Build Merkle tree (parallel file hashing)
-	matcher := ignore.NewMatcher(dir)
+	matcher := ignore.NewMatcherWithPolicy(dir, policy)
 	fmt.Fprintf(log, "Building Merkle tree for %s...\n", dir)
 	start := time.Now()
 	currentTree, err := merkle.BuildTreeWithStateCache(dir, matcher, hashCache)
@@ -455,7 +473,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 			}
 			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
 		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -473,7 +491,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -491,19 +509,19 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
 	var err error
 
 	// Detect secrets
 	secrets := diff.DetectSecrets(currentState)
 
 	if dryRun {
-		fmt.Fprint(log, diff.FormatDryRun(result, currentState, ignoredPatterns(), secrets))
-		return dryRunSyncResult(rootID, name, dir, result, secrets), nil
+		fmt.Fprint(log, diff.FormatDryRun(result, currentState, ignoredPatterns(policy), secrets))
+		return dryRunSyncResult(rootID, name, dir, result, policy, secrets), nil
 	}
 
 	// Need a server connection for actual sync
@@ -655,8 +673,8 @@ func syncConflictFromError(err error) (*syncConflictError, bool) {
 	return &syncConflictError{SyncConflictResponse: resp}, true
 }
 
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, log io.Writer) (*syncCommandResult, error) {
-	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, log)
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
+	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return syncResult, err
@@ -679,7 +697,7 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 		}
 		return unchangedSyncResult(rootID, name, dir, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq), nil
 	}
-	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, log)
+	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, policy, log)
 }
 
 func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*models.SyncJob, error) {
@@ -734,7 +752,7 @@ func unchangedSyncResult(rootID, name, dir, generationID string, generationSeq i
 	}
 }
 
-func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, secrets []string) *syncCommandResult {
+func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, policy ignore.PolicyPatternSet, secrets []string) *syncCommandResult {
 	stats := result.Stats
 	return &syncCommandResult{
 		Status:      "dry_run",
@@ -745,7 +763,7 @@ func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, secret
 		Changes:     countChanges(result),
 		Stats:       &stats,
 		FileChanges: filterChanges(result),
-		Ignored:     ignoredPatterns(),
+		Ignored:     ignoredPatterns(policy),
 		Secrets:     secrets,
 	}
 }
@@ -1418,8 +1436,21 @@ func countChanges(result models.DiffResult) int {
 	return count
 }
 
-func ignoredPatterns() []string {
+func ignoredPatterns(policy ignore.PolicyPatternSet) []string {
 	patterns := []string{".git/", "node_modules/", ".venv/", "__pycache__/", ".DS_Store"}
+	patterns = appendPolicyPatterns(patterns, "org", policy.OrgPatterns)
+	patterns = appendPolicyPatterns(patterns, "user", policy.UserPatterns)
 	sort.Strings(patterns)
+	return patterns
+}
+
+func appendPolicyPatterns(patterns []string, label, text string) []string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		patterns = append(patterns, fmt.Sprintf("%s policy: %s", label, line))
+	}
 	return patterns
 }

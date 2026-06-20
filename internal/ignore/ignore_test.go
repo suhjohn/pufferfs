@@ -89,3 +89,41 @@ func TestMatcherLoadsGlobalTpfsIgnore(t *testing.T) {
 		}
 	}
 }
+
+func TestMatcherLoadsCentralPolicyPatterns(t *testing.T) {
+	root := t.TempDir()
+	matcher := NewMatcherWithPolicy(root, PolicyPatternSet{
+		OrgPatterns:  "org-private/\n*.orgtmp\n",
+		UserPatterns: "user-private/\n*.usertmp\n",
+	})
+
+	for _, path := range []string{
+		"org-private/plan.md",
+		"notes.orgtmp",
+		"user-private/scratch.md",
+		"notes.usertmp",
+	} {
+		if !matcher.ShouldIgnore(path, false) {
+			t.Fatalf("ShouldIgnore(%q) = false, want true", path)
+		}
+	}
+	if matcher.ShouldIgnore("shared/README.md", false) {
+		t.Fatalf("central policy ignored shared file")
+	}
+}
+
+func TestPolicyMatcherDoesNotLoadLocalRules(t *testing.T) {
+	matcher := NewPolicyMatcher(PolicyPatternSet{
+		OrgPatterns: "org-private/\n",
+	})
+
+	if !matcher.ShouldIgnore("org-private/a.txt", false) {
+		t.Fatalf("policy matcher did not apply org rule")
+	}
+	if matcher.ShouldIgnore(".env", false) {
+		t.Fatalf("policy matcher should not apply secret filename rules")
+	}
+	if matcher.ShouldIgnore("node_modules/pkg/index.js", false) {
+		t.Fatalf("policy matcher should not apply default local rules")
+	}
+}

@@ -433,8 +433,8 @@ PufferFS currently supports:
 - Incremental filesystem sync from CLI.
 - Merkle-based local diffing, move/rename detection, and conflict retry against
   remote generation changes.
-- Built-in ignore rules plus `.gitignore`, `.tpfsignore`, and global
-  `~/.tpfs/.tpfsignore`.
+- Built-in ignore rules plus server-managed org/user policies, `.gitignore`,
+  `.tpfsignore`, and global `~/.tpfs/.tpfsignore`.
 - Default exclusion of likely secret filenames before sync state is built.
 - Small-file bundle uploads and standalone large-file uploads.
 - Gzip root state storage by object reference.

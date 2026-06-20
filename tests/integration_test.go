@@ -956,6 +956,111 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
 		cleanupDone = true
 	})
+
+	t.Run("central ignore policy rejects matching finalize and cleans source uploads", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var orgPolicy models.IgnorePolicy
+		status, body := jsonRequest(t, http.MethodPut, env.serverURL+"/ignore-policy/org", env.apiKey, models.IgnorePolicyUpdateRequest{
+			Patterns: "blocked-org/\n",
+		}, &orgPolicy)
+		if status != http.StatusOK {
+			t.Fatalf("set org ignore policy: HTTP %d: %s", status, string(body))
+		}
+		if orgPolicy.Patterns != "blocked-org/\n" || orgPolicy.UpdatedByUserID != env.userID {
+			t.Fatalf("unexpected org policy: %#v", orgPolicy)
+		}
+
+		var userPolicy models.IgnorePolicy
+		status, body = jsonRequest(t, http.MethodPut, env.serverURL+"/ignore-policy/user", env.apiKey, models.IgnorePolicyUpdateRequest{
+			Patterns: "blocked-user/\n",
+		}, &userPolicy)
+		if status != http.StatusOK {
+			t.Fatalf("set user ignore policy: HTTP %d: %s", status, string(body))
+		}
+		if userPolicy.Patterns != "blocked-user/\n" || userPolicy.UserID != env.userID {
+			t.Fatalf("unexpected user policy: %#v", userPolicy)
+		}
+
+		var effective models.EffectiveIgnorePolicy
+		status, body = jsonRequest(t, http.MethodGet, env.serverURL+"/ignore-policy", env.apiKey, nil, &effective)
+		if status != http.StatusOK {
+			t.Fatalf("get effective ignore policy: HTTP %d: %s", status, string(body))
+		}
+		if effective.OrgPatterns != "blocked-org/\n" || effective.UserPatterns != "blocked-user/\n" {
+			t.Fatalf("effective policy = %#v", effective)
+		}
+
+		var root models.RootMetadata
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-ignore-policy-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		sourceBytes := []byte("# Blocked\n")
+		fileUploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("blocked-org/a.md"),
+		)
+		var fileUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, sourceBytes, "application/octet-stream", &fileUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
+		}
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/sources/", syncInit.GenerationID))
+
+		blockedReq := models.SyncRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			GenerationID:    syncInit.GenerationID,
+			Changes: []models.FileChange{{
+				Path:         "blocked-org/a.md",
+				Status:       models.StatusAdded,
+				SourceKey:    fileUpload.Key,
+				SourceLength: int64(len(sourceBytes)),
+			}},
+			State: map[string]models.FileState{
+				"blocked-org/a.md": {Size: int64(len(sourceBytes)), ContentHash: "hash-blocked", Mtime: time.Now().Unix()},
+			},
+		}
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync", env.apiKey, blockedReq, nil)
+		if status != http.StatusBadRequest {
+			t.Fatalf("ignored finalize: HTTP %d, want 400: %s", status, string(body))
+		}
+		if !strings.Contains(string(body), "ignored by org/user policy") {
+			t.Fatalf("ignored finalize response did not mention policy: %s", string(body))
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
+		if gotStatus != "failed" {
+			t.Fatalf("generation status = %q, want failed", gotStatus)
+		}
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
+	})
 }
 
 type realServices struct {
@@ -1584,6 +1689,8 @@ func deleteCreatedDataAndAssertGone(t *testing.T, serverURL, orgID string, userI
 	assertDBCountZero(t, "org members", `SELECT COUNT(*) FROM org_members WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org API keys", `SELECT COUNT(*) FROM api_keys WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org ACLs", `SELECT COUNT(*) FROM root_acls WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org ignore policies", `SELECT COUNT(*) FROM org_ignore_policies WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "user ignore policies", `SELECT COUNT(*) FROM user_ignore_policies WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org sync jobs", `SELECT COUNT(*) FROM sync_jobs WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org sync generations", `SELECT COUNT(*) FROM sync_generations WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org content proofs", `SELECT COUNT(*) FROM content_proofs WHERE org_id = `+sqlQuote(orgID))

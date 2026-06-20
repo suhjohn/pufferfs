@@ -70,6 +70,26 @@ type OrgInvite struct {
 	CreatedAt       time.Time `json:"created_at"`
 }
 
+// IgnorePolicy stores a raw gitignore-style policy document.
+type IgnorePolicy struct {
+	OrgID           string    `json:"org_id,omitempty"`
+	UserID          string    `json:"user_id,omitempty"`
+	Patterns        string    `json:"patterns"`
+	UpdatedByUserID string    `json:"updated_by_user_id,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// EffectiveIgnorePolicy is the centrally managed policy visible to a caller.
+type EffectiveIgnorePolicy struct {
+	OrgPatterns  string `json:"org_patterns"`
+	UserPatterns string `json:"user_patterns"`
+}
+
+// IgnorePolicyUpdateRequest updates a raw gitignore-style policy document.
+type IgnorePolicyUpdateRequest struct {
+	Patterns string `json:"patterns"`
+}
+
 // ---------------------------------------------------------------------------
 // API Keys
 // ---------------------------------------------------------------------------

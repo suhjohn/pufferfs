@@ -174,12 +174,13 @@ PufferFS decides which files to sync (and index) by evaluating a layered set of
 ignore rules. Anything matched by an ignore rule is excluded from the Merkle
 tree, the diff, the upload, and the search index.
 
-Ignore matching is **local CLI behavior**. The API server does not read
-`.gitignore`, `.tpfsignore`, or `~/.tpfs/.tpfsignore`, because those files live on
-the syncing machine and the server only receives the submitted sync request,
-state, and uploaded objects. Direct API clients must apply their own filtering
-before calling `POST /roots/{id}/sync`; the server still enforces authentication,
-write ACLs, protocol validation, and upload limits.
+Ignore matching combines server-managed policy and local CLI rules. Organization
+and user ignore policies are fetched from the server before scanning and are also
+enforced by the server during sync finalize. Local `.gitignore`, `.tpfsignore`,
+and `~/.tpfs/.tpfsignore` files live on the syncing machine, so direct API
+clients must apply equivalent local filtering themselves before calling
+`POST /roots/{id}/sync`. The server still enforces authentication, org/user
+ignore policy, write ACLs, protocol validation, and upload limits.
 
 ### Ignore rule sources (in evaluation order)
 
@@ -188,15 +189,38 @@ write ACLs, protocol validation, and upload limits.
 | **Always ignored** | All projects | Hard-coded (`.git`) |
 | **Built-in defaults** | All projects | Hard-coded list (see below) |
 | **Secret-file patterns** | All projects | Filename glob (see below) |
+| **Org ignore policy** | Every root in the org | Gitignore syntax, server-managed |
+| **User ignore policy** | Syncs by the current user in the org | Gitignore syntax, server-managed |
+| **`~/.tpfs/.tpfsignore`** | All projects for the current local machine user | gitignore syntax |
 | **`.gitignore`** | Directory where the file lives (recursive) | [gitignore syntax](https://git-scm.com/docs/gitignore) |
 | **`.tpfsignore`** | Directory where the file lives (recursive) | gitignore syntax |
-| **`~/.tpfs/.tpfsignore`** | All projects for the current user | gitignore syntax |
 
 A file is excluded if **any** source matches it. There is currently no negation
 or override mechanism across sources (though negation patterns such as `!keep`
 work within a single gitignore-syntax file).
 
 ### User-defined ignore files
+
+#### Server-managed org and user policies
+
+Use server-managed policies for rules that should apply before upload and should
+also be enforced against direct API clients.
+
+```sh
+pufferfs ignore get --level effective
+pufferfs ignore get --level user
+pufferfs ignore set --level user --file ~/.tpfs/user.tpfsignore
+pufferfs ignore edit --level user
+
+pufferfs ignore get --level org
+pufferfs ignore set --level org --file org.tpfsignore
+pufferfs ignore edit --level org
+```
+
+Org policy applies to every root in the organization and requires org admin
+permission to change. User policy applies to syncs performed by the current user
+inside that organization. These policies are additive: a lower layer cannot
+un-ignore a path ignored by org or user policy.
 
 #### `.tpfsignore` (project-level)
 

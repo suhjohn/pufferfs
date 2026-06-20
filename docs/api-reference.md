@@ -173,6 +173,68 @@ Returns `{"status":"deleted"}`.
 
 ---
 
+## Ignore Policies
+
+Server-managed ignore policies use gitignore-style pattern text. They are
+additive deny rules: if org policy or user policy matches a path, new uploaded
+content for that path is rejected during sync finalize. Remove/close operations
+for previously indexed ignored paths are allowed so policy changes can remove
+existing rows from the visible index.
+
+### `GET /ignore-policy`
+
+Return the effective central policy for the authenticated caller. Requires
+`query`, `sync`, `read`, or `write` scope.
+
+```json
+{
+  "org_patterns": "blocked-org/\n*.secret\n",
+  "user_patterns": "scratch/\n*.local\n"
+}
+```
+
+### `GET /ignore-policy/user`
+
+Return the caller's user-level policy document for the current org. Requires
+`query`, `sync`, `read`, or `write` scope.
+
+### `PUT /ignore-policy/user`
+
+Replace the caller's user-level policy document for the current org. Requires
+`sync` / `write`.
+
+```json
+{ "patterns": "scratch/\n*.local\n" }
+```
+
+### `GET /ignore-policy/org`
+
+Return the org-level policy document for the current org. Requires `query`,
+`sync`, `read`, `write`, `org:admin`, or `admin` scope.
+
+### `PUT /ignore-policy/org`
+
+Replace the org-level policy document for the current org. Requires admin role
+and `org:admin` / `admin` / `write` scope.
+
+```json
+{ "patterns": "blocked-org/\n*.secret\n" }
+```
+
+Policy update responses:
+
+```json
+{
+  "org_id": "...",
+  "user_id": "...",
+  "patterns": "scratch/\n*.local\n",
+  "updated_by_user_id": "...",
+  "updated_at": "RFC3339"
+}
+```
+
+---
+
 ## Roots
 
 A root is the unit of sync and access control.
@@ -439,6 +501,9 @@ Rules:
   `syncs/<generation_id>/sources/files/<path>` or
   `syncs/<generation_id>/sources/bundles/<bundle_id>` for new clients. Legacy
   `files/<root_id>/...` and `bundles/<root_id>/...` refs are still accepted.
+- Central org/user ignore policy is enforced during finalize. New content under
+  ignored paths returns `400`; removals for ignored paths are allowed so policy
+  changes can remove existing indexed rows.
 - `base_generation_id`/`seq` must match the root's current visible generation,
   otherwise a [sync conflict](#sync-conflicts) is returned.
 - `changes[].status` is one of `ADDED`, `MODIFIED`, `REMOVED`, `MOVED`,

@@ -51,8 +51,10 @@ secret_access_key = ""
 Per-root local cache (root metadata, flat file state, Merkle snapshot) lives
 under `~/.tpfs/roots/<root-id>/`. Global ignore rules live at
 `~/.tpfs/.tpfsignore` (gitignore syntax, applies to all projects for the current
-user). Project-level ignore rules use `.tpfsignore` files placed anywhere in the
-synced tree.
+local user). Server-managed org/user ignore policy is configured through
+`pufferfs ignore` or the `/ignore-policy` API and is enforced by the server.
+Project-level ignore rules use `.tpfsignore` files placed anywhere in the synced
+tree.
 See [developer-guide.md § What Gets Synced](./developer-guide.md#what-gets-synced)
 for full ignore-rule documentation.
 

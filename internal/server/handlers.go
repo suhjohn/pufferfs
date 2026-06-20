@@ -21,6 +21,7 @@ import (
 
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/internal/ignore"
 	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
@@ -115,6 +116,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /org/invites", s.handleListInvites)
 	s.mux.HandleFunc("POST /org/invites", s.handleCreateInvite)
 	s.mux.HandleFunc("DELETE /org/invites/{id}", s.handleDeleteInvite)
+	s.mux.HandleFunc("GET /ignore-policy", s.handleGetEffectiveIgnorePolicy)
+	s.mux.HandleFunc("GET /ignore-policy/user", s.handleGetUserIgnorePolicy)
+	s.mux.HandleFunc("PUT /ignore-policy/user", s.handleSetUserIgnorePolicy)
+	s.mux.HandleFunc("GET /ignore-policy/org", s.handleGetOrgIgnorePolicy)
+	s.mux.HandleFunc("PUT /ignore-policy/org", s.handleSetOrgIgnorePolicy)
 
 	// Platform admin
 	s.mux.HandleFunc("POST /admin/orgs", s.handleAdminProvisionOrg)
@@ -1578,6 +1584,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "changes or change_refs is required"})
 		return
 	}
+	if err := s.validateSyncIgnorePolicy(r.Context(), id, &req); err != nil {
+		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
 		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
@@ -1706,6 +1717,52 @@ func (s *Server) cleanupRejectedSyncRequest(ctx context.Context, orgID, rootID s
 	if cleanupErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, nil); cleanupErr != nil {
 		log.Printf("warning: failed rejected sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
 	}
+}
+
+func (s *Server) validateSyncIgnorePolicy(ctx context.Context, id *auth.Identity, req *models.SyncRequest) error {
+	if id == nil || req == nil {
+		return nil
+	}
+	policy, err := s.db.GetEffectiveIgnorePolicy(ctx, id.OrgID, id.UserID)
+	if err != nil {
+		return fmt.Errorf("loading ignore policy: %w", err)
+	}
+	if strings.TrimSpace(policy.OrgPatterns) == "" && strings.TrimSpace(policy.UserPatterns) == "" {
+		return nil
+	}
+	matcher := ignore.NewPolicyMatcher(ignore.PolicyPatternSet{
+		OrgPatterns:  policy.OrgPatterns,
+		UserPatterns: policy.UserPatterns,
+	})
+	changes, err := s.syncRequestChangesForACL(ctx, req)
+	if err != nil {
+		return err
+	}
+	for _, change := range changes {
+		for _, path := range syncChangePolicyPaths(change) {
+			if matcher.ShouldIgnore(path, false) {
+				return fmt.Errorf("path %q is ignored by org/user policy", path)
+			}
+		}
+	}
+	return nil
+}
+
+func syncChangePolicyPaths(change models.FileChange) []string {
+	switch change.Status {
+	case models.StatusRemoved:
+		return nil
+	case models.StatusMoved, models.StatusRenamed:
+		if strings.TrimSpace(change.Path) == "" {
+			return nil
+		}
+		return []string{change.Path}
+	}
+	paths := make([]string, 0, 2)
+	if strings.TrimSpace(change.Path) != "" {
+		paths = append(paths, change.Path)
+	}
+	return paths
 }
 
 func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest, currentGenerationID string, currentGenerationSeq int64) {
@@ -1948,6 +2005,130 @@ func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, jobs)
+}
+
+// ---------------------------------------------------------------------------
+// Ignore policies
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleGetEffectiveIgnorePolicy(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read or sync scope required"})
+		return
+	}
+	policy, err := s.db.GetEffectiveIgnorePolicy(r.Context(), id.OrgID, id.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleGetOrgIgnorePolicy(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "query", "sync", "read", "write", "org:admin", "admin") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read or sync scope required"})
+		return
+	}
+	policy, err := s.db.GetOrgIgnorePolicy(r.Context(), id.OrgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleSetOrgIgnorePolicy(w http.ResponseWriter, r *http.Request) {
+	id, ok := requireOrgAdmin(w, r)
+	if !ok {
+		return
+	}
+	patterns, ok := decodeIgnorePolicyUpdate(w, r)
+	if !ok {
+		return
+	}
+	policy, err := s.db.SetOrgIgnorePolicy(r.Context(), id.OrgID, id.UserID, patterns)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleGetUserIgnorePolicy(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read or sync scope required"})
+		return
+	}
+	policy, err := s.db.GetUserIgnorePolicy(r.Context(), id.OrgID, id.UserID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func (s *Server) handleSetUserIgnorePolicy(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
+		return
+	}
+	patterns, ok := decodeIgnorePolicyUpdate(w, r)
+	if !ok {
+		return
+	}
+	policy, err := s.db.SetUserIgnorePolicy(r.Context(), id.OrgID, id.UserID, patterns)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, policy)
+}
+
+func decodeIgnorePolicyUpdate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var req models.IgnorePolicyUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return "", false
+	}
+	patterns, err := normalizeIgnorePolicyPatterns(req.Patterns)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return "", false
+	}
+	return patterns, true
+}
+
+func normalizeIgnorePolicyPatterns(patterns string) (string, error) {
+	const maxIgnorePolicyBytes = 256 << 10
+	patterns = strings.ReplaceAll(patterns, "\r\n", "\n")
+	patterns = strings.ReplaceAll(patterns, "\r", "\n")
+	if len(patterns) > maxIgnorePolicyBytes {
+		return "", fmt.Errorf("ignore policy is too large; max %d bytes", maxIgnorePolicyBytes)
+	}
+	if strings.Contains(patterns, "\x00") {
+		return "", fmt.Errorf("ignore policy contains NUL byte")
+	}
+	return patterns, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,10 +2630,10 @@ func (s *Server) syncRequestChangesForACL(ctx context.Context, req *models.SyncR
 	if req == nil {
 		return nil, nil
 	}
-	if len(req.ChangeRefs) == 0 || len(req.Changes) > 0 {
-		return req.Changes, nil
+	changes := append([]models.FileChange(nil), req.Changes...)
+	if len(req.ChangeRefs) == 0 {
+		return changes, nil
 	}
-	var changes []models.FileChange
 	for _, ref := range req.ChangeRefs {
 		data, err := s.s3.Download(ctx, ref)
 		if err != nil {
