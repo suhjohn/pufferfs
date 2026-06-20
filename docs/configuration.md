@@ -130,6 +130,7 @@ API-key-only setups).
 | `JWT_SECRET` | HMAC secret for signing/validating session JWTs. | **Required.** Session TTL is 24h. |
 | `PUFFERFS_ADMIN_KEY` | Platform admin key (plaintext form). Hashed internally. | optional |
 | `PUFFERFS_ADMIN_KEY_HASH` | SHA-256 hash of the admin key (preferred over plaintext). | optional |
+| `ENABLE_EMAIL_LOGIN` | Enables email one-time-code login endpoints. Set to `false` to disable. | enabled |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google OAuth credentials. OAuth is enabled only when these are set. | optional |
 | `OAUTH_REDIRECT_URL` | OAuth callback URL, e.g. `https://api.example.com/auth/callback`. | optional |
 
@@ -165,24 +166,30 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). |
 | `PUFFERFS_EMBEDDING_MODEL_VERSION` | Embedding cache version; must be bumped when the Modal embedding model changes. | — |
 
-### Invite email (AWS SES, optional)
+### Transactional email (AWS SES, optional)
 
 Invites work without email: `POST /org/invites` stores a pending invite, and
-the invited address accepts it on the next OAuth sign-in. Set
-`INVITE_EMAIL_FROM` to additionally send invite notifications through AWS SES.
+the invited address accepts it on the next sign-in that proves the invited
+email address. Email-code login requires transactional email. Set
+`TRANSACTIONAL_EMAIL_FROM` to send login codes and invite notifications through
+AWS SES.
 
 | Variable | Meaning |
 | --- | --- |
-| `INVITE_EMAIL_FROM` | Verified SES sender email address. Enables invite email when set. |
-| `INVITE_EMAIL_FROM_NAME` | Optional display name for the sender. |
-| `INVITE_EMAIL_REPLY_TO` | Optional comma-separated reply-to addresses. |
-| `INVITE_EMAIL_APP_URL` | Web app URL used for invite links. Defaults to `FRONTEND_URL`. |
+| `TRANSACTIONAL_EMAIL_FROM` | Verified SES sender email address. Enables login-code and invite email when set. |
+| `TRANSACTIONAL_EMAIL_FROM_NAME` | Optional display name for the sender. |
+| `TRANSACTIONAL_EMAIL_REPLY_TO` | Optional comma-separated reply-to addresses. |
+| `TRANSACTIONAL_EMAIL_APP_URL` | Web app URL used for email links. Defaults to `FRONTEND_URL`. |
 | `SES_REGION` | SES region. Defaults to `AWS_REGION`, then `AWS_DEFAULT_REGION`, then `us-east-1`. |
 | `SES_CONFIGURATION_SET` | Optional SES configuration set. |
 | `SES_FROM_IDENTITY_ARN` | Optional SES identity ARN for least-privilege/sending authorization. |
 | `SES_FEEDBACK_EMAIL` | Optional bounce/complaint forwarding address. |
 | `SES_FEEDBACK_IDENTITY_ARN` | Optional identity ARN for the feedback address. |
 | `SES_ENDPOINT_URL` | Optional SES-compatible endpoint override, mainly for local testing. |
+
+The older `INVITE_EMAIL_FROM`, `INVITE_EMAIL_FROM_NAME`,
+`INVITE_EMAIL_REPLY_TO`, and `INVITE_EMAIL_APP_URL` variables remain accepted as
+compatibility aliases, but new deployments should use the transactional names.
 
 ### Sync pipeline tuning
 

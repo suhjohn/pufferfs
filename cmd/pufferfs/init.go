@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"net"
@@ -22,6 +25,7 @@ const defaultServerURL = "https://api.pufferfs.com"
 type initOptions struct {
 	ServerURL string
 	APIKey    string
+	Login     string
 	Manual    bool
 	NoBrowser bool
 }
@@ -44,6 +48,7 @@ func initCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&options.ServerURL, "server-url", options.ServerURL, "PufferFS API server URL")
 	cmd.Flags().StringVar(&options.APIKey, "api-key", "", "API key to write without opening the browser login flow")
+	cmd.Flags().StringVar(&options.Login, "login", "email", "Login method: email or google")
 	cmd.Flags().BoolVar(&options.Manual, "manual", false, "Write config without logging in")
 	cmd.Flags().BoolVar(&options.NoBrowser, "no-browser", false, "Print the login URL instead of opening a browser")
 	return cmd
@@ -75,7 +80,15 @@ func runInit(options initOptions) error {
 		return nil
 	}
 
-	result, err := runBrowserLogin(serverURL, !options.NoBrowser)
+	var result cliAuthResult
+	switch strings.ToLower(strings.TrimSpace(options.Login)) {
+	case "", "email":
+		result, err = runEmailLogin(serverURL)
+	case "google":
+		result, err = runBrowserLogin(serverURL, !options.NoBrowser)
+	default:
+		err = fmt.Errorf("unsupported login method %q; use email or google", options.Login)
+	}
 	if err != nil {
 		return err
 	}
@@ -185,6 +198,98 @@ func runBrowserLogin(serverURL string, openBrowser bool) (cliAuthResult, error) 
 	case <-time.After(5 * time.Minute):
 		return cliAuthResult{}, fmt.Errorf("login timed out")
 	}
+}
+
+func runEmailLogin(serverURL string) (cliAuthResult, error) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Email: ")
+	email, err := reader.ReadString('\n')
+	if err != nil {
+		return cliAuthResult{}, fmt.Errorf("reading email: %w", err)
+	}
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return cliAuthResult{}, fmt.Errorf("email is required")
+	}
+
+	callbackURL := "http://127.0.0.1:49152/callback"
+	var startResp struct {
+		ChallengeID string `json:"challenge_id"`
+		ExpiresIn   int    `json:"expires_in"`
+		ResendAfter int    `json:"resend_after"`
+	}
+	if err := postJSON(serverURL+"/auth/email/start", map[string]string{
+		"email":            email,
+		"flow":             "cli",
+		"cli_redirect_uri": callbackURL,
+	}, &startResp); err != nil {
+		return cliAuthResult{}, fmt.Errorf("requesting login code: %w", err)
+	}
+	if startResp.ChallengeID == "" {
+		return cliAuthResult{}, fmt.Errorf("login code response did not include a challenge")
+	}
+
+	if startResp.ExpiresIn > 0 {
+		fmt.Printf("Sent a login code to %s. It expires in %d minutes.\n", email, (startResp.ExpiresIn+59)/60)
+	} else {
+		fmt.Printf("Sent a login code to %s.\n", email)
+	}
+	fmt.Print("Code: ")
+	code, err := reader.ReadString('\n')
+	if err != nil {
+		return cliAuthResult{}, fmt.Errorf("reading code: %w", err)
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return cliAuthResult{}, fmt.Errorf("code is required")
+	}
+
+	var verifyResp struct {
+		APIKey string `json:"api_key"`
+		Email  string `json:"email"`
+	}
+	if err := postJSON(serverURL+"/auth/email/verify", map[string]string{
+		"challenge_id": startResp.ChallengeID,
+		"code":         code,
+	}, &verifyResp); err != nil {
+		return cliAuthResult{}, fmt.Errorf("verifying login code: %w", err)
+	}
+	if verifyResp.APIKey == "" {
+		return cliAuthResult{}, fmt.Errorf("login response did not include an API key")
+	}
+	return cliAuthResult{APIKey: verifyResp.APIKey, Email: verifyResp.Email}, nil
+}
+
+func postJSON(endpoint string, reqBody any, out any) error {
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var apiErr struct {
+			Error string `json:"error"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&apiErr)
+		if apiErr.Error != "" {
+			return fmt.Errorf("HTTP %d: %s", resp.StatusCode, apiErr.Error)
+		}
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if out == nil {
+		return nil
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 func openURL(target string) error {

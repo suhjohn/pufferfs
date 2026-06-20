@@ -153,14 +153,18 @@ func tokenFromRequest(r *http.Request) (string, bool) {
 // endpoints, the CLI version manifest, the Stripe webhook) are skipped.
 func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handler) http.Handler {
 	unauthPaths := map[string]bool{
-		"/healthz":         true,
-		"/readyz":          true,
-		"/health":          true,
-		"/cli/version":     true,
-		"/auth/google":     true,
-		"/auth/callback":   true,
-		"/auth/logout":     true,
-		"/billing/webhook": true,
+		"/healthz":           true,
+		"/readyz":            true,
+		"/health":            true,
+		"/cli/version":       true,
+		"/auth/providers":    true,
+		"/auth/google":       true,
+		"/auth/callback":     true,
+		"/auth/email/start":  true,
+		"/auth/email/resend": true,
+		"/auth/email/verify": true,
+		"/auth/logout":       true,
+		"/billing/webhook":   true,
 	}
 
 	return func(next http.Handler) http.Handler {

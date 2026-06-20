@@ -78,27 +78,30 @@ ENABLE_BILLING=false
 VITE_ENABLE_BILLING=false
 ```
 
-Optional invite email variables:
+Optional transactional email variables:
 
 ```text
-INVITE_EMAIL_FROM=team@your-domain.com
-INVITE_EMAIL_FROM_NAME=PufferFS
-INVITE_EMAIL_REPLY_TO=support@your-domain.com
-INVITE_EMAIL_APP_URL=https://your-domain.com
-INVITE_EMAIL_SES_REGION=us-west-2
-INVITE_EMAIL_IDENTITY=your-domain.com
-INVITE_EMAIL_IDENTITY_ARN=arn:aws:ses:us-west-2:123456789012:identity/your-domain.com
+ENABLE_EMAIL_LOGIN=true
+TRANSACTIONAL_EMAIL_FROM=team@your-domain.com
+TRANSACTIONAL_EMAIL_FROM_NAME=PufferFS
+TRANSACTIONAL_EMAIL_REPLY_TO=support@your-domain.com
+TRANSACTIONAL_EMAIL_APP_URL=https://your-domain.com
+TRANSACTIONAL_EMAIL_SES_REGION=us-west-2
+TRANSACTIONAL_EMAIL_IDENTITY=your-domain.com
+TRANSACTIONAL_EMAIL_IDENTITY_ARN=arn:aws:ses:us-west-2:123456789012:identity/your-domain.com
 SES_CONFIGURATION_SET=
 SES_FEEDBACK_EMAIL=
 SES_FEEDBACK_IDENTITY_ARN=
 SES_ENDPOINT_URL=
 ```
 
-Leave `INVITE_EMAIL_FROM` unset to keep invites database-only. Set
-`INVITE_EMAIL_IDENTITY` when you want Pulumi to create the SES identity and
-output DNS validation records. Omit it when the sender identity is already
-verified in SES; in that case set `INVITE_EMAIL_IDENTITY_ARN` if you want the
-ECS task role scoped to that identity instead of all SES identities.
+Leave `TRANSACTIONAL_EMAIL_FROM` unset to keep invites database-only and make
+email-code login unavailable. Set `TRANSACTIONAL_EMAIL_IDENTITY` when you want
+Pulumi to create the SES identity and output DNS validation records. Omit it
+when the sender identity is already verified in SES; in that case set
+`TRANSACTIONAL_EMAIL_IDENTITY_ARN` if you want the ECS task role scoped to that
+identity instead of all SES identities. The older `INVITE_EMAIL_*` Pulumi config
+names remain accepted as aliases.
 
 Required Modal endpoint variables, unless stored as secrets:
 
@@ -187,12 +190,13 @@ After a successful release, update the deploy environment variable
 `PUFFERFS_CLI_LATEST_VERSION` and run the `backend` deploy component so
 `GET /cli/version` advertises the new release.
 
-## Invite Email DNS
+## Transactional Email DNS
 
-Invite emails use Amazon SES only when `INVITE_EMAIL_FROM` is set. For a new
-domain, set `INVITE_EMAIL_IDENTITY` to the domain you want SES to verify, for
-example `your-domain.com` or `mail.your-domain.com`, then run the backend
-Pulumi deploy once.
+Login-code and invite emails use Amazon SES only when
+`TRANSACTIONAL_EMAIL_FROM` is set. For a new domain, set
+`TRANSACTIONAL_EMAIL_IDENTITY` to the domain you want SES to verify, for example
+`your-domain.com` or `mail.your-domain.com`, then run the backend Pulumi deploy
+once.
 
 After the deploy, read:
 
@@ -200,6 +204,8 @@ After the deploy, read:
 cd infra/pulumi
 pulumi stack output inviteEmailDkimValidationRecords
 pulumi stack output inviteEmailIdentityVerificationStatus
+pulumi stack output transactionalEmailDkimValidationRecords
+pulumi stack output transactionalEmailIdentityVerificationStatus
 ```
 
 Create each returned record in your DNS provider as a CNAME. The names look
@@ -211,7 +217,7 @@ like:
 
 Keep these records DNS-only if your DNS provider has proxying. SES will mark
 the identity verified after it sees the records. If the SES account is still in
-sandbox, request production access in the same `INVITE_EMAIL_SES_REGION`;
+sandbox, request production access in the same `TRANSACTIONAL_EMAIL_SES_REGION`;
 otherwise SES can only send to verified recipient addresses.
 
 ## Local GitHub Actions

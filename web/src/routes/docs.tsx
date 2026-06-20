@@ -12,14 +12,22 @@ const COMMANDS = [
     name: "init",
     usage: "pufferfs init",
     detail:
-      "Connects the CLI to an account and writes ~/.tpfs/config.toml. Browser login creates a normal user API key, not a platform admin key.",
+      "Connects the CLI to an account and writes ~/.tpfs/config.toml. Login creates a normal user API key, not a platform admin key.",
     flags: [
       "--server-url <url>: use a non-default API server",
       "--api-key <key>: write a provided key without browser login",
+      "--login email|google: choose email-code login or Google browser login",
       "--manual: write config without logging in",
-      "--no-browser: print the login URL instead of opening it",
+      "--no-browser: print the Google login URL instead of opening it",
     ],
-    transcript: `$ pufferfs init
+    transcript: `$ pufferfs init --login email
+Email: me@example.com
+Sent a login code to me@example.com. It expires in 10 minutes.
+Code: 12345678
+Config written to /Users/me/.tpfs/config.toml
+PufferFS CLI connected as me@example.com.
+
+$ pufferfs init --login google
 Opening browser to connect your PufferFS account...
 Config written to /Users/me/.tpfs/config.toml
 PufferFS CLI connected as me@example.com.
@@ -159,6 +167,71 @@ Restarted installed pufferfs services.`,
 
 const ENDPOINTS = [
   {
+    operationId: "listAuthProviders",
+    method: "GET",
+    path: "/auth/providers",
+    summary: "List enabled interactive login providers.",
+    auth: "No authentication required.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Provider availability.", `{
+  "email_code": true,
+  "google": true
+}`],
+    ],
+  },
+  {
+    operationId: "startEmailLogin",
+    method: "POST",
+    path: "/auth/email/start",
+    summary: "Send an email login code.",
+    auth: "No authentication required.",
+    requestBody: `{
+  "email": "user@example.com",
+  "flow": "web"
+}`,
+    requestFields: [
+      ["email", "string", "required", "Address that will receive the one-time login code."],
+      ["flow", "\"web\" | \"cli\"", "optional", "Use web for dashboard sessions and cli for pufferfs init."],
+      ["cli_redirect_uri", "string", "required for cli", "Loopback callback URI for CLI login continuity."],
+    ],
+    responses: [
+      ["200", "Code was sent.", `{
+  "challenge_id": "elc_...",
+  "expires_in": 600,
+  "resend_after": 30
+}`],
+      ["429", "Too many recent code requests.", `{
+  "error": "too many login codes requested; try again later"
+}`],
+    ],
+  },
+  {
+    operationId: "verifyEmailLogin",
+    method: "POST",
+    path: "/auth/email/verify",
+    summary: "Verify an email login code.",
+    auth: "No authentication required.",
+    requestBody: `{
+  "challenge_id": "elc_...",
+  "code": "12345678"
+}`,
+    requestFields: [
+      ["challenge_id", "string", "required", "Challenge returned by /auth/email/start."],
+      ["code", "string", "required", "One-time code from email."],
+    ],
+    responses: [
+      ["200", "Web flow sets pf_session; CLI flow returns a scoped API key.", `{
+  "status": "ok",
+  "api_key": "pfs_..."
+}`],
+      ["400", "Code is invalid, expired, consumed, or over the attempt limit.", `{
+  "error": "invalid or expired login code"
+}`],
+    ],
+  },
+  {
     operationId: "createApiKey",
     method: "POST",
     path: "/auth/api-keys",
@@ -249,7 +322,7 @@ const ENDPOINTS = [
   "role": "editor"
 }`,
     requestFields: [
-      ["email", "string", "required", "Email address that can accept the invite on next OAuth sign-in."],
+      ["email", "string", "required", "Email address that can accept the invite on next sign-in."],
       ["role", "\"owner\" | \"admin\" | \"editor\" | \"viewer\"", "required", "Starting role. Owners can invite any role; admins can invite only editor or viewer."],
     ],
     responses: [

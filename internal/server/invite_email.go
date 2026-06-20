@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -32,12 +33,24 @@ type OrgInviteEmail struct {
 	InviterEmail string
 }
 
-// InviteEmailSender sends best-effort org invite notifications.
-type InviteEmailSender interface {
+// TransactionalEmailSender sends best-effort product emails.
+type TransactionalEmailSender interface {
 	SendOrgInvite(ctx context.Context, invite OrgInviteEmail) error
+	SendLoginCode(ctx context.Context, login LoginCodeEmail) error
 }
 
-type SESInviteEmailConfig struct {
+// InviteEmailSender is kept as a compatibility alias for older server wiring.
+type InviteEmailSender = TransactionalEmailSender
+
+// LoginCodeEmail is the data needed to send a one-time email login code.
+type LoginCodeEmail struct {
+	To        string
+	Code      string
+	ExpiresIn time.Duration
+	AppURL    string
+}
+
+type SESTransactionalEmailConfig struct {
 	Region              string
 	EndpointURL         string
 	FromEmail           string
@@ -50,12 +63,16 @@ type SESInviteEmailConfig struct {
 	FeedbackIdentityARN string
 }
 
-type SESInviteEmailSender struct {
+type SESTransactionalEmailSender struct {
 	client *sesv2.Client
-	cfg    SESInviteEmailConfig
+	cfg    SESTransactionalEmailConfig
 }
 
-func NewSESInviteEmailSender(ctx context.Context, cfg SESInviteEmailConfig) (*SESInviteEmailSender, error) {
+// SESInviteEmailConfig and SESInviteEmailSender are compatibility aliases.
+type SESInviteEmailConfig = SESTransactionalEmailConfig
+type SESInviteEmailSender = SESTransactionalEmailSender
+
+func NewSESTransactionalEmailSender(ctx context.Context, cfg SESTransactionalEmailConfig) (*SESTransactionalEmailSender, error) {
 	cfg.FromEmail = strings.TrimSpace(cfg.FromEmail)
 	cfg.FromName = strings.TrimSpace(cfg.FromName)
 	cfg.AppURL = strings.TrimRight(strings.TrimSpace(cfg.AppURL), "/")
@@ -99,15 +116,19 @@ func NewSESInviteEmailSender(ctx context.Context, cfg SESInviteEmailConfig) (*SE
 			o.BaseEndpoint = aws.String(cfg.EndpointURL)
 		}
 	})
-	return &SESInviteEmailSender{client: client, cfg: cfg}, nil
+	return &SESTransactionalEmailSender{client: client, cfg: cfg}, nil
 }
 
-func NewInviteEmailSenderFromEnv(ctx context.Context) (*SESInviteEmailSender, error) {
-	from := strings.TrimSpace(os.Getenv("INVITE_EMAIL_FROM"))
+func NewSESInviteEmailSender(ctx context.Context, cfg SESInviteEmailConfig) (*SESInviteEmailSender, error) {
+	return NewSESTransactionalEmailSender(ctx, cfg)
+}
+
+func NewTransactionalEmailSenderFromEnv(ctx context.Context) (*SESTransactionalEmailSender, error) {
+	from := firstEnv("TRANSACTIONAL_EMAIL_FROM", "INVITE_EMAIL_FROM")
 	if from == "" {
 		return nil, nil
 	}
-	appURL := strings.TrimSpace(os.Getenv("INVITE_EMAIL_APP_URL"))
+	appURL := firstEnv("TRANSACTIONAL_EMAIL_APP_URL", "INVITE_EMAIL_APP_URL")
 	if appURL == "" {
 		appURL = strings.TrimSpace(os.Getenv("FRONTEND_URL"))
 	}
@@ -118,12 +139,12 @@ func NewInviteEmailSenderFromEnv(ctx context.Context) (*SESInviteEmailSender, er
 	if region == "" {
 		region = strings.TrimSpace(os.Getenv("AWS_DEFAULT_REGION"))
 	}
-	return NewSESInviteEmailSender(ctx, SESInviteEmailConfig{
+	return NewSESTransactionalEmailSender(ctx, SESTransactionalEmailConfig{
 		Region:              region,
 		EndpointURL:         os.Getenv("SES_ENDPOINT_URL"),
 		FromEmail:           from,
-		FromName:            os.Getenv("INVITE_EMAIL_FROM_NAME"),
-		ReplyTo:             splitEmailList(os.Getenv("INVITE_EMAIL_REPLY_TO")),
+		FromName:            firstEnv("TRANSACTIONAL_EMAIL_FROM_NAME", "INVITE_EMAIL_FROM_NAME"),
+		ReplyTo:             splitEmailList(firstEnv("TRANSACTIONAL_EMAIL_REPLY_TO", "INVITE_EMAIL_REPLY_TO")),
 		AppURL:              appURL,
 		ConfigurationSet:    os.Getenv("SES_CONFIGURATION_SET"),
 		FromIdentityARN:     os.Getenv("SES_FROM_IDENTITY_ARN"),
@@ -132,7 +153,11 @@ func NewInviteEmailSenderFromEnv(ctx context.Context) (*SESInviteEmailSender, er
 	})
 }
 
-func (s *SESInviteEmailSender) SendOrgInvite(ctx context.Context, invite OrgInviteEmail) error {
+func NewInviteEmailSenderFromEnv(ctx context.Context) (*SESInviteEmailSender, error) {
+	return NewTransactionalEmailSenderFromEnv(ctx)
+}
+
+func (s *SESTransactionalEmailSender) SendOrgInvite(ctx context.Context, invite OrgInviteEmail) error {
 	to := strings.TrimSpace(invite.To)
 	if _, err := mail.ParseAddress(to); err != nil {
 		return fmt.Errorf("parsing invite recipient: %w", err)
@@ -178,14 +203,58 @@ func (s *SESInviteEmailSender) SendOrgInvite(ctx context.Context, invite OrgInvi
 	return nil
 }
 
-func (s *SESInviteEmailSender) fromAddress() string {
+func (s *SESTransactionalEmailSender) SendLoginCode(ctx context.Context, login LoginCodeEmail) error {
+	to := strings.TrimSpace(login.To)
+	if _, err := mail.ParseAddress(to); err != nil {
+		return fmt.Errorf("parsing login recipient: %w", err)
+	}
+	subject, textBody, htmlBody := s.renderLoginCode(login)
+	charset := "UTF-8"
+	from := s.fromAddress()
+	input := &sesv2.SendEmailInput{
+		FromEmailAddress: &from,
+		Destination: &types.Destination{
+			ToAddresses: []string{to},
+		},
+		Content: &types.EmailContent{
+			Simple: &types.Message{
+				Subject: &types.Content{Data: &subject, Charset: &charset},
+				Body: &types.Body{
+					Text: &types.Content{Data: &textBody, Charset: &charset},
+					Html: &types.Content{Data: &htmlBody, Charset: &charset},
+				},
+			},
+		},
+	}
+	if len(s.cfg.ReplyTo) > 0 {
+		input.ReplyToAddresses = s.cfg.ReplyTo
+	}
+	if s.cfg.ConfigurationSet != "" {
+		input.ConfigurationSetName = &s.cfg.ConfigurationSet
+	}
+	if s.cfg.FromIdentityARN != "" {
+		input.FromEmailAddressIdentityArn = &s.cfg.FromIdentityARN
+	}
+	if s.cfg.FeedbackEmail != "" {
+		input.FeedbackForwardingEmailAddress = &s.cfg.FeedbackEmail
+	}
+	if s.cfg.FeedbackIdentityARN != "" {
+		input.FeedbackForwardingEmailAddressIdentityArn = &s.cfg.FeedbackIdentityARN
+	}
+	if _, err := s.client.SendEmail(ctx, input); err != nil {
+		return fmt.Errorf("sending SES login code email: %w", err)
+	}
+	return nil
+}
+
+func (s *SESTransactionalEmailSender) fromAddress() string {
 	if s.cfg.FromName == "" {
 		return s.cfg.FromEmail
 	}
 	return (&mail.Address{Name: s.cfg.FromName, Address: s.cfg.FromEmail}).String()
 }
 
-func (s *SESInviteEmailSender) renderInvite(invite OrgInviteEmail) (subject, textBody, htmlBody string) {
+func (s *SESTransactionalEmailSender) renderInvite(invite OrgInviteEmail) (subject, textBody, htmlBody string) {
 	orgName := strings.TrimSpace(invite.OrgName)
 	if orgName == "" {
 		orgName = "a PufferFS organization"
@@ -228,6 +297,38 @@ func (s *SESInviteEmailSender) renderInvite(invite OrgInviteEmail) (subject, tex
 	return subject, textBody, htmlBody
 }
 
+func (s *SESTransactionalEmailSender) renderLoginCode(login LoginCodeEmail) (subject, textBody, htmlBody string) {
+	expires := login.ExpiresIn
+	if expires <= 0 {
+		expires = 10 * time.Minute
+	}
+	minutes := int(expires.Round(time.Minute).Minutes())
+	if minutes < 1 {
+		minutes = 1
+	}
+	appURL := strings.TrimRight(strings.TrimSpace(login.AppURL), "/")
+	if appURL == "" {
+		appURL = s.cfg.AppURL
+	}
+	loginURL := appURL + "/login"
+	subject = "Your PufferFS login code"
+	textBody = fmt.Sprintf("Your PufferFS login code is %s.\n\nIt expires in %d minutes. If you did not request this code, you can ignore this email.\n\n%s\n", login.Code, minutes, loginURL)
+
+	escapedCode := html.EscapeString(login.Code)
+	escapedURL := html.EscapeString(loginURL)
+	htmlBody = fmt.Sprintf(`<!doctype html>
+<html>
+  <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111827;line-height:1.5">
+    <p>Your PufferFS login code is:</p>
+    <p style="font-size:24px;font-weight:700;letter-spacing:4px">%s</p>
+    <p>This code expires in %d minutes.</p>
+    <p><a href="%s" style="display:inline-block;background:#111827;color:#ffffff;text-decoration:none;padding:10px 14px;border-radius:6px">Open PufferFS</a></p>
+    <p style="color:#6b7280;font-size:13px">If you did not request this code, you can ignore this email.</p>
+  </body>
+</html>`, escapedCode, minutes, escapedURL)
+	return subject, textBody, htmlBody
+}
+
 func splitEmailList(raw string) []string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -241,4 +342,13 @@ func splitEmailList(raw string) []string {
 		}
 	}
 	return out
+}
+
+func firstEnv(names ...string) string {
+	for _, name := range names {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }

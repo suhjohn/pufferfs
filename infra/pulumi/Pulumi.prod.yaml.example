@@ -42,17 +42,19 @@ config:
   pufferfs:webHttpsReady: false
   pufferfs:apiHttpsReady: false
 
-  # Invite email through AWS SES (optional). Leave inviteEmailFrom unset to keep
-  # invites database-only. Set inviteEmailIdentity to have Pulumi create the SES
-  # identity and output DKIM CNAMEs; omit it if using an already-verified identity.
-  # pufferfs:inviteEmailFrom: "team@example.com"
-  # pufferfs:inviteEmailFromName: "PufferFS"
-  # pufferfs:inviteEmailReplyTo: "support@example.com"
-  # pufferfs:inviteEmailAppUrl: "https://example.com"
-  # pufferfs:inviteEmailSesRegion: "us-west-2"
-  # pufferfs:inviteEmailIdentity: "example.com"
-  # pufferfs:inviteEmailIdentityArn: "arn:aws:ses:us-west-2:123456789012:identity/example.com"
-  # pufferfs:inviteEmailConfigurationSet: "optional-ses-config-set"
+  # Transactional email through AWS SES. Required for email-code login and also
+  # used for invite notifications. Set transactionalEmailIdentity to have Pulumi
+  # create the SES identity and output DKIM CNAMEs; omit it if using an already
+  # verified identity.
+  pufferfs:enableEmailLogin: true
+  # pufferfs:transactionalEmailFrom: "team@example.com"
+  # pufferfs:transactionalEmailFromName: "PufferFS"
+  # pufferfs:transactionalEmailReplyTo: "support@example.com"
+  # pufferfs:transactionalEmailAppUrl: "https://example.com"
+  # pufferfs:transactionalEmailSesRegion: "us-west-2"
+  # pufferfs:transactionalEmailIdentity: "example.com"
+  # pufferfs:transactionalEmailIdentityArn: "arn:aws:ses:us-west-2:123456789012:identity/example.com"
+  # pufferfs:transactionalEmailConfigurationSet: "optional-ses-config-set"
 
   # Billing (optional). Leave disabled to deploy without payments.
   pufferfs:enableBilling: false

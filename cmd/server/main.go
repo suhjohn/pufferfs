@@ -89,6 +89,8 @@ func main() {
 		Domain: strings.TrimSpace(os.Getenv("COOKIE_DOMAIN")),
 		Secure: strings.HasPrefix(frontendURL, "https://"),
 	}
+	srv.SetSessionAuth(jwtSecret, cookieCfg, frontendURL)
+	srv.SetEmailLoginEnabled(!strings.EqualFold(strings.TrimSpace(os.Getenv("ENABLE_EMAIL_LOGIN")), "false"))
 
 	// Billing (Stripe) — optional. Enabled only when ENABLE_BILLING=true and a
 	// secret key is present, mirroring the OAuth wiring below.
@@ -107,11 +109,11 @@ func main() {
 		}
 	}
 
-	if inviteSender, err := server.NewInviteEmailSenderFromEnv(context.Background()); err != nil {
-		log.Printf("Invite email disabled: %v", err)
-	} else if inviteSender != nil {
-		srv.SetInviteEmailSender(inviteSender)
-		log.Println("Invite email (SES) enabled")
+	if emailSender, err := server.NewTransactionalEmailSenderFromEnv(context.Background()); err != nil {
+		log.Printf("Transactional email disabled: %v", err)
+	} else if emailSender != nil {
+		srv.SetTransactionalEmailSender(emailSender)
+		log.Println("Transactional email (SES) enabled")
 	}
 
 	// Auth middleware: supports both JWT and tenant API key for normal routes.
@@ -121,6 +123,10 @@ func main() {
 	topMux := http.NewServeMux()
 	topMux.Handle("/admin/", adminHandler)
 	topMux.Handle("/", appHandler)
+	topMux.HandleFunc("POST /auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		auth.ClearSessionCookie(w, cookieCfg)
+		w.WriteHeader(http.StatusNoContent)
+	})
 
 	// OAuth2 handler (Google)
 	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
@@ -131,6 +137,7 @@ func main() {
 	}
 
 	if googleClientID != "" && googleClientSecret != "" {
+		srv.SetGoogleLoginEnabled(true)
 		oauthHandler := auth.NewOAuthHandler(auth.OAuthConfig{
 			GoogleClientID:     googleClientID,
 			GoogleClientSecret: googleClientSecret,
@@ -155,11 +162,10 @@ func main() {
 					},
 				})
 			},
-		}, db.UpsertUser)
+		}, db.CompleteLogin)
 
 		topMux.HandleFunc("GET /auth/google", oauthHandler.HandleLogin)
 		topMux.HandleFunc("GET /auth/callback", oauthHandler.HandleCallback)
-		topMux.HandleFunc("POST /auth/logout", oauthHandler.HandleLogout)
 
 		log.Println("Google OAuth2 enabled")
 	} else {

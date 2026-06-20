@@ -126,6 +126,25 @@ pulumi config set --secret pufferfs:googleClientSecret "$GOOGLE_CLIENT_SECRET"
 pulumi config set pufferfs:oauthRedirectUrl https://api.pufferfs.com/auth/callback
 ```
 
+### Transactional Email
+
+Email-code login and invite notifications use SES. Existing `inviteEmail*`
+config keys still work as aliases, but new deployments should use the
+transactional names.
+
+```sh
+pulumi config set pufferfs:enableEmailLogin true
+pulumi config set pufferfs:transactionalEmailFrom team@pufferfs.com
+pulumi config set pufferfs:transactionalEmailIdentity pufferfs.com
+pulumi config set pufferfs:transactionalEmailAppUrl https://pufferfs.com
+```
+
+If the SES identity already exists, set
+`pufferfs:transactionalEmailIdentityArn` instead of
+`pufferfs:transactionalEmailIdentity`. Pulumi exports
+`transactionalEmailDkimValidationRecords` and
+`transactionalEmailIdentityVerificationStatus` for DNS verification.
+
 ### Payment (optional)
 
 Billing is **off by default**. Deploy without payments and nothing Stripe is

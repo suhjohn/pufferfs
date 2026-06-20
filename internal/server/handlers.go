@@ -40,15 +40,20 @@ type objectStore interface {
 
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
-	db        *DB
-	s3        objectStore
-	modal     *ModalClient
-	tp        *TPClient
-	queue     queue.Queue
-	billing   *StripeClient
-	invites   InviteEmailSender
-	analytics productanalytics.Capturer
-	mux       *http.ServeMux
+	db          *DB
+	s3          objectStore
+	modal       *ModalClient
+	tp          *TPClient
+	queue       queue.Queue
+	billing     *StripeClient
+	emails      TransactionalEmailSender
+	jwtSecret   []byte
+	cookie      auth.CookieConfig
+	frontend    string
+	emailLogin  bool
+	googleLogin bool
+	analytics   productanalytics.Capturer
+	mux         *http.ServeMux
 }
 
 // New creates a new Server with all dependencies.
@@ -58,12 +63,13 @@ func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
 
 func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Server {
 	s := &Server{
-		db:        db,
-		s3:        s3,
-		modal:     modal,
-		tp:        tp,
-		analytics: productanalytics.Noop{},
-		mux:       http.NewServeMux(),
+		db:         db,
+		s3:         s3,
+		modal:      modal,
+		tp:         tp,
+		emailLogin: true,
+		analytics:  productanalytics.Noop{},
+		mux:        http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -77,7 +83,28 @@ func (s *Server) SetQueue(q queue.Queue) {
 
 // SetInviteEmailSender enables best-effort email notifications for org invites.
 func (s *Server) SetInviteEmailSender(sender InviteEmailSender) {
-	s.invites = sender
+	s.emails = sender
+}
+
+// SetTransactionalEmailSender enables best-effort transactional product emails.
+func (s *Server) SetTransactionalEmailSender(sender TransactionalEmailSender) {
+	s.emails = sender
+}
+
+// SetSessionAuth configures browser/CLI session issuance for non-OAuth login
+// providers such as email-code.
+func (s *Server) SetSessionAuth(jwtSecret []byte, cookie auth.CookieConfig, frontendURL string) {
+	s.jwtSecret = jwtSecret
+	s.cookie = cookie
+	s.frontend = strings.TrimRight(strings.TrimSpace(frontendURL), "/")
+}
+
+func (s *Server) SetEmailLoginEnabled(enabled bool) {
+	s.emailLogin = enabled
+}
+
+func (s *Server) SetGoogleLoginEnabled(enabled bool) {
+	s.googleLogin = enabled
 }
 
 // SetAnalytics enables best-effort product analytics.
@@ -102,6 +129,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /cli/version", s.handleCLIVersion)
 
 	// Auth
+	s.mux.HandleFunc("GET /auth/providers", s.handleAuthProviders)
+	s.mux.HandleFunc("POST /auth/email/start", s.handleEmailLoginStart)
+	s.mux.HandleFunc("POST /auth/email/resend", s.handleEmailLoginStart)
+	s.mux.HandleFunc("POST /auth/email/verify", s.handleEmailLoginVerify)
 	s.mux.HandleFunc("GET /auth/me", s.handleMe)
 	s.mux.HandleFunc("POST /auth/api-keys", s.handleCreateAPIKey)
 	s.mux.HandleFunc("GET /auth/api-keys", s.handleListAPIKeys)
@@ -240,6 +271,13 @@ func cleanSHAEnv(platform string) string {
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
+
+func (s *Server) handleAuthProviders(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"email_code": s.emailLogin && s.emails != nil,
+		"google":     s.googleLogin,
+	})
+}
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
@@ -586,11 +624,11 @@ func (s *Server) handleCreateInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := orgInviteResponse{OrgInvite: *invite}
-	if s.invites != nil {
+	if s.emails != nil {
 		org, err := s.db.GetOrganization(r.Context(), id.OrgID)
 		if err != nil {
 			resp.EmailError = "invite email was not sent: " + err.Error()
-		} else if err := s.invites.SendOrgInvite(r.Context(), OrgInviteEmail{
+		} else if err := s.emails.SendOrgInvite(r.Context(), OrgInviteEmail{
 			To:           invite.Email,
 			Role:         invite.Role,
 			OrgName:      org.Name,

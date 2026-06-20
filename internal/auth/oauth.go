@@ -46,9 +46,29 @@ type UserInfo struct {
 	Picture string `json:"picture"`
 }
 
-// UserUpsertFunc is called to create-or-update a user after OAuth, returning
-// (userID, orgID, role).
-type UserUpsertFunc func(ctx context.Context, info UserInfo, provider string) (userID, orgID string, role Role, err error)
+// VerifiedIdentity is the provider-neutral identity proof produced by OAuth,
+// email-code, or future login providers.
+type VerifiedIdentity struct {
+	Provider      string
+	ProviderID    string
+	Email         string
+	Name          string
+	AvatarURL     string
+	EmailVerified bool
+}
+
+// LoginResult is the canonical session subject resolved after an identity is
+// verified and mapped to a PufferFS user/org membership.
+type LoginResult struct {
+	UserID string
+	OrgID  string
+	Role   Role
+	Email  string
+}
+
+// LoginCompleteFunc creates or updates a user identity after a provider has
+// verified control of an email address.
+type LoginCompleteFunc func(ctx context.Context, identity VerifiedIdentity) (LoginResult, error)
 
 // APIKeyCreateFunc creates a raw API key for a user. It is used by the CLI
 // browser login flow after OAuth succeeds.
@@ -71,7 +91,7 @@ type OAuthLoginSucceededFunc func(ctx context.Context, event OAuthLoginEvent)
 type OAuthHandler struct {
 	oauthCfg       *oauth2.Config
 	jwtSecret      []byte
-	upsertUser     UserUpsertFunc
+	completeLogin  LoginCompleteFunc
 	createAPIKey   APIKeyCreateFunc
 	loginSucceeded OAuthLoginSucceededFunc
 	frontendURL    string
@@ -79,7 +99,7 @@ type OAuthHandler struct {
 }
 
 // NewOAuthHandler creates a handler for Google OAuth2.
-func NewOAuthHandler(cfg OAuthConfig, upsertUser UserUpsertFunc) *OAuthHandler {
+func NewOAuthHandler(cfg OAuthConfig, completeLogin LoginCompleteFunc) *OAuthHandler {
 	return &OAuthHandler{
 		oauthCfg: &oauth2.Config{
 			ClientID:     cfg.GoogleClientID,
@@ -89,7 +109,7 @@ func NewOAuthHandler(cfg OAuthConfig, upsertUser UserUpsertFunc) *OAuthHandler {
 			Endpoint:     google.Endpoint,
 		},
 		jwtSecret:      cfg.JWTSecret,
-		upsertUser:     upsertUser,
+		completeLogin:  completeLogin,
 		createAPIKey:   cfg.CreateAPIKey,
 		loginSucceeded: cfg.LoginSucceeded,
 		frontendURL:    strings.TrimRight(cfg.FrontendURL, "/"),
@@ -158,8 +178,15 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upsert user + resolve org
-	userID, orgID, role, err := h.upsertUser(r.Context(), info, "google")
+	// Resolve provider-neutral identity to a PufferFS user + org membership.
+	login, err := h.completeLogin(r.Context(), VerifiedIdentity{
+		Provider:      "google",
+		ProviderID:    info.ID,
+		Email:         info.Email,
+		Name:          info.Name,
+		AvatarURL:     info.Picture,
+		EmailVerified: true,
+	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"user setup failed: %s"}`, err), http.StatusInternalServerError)
 		return
@@ -167,7 +194,7 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Generate JWT
 	const sessionTTL = 24 * time.Hour
-	jwtToken, err := GenerateJWT(h.jwtSecret, userID, orgID, role, info.Email, sessionTTL)
+	jwtToken, err := GenerateJWT(h.jwtSecret, login.UserID, login.OrgID, login.Role, login.Email, sessionTTL)
 	if err != nil {
 		http.Error(w, `{"error":"generating token"}`, http.StatusInternalServerError)
 		return
@@ -175,17 +202,17 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	if h.loginSucceeded != nil {
 		h.loginSucceeded(r.Context(), OAuthLoginEvent{
-			UserID:   userID,
-			OrgID:    orgID,
-			Email:    info.Email,
-			Role:     role,
+			UserID:   login.UserID,
+			OrgID:    login.OrgID,
+			Email:    login.Email,
+			Role:     login.Role,
 			Flow:     state.Flow,
 			Provider: "google",
 		})
 	}
 
 	if state.Flow == "cli" {
-		h.finishCLILogin(w, r, state, orgID, userID, info.Email)
+		h.finishCLILogin(w, r, state, login.OrgID, login.UserID, login.Email)
 		return
 	}
 
@@ -200,9 +227,9 @@ func (h *OAuthHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
 		"token":   jwtToken,
-		"user_id": userID,
-		"org_id":  orgID,
-		"email":   info.Email,
+		"user_id": login.UserID,
+		"org_id":  login.OrgID,
+		"email":   login.Email,
 		"name":    info.Name,
 	})
 }

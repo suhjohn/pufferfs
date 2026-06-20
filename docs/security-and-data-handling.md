@@ -36,15 +36,17 @@ Three credential types:
    afterward. Resolved to an org, user, role, and scope set. Newly created
    user keys must include an explicit non-empty scope list.
 2. **Session JWTs** — HS256, signed with `JWT_SECRET`, 24-hour TTL. Carried in
-   the `Authorization` header or the `pf_session` httpOnly cookie. Issued by the
-   Google OAuth flow. OAuth callbacks require signed state bound to a
-   short-lived httpOnly state cookie.
+   the `Authorization` header or the `pf_session` httpOnly cookie. Issued by
+   login providers such as email-code and Google OAuth. OAuth callbacks require
+   signed state bound to a short-lived httpOnly state cookie; email-code
+   challenges are short-lived, attempt-limited, and stored as HMAC hashes.
 3. **Platform admin key** — a separate key for `/admin/*`, compared in constant
    time against `PUFFERFS_ADMIN_KEY_HASH`. If unset, all admin routes return
    `403`.
 
 Unauthenticated routes are limited to health checks, `GET /cli/version`, the
-OAuth endpoints, and the Stripe webhook (which is instead verified by signature).
+login endpoints, and the Stripe webhook (which is instead verified by
+signature).
 
 ### Session cookie properties
 
@@ -203,4 +205,4 @@ These are real, in-code limitations to account for in a deployment:
       state, and vectors.
 - [ ] Use ACL deny prefixes and ignore files for sensitive subtrees; do not rely
       on filename-based secret filtering alone.
-- [ ] Harden OAuth state before exposing Google login publicly.
+- [x] Harden OAuth state before exposing Google login publicly.

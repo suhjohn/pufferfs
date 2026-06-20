@@ -45,6 +45,21 @@ type RootStateRecord struct {
 	Ref   string
 }
 
+type EmailLoginChallenge struct {
+	ID             string
+	Email          string
+	CodeHash       string
+	Flow           string
+	CLIRedirectURI string
+	Attempts       int
+	MaxAttempts    int
+	RequestIPHash  string
+	UserAgentHash  string
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
+	ConsumedAt     *time.Time
+}
+
 var errSyncInProgress = errors.New("sync already in progress for root")
 var errStaleSyncBase = errors.New("sync base generation is stale")
 
@@ -116,6 +131,43 @@ func (db *DB) migrateFallback() error {
 		);
 		ALTER TABLE users ADD COLUMN IF NOT EXISTS external_id TEXT;
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id ON users(external_id) WHERE external_id IS NOT NULL;
+
+		CREATE TABLE IF NOT EXISTS user_identities (
+			id             TEXT PRIMARY KEY,
+			user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			provider       TEXT NOT NULL,
+			provider_id    TEXT NOT NULL DEFAULT '',
+			email          TEXT NOT NULL,
+			email_verified BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_id
+			ON user_identities(provider, provider_id)
+			WHERE provider_id <> '';
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_email
+			ON user_identities(provider, email)
+			WHERE provider_id = '';
+		CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id);
+
+		CREATE TABLE IF NOT EXISTS email_login_challenges (
+			id               TEXT PRIMARY KEY,
+			email            TEXT NOT NULL,
+			code_hash        TEXT NOT NULL,
+			flow             TEXT NOT NULL DEFAULT 'web',
+			cli_redirect_uri TEXT NOT NULL DEFAULT '',
+			attempts         INT NOT NULL DEFAULT 0,
+			max_attempts     INT NOT NULL DEFAULT 5,
+			request_ip_hash  TEXT NOT NULL DEFAULT '',
+			user_agent_hash  TEXT NOT NULL DEFAULT '',
+			created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at       TIMESTAMPTZ NOT NULL,
+			consumed_at      TIMESTAMPTZ
+		);
+		CREATE INDEX IF NOT EXISTS idx_email_login_challenges_email_created
+			ON email_login_challenges(email, created_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_email_login_challenges_expires
+			ON email_login_challenges(expires_at);
 
 		CREATE TABLE IF NOT EXISTS org_members (
 			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -399,85 +451,198 @@ func (db *DB) ProvisionOrganization(ctx context.Context, id, name, slug, externa
 // Users
 // ---------------------------------------------------------------------------
 
-// UpsertUser creates or updates a user from OAuth info, returning the user ID.
-// Also creates a personal org if the user is new.
-func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider string) (userID, orgID string, role auth.Role, err error) {
-	info.Email = normalizeEmail(info.Email)
-
-	// Check if user exists
-	var existingID string
-	err = db.pool.QueryRow(ctx,
-		`SELECT id FROM users WHERE email = $1`, info.Email,
-	).Scan(&existingID)
-
-	if err == nil {
-		// User exists — update profile
-		_, err = db.pool.Exec(ctx,
-			`UPDATE users SET name = $1, avatar_url = $2, provider_id = $3 WHERE id = $4`,
-			info.Name, info.Picture, info.ID, existingID,
-		)
-		if err != nil {
-			return "", "", "", fmt.Errorf("updating user: %w", err)
-		}
-
-		invitedOrgID, invitedRole, accepted, err := db.acceptPendingOrgInvite(ctx, existingID, info.Email)
-		if err != nil {
-			return "", "", "", fmt.Errorf("accepting org invite: %w", err)
-		}
-		if accepted {
-			return existingID, invitedOrgID, invitedRole, nil
-		}
-
-		// Find their org membership (pick first org)
-		err = db.pool.QueryRow(ctx,
-			`SELECT org_id, role FROM org_members WHERE user_id = $1 LIMIT 1`, existingID,
-		).Scan(&orgID, &role)
-		if err != nil {
-			return "", "", "", fmt.Errorf("looking up org membership: %w", err)
-		}
-		return existingID, orgID, role, nil
-	}
-
-	// New user — create user + personal org
-	userID = uuid.New().String()
-	_, err = db.pool.Exec(ctx,
-		`INSERT INTO users (id, email, name, avatar_url, provider, provider_id, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-		userID, info.Email, info.Name, info.Picture, provider, info.ID,
-	)
-	if err != nil {
-		return "", "", "", fmt.Errorf("creating user: %w", err)
-	}
-
-	invitedOrgID, invitedRole, accepted, err := db.acceptPendingOrgInvite(ctx, userID, info.Email)
-	if err != nil {
-		return "", "", "", fmt.Errorf("accepting org invite: %w", err)
-	}
-	if accepted {
-		return userID, invitedOrgID, invitedRole, nil
-	}
-
-	// Create a personal org
-	slug := strings.Split(info.Email, "@")[0]
-	org, err := db.CreateOrganization(ctx, info.Name+"'s Workspace", slug)
-	if err != nil {
-		return "", "", "", fmt.Errorf("creating personal org: %w", err)
-	}
-
-	// Add user as owner
-	_, err = db.pool.Exec(ctx,
-		`INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'owner')`,
-		org.ID, userID,
-	)
-	if err != nil {
-		return "", "", "", fmt.Errorf("adding org membership: %w", err)
-	}
-
-	return userID, org.ID, auth.RoleOwner, nil
-}
-
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+// UpsertUser is retained for older OAuth call sites. New providers should call
+// CompleteLogin so identity, invite, and org resolution remain provider-neutral.
+func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider string) (userID, orgID string, role auth.Role, err error) {
+	login, err := db.CompleteLogin(ctx, auth.VerifiedIdentity{
+		Provider:      provider,
+		ProviderID:    info.ID,
+		Email:         info.Email,
+		Name:          info.Name,
+		AvatarURL:     info.Picture,
+		EmailVerified: true,
+	})
+	if err != nil {
+		return "", "", "", err
+	}
+	return login.UserID, login.OrgID, login.Role, nil
+}
+
+// CompleteLogin resolves a verified provider identity into a PufferFS user,
+// accepts pending email invites, and returns the effective org membership.
+func (db *DB) CompleteLogin(ctx context.Context, identity auth.VerifiedIdentity) (auth.LoginResult, error) {
+	identity.Email = normalizeEmail(identity.Email)
+	identity.Provider = strings.TrimSpace(identity.Provider)
+	identity.ProviderID = strings.TrimSpace(identity.ProviderID)
+	identity.Name = strings.TrimSpace(identity.Name)
+	identity.AvatarURL = strings.TrimSpace(identity.AvatarURL)
+	if identity.Email == "" {
+		return auth.LoginResult{}, fmt.Errorf("email is required")
+	}
+	if identity.Provider == "" {
+		return auth.LoginResult{}, fmt.Errorf("provider is required")
+	}
+
+	userID, err := db.findOrCreateLoginUser(ctx, identity)
+	if err != nil {
+		return auth.LoginResult{}, err
+	}
+	if err := db.upsertUserIdentity(ctx, userID, identity); err != nil {
+		return auth.LoginResult{}, err
+	}
+
+	invitedOrgID, invitedRole, accepted, err := db.acceptPendingOrgInvite(ctx, userID, identity.Email)
+	if err != nil {
+		return auth.LoginResult{}, fmt.Errorf("accepting org invite: %w", err)
+	}
+	if accepted {
+		return auth.LoginResult{UserID: userID, OrgID: invitedOrgID, Role: invitedRole, Email: identity.Email}, nil
+	}
+
+	var orgID string
+	var rawRole string
+	err = db.pool.QueryRow(ctx,
+		`SELECT org_id, role FROM org_members WHERE user_id = $1 ORDER BY joined_at LIMIT 1`,
+		userID,
+	).Scan(&orgID, &rawRole)
+	if err == nil {
+		return auth.LoginResult{UserID: userID, OrgID: orgID, Role: auth.Role(rawRole), Email: identity.Email}, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return auth.LoginResult{}, fmt.Errorf("looking up org membership: %w", err)
+	}
+
+	org, err := db.CreateOrganization(ctx, workspaceName(identity), personalOrgSlug(identity.Email))
+	if err != nil {
+		return auth.LoginResult{}, fmt.Errorf("creating personal org: %w", err)
+	}
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO org_members (org_id, user_id, role) VALUES ($1, $2, 'owner')`,
+		org.ID, userID,
+	); err != nil {
+		return auth.LoginResult{}, fmt.Errorf("adding org membership: %w", err)
+	}
+	return auth.LoginResult{UserID: userID, OrgID: org.ID, Role: auth.RoleOwner, Email: identity.Email}, nil
+}
+
+func (db *DB) findOrCreateLoginUser(ctx context.Context, identity auth.VerifiedIdentity) (string, error) {
+	var existingID string
+	var existingProvider string
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, provider FROM users WHERE email = $1`,
+		identity.Email,
+	).Scan(&existingID, &existingProvider)
+	if err == nil {
+		nameExpr := `name`
+		avatarExpr := `avatar_url`
+		args := []any{existingID}
+		if identity.Name != "" {
+			nameExpr = fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, identity.Name)
+		}
+		if identity.AvatarURL != "" {
+			avatarExpr = fmt.Sprintf("$%d", len(args)+1)
+			args = append(args, identity.AvatarURL)
+		}
+		if existingProvider == identity.Provider && identity.ProviderID != "" {
+			args = append(args, identity.ProviderID)
+			if _, err := db.pool.Exec(ctx,
+				fmt.Sprintf(`UPDATE users SET name = %s, avatar_url = %s, provider_id = $%d WHERE id = $1`, nameExpr, avatarExpr, len(args)),
+				args...,
+			); err != nil {
+				return "", fmt.Errorf("updating user: %w", err)
+			}
+		} else if _, err := db.pool.Exec(ctx,
+			fmt.Sprintf(`UPDATE users SET name = %s, avatar_url = %s WHERE id = $1`, nameExpr, avatarExpr),
+			args...,
+		); err != nil {
+			return "", fmt.Errorf("updating user: %w", err)
+		}
+		return existingID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("looking up user: %w", err)
+	}
+
+	userID := uuid.New().String()
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO users (id, email, name, avatar_url, provider, provider_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+		userID, identity.Email, identity.Name, identity.AvatarURL, identity.Provider, identity.ProviderID,
+	); err != nil {
+		return "", fmt.Errorf("creating user: %w", err)
+	}
+	return userID, nil
+}
+
+func (db *DB) upsertUserIdentity(ctx context.Context, userID string, identity auth.VerifiedIdentity) error {
+	var identityID string
+	var err error
+	if identity.ProviderID != "" {
+		err = db.pool.QueryRow(ctx,
+			`SELECT id FROM user_identities WHERE provider = $1 AND provider_id = $2`,
+			identity.Provider, identity.ProviderID,
+		).Scan(&identityID)
+	} else {
+		err = db.pool.QueryRow(ctx,
+			`SELECT id FROM user_identities WHERE provider = $1 AND provider_id = '' AND email = $2`,
+			identity.Provider, identity.Email,
+		).Scan(&identityID)
+	}
+	if err == nil {
+		_, err = db.pool.Exec(ctx,
+			`UPDATE user_identities
+			 SET user_id = $1, email = $2, email_verified = $3, last_seen_at = NOW()
+			 WHERE id = $4`,
+			userID, identity.Email, identity.EmailVerified, identityID,
+		)
+		if err != nil {
+			return fmt.Errorf("updating identity: %w", err)
+		}
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("looking up identity: %w", err)
+	}
+
+	if _, err := db.pool.Exec(ctx,
+		`INSERT INTO user_identities (id, user_id, provider, provider_id, email, email_verified, created_at, last_seen_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())`,
+		"uid_"+uuid.New().String(), userID, identity.Provider, identity.ProviderID, identity.Email, identity.EmailVerified,
+	); err != nil {
+		return fmt.Errorf("creating identity: %w", err)
+	}
+	return nil
+}
+
+func workspaceName(identity auth.VerifiedIdentity) string {
+	if identity.Name != "" {
+		return identity.Name + "'s Workspace"
+	}
+	local := strings.Split(identity.Email, "@")[0]
+	if local == "" {
+		local = "PufferFS"
+	}
+	return local + "'s Workspace"
+}
+
+func personalOrgSlug(email string) string {
+	local := strings.Split(normalizeEmail(email), "@")[0]
+	local = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, local)
+	local = strings.Trim(local, "-")
+	if local == "" {
+		local = "workspace"
+	}
+	return local + "-" + uuid.New().String()[:8]
 }
 
 func (db *DB) acceptPendingOrgInvite(ctx context.Context, userID, email string) (orgID string, role auth.Role, accepted bool, err error) {
@@ -519,6 +684,108 @@ func (db *DB) acceptPendingOrgInvite(ctx context.Context, userID, email string) 
 		return "", "", false, err
 	}
 	return orgID, auth.Role(rawRole), true, nil
+}
+
+func (db *DB) CreateEmailLoginChallenge(ctx context.Context, challenge EmailLoginChallenge) error {
+	if challenge.ID == "" {
+		challenge.ID = "elc_" + uuid.New().String()
+	}
+	challenge.Email = normalizeEmail(challenge.Email)
+	if challenge.Flow == "" {
+		challenge.Flow = "web"
+	}
+	if challenge.MaxAttempts <= 0 {
+		challenge.MaxAttempts = 5
+	}
+	_, err := db.pool.Exec(ctx,
+		`INSERT INTO email_login_challenges
+		 (id, email, code_hash, flow, cli_redirect_uri, max_attempts, request_ip_hash, user_agent_hash, created_at, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)`,
+		challenge.ID,
+		challenge.Email,
+		challenge.CodeHash,
+		challenge.Flow,
+		challenge.CLIRedirectURI,
+		challenge.MaxAttempts,
+		challenge.RequestIPHash,
+		challenge.UserAgentHash,
+		challenge.ExpiresAt,
+	)
+	return err
+}
+
+func (db *DB) GetEmailLoginChallenge(ctx context.Context, id string) (*EmailLoginChallenge, error) {
+	var challenge EmailLoginChallenge
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, email, code_hash, flow, cli_redirect_uri, attempts, max_attempts,
+		        request_ip_hash, user_agent_hash, created_at, expires_at, consumed_at
+		   FROM email_login_challenges
+		  WHERE id = $1`,
+		id,
+	).Scan(
+		&challenge.ID,
+		&challenge.Email,
+		&challenge.CodeHash,
+		&challenge.Flow,
+		&challenge.CLIRedirectURI,
+		&challenge.Attempts,
+		&challenge.MaxAttempts,
+		&challenge.RequestIPHash,
+		&challenge.UserAgentHash,
+		&challenge.CreatedAt,
+		&challenge.ExpiresAt,
+		&challenge.ConsumedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &challenge, nil
+}
+
+func (db *DB) IncrementEmailLoginChallengeAttempts(ctx context.Context, id string) error {
+	_, err := db.pool.Exec(ctx,
+		`UPDATE email_login_challenges SET attempts = attempts + 1 WHERE id = $1`,
+		id,
+	)
+	return err
+}
+
+func (db *DB) ConsumeEmailLoginChallenge(ctx context.Context, id string) error {
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE email_login_challenges
+		    SET consumed_at = NOW()
+		  WHERE id = $1 AND consumed_at IS NULL`,
+		id,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (db *DB) CountRecentEmailLoginChallenges(ctx context.Context, email, ipHash string, since time.Time) (int, error) {
+	email = normalizeEmail(email)
+	var count int
+	err := db.pool.QueryRow(ctx,
+		`SELECT COUNT(*)
+		   FROM email_login_challenges
+		  WHERE created_at >= $1
+		    AND (email = $2 OR ($3 <> '' AND request_ip_hash = $3))`,
+		since, email, ipHash,
+	).Scan(&count)
+	return count, err
+}
+
+func (db *DB) DeleteExpiredEmailLoginChallenges(ctx context.Context) error {
+	_, err := db.pool.Exec(ctx,
+		`DELETE FROM email_login_challenges
+		  WHERE expires_at < NOW() - INTERVAL '1 day'
+		     OR consumed_at < NOW() - INTERVAL '1 day'`,
+	)
+	return err
 }
 
 // GetUser retrieves a user by ID.

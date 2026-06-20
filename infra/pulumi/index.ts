@@ -40,31 +40,40 @@ const tags = {
 
 const deployRegion = aws.config.region ?? "us-west-2";
 const regionalBucketPrefix = (suffix: string) => `${name(suffix)}-${deployRegion}-`;
-const inviteEmailFrom = cfg.get("inviteEmailFrom");
-const inviteEmailFromName = cfg.get("inviteEmailFromName");
-const inviteEmailReplyTo = cfg.get("inviteEmailReplyTo");
-const inviteEmailAppUrl = cfg.get("inviteEmailAppUrl") ?? frontendUrl;
-const inviteEmailSesRegion = cfg.get("inviteEmailSesRegion") ?? deployRegion;
-const inviteEmailConfigurationSet = cfg.get("inviteEmailConfigurationSet");
-const inviteEmailIdentityName = cfg.get("inviteEmailIdentity");
-const inviteEmailExistingIdentityArn = cfg.get("inviteEmailIdentityArn");
-const inviteEmailFeedbackEmail = cfg.get("inviteEmailFeedbackEmail");
-const inviteEmailFeedbackIdentityArn = cfg.get("inviteEmailFeedbackIdentityArn");
-const inviteEmailSesEndpointUrl = cfg.get("inviteEmailSesEndpointUrl");
+const enableEmailLogin = cfg.getBoolean("enableEmailLogin") ?? true;
+const transactionalEmailFrom = cfg.get("transactionalEmailFrom") ?? cfg.get("inviteEmailFrom");
+const transactionalEmailFromName =
+  cfg.get("transactionalEmailFromName") ?? cfg.get("inviteEmailFromName");
+const transactionalEmailReplyTo =
+  cfg.get("transactionalEmailReplyTo") ?? cfg.get("inviteEmailReplyTo");
+const transactionalEmailAppUrl = cfg.get("transactionalEmailAppUrl") ?? cfg.get("inviteEmailAppUrl") ?? frontendUrl;
+const transactionalEmailSesRegion = cfg.get("transactionalEmailSesRegion") ?? cfg.get("inviteEmailSesRegion") ?? deployRegion;
+const transactionalEmailConfigurationSet =
+  cfg.get("transactionalEmailConfigurationSet") ?? cfg.get("inviteEmailConfigurationSet");
+const transactionalEmailIdentityName =
+  cfg.get("transactionalEmailIdentity") ?? cfg.get("inviteEmailIdentity");
+const transactionalEmailExistingIdentityArn =
+  cfg.get("transactionalEmailIdentityArn") ?? cfg.get("inviteEmailIdentityArn");
+const transactionalEmailFeedbackEmail =
+  cfg.get("transactionalEmailFeedbackEmail") ?? cfg.get("inviteEmailFeedbackEmail");
+const transactionalEmailFeedbackIdentityArn =
+  cfg.get("transactionalEmailFeedbackIdentityArn") ?? cfg.get("inviteEmailFeedbackIdentityArn");
+const transactionalEmailSesEndpointUrl =
+  cfg.get("transactionalEmailSesEndpointUrl") ?? cfg.get("inviteEmailSesEndpointUrl");
 
-let inviteEmailIdentity: aws.sesv2.EmailIdentity | undefined;
-if (inviteEmailIdentityName) {
-  inviteEmailIdentity = new aws.sesv2.EmailIdentity(name("invite-email-identity"), {
-    emailIdentity: inviteEmailIdentityName,
-    configurationSetName: inviteEmailConfigurationSet || undefined,
-    region: inviteEmailSesRegion,
+let transactionalEmailIdentity: aws.sesv2.EmailIdentity | undefined;
+if (transactionalEmailIdentityName) {
+  transactionalEmailIdentity = new aws.sesv2.EmailIdentity(name("transactional-email-identity"), {
+    emailIdentity: transactionalEmailIdentityName,
+    configurationSetName: transactionalEmailConfigurationSet || undefined,
+    region: transactionalEmailSesRegion,
     tags,
   });
 }
-const inviteEmailIdentityArn: pulumi.Input<string> | undefined =
-  inviteEmailExistingIdentityArn ?? inviteEmailIdentity?.arn;
-const sesSendResource: pulumi.Input<string> | undefined = inviteEmailFrom
-  ? inviteEmailIdentityArn ?? "*"
+const transactionalEmailIdentityArn: pulumi.Input<string> | undefined =
+  transactionalEmailExistingIdentityArn ?? transactionalEmailIdentity?.arn;
+const sesSendResource: pulumi.Input<string> | undefined = transactionalEmailFrom
+  ? transactionalEmailIdentityArn ?? "*"
   : undefined;
 
 const vpc = new aws.ec2.Vpc(name("vpc"), {
@@ -604,6 +613,7 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "MODAL_CHUNK_SHARD_ENDPOINT", value: cfg.require("modalChunkShardEndpoint") },
   { name: "MODAL_EMBED_SHARD_ENDPOINT", value: cfg.require("modalEmbedShardEndpoint") },
   { name: "MODAL_INDEX_SHARD_ENDPOINT", value: cfg.require("modalIndexShardEndpoint") },
+  { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
 ];
@@ -629,34 +639,34 @@ if (frontendUrl) {
   appEnv.push({ name: "FRONTEND_URL", value: frontendUrl });
 }
 
-if (inviteEmailFrom) {
+if (transactionalEmailFrom) {
   appEnv.push(
-    { name: "INVITE_EMAIL_FROM", value: inviteEmailFrom },
-    { name: "SES_REGION", value: inviteEmailSesRegion },
+    { name: "TRANSACTIONAL_EMAIL_FROM", value: transactionalEmailFrom },
+    { name: "SES_REGION", value: transactionalEmailSesRegion },
   );
-  if (inviteEmailFromName) {
-    appEnv.push({ name: "INVITE_EMAIL_FROM_NAME", value: inviteEmailFromName });
+  if (transactionalEmailFromName) {
+    appEnv.push({ name: "TRANSACTIONAL_EMAIL_FROM_NAME", value: transactionalEmailFromName });
   }
-  if (inviteEmailReplyTo) {
-    appEnv.push({ name: "INVITE_EMAIL_REPLY_TO", value: inviteEmailReplyTo });
+  if (transactionalEmailReplyTo) {
+    appEnv.push({ name: "TRANSACTIONAL_EMAIL_REPLY_TO", value: transactionalEmailReplyTo });
   }
-  if (inviteEmailAppUrl) {
-    appEnv.push({ name: "INVITE_EMAIL_APP_URL", value: inviteEmailAppUrl });
+  if (transactionalEmailAppUrl) {
+    appEnv.push({ name: "TRANSACTIONAL_EMAIL_APP_URL", value: transactionalEmailAppUrl });
   }
-  if (inviteEmailConfigurationSet) {
-    appEnv.push({ name: "SES_CONFIGURATION_SET", value: inviteEmailConfigurationSet });
+  if (transactionalEmailConfigurationSet) {
+    appEnv.push({ name: "SES_CONFIGURATION_SET", value: transactionalEmailConfigurationSet });
   }
-  if (inviteEmailIdentityArn) {
-    appEnv.push({ name: "SES_FROM_IDENTITY_ARN", value: inviteEmailIdentityArn });
+  if (transactionalEmailIdentityArn) {
+    appEnv.push({ name: "SES_FROM_IDENTITY_ARN", value: transactionalEmailIdentityArn });
   }
-  if (inviteEmailFeedbackEmail) {
-    appEnv.push({ name: "SES_FEEDBACK_EMAIL", value: inviteEmailFeedbackEmail });
+  if (transactionalEmailFeedbackEmail) {
+    appEnv.push({ name: "SES_FEEDBACK_EMAIL", value: transactionalEmailFeedbackEmail });
   }
-  if (inviteEmailFeedbackIdentityArn) {
-    appEnv.push({ name: "SES_FEEDBACK_IDENTITY_ARN", value: inviteEmailFeedbackIdentityArn });
+  if (transactionalEmailFeedbackIdentityArn) {
+    appEnv.push({ name: "SES_FEEDBACK_IDENTITY_ARN", value: transactionalEmailFeedbackIdentityArn });
   }
-  if (inviteEmailSesEndpointUrl) {
-    appEnv.push({ name: "SES_ENDPOINT_URL", value: inviteEmailSesEndpointUrl });
+  if (transactionalEmailSesEndpointUrl) {
+    appEnv.push({ name: "SES_ENDPOINT_URL", value: transactionalEmailSesEndpointUrl });
   }
 }
 
@@ -958,7 +968,7 @@ function certValidationRecord(cert: aws.acm.Certificate) {
   }));
 }
 
-function inviteEmailDkimRecords(identity: aws.sesv2.EmailIdentity) {
+function transactionalEmailDkimRecords(identity: aws.sesv2.EmailIdentity) {
   return pulumi
     .all([identity.emailIdentity, identity.dkimSigningAttributes])
     .apply(([emailIdentity, dkim]) =>
@@ -988,14 +998,19 @@ export const webUrl = useWebCustomCert
   ? `https://${webDomain}`
   : pulumi.interpolate`https://${webDistribution.domainName}`;
 export const billingEnabled = enableBilling;
-export const inviteEmailEnabled = Boolean(inviteEmailFrom);
-export const inviteEmailIdentityNameOutput = inviteEmailIdentityName;
-export const inviteEmailIdentityVerificationStatus = inviteEmailIdentity
-  ? inviteEmailIdentity.verificationStatus
+export const emailLoginEnabled = enableEmailLogin;
+export const transactionalEmailEnabled = Boolean(transactionalEmailFrom);
+export const transactionalEmailIdentityNameOutput = transactionalEmailIdentityName;
+export const transactionalEmailIdentityVerificationStatus = transactionalEmailIdentity
+  ? transactionalEmailIdentity.verificationStatus
   : undefined;
-export const inviteEmailDkimValidationRecords = inviteEmailIdentity
-  ? inviteEmailDkimRecords(inviteEmailIdentity)
+export const transactionalEmailDkimValidationRecords = transactionalEmailIdentity
+  ? transactionalEmailDkimRecords(transactionalEmailIdentity)
   : undefined;
+export const inviteEmailEnabled = transactionalEmailEnabled;
+export const inviteEmailIdentityNameOutput = transactionalEmailIdentityNameOutput;
+export const inviteEmailIdentityVerificationStatus = transactionalEmailIdentityVerificationStatus;
+export const inviteEmailDkimValidationRecords = transactionalEmailDkimValidationRecords;
 export const artifactBucket = bucket.bucket;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;

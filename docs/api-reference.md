@@ -43,7 +43,8 @@ Normal routes accept either of:
 - **API key** — `Authorization: Bearer <pfs_sk_...>`. Resolved to an
   org/user/role/scope set. This is the path used by the CLI and by automation.
 - **JWT session** — `Authorization: Bearer <jwt>` or the `pf_session` httpOnly
-  cookie set by the OAuth flow. Used by the web console.
+  cookie set by an interactive login provider such as email-code or Google
+  OAuth. Used by the web console.
 
 `/admin/*` routes require a **separate platform admin key** as
 `Authorization: Bearer <admin-key>`, compared in constant time against the
@@ -74,8 +75,9 @@ full model.
 ### Unauthenticated routes
 
 These skip the auth middleware entirely: `GET /healthz`, `GET /readyz`,
-`GET /health`, `GET /cli/version`, the OAuth routes (`/auth/google`,
-`/auth/callback`, `/auth/logout`), and `POST /billing/webhook` (verified by
+`GET /health`, `GET /cli/version`, login routes (`/auth/providers`,
+`/auth/google`, `/auth/callback`, `/auth/email/start`, `/auth/email/resend`,
+`/auth/email/verify`, `/auth/logout`), and `POST /billing/webhook` (verified by
 Stripe signature instead).
 
 ---
@@ -117,6 +119,56 @@ server's `SyncProtocolVersion` (currently `1`).
 ---
 
 ## Auth and identity
+
+### `GET /auth/providers`
+
+Returns which interactive login providers are enabled for this deployment.
+
+```json
+{ "email_code": true, "google": true }
+```
+
+### `POST /auth/email/start`
+
+Start an email one-time-code login. No authentication required.
+
+Request:
+
+```json
+{ "email": "user@example.com", "flow": "web" }
+```
+
+For CLI login, send `flow: "cli"` and a loopback `cli_redirect_uri`.
+
+Response `200`:
+
+```json
+{ "challenge_id": "elc_...", "expires_in": 600, "resend_after": 30 }
+```
+
+### `POST /auth/email/verify`
+
+Verify an email login code. No authentication required. Web flow sets the
+httpOnly `pf_session` cookie used by the dashboard. CLI flow returns a scoped
+CLI API key.
+
+Request:
+
+```json
+{ "challenge_id": "elc_...", "code": "12345678" }
+```
+
+Web response `200`:
+
+```json
+{ "status": "ok" }
+```
+
+CLI response `200`:
+
+```json
+{ "status": "ok", "api_key": "pfs_sk_...", "email": "user@example.com" }
+```
 
 ### `GET /auth/me`
 

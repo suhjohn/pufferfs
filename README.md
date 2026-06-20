@@ -92,8 +92,8 @@ PufferFS depends on a few external systems:
 - Turbopuffer for hybrid search namespaces.
 - Modal for chunking, embeddings, OCR/image processing, and shard workers.
 - NATS JetStream for the optional queued sync pipeline.
-- Google OAuth for hosted web login.
-- AWS SES for optional email invites.
+- Email-code and Google OAuth for hosted web login.
+- AWS SES for transactional login-code and invite email.
 - Stripe for optional billing.
 
 See [Configuration](docs/configuration.md) for environment variables.

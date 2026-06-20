@@ -97,8 +97,9 @@ Important API surfaces:
 
 - Health and readiness: `GET /healthz`, `GET /readyz`, `GET /health`.
 - CLI version manifest: `GET /cli/version`.
-- OAuth/session: `GET /auth/google`, `GET /auth/callback`,
-  `POST /auth/logout`, `GET /auth/me`.
+- Login/session: `GET /auth/providers`, `GET /auth/google`,
+  `GET /auth/callback`, `POST /auth/email/start`,
+  `POST /auth/email/verify`, `POST /auth/logout`, `GET /auth/me`.
 - API keys: create, list, delete.
 - Org management: get org, list/add/remove members.
 - Platform admin: provision/delete orgs and users, upsert org membership,
@@ -355,10 +356,11 @@ Normal API authentication accepts:
   httpOnly `pf_session` cookie.
 - API keys stored as SHA-256 hashes and resolved to org/user/role/scopes.
 
-Google OAuth is optional. When enabled, the server redirects to Google, upserts
-the user, creates or resolves org membership, signs a JWT, and either returns it
-as JSON for legacy clients or sets an httpOnly browser session cookie and
-redirects to the frontend.
+Login providers resolve through a shared identity-completion path. Google OAuth
+and email one-time-code login both prove an email address, upsert a
+`user_identities` row, accept any pending invite for that email, create or
+resolve org membership, and then issue either a browser session cookie or a CLI
+API key.
 
 Authorization layers:
 
@@ -377,7 +379,7 @@ Authorization layers:
 
 The React app is an authenticated management console:
 
-- `/login`: starts Google OAuth through the API.
+- `/login`: starts email-code login or Google OAuth through the API.
 - `/_app` layout: requires a valid session cookie, shows navigation and logout.
 - `/dashboard`: lists accessible roots.
 - `/organization`: shows org name and members.
@@ -424,8 +426,8 @@ and CLI release publishing.
 
 PufferFS currently supports:
 
-- Multi-tenant org/user authentication with Google OAuth, JWT sessions, and API
-  keys.
+- Multi-tenant org/user authentication with email-code login, Google OAuth, JWT
+  sessions, and API keys.
 - Scoped tenant API keys and platform admin provisioning APIs.
 - Org roots and user-owned roots.
 - Root create/list/get/delete.
@@ -468,8 +470,8 @@ PufferFS currently supports:
   must apply the same visible-generation window.
 - The embedding cache version must be bumped when the Modal embedding model
   changes.
-- OAuth login currently uses a fixed state value, with a code comment noting
-  production should use random state stored in a cookie for CSRF protection.
+- OAuth login uses signed random state bound to a short-lived httpOnly state
+  cookie for CSRF protection.
 - ACLs are modeled as entries but the implemented read/write checks primarily
   enforce `permission == "none"` as deny prefixes.
 - Root deletion removes PufferFS copies and indexes, not source files on the
