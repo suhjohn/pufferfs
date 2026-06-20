@@ -370,16 +370,17 @@ const ENDPOINTS = [
   "protocol_version": 1,
   "base_generation_id": "gen_prev",
   "base_generation_seq": 7,
+  "generation_id": "gen_new",
   "changes": [
     {
       "path": "policies/time-off.pdf",
       "status": "MODIFIED",
       "content_hash": "sha256:...",
       "size": 18422,
-      "source_key": "files/root_8z7m/policies/time-off.pdf"
+      "source_key": "syncs/gen_new/sources/files/policies/time-off.pdf"
     }
   ],
-  "state_ref": "bundles/root_8z7m/state.gz",
+  "state_ref": "syncs/gen_new/state/state.json.gz",
   "content_proof": {
     "root_hash": "sha256:...",
     "file_hashes": {},
@@ -390,12 +391,13 @@ const ENDPOINTS = [
       ["protocol_version", "number", "required", "Client/server sync wire version. Must match the server's supported SyncProtocolVersion."],
       ["base_generation_id", "string", "required", "Generation the client diffed from. Use the root's current visible generation before applying local changes."],
       ["base_generation_seq", "number", "required", "Monotonic sequence for the base generation. The server rejects stale bases with 409."],
+      ["generation_id", "string", "recommended", "Generation returned by sync/init. Source upload objects under syncs/<generation_id>/ are temporary and removed on terminal sync outcomes."],
       ["changes", "array", "required", "Files added, modified, or deleted in this sync. Each item names a path plus content metadata or deletion status."],
       ["changes[].path", "string", "required", "Path relative to the root directory."],
       ["changes[].status", "string", "required", "File state such as ADDED, MODIFIED, or DELETED."],
       ["changes[].content_hash", "string", "required for uploaded content", "SHA-256 content identity used for diffing, proof, and dedupe."],
       ["changes[].size", "number", "required for uploaded content", "File size in bytes. Single-file uploads are limited to 512 MiB."],
-      ["changes[].source_key", "string", "required for uploaded content", "Object-storage key where the uploaded file bytes can be read by the server pipeline."],
+      ["changes[].source_key", "string", "required for uploaded content", "Object-storage key where the uploaded file bytes can be read by the server pipeline. New clients should use syncs/<generation_id>/sources/... keys."],
       ["state_ref", "string", "required", "Object-storage reference for the serialized client sync state bundle."],
       ["content_proof.root_hash", "string", "required", "Merkle root hash for the submitted filesystem state."],
       ["content_proof.file_hashes", "object", "required", "Per-file proof data keyed by relative path when needed for filtering and validation."],

@@ -614,8 +614,8 @@ Client                              Server
 Key properties:
 
 - **Generation-scoped artifact namespace**: transient sync artifacts live under
-  `syncs/<generation_id>/manifests/`, `syncs/<generation_id>/proofs/`, etc. —
-  separate from source bundles under `bundles/<root>/`.
+  `syncs/<generation_id>/manifests/`, `syncs/<generation_id>/proofs/`, and
+  `syncs/<generation_id>/sources/`.
 - **Small finalize request**: the sync POST carries only a `generation_id` and
   a list of `change_refs` pointing to manifest shards, not inline file changes.
 - **Abort semantics**: if the client fails before finalize, it calls

@@ -288,6 +288,18 @@ func TestRootIndexNamespaceForPathSelectsShard(t *testing.T) {
 	}
 }
 
+func TestModalCanReadSourceDirectlyDistinguishesBundles(t *testing.T) {
+	if !modalCanReadSourceDirectly("syncs/gen-1/sources/files/docs/a.pdf", models.FileChange{SourceOffset: 0, SourceLength: 100}) {
+		t.Fatalf("generation file source should be directly readable")
+	}
+	if modalCanReadSourceDirectly("syncs/gen-1/sources/bundles/bundle-1", models.FileChange{SourceOffset: 0, SourceLength: 100}) {
+		t.Fatalf("generation bundle source should not be directly readable")
+	}
+	if modalCanReadSourceDirectly("bundles/root-1/bundle-1", models.FileChange{SourceOffset: 0, SourceLength: 100}) {
+		t.Fatalf("legacy bundle source should not be directly readable")
+	}
+}
+
 func TestEnsureSyncStateRefUploadsAndClearsInlineState(t *testing.T) {
 	ctx := context.Background()
 	store := newMemoryObjectStore()
@@ -317,6 +329,33 @@ func TestEnsureSyncStateRefUploadsAndClearsInlineState(t *testing.T) {
 	}
 	if state["docs/a.txt"].ContentHash != "hash-a" {
 		t.Fatalf("state object = %#v", state)
+	}
+}
+
+func TestEnsureSyncStateRefCopiesGenerationScopedState(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	srv := NewWithStore(nil, store, &ModalClient{}, nil)
+	const tempRef = "syncs/gen-1/state/state.json.gz"
+	if err := store.Upload(ctx, tempRef, []byte("gzipped-state"), "application/gzip"); err != nil {
+		t.Fatalf("upload temp state: %v", err)
+	}
+	req := &models.SyncRequest{
+		RootID:   "root-1",
+		StateRef: tempRef,
+	}
+	if err := srv.ensureSyncStateRef(ctx, "root-1", "gen-1", req); err != nil {
+		t.Fatalf("ensure state ref: %v", err)
+	}
+	if req.StateRef != "states/root-1/gen-1.json.gz" {
+		t.Fatalf("state_ref = %q", req.StateRef)
+	}
+	data, err := store.Download(ctx, req.StateRef)
+	if err != nil {
+		t.Fatalf("download durable state ref: %v", err)
+	}
+	if string(data) != "gzipped-state" {
+		t.Fatalf("durable state = %q", string(data))
 	}
 }
 

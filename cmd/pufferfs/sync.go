@@ -545,7 +545,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	baseGenerationSeq = syncInit.BaseGenerationSeq
 
 	changes := withAbsolutePaths(dir, filterChanges(result))
-	manifestRef, err := uploadChangedFiles(client, rootID, dir, changes)
+	manifestRef, err := uploadChangedFiles(client, rootID, syncInit.GenerationID, dir, changes)
 	if err != nil {
 		return nil, err
 	}
@@ -949,7 +949,7 @@ type bundleManifestEntry struct {
 	Length      int64  `json:"length,omitempty"`
 }
 
-func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.FileChange) (string, error) {
+func uploadChangedFiles(client *apiClient, rootID, generationID, dir string, changes []models.FileChange) (string, error) {
 	smallLimit := uploadBundleSmallFileLimit()
 	maxBundleBytes := uploadBundleMaxBytes()
 	var manifest []bundleManifestEntry
@@ -962,7 +962,7 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 		if bundle.Len() == 0 {
 			return nil
 		}
-		key, err := uploadBundle(client, rootID, fmt.Sprintf("%s-%06d", bundleID, bundleIndex), bundle.Bytes(), "application/octet-stream")
+		key, err := uploadBundle(client, rootID, generationID, fmt.Sprintf("%s-%06d", bundleID, bundleIndex), bundle.Bytes(), "application/octet-stream")
 		if err != nil {
 			return err
 		}
@@ -993,7 +993,7 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 			return "", fmt.Errorf("stat %s: %w", change.Path, err)
 		}
 		if info.Size() == 0 || info.Size() > smallLimit {
-			key, err := uploadFile(client, rootID, change.Path, localPath)
+			key, err := uploadFile(client, rootID, generationID, change.Path, localPath)
 			if err != nil {
 				return "", fmt.Errorf("uploading %s: %w", change.Path, err)
 			}
@@ -1048,7 +1048,7 @@ func uploadChangedFiles(client *apiClient, rootID, dir string, changes []models.
 	if err != nil {
 		return "", err
 	}
-	key, err := uploadBundle(client, rootID, bundleID+"-manifest", manifestBytes, "application/json")
+	key, err := uploadBundle(client, rootID, generationID, bundleID+"-manifest", manifestBytes, "application/json")
 	if err != nil {
 		return "", fmt.Errorf("uploading source manifest: %w", err)
 	}
@@ -1137,14 +1137,14 @@ func uploadContentProof(client *apiClient, rootID, generationID string, proof *m
 	return uploadSyncArtifact(client, rootID, generationID, "proof", "content-proof.json", data, "application/json")
 }
 
-func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, error) {
+func uploadFile(client *apiClient, rootID, generationID, relPath, localPath string) (string, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	url := fmt.Sprintf("/roots/%s/upload?path=%s", rootID, url.QueryEscape(relPath))
-	respBody, err := client.postStream(url, file, "application/octet-stream")
+	path := fmt.Sprintf("/roots/%s/upload?generation_id=%s&path=%s", rootID, url.QueryEscape(generationID), url.QueryEscape(relPath))
+	respBody, err := client.postStream(path, file, "application/octet-stream")
 	if err != nil {
 		return "", err
 	}
@@ -1157,9 +1157,9 @@ func uploadFile(client *apiClient, rootID, relPath, localPath string) (string, e
 	return resp.Key, nil
 }
 
-func uploadBundle(client *apiClient, rootID, bundleID string, data []byte, contentType string) (string, error) {
-	url := fmt.Sprintf("/roots/%s/upload-bundle?bundle_id=%s", rootID, url.QueryEscape(bundleID))
-	respBody, err := client.postRaw(url, data, contentType)
+func uploadBundle(client *apiClient, rootID, generationID, bundleID string, data []byte, contentType string) (string, error) {
+	path := fmt.Sprintf("/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s", rootID, url.QueryEscape(generationID), url.QueryEscape(bundleID))
+	respBody, err := client.postRaw(path, data, contentType)
 	if err != nil {
 		return "", err
 	}

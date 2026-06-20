@@ -1365,6 +1365,22 @@ func (db *DB) GetSyncGeneration(ctx context.Context, orgID, rootID, generationID
 	return &generation, nil
 }
 
+func (db *DB) GetSyncGenerationForJob(ctx context.Context, orgID, rootID, jobID string) (*SyncGeneration, error) {
+	var generation SyncGeneration
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, org_id, root_id, COALESCE(sync_job_id, ''), COALESCE(base_generation_id, ''), seq, base_generation_seq
+		 FROM sync_generations
+		 WHERE org_id = $1 AND root_id = $2 AND sync_job_id = $3
+		 ORDER BY seq DESC
+		 LIMIT 1`,
+		orgID, rootID, jobID,
+	).Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.SyncJobID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq)
+	if err != nil {
+		return nil, err
+	}
+	return &generation, nil
+}
+
 func validateSyncBase(clientBaseGenerationID string, clientBaseGenerationSeq int64, visibleGenerationID string, visibleGenerationSeq int64) error {
 	if clientBaseGenerationID != visibleGenerationID {
 		return fmt.Errorf("%w: client base generation %q does not match visible generation %q", errStaleSyncBase, clientBaseGenerationID, visibleGenerationID)

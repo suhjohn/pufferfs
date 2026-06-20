@@ -461,7 +461,11 @@ func (p *syncPipeline) chunkChange(ctx context.Context, change models.FileChange
 }
 
 func modalCanReadSourceDirectly(s3Key string, change models.FileChange) bool {
-	return s3Key != "" && !strings.HasPrefix(s3Key, "bundles/") && change.SourceOffset == 0
+	return s3Key != "" && !isSourceBundleKey(s3Key) && change.SourceOffset == 0
+}
+
+func isSourceBundleKey(s3Key string) bool {
+	return strings.HasPrefix(s3Key, "bundles/") || strings.Contains(s3Key, "/sources/bundles/")
 }
 
 func attachAbsolutePath(chunks []map[string]any, absolutePath string) {

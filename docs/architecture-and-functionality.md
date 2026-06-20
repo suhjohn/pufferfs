@@ -18,8 +18,8 @@ hybrid text/vector retrieval. The system is split into:
 - Python Modal functions that chunk files, embed chunks and queries, and can
   execute full shard-level chunk/embed/index work.
 - Turbopuffer namespaces for BM25/vector/hybrid search.
-- S3-compatible object storage for uploaded source files, bundled transport
-  files, root state, sync artifacts, page images, and queue artifacts.
+- S3-compatible object storage for temporary source transport objects, durable
+  root state, sync artifacts, page images, and queue artifacts.
 - PostgreSQL for control-plane state plus small durable caches: orgs, users,
   API keys, roots, ACLs, sync jobs/generations, root state refs, embedding
   cache, content proofs, and subscriptions.
@@ -152,9 +152,12 @@ ACLs, API keys, org members, and sync jobs.
 
 Object storage carries the high-volume data plane:
 
-- `files/<rootID>/<path>`: individually uploaded large or empty source files.
-- `bundles/<rootID>/<bundleID>`: packed small-file transport bundles, bundle
-  manifests, and CLI-uploaded gzip state refs.
+- `syncs/<generationID>/sources/files/<path>`: generation-scoped standalone
+  source uploads for large or empty changed files.
+- `syncs/<generationID>/sources/bundles/<bundleID>`: generation-scoped packed
+  small-file source transport bundles and source manifests.
+- `files/<rootID>/<path>` and `bundles/<rootID>/<bundleID>`: legacy
+  root-scoped source transport accepted for older clients.
 - `states/<rootID>/<generationID>.json.gz`: compressed root state snapshots
   written by the server when a sync request carries inline state instead of a
   state ref.
@@ -196,10 +199,10 @@ Likely secret filenames are excluded by the ignore matcher before state is
 created. For included files, the CLI uploads changed source content to the
 server:
 
-- Small non-empty files are concatenated into bundle objects up to
+- Small non-empty files are concatenated into generation-scoped bundle objects up to
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
 - Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` and empty files are
-  uploaded as standalone objects.
+  uploaded as generation-scoped standalone objects.
 - Each file change carries `source_key`, `source_offset`, and `source_length`
   so server/Modal can read exact bytes.
 - The complete root state is gzip-compressed and uploaded through the bundle
@@ -216,7 +219,11 @@ For large trees, the CLI uses the manifest-session flow:
    and `change_refs` pointing to the uploaded shards — no inline `changes` needed.
 
 If client upload fails before finalize, `DELETE /roots/{id}/sync/{generation_id}`
-aborts the session and cleans up artifacts.
+aborts the session and deletes the generation's temporary transport/artifact
+prefix. Rejected, failed, expired, and successfully committed syncs also delete
+temporary transport objects for the generation. Durable committed state remains
+under `states/<rootID>/...`, and rendered/indexed media remains under
+`chunks/<rootID>/...`.
 
 For backward compatibility the sync request still accepts inline changes without
 a prior `sync/init` call. If the server reports a stale base generation, the CLI
@@ -262,8 +269,10 @@ The pipeline shape is:
    - Clean rows from failed generations for the root.
    - Mark the new generation visible and complete the sync job.
 6. Cleanup:
-   - Queue-backed syncs can delete transient source/sync artifacts while
-     preserving OCR/page images referenced by indexed chunks.
+   - Delete `syncs/<generationID>/` and any legacy root-scoped source transport
+     refs known from the finalized request.
+   - Preserve durable root state and OCR/page images referenced by indexed
+     chunks.
 
 ### Generation Visibility
 

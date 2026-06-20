@@ -87,8 +87,8 @@ pufferfs root delete handbook --yes
 PufferFS depends on a few external systems:
 
 - PostgreSQL for users, organizations, roots, jobs, and metadata.
-- S3-compatible object storage for uploaded files, bundles, states, and sync
-  artifacts.
+- S3-compatible object storage for temporary source transport, durable state
+  snapshots, rendered file artifacts, and sync artifacts.
 - Turbopuffer for hybrid search namespaces.
 - Modal for chunking, embeddings, OCR/image processing, and shard workers.
 - NATS JetStream for the optional queued sync pipeline.

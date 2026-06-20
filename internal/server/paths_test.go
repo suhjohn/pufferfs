@@ -41,6 +41,44 @@ func TestNormalizeSyncRequestValidatesSourceRefs(t *testing.T) {
 			},
 		},
 		{
+			name: "generation file source for path",
+			change: models.FileChange{
+				Path:         "docs/a.txt",
+				Status:       models.StatusModified,
+				SourceKey:    "syncs/gen-1/sources/files/docs/a.txt",
+				SourceLength: 10,
+			},
+		},
+		{
+			name: "generation bundle source",
+			change: models.FileChange{
+				Path:         "docs/a.txt",
+				Status:       models.StatusAdded,
+				SourceKey:    "syncs/gen-1/sources/bundles/123-000001",
+				SourceOffset: 5,
+				SourceLength: 10,
+			},
+		},
+		{
+			name: "generation file source must match path",
+			change: models.FileChange{
+				Path:         "docs/a.txt",
+				Status:       models.StatusAdded,
+				SourceKey:    "syncs/gen-1/sources/files/docs/b.txt",
+				SourceLength: 10,
+			},
+			wantErr: "source file key must match change path",
+		},
+		{
+			name: "generation bundle source needs byte length",
+			change: models.FileChange{
+				Path:      "docs/a.txt",
+				Status:    models.StatusAdded,
+				SourceKey: "syncs/gen-1/sources/bundles/123-000001",
+			},
+			wantErr: "source_length must be positive",
+		},
+		{
 			name: "file source must match path",
 			change: models.FileChange{
 				Path:         "docs/a.txt",
@@ -101,8 +139,9 @@ func TestNormalizeSyncRequestValidatesSourceRefs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := models.SyncRequest{
-				RootID:  "root-1",
-				Changes: []models.FileChange{tt.change},
+				RootID:       "root-1",
+				GenerationID: "gen-1",
+				Changes:      []models.FileChange{tt.change},
 			}
 			err := normalizeSyncRequest(&req)
 			if tt.wantErr == "" {
@@ -115,6 +154,23 @@ func TestNormalizeSyncRequestValidatesSourceRefs(t *testing.T) {
 				t.Fatalf("normalizeSyncRequest error = %v, want containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestNormalizeSyncRequestAcceptsGenerationScopedStateRef(t *testing.T) {
+	req := models.SyncRequest{
+		RootID:       "root-1",
+		GenerationID: "gen-1",
+		Changes: []models.FileChange{{
+			Path:         "docs/a.txt",
+			Status:       models.StatusAdded,
+			SourceKey:    "syncs/gen-1/sources/files/docs/a.txt",
+			SourceLength: 10,
+		}},
+		StateRef: "syncs/gen-1/state/state.json.gz",
+	}
+	if err := normalizeSyncRequest(&req); err != nil {
+		t.Fatalf("normalizeSyncRequest: %v", err)
 	}
 }
 

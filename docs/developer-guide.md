@@ -66,8 +66,9 @@ The usual flow is:
 4. Optionally keep the folder current with `sync --follow` or a background service.
 
 A root is the durable unit of sync and access control. The local folder remains
-the source of truth. PufferFS stores uploaded copies, extracted chunks,
-embeddings, state snapshots, and search index rows so it can answer queries.
+the source of truth. PufferFS stores temporary uploaded copies during sync, then
+keeps extracted chunks, embeddings, state snapshots, and search index rows so it
+can answer queries.
 Deleting a root removes PufferFS artifacts and index metadata, not local source
 files.
 
@@ -155,6 +156,9 @@ What to expect:
 - It uploads only changed content.
 - Small files are packed into bundle objects; large and empty files are
   uploaded individually.
+- Uploaded source objects are temporary transport for the sync generation. They
+  are removed after the generation commits, is aborted, is rejected, fails, or
+  expires incomplete.
 - The server creates a sync job and a new generation.
 - The index is not visible to queries until the generation commits.
 - By default, the CLI polls async sync jobs until completion. With
@@ -477,8 +481,8 @@ What to expect:
   working directory from the local `.tpfs` metadata.
 - Without `--yes`, the confirmation prompt requires the root ID even when the
   root was detected from the current directory.
-- Root deletion removes PufferFS metadata, stored source copies, sync artifacts,
-  chunk/page artifacts, and Turbopuffer namespaces.
+- Root deletion removes PufferFS metadata, any remaining transport/sync
+  artifacts, durable state, chunk/page artifacts, and Turbopuffer namespaces.
 - Root deletion removes the local PufferFS cache for that root.
 - It does not delete local source files.
 - Roots with active sync jobs cannot be deleted until jobs finish.
@@ -549,8 +553,8 @@ Without queued workers, the server can run the same pipeline in-process.
 
 Storage expectations:
 
-- Object storage is the data plane for uploaded source copies, state refs, sync
-  artifacts, and page images.
+- Object storage is the data plane for temporary source transport, durable state
+  refs, sync artifacts, and page images.
 - PostgreSQL is the control plane plus small durable caches.
 - Turbopuffer is the search index.
 - Modal is the heavy compute layer for embeddings and document/image

@@ -592,7 +592,15 @@ def _row_from_existing(job: dict, file_path: str, absolute_path: str, file_hash:
 
 
 def _modal_can_read_source_directly(s3_key: str, change: dict) -> bool:
-    return bool(s3_key) and not s3_key.startswith("bundles/") and int(change.get("source_offset") or 0) == 0
+    return (
+        bool(s3_key)
+        and not _source_key_is_bundle(s3_key)
+        and int(change.get("source_offset") or 0) == 0
+    )
+
+
+def _source_key_is_bundle(s3_key: str) -> bool:
+    return s3_key.startswith("bundles/") or "/sources/bundles/" in s3_key
 
 
 @app.function(

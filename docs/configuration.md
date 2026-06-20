@@ -194,7 +194,7 @@ the invited address accepts it on the next OAuth sign-in. Set
 | `PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE` | Embedding-cache lookup batch size. | 500 |
 | `PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY` | Concurrent embedding-cache lookups. | 4 |
 | `PUFFERFS_CLEANUP_BATCH_SIZE` | Rows per cleanup batch. | 1000 |
-| `PUFFERFS_CLEANUP_SYNC_ARTIFACTS` | Whether queued syncs delete transient sync artifacts after commit. | enabled when set |
+| `PUFFERFS_CLEANUP_SYNC_ARTIFACTS` | Whether terminal syncs delete transient source/sync artifacts. Set `0`, `false`, `no`, or `off` to disable. | enabled |
 
 ### Queue (NATS JetStream)
 

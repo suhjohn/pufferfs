@@ -227,17 +227,21 @@ Response `200`:
 }
 ```
 
-### `POST /roots/{id}/upload?path=<relpath>`
+### `POST /roots/{id}/upload?path=<relpath>[&generation_id=<id>]`
 
 Upload a single source file's bytes (large/empty files). Requires `sync`/`write`
-and write-ACL on the path. Body is the raw file. **Max 512 MiB.** Stored at
-`files/<rootID>/<path>`. Response `{"key": "files/..."}`.
+and write-ACL on the path. Body is the raw file. **Max 512 MiB.** With
+`generation_id`, stored as temporary transport at
+`syncs/<generationID>/sources/files/<path>`. Without `generation_id`, stored at
+legacy `files/<rootID>/<path>`. Response `{"key": "..."}`.
 
-### `POST /roots/{id}/upload-bundle?bundle_id=<id>`
+### `POST /roots/{id}/upload-bundle?bundle_id=<id>[&generation_id=<id>]`
 
 Upload a packed small-file bundle or a gzip state ref. Requires `sync`/`write`.
-Body is the raw bundle. **Max 1024 MiB.** Stored at
-`bundles/<rootID>/<bundleID>`. Response `{"key": "bundles/..."}`.
+Body is the raw bundle. **Max 1024 MiB.** With `generation_id`, stored as
+temporary transport at `syncs/<generationID>/sources/bundles/<bundleID>`.
+Without `generation_id`, stored at legacy `bundles/<rootID>/<bundleID>`.
+Response `{"key": "..."}`.
 
 ### `GET /roots/{id}/state`
 
@@ -375,6 +379,10 @@ up any artifacts already uploaded under `syncs/<generation_id>/`. Requires scope
 Use this if the client encounters an upload error before calling
 `POST /roots/{id}/sync` to finalize.
 
+The server also deletes generation-scoped temporary transport/artifact objects
+when finalize is rejected, processing fails, an async job expires incomplete, or
+the generation commits successfully.
+
 ### `GET /roots/{id}/sync/status[?job_id=<id>]`
 
 Return a sync job's status. Without `job_id`, returns the latest job for the
@@ -427,6 +435,10 @@ Rules:
   `400` with `{"error","protocol_version","required_version"}`.
 - Exactly one of `state` (inline map) or `state_ref` (object key) is required.
   Inline state is gzipped and persisted by the server as a state ref.
+- `source_key` values for uploaded content should reference
+  `syncs/<generation_id>/sources/files/<path>` or
+  `syncs/<generation_id>/sources/bundles/<bundle_id>` for new clients. Legacy
+  `files/<root_id>/...` and `bundles/<root_id>/...` refs are still accepted.
 - `base_generation_id`/`seq` must match the root's current visible generation,
   otherwise a [sync conflict](#sync-conflicts) is returned.
 - `changes[].status` is one of `ADDED`, `MODIFIED`, `REMOVED`, `MOVED`,

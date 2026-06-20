@@ -30,7 +30,7 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 			}
 		}
 
-		if err := validateSourceRef(req.RootID, &req.Changes[i]); err != nil {
+		if err := validateSourceRef(req.RootID, req.GenerationID, &req.Changes[i]); err != nil {
 			return fmt.Errorf("invalid source for %q: %w", req.Changes[i].Path, err)
 		}
 	}
@@ -90,11 +90,11 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 	}
 
 	req.StateRef = strings.TrimSpace(strings.ReplaceAll(req.StateRef, "\\", "/"))
-	if err := validateStateRef(req.RootID, req.StateRef); err != nil {
+	if err := validateSyncStateRef(req.RootID, req.GenerationID, req.StateRef); err != nil {
 		return err
 	}
 	req.ManifestRef = strings.TrimSpace(strings.ReplaceAll(req.ManifestRef, "\\", "/"))
-	if err := validateBundleObjectRef(req.RootID, req.ManifestRef, "manifest_ref"); err != nil {
+	if err := validateManifestRef(req.RootID, req.GenerationID, req.ManifestRef); err != nil {
 		return err
 	}
 
@@ -131,6 +131,17 @@ func validateSyncArtifactRef(generationID, ref, dir, field string) error {
 		return fmt.Errorf("%s sync artifact key is invalid", field)
 	}
 	return nil
+}
+
+func validateSyncStateRef(rootID, generationID, stateRef string) error {
+	stateRef = strings.TrimSpace(strings.ReplaceAll(stateRef, "\\", "/"))
+	if stateRef == "" {
+		return nil
+	}
+	if generationID != "" && strings.HasPrefix(stateRef, fmt.Sprintf("syncs/%s/state/", generationID)) {
+		return validateSyncArtifactRef(generationID, stateRef, "state", "state_ref")
+	}
+	return validateStateRef(rootID, stateRef)
 }
 
 func validateStateRef(rootID, stateRef string) error {
@@ -179,7 +190,18 @@ func validateBundleObjectRef(rootID, ref, field string) error {
 	return nil
 }
 
-func validateSourceRef(rootID string, change *models.FileChange) error {
+func validateManifestRef(rootID, generationID, ref string) error {
+	ref = strings.TrimSpace(strings.ReplaceAll(ref, "\\", "/"))
+	if ref == "" {
+		return nil
+	}
+	if strings.HasPrefix(ref, syncSourceBundlePrefix(generationID)) {
+		return validateSyncSourceBundleRef(generationID, ref, "manifest_ref")
+	}
+	return validateBundleObjectRef(rootID, ref, "manifest_ref")
+}
+
+func validateSourceRef(rootID, generationID string, change *models.FileChange) error {
 	if change.SourceOffset < 0 {
 		return fmt.Errorf("source_offset must be non-negative")
 	}
@@ -203,6 +225,27 @@ func validateSourceRef(rootID string, change *models.FileChange) error {
 		return fmt.Errorf("source_key contains NUL byte")
 	}
 
+	if generationID != "" && strings.HasPrefix(change.SourceKey, syncSourceFilePrefix(generationID)) {
+		path := strings.TrimPrefix(change.SourceKey, syncSourceFilePrefix(generationID))
+		if path != change.Path {
+			return fmt.Errorf("source file key must match change path")
+		}
+		if change.SourceOffset != 0 {
+			return fmt.Errorf("source_offset must be zero for file uploads")
+		}
+		return nil
+	}
+
+	if generationID != "" && strings.HasPrefix(change.SourceKey, syncSourceBundlePrefix(generationID)) {
+		if err := validateSyncSourceBundleRef(generationID, change.SourceKey, "source_key"); err != nil {
+			return err
+		}
+		if change.SourceLength <= 0 {
+			return fmt.Errorf("source_length must be positive for bundled files")
+		}
+		return nil
+	}
+
 	fileKey := fmt.Sprintf("files/%s/%s", rootID, change.Path)
 	if change.SourceKey == fileKey {
 		if change.SourceOffset != 0 {
@@ -223,7 +266,51 @@ func validateSourceRef(rootID string, change *models.FileChange) error {
 		return nil
 	}
 
-	return fmt.Errorf("source_key must reference this root's upload or bundle")
+	return fmt.Errorf("source_key must reference this root's upload, bundle, or generation source")
+}
+
+func validateSyncSourceBundleRef(generationID, ref, field string) error {
+	if generationID == "" {
+		return fmt.Errorf("%s requires generation_id", field)
+	}
+	if strings.Contains(ref, "\x00") {
+		return fmt.Errorf("%s contains NUL byte", field)
+	}
+	prefix := syncSourceBundlePrefix(generationID)
+	if !strings.HasPrefix(ref, prefix) {
+		return fmt.Errorf("%s must reference this generation's source bundle", field)
+	}
+	name := strings.TrimPrefix(ref, prefix)
+	if name == "" || name != safeObjectName(name) {
+		return fmt.Errorf("%s source bundle key is invalid", field)
+	}
+	return nil
+}
+
+func syncGenerationPrefix(generationID string) string {
+	return fmt.Sprintf("syncs/%s/", generationID)
+}
+
+func syncSourceFilePrefix(generationID string) string {
+	if generationID == "" {
+		return ""
+	}
+	return fmt.Sprintf("syncs/%s/sources/files/", generationID)
+}
+
+func syncSourceBundlePrefix(generationID string) string {
+	if generationID == "" {
+		return ""
+	}
+	return fmt.Sprintf("syncs/%s/sources/bundles/", generationID)
+}
+
+func syncSourceFileKey(generationID, filePath string) string {
+	return syncSourceFilePrefix(generationID) + filePath
+}
+
+func syncSourceBundleKey(generationID, bundleID string) string {
+	return syncSourceBundlePrefix(generationID) + bundleID
 }
 
 func cleanFilePath(filePath string) (string, error) {

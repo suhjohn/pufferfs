@@ -12,16 +12,18 @@ PufferFS stores derived copies and metadata across four systems:
 
 | System | Holds | Plane |
 | --- | --- | --- |
-| Object storage (S3-compatible) | Uploaded source file copies, packed transport bundles, gzipped root state snapshots, sync artifacts, and rendered page/OCR images. | Data |
+| Object storage (S3-compatible) | Temporary source transport copies, packed transport bundles, gzipped root state snapshots, sync artifacts, and rendered page/OCR images. | Data |
 | PostgreSQL | Orgs, users, API key hashes, roots, ACLs, sync jobs/generations, root state refs, embedding cache, content proofs, subscriptions. | Control |
 | Turbopuffer | Search index rows: extracted content, path metadata, file/chunk hashes, file type, generation metadata, and embedding vectors. | Index |
 | Modal | Transient compute for chunking, OCR/vision extraction, and embeddings. | Compute |
 
-Object storage object layout (by prefix): `files/<rootID>/...`,
-`bundles/<rootID>/...`, `states/<rootID>/...`, `syncs/<generationID>/...`,
-`chunks/<rootID>/...`.
+Object storage object layout (by prefix): `syncs/<generationID>/sources/...`
+for temporary source transport, legacy `files/<rootID>/...` and
+`bundles/<rootID>/...` transport for older clients, durable
+`states/<rootID>/...`, generation artifacts under `syncs/<generationID>/...`,
+and rendered/indexed media under `chunks/<rootID>/...`.
 
-> **Implication for reviewers:** extracted document content and a copy of source
+> **Implication for reviewers:** extracted document content and temporary source
 > bytes leave the local machine. Treat the server, its object store, Postgres,
 > Turbopuffer, and Modal as in-scope for any data-sensitivity assessment.
 
@@ -155,7 +157,9 @@ dependency folders out of the index and reducing exposure surface.
 - Deletion does not imply deletion of already exported logs, provider billing
   records, or vendor-side operational records unless those are covered by the
   deployment's separate retention process.
-- Failed or partial generations are cleaned up and never become visible to
+- Temporary source transport and sync artifacts are deleted when a generation
+  commits, is aborted, is rejected during finalize, fails during processing, or
+  expires as incomplete. Failed or partial generations never become visible to
   queries.
 - The embedding cache is keyed by org + model version + content hash; bumping
   `PUFFERFS_EMBEDDING_MODEL_VERSION` effectively invalidates stale cached
@@ -193,7 +197,8 @@ These are real, in-code limitations to account for in a deployment:
 - [ ] Restrict CORS origins to your known web app origin(s).
 - [ ] Issue API keys with explicit least-privilege scopes; rotate regularly.
 - [ ] Lock down the object store, Postgres, and Turbopuffer to the server's
-      network; they hold source copies, extracted content, and vectors.
+      network; they hold temporary source transport, extracted content, durable
+      state, and vectors.
 - [ ] Use ACL deny prefixes and ignore files for sensitive subtrees; do not rely
       on filename-based secret filtering alone.
 - [ ] Harden OAuth state before exposing Google login publicly.

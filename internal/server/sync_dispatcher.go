@@ -123,6 +123,10 @@ func (d *SyncDispatcher) markMessageFailed(ctx context.Context, msg queue.JobMes
 	if msg.SyncJobID != "" {
 		_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": cause.Error()}})
 	}
+	req := d.server.syncRequestForCleanup(ctx, msg.GenerationID)
+	if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+		log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+	}
 }
 
 func (d *SyncDispatcher) startHeartbeat(ctx context.Context, msg queue.ReceivedMessage) func() {
@@ -305,6 +309,10 @@ func (d *SyncDispatcher) shouldSkipMessage(ctx context.Context, msg queue.JobMes
 	if err := d.server.cleanupFailedGenerationRows(ctx, msg.OrgID, msg.RootID, msg.GenerationID); err != nil {
 		log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, err)
 	}
+	req := d.server.syncRequestForCleanup(ctx, msg.GenerationID)
+	if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+		log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+	}
 	log.Printf("skipping sync job stage=%s job_id=%s generation_id=%s status=failed", msg.Stage, msg.JobID, msg.GenerationID)
 	return true, nil
 }
@@ -407,11 +415,7 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 				return completeErr
 			}
 		}
-		keys, keyErr := cleanupGenerationKeysWithChangeRefSources(ctx, d.server.s3, req, msg)
-		if keyErr != nil {
-			return keyErr
-		}
-		return enqueueCleanupBatches(ctx, d.queue, msg, keys)
+		return d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req)
 	}
 	if err != nil {
 		return err
@@ -440,6 +444,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		if msg.SyncJobID != "" {
 			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
 		return fmt.Errorf("storing content proof: %w", err)
 	}
 	if err := d.server.ensureSyncStateRef(ctx, msg.RootID, msg.GenerationID, req); err != nil {
@@ -450,6 +457,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		if msg.SyncJobID != "" {
 			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
 		return fmt.Errorf("preparing sync state: %w", err)
 	}
 	if err := d.server.cleanupFailedGenerationRowsForRoot(ctx, msg.OrgID, msg.RootID); err != nil {
@@ -459,6 +469,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		}
 		if msg.SyncJobID != "" {
 			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
+		}
+		if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
 		}
 		return fmt.Errorf("cleaning failed generations before commit: %w", err)
 	}
@@ -473,6 +486,9 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		if msg.SyncJobID != "" {
 			_ = d.server.db.CompleteSyncJob(ctx, msg.SyncJobID, "failed", []map[string]string{{"error": err.Error()}})
 		}
+		if cleanupErr := d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req); cleanupErr != nil {
+			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", msg.RootID, msg.GenerationID, cleanupErr)
+		}
 		return err
 	}
 	if msg.SyncJobID != "" {
@@ -481,11 +497,7 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		}
 	}
 	d.server.captureSyncCompleted(ctx, msg.OrgID, msg.UserID, root, req, job, nil)
-	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, d.server.s3, req, msg)
-	if err != nil {
-		return err
-	}
-	return enqueueCleanupBatches(ctx, d.queue, msg, keys)
+	return d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, req)
 }
 
 func (d *SyncDispatcher) readSyncRequest(ctx context.Context, generationID string) (*models.SyncRequest, error) {

@@ -199,6 +199,51 @@ func cleanupSourceKeysFromChangeRef(ctx context.Context, s3 objectStore, rootID,
 	return cleanupDeletableKeys(keys), nil
 }
 
+func (s *Server) cleanupTerminalSyncObjects(ctx context.Context, rootID, generationID string, req *models.SyncRequest) error {
+	if s == nil || s.s3 == nil || generationID == "" || !cleanupSyncArtifactsEnabled() {
+		return nil
+	}
+	msg := queue.JobMessage{RootID: rootID, GenerationID: generationID}
+	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, s.s3, req, msg)
+	if err != nil {
+		return err
+	}
+
+	prefix := syncGenerationPrefix(generationID)
+	legacyKeys := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if strings.HasPrefix(key, prefix) {
+			continue
+		}
+		legacyKeys = append(legacyKeys, key)
+	}
+
+	if _, err := s.s3.DeletePrefix(ctx, prefix); err != nil {
+		return fmt.Errorf("deleting sync generation prefix %s: %w", prefix, err)
+	}
+	if len(legacyKeys) > 0 {
+		if err := s.s3.DeleteMany(ctx, cleanupDeletableKeys(legacyKeys)); err != nil {
+			return fmt.Errorf("deleting legacy sync source objects: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) syncRequestForCleanup(ctx context.Context, generationID string) *models.SyncRequest {
+	if s == nil || s.s3 == nil || generationID == "" {
+		return nil
+	}
+	data, err := s.s3.Download(ctx, syncRequestKey(generationID))
+	if err != nil {
+		return nil
+	}
+	var req models.SyncRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return nil
+	}
+	return &req
+}
+
 func (d *SyncDispatcher) processCleanup(ctx context.Context, msg queue.JobMessage) error {
 	keys := cleanupDeletableKeys(msg.CleanupKeys)
 	if len(keys) == 0 {

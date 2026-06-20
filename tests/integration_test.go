@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -228,8 +229,11 @@ func TestPufferFSEndToEnd(t *testing.T) {
 				deleteTPNamespaces(t, services, namespaces)
 			}
 		})
-		assertMinioHasPrefix(t, fmt.Sprintf("bundles/%s/", rootID))
-		assertMinioHasPrefix(t, "syncs/")
+		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
+		assertMinioHasPrefix(t, fmt.Sprintf("states/%s/", rootID))
 
 		assertNestedRowsIndexed(t, services, namespaces, fixtures)
 		assertPDFPageRows(t, services, namespaces, fixtures.pdfs)
@@ -381,6 +385,16 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		failedGenerationIDs := syncGenerationIDsForRoots(t, []string{rootID})
+		if len(failedGenerationIDs) == 0 {
+			t.Fatalf("failed sync created no sync generation for root %s", rootID)
+		}
+		for _, generationID := range failedGenerationIDs {
+			eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
+
 		rootStateDir := filepath.Join(homeDir, ".tpfs", "roots", rootID)
 		assertFileMissing(t, filepath.Join(rootStateDir, "tree.json"))
 		assertFileMissing(t, filepath.Join(rootStateDir, "state.json"))
@@ -447,7 +461,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 				deleteTPNamespaces(t, services, namespaces)
 			}
 		})
-		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/done/", generationID))
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
 		assertHasTPRows(t, services, namespaces, "queued/architecture.md")
 		assertHasTPRows(t, services, namespaces, "queued/document.pdf")
 		assertCLIQuery(t, homeDir, env, "JetStream dispatchers Modal compute", env.rootName, "hybrid", "", "queued/architecture.md")
@@ -478,6 +494,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "Sync complete")
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
 		namespaces := rootIndexNamespaces(t, rootID)
 		assertRootIndexNamespaceCount(t, namespaces, 2)
 		cleanupDone := false
@@ -487,6 +504,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 				deleteTPNamespaces(t, services, namespaces)
 			}
 		})
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
 		assertHasTPRows(t, services, namespaces, "docs/readme.md")
 		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
 
@@ -510,9 +530,8 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("sharded blocking sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
 		requireOutputContains(t, stdout, "Sync complete")
-		assertMinioHasPrefix(t, "syncs/")
-
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
 		namespaces := rootIndexNamespaces(t, rootID)
 		cleanupDone := false
 		t.Cleanup(func() {
@@ -521,6 +540,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 				deleteTPNamespaces(t, services, namespaces)
 			}
 		})
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
 		assertCLIQuery(t, homeDir, env, "Gamma sharded change reference", env.rootName, "hybrid", "", "docs/three.md")
 
 		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
@@ -530,6 +552,156 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		requireOutputContains(t, stdout, "No changes detected")
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
+	t.Run("abort before finalize cleans generation-scoped source uploads", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-abort-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      2,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+		if syncInit.GenerationID == "" {
+			t.Fatalf("sync init returned empty generation: %#v", syncInit)
+		}
+
+		fileUploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("docs/a.md"),
+		)
+		var fileUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Abort\n\nTemporary source bytes.\n"), "application/octet-stream", &fileUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
+		}
+		wantFileKey := fmt.Sprintf("syncs/%s/sources/files/docs/a.md", syncInit.GenerationID)
+		if fileUpload.Key != wantFileKey {
+			t.Fatalf("file upload key = %q, want %q", fileUpload.Key, wantFileKey)
+		}
+
+		bundleUploadPath := fmt.Sprintf("%s/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("abort-bundle"),
+		)
+		var bundleUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, bundleUploadPath, env.apiKey, []byte("bundle bytes"), "application/octet-stream", &bundleUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source bundle: HTTP %d: %s", status, string(body))
+		}
+		wantBundleKey := fmt.Sprintf("syncs/%s/sources/bundles/abort-bundle", syncInit.GenerationID)
+		if bundleUpload.Key != wantBundleKey {
+			t.Fatalf("bundle upload key = %q, want %q", bundleUpload.Key, wantBundleKey)
+		}
+
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/sources/", syncInit.GenerationID))
+		status, body = jsonRequest(t, http.MethodDelete, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/"+url.PathEscape(syncInit.GenerationID), env.apiKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("abort sync: HTTP %d: %s", status, string(body))
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
+		if gotStatus != "failed" {
+			t.Fatalf("generation status = %q, want failed", gotStatus)
+		}
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
+	})
+
+	t.Run("rejected finalize cleans generation-scoped source uploads", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-rejected-finalize-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		fileUploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("docs/a.md"),
+		)
+		var fileUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Rejected\n"), "application/octet-stream", &fileUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
+		}
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/sources/", syncInit.GenerationID))
+
+		rejectedReq := models.SyncRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			GenerationID:    syncInit.GenerationID,
+			Changes: []models.FileChange{{
+				Path:         "docs/b.md",
+				Status:       models.StatusAdded,
+				SourceKey:    fileUpload.Key,
+				SourceLength: int64(len("# Rejected\n")),
+			}},
+			State: map[string]models.FileState{},
+		}
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync", env.apiKey, rejectedReq, nil)
+		if status != http.StatusBadRequest {
+			t.Fatalf("rejected finalize: HTTP %d, want 400: %s", status, string(body))
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
+		if gotStatus != "failed" {
+			t.Fatalf("generation status = %q, want failed", gotStatus)
+		}
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
 		cleanupDone = true
 	})
 
@@ -619,6 +791,170 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 	t.Run("acme-corp R2 source corpus sync and query", func(t *testing.T) {
 		runAcmeCorpSync(t, services)
+	})
+}
+
+func TestSyncTransportCleanupIntegration(t *testing.T) {
+	setupE2EInfra(t)
+	fakeTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v2/namespaces/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer fakeTP.Close()
+	services := realServices{
+		turbopufferAPIKey: "fake-tp-key",
+		turbopufferAPIURL: fakeTP.URL,
+		storageEnv:        e2eStorageEnv(),
+	}
+
+	t.Run("abort before finalize cleans generation-scoped source uploads", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-abort-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      2,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		fileUploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("docs/a.md"),
+		)
+		var fileUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Abort\n\nTemporary source bytes.\n"), "application/octet-stream", &fileUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
+		}
+		wantFileKey := fmt.Sprintf("syncs/%s/sources/files/docs/a.md", syncInit.GenerationID)
+		if fileUpload.Key != wantFileKey {
+			t.Fatalf("file upload key = %q, want %q", fileUpload.Key, wantFileKey)
+		}
+
+		bundleUploadPath := fmt.Sprintf("%s/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("abort-bundle"),
+		)
+		var bundleUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, bundleUploadPath, env.apiKey, []byte("bundle bytes"), "application/octet-stream", &bundleUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source bundle: HTTP %d: %s", status, string(body))
+		}
+		wantBundleKey := fmt.Sprintf("syncs/%s/sources/bundles/abort-bundle", syncInit.GenerationID)
+		if bundleUpload.Key != wantBundleKey {
+			t.Fatalf("bundle upload key = %q, want %q", bundleUpload.Key, wantBundleKey)
+		}
+
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/sources/", syncInit.GenerationID))
+		status, body = jsonRequest(t, http.MethodDelete, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/"+url.PathEscape(syncInit.GenerationID), env.apiKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("abort sync: HTTP %d: %s", status, string(body))
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
+		if gotStatus != "failed" {
+			t.Fatalf("generation status = %q, want failed", gotStatus)
+		}
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
+	})
+
+	t.Run("rejected finalize cleans generation-scoped source uploads", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-rejected-finalize-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		fileUploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("docs/a.md"),
+		)
+		var fileUpload struct {
+			Key string `json:"key"`
+		}
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Rejected\n"), "application/octet-stream", &fileUpload)
+		if status != http.StatusOK {
+			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
+		}
+		assertMinioHasPrefix(t, fmt.Sprintf("syncs/%s/sources/", syncInit.GenerationID))
+
+		rejectedReq := models.SyncRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			GenerationID:    syncInit.GenerationID,
+			Changes: []models.FileChange{{
+				Path:         "docs/b.md",
+				Status:       models.StatusAdded,
+				SourceKey:    fileUpload.Key,
+				SourceLength: int64(len("# Rejected\n")),
+			}},
+			State: map[string]models.FileState{},
+		}
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync", env.apiKey, rejectedReq, nil)
+		if status != http.StatusBadRequest {
+			t.Fatalf("rejected finalize: HTTP %d, want 400: %s", status, string(body))
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
+		if gotStatus != "failed" {
+			t.Fatalf("generation status = %q, want failed", gotStatus)
+		}
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
 	})
 }
 
@@ -852,25 +1188,30 @@ func newMinioClient(t *testing.T) *s3sdk.Client {
 func assertMinioHasPrefix(t *testing.T, prefix string) {
 	t.Helper()
 
-	client := newMinioClient(t)
-	bucket := e2eMinioBucket
-	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
-		bucket = os.Getenv("AWS_BUCKET_NAME")
-	}
-	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
-		Bucket:  aws.String(bucket),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(1),
-	})
-	if err != nil {
-		t.Fatalf("listing MinIO prefix %s: %v", prefix, err)
-	}
-	if len(resp.Contents) == 0 {
+	keys := listStorageKeysWithPrefix(t, prefix, 1)
+	if len(keys) == 0 {
 		t.Fatalf("expected at least one object with prefix %s", prefix)
 	}
 }
 
-func assertStoragePrefixEmpty(t *testing.T, prefix string) {
+func eventuallyStoragePrefixEmpty(t *testing.T, prefix string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	var keys []string
+	for {
+		keys = listStorageKeysWithPrefix(t, prefix, 10)
+		if len(keys) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected no objects with prefix %s; remaining keys: %#v", prefix, keys)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func listStorageKeysWithPrefix(t *testing.T, prefix string, maxKeys int32) []string {
 	t.Helper()
 
 	client := newMinioClient(t)
@@ -878,15 +1219,30 @@ func assertStoragePrefixEmpty(t *testing.T, prefix string) {
 	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
 		bucket = os.Getenv("AWS_BUCKET_NAME")
 	}
+	if maxKeys <= 0 {
+		maxKeys = 1000
+	}
 	resp, err := client.ListObjectsV2(context.Background(), &s3sdk.ListObjectsV2Input{
 		Bucket:  aws.String(bucket),
 		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int32(1),
+		MaxKeys: aws.Int32(maxKeys),
 	})
 	if err != nil {
-		t.Fatalf("listing storage prefix %s: %v", prefix, err)
+		t.Fatalf("listing MinIO prefix %s: %v", prefix, err)
 	}
-	if len(resp.Contents) != 0 {
+	keys := make([]string, 0, len(resp.Contents))
+	for _, object := range resp.Contents {
+		if object.Key != nil {
+			keys = append(keys, *object.Key)
+		}
+	}
+	return keys
+}
+
+func assertStoragePrefixEmpty(t *testing.T, prefix string) {
+	t.Helper()
+
+	if keys := listStorageKeysWithPrefix(t, prefix, 1); len(keys) != 0 {
 		t.Fatalf("expected no objects with prefix %s after delete", prefix)
 	}
 }
@@ -1388,6 +1744,35 @@ func jsonRequest(t *testing.T, method, requestURL, bearer string, payload any, o
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, requestURL, err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if out != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := json.Unmarshal(respBody, out); err != nil {
+			t.Fatalf("decoding response %s: %v", string(respBody), err)
+		}
+	}
+	return resp.StatusCode, respBody
+}
+
+func rawRequest(t *testing.T, method, requestURL, bearer string, payload []byte, contentType string, out any) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, requestURL, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("creating raw request: %v", err)
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -3018,6 +3403,7 @@ func runAcmeCorpSync(t *testing.T, services realServices) {
 	requireOutputContains(t, stdout, "Sync complete")
 
 	rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+	generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
 	namespaces := rootIndexNamespaces(t, rootID)
 	t.Logf("root %s has %d namespace shards", rootID, len(namespaces))
 	cleanupDone := false
@@ -3028,9 +3414,11 @@ func runAcmeCorpSync(t *testing.T, services realServices) {
 		}
 	})
 
-	// Verify storage artifacts exist.
-	assertMinioHasPrefix(t, fmt.Sprintf("bundles/%s/", rootID))
-	assertMinioHasPrefix(t, "syncs/")
+	// Verify temporary transport artifacts were removed while durable state remains.
+	eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+	eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
+	eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
+	assertMinioHasPrefix(t, fmt.Sprintf("states/%s/", rootID))
 
 	// Verify indexing completed for a sample of known files.
 	samplePaths := []string{
