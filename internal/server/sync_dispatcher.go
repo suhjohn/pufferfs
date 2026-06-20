@@ -407,7 +407,11 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 				return completeErr
 			}
 		}
-		return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
+		keys, keyErr := cleanupGenerationKeysWithChangeRefSources(ctx, d.server.s3, req, msg)
+		if keyErr != nil {
+			return keyErr
+		}
+		return enqueueCleanupBatches(ctx, d.queue, msg, keys)
 	}
 	if err != nil {
 		return err
@@ -477,7 +481,11 @@ func (d *SyncDispatcher) processCommit(ctx context.Context, msg queue.JobMessage
 		}
 	}
 	d.server.captureSyncCompleted(ctx, msg.OrgID, msg.UserID, root, req, job, nil)
-	return enqueueCleanupBatches(ctx, d.queue, msg, cleanupGenerationKeys(req, msg))
+	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, d.server.s3, req, msg)
+	if err != nil {
+		return err
+	}
+	return enqueueCleanupBatches(ctx, d.queue, msg, keys)
 }
 
 func (d *SyncDispatcher) readSyncRequest(ctx context.Context, generationID string) (*models.SyncRequest, error) {

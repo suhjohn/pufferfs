@@ -1742,6 +1742,9 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		resp.SyncJobID = job.ID
 	}
 	s.captureSyncCompleted(ctx, orgID, userID, root, req, job, resp)
+	if err := s.cleanupCommittedSyncObjects(ctx, rootID, generation, req); err != nil {
+		log.Printf("warning: failed committed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, err)
+	}
 	return resp, nil
 }
 
@@ -1776,6 +1779,24 @@ func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootI
 		return nil
 	}
 	return s.db.UpsertContentProof(ctx, orgID, userID, rootID, proof.RootHash, proofBytes)
+}
+
+func (s *Server) cleanupCommittedSyncObjects(ctx context.Context, rootID string, generation *SyncGeneration, req *models.SyncRequest) error {
+	if s == nil || s.s3 == nil || generation == nil || !cleanupSyncArtifactsEnabled() {
+		return nil
+	}
+	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, s.s3, req, queue.JobMessage{
+		RootID:       rootID,
+		GenerationID: generation.ID,
+	})
+	if err != nil {
+		return err
+	}
+	keys = cleanupDeletableKeys(keys)
+	if len(keys) == 0 {
+		return nil
+	}
+	return s.s3.DeleteMany(ctx, keys)
 }
 
 // ---------------------------------------------------------------------------

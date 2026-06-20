@@ -96,6 +96,103 @@ func TestCleanupGenerationKeysIncludesTransientArtifactsOnly(t *testing.T) {
 	}
 }
 
+func TestCleanupGenerationKeysExpandsChangeRefSourceKeys(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	ref := "syncs/gen-1/manifests/000000.jsonl"
+	data := "" +
+		"{\"path\":\"a.txt\",\"status\":\"ADDED\",\"source_key\":\"files/root-1/a.txt\"}\n" +
+		"{\"path\":\"b.txt\",\"status\":\"MODIFIED\",\"source_key\":\"bundles/root-1/bundle-1.bin\",\"source_offset\":10,\"source_length\":5}\n" +
+		"{\"path\":\"c.txt\",\"status\":\"ADDED\"}\n" +
+		"{\"path\":\"old.txt\",\"status\":\"REMOVED\",\"source_key\":\"files/root-1/old.txt\"}\n" +
+		"{\"path\":\"doc.pdf\",\"status\":\"ADDED\",\"source_key\":\"chunks/root-1/doc.pdf.0.jpg\"}\n"
+	if err := store.Upload(ctx, ref, []byte(data), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload change ref: %v", err)
+	}
+	req := &models.SyncRequest{
+		GenerationID: "gen-1",
+		ChangeRefs:   []string{ref},
+	}
+	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, store, req, queue.JobMessage{
+		RootID:       "root-1",
+		GenerationID: "gen-1",
+		TotalShards:  1,
+	})
+	if err != nil {
+		t.Fatalf("cleanup keys: %v", err)
+	}
+	want := map[string]bool{
+		"syncs/gen-1/request.json":           true,
+		"syncs/gen-1/done/shard-000000.done": true,
+		ref:                                  true,
+		"files/root-1/a.txt":                 true,
+		"bundles/root-1/bundle-1.bin":        true,
+		"files/root-1/c.txt":                 true,
+	}
+	if len(keys) != len(want) {
+		t.Fatalf("cleanup keys = %#v, want %d keys", keys, len(want))
+	}
+	for _, key := range keys {
+		if !want[key] {
+			t.Fatalf("unexpected cleanup key %s in %#v", key, keys)
+		}
+	}
+}
+
+func TestCleanupGenerationKeysIgnoresAlreadyDeletedChangeRefs(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	ref := "syncs/gen-1/manifests/000000.jsonl"
+	req := &models.SyncRequest{
+		GenerationID: "gen-1",
+		ChangeRefs:   []string{ref},
+	}
+	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, store, req, queue.JobMessage{
+		RootID:       "root-1",
+		GenerationID: "gen-1",
+	})
+	if err != nil {
+		t.Fatalf("cleanup keys: %v", err)
+	}
+	want := map[string]bool{
+		"syncs/gen-1/request.json": true,
+		ref:                        true,
+	}
+	if len(keys) != len(want) {
+		t.Fatalf("cleanup keys = %#v, want %d keys", keys, len(want))
+	}
+	for _, key := range keys {
+		if !want[key] {
+			t.Fatalf("unexpected cleanup key %s in %#v", key, keys)
+		}
+	}
+}
+
+func TestCleanupShardKeysKeepsClientManifestRefsForCommit(t *testing.T) {
+	keys := cleanupShardKeys(queue.JobMessage{
+		GenerationID: "gen-1",
+		PayloadRef:   "syncs/gen-1/index_rows/job.jsonl",
+		CleanupKeys: []string{
+			"syncs/gen-1/manifests/000000.jsonl",
+			"syncs/gen-1/chunks/job.jsonl",
+			"syncs/other/manifests/000000.jsonl",
+		},
+	})
+	want := map[string]bool{
+		"syncs/gen-1/index_rows/job.jsonl":   true,
+		"syncs/gen-1/chunks/job.jsonl":       true,
+		"syncs/other/manifests/000000.jsonl": true,
+	}
+	if len(keys) != len(want) {
+		t.Fatalf("cleanup keys = %#v, want %d keys", keys, len(want))
+	}
+	for _, key := range keys {
+		if !want[key] {
+			t.Fatalf("unexpected cleanup key %s in %#v", key, keys)
+		}
+	}
+}
+
 func TestEnqueueCleanupBatchesHonorsFlag(t *testing.T) {
 	ctx := context.Background()
 	q := &recordingQueue{}

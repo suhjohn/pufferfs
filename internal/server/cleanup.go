@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -100,7 +103,23 @@ func cleanupShardKeys(msg queue.JobMessage) []string {
 	if msg.PayloadRef != "" {
 		keys = append(keys, msg.PayloadRef)
 	}
+	keys = keepGenerationManifestRefs(keys, msg.GenerationID)
 	return cleanupDeletableKeys(keys)
+}
+
+func keepGenerationManifestRefs(keys []string, generationID string) []string {
+	if generationID == "" {
+		return keys
+	}
+	prefix := fmt.Sprintf("syncs/%s/manifests/", generationID)
+	out := keys[:0]
+	for _, key := range keys {
+		if strings.HasPrefix(key, prefix) {
+			continue
+		}
+		out = append(out, key)
+	}
+	return out
 }
 
 func cleanupGenerationKeys(req *models.SyncRequest, msg queue.JobMessage) []string {
@@ -128,6 +147,56 @@ func cleanupGenerationKeys(req *models.SyncRequest, msg queue.JobMessage) []stri
 		}
 	}
 	return cleanupDeletableKeys(keys)
+}
+
+func cleanupGenerationKeysWithChangeRefSources(ctx context.Context, s3 objectStore, req *models.SyncRequest, msg queue.JobMessage) ([]string, error) {
+	keys := cleanupGenerationKeys(req, msg)
+	if req == nil || s3 == nil || len(req.ChangeRefs) == 0 {
+		return keys, nil
+	}
+	for _, ref := range req.ChangeRefs {
+		if ref == "" {
+			continue
+		}
+		sourceKeys, err := cleanupSourceKeysFromChangeRef(ctx, s3, msg.RootID, ref)
+		if err != nil {
+			if isObjectNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		keys = append(keys, sourceKeys...)
+	}
+	return cleanupDeletableKeys(keys), nil
+}
+
+func cleanupSourceKeysFromChangeRef(ctx context.Context, s3 objectStore, rootID, ref string) ([]string, error) {
+	data, err := s3.Download(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("downloading cleanup change ref %s: %w", ref, err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var keys []string
+	for {
+		var change models.FileChange
+		if err := dec.Decode(&change); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("parsing cleanup change ref %s: %w", ref, err)
+		}
+		if change.Status != models.StatusAdded && change.Status != models.StatusModified {
+			continue
+		}
+		if change.SourceKey != "" {
+			keys = append(keys, change.SourceKey)
+			continue
+		}
+		if change.Path != "" {
+			keys = append(keys, fmt.Sprintf("files/%s/%s", rootID, change.Path))
+		}
+	}
+	return cleanupDeletableKeys(keys), nil
 }
 
 func (d *SyncDispatcher) processCleanup(ctx context.Context, msg queue.JobMessage) error {
