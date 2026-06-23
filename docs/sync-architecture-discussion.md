@@ -628,3 +628,33 @@ Key properties:
 
 This is the recommended path for any sync exceeding a few thousand files. The
 CLI uses this flow by default.
+
+## 18. Document-scoped sync
+
+The current CLI also supports selected-file updates inside an existing root:
+
+```bash
+pufferfs sync --root /Users/me/workspace --only docs/spec.md --name workspace
+```
+
+This is not a partial-generation commit. The client resolves `--root` to an
+existing synced root, accepts each `--only` path as root-relative or absolute
+inside that root, loads the current committed root state, hashes only selected
+files, and patches those entries into a complete merged state map. It then uses
+the same manifest-session flow as a normal sync: upload selected source bytes,
+upload change shards, upload content proof and state, then finalize the
+generation.
+
+Important invariants:
+
+- No root is created in `--only` mode; the root must already exist.
+- Unselected files remain in the merged root state and stay visible after the
+  generation commits.
+- Missing selected files become removals only when they exist in the base state.
+- The server still validates ignore policy, ACLs, base generation, source refs,
+  and the requirement for a full `state`/`state_ref`.
+
+During prod integration testing, the deployed Modal embed endpoint accepted the
+base chunk schema but returned HTTP 500 when line metadata fields were included
+in the embedding request. The server therefore strips `line_start` and
+`line_end` from the Modal embed payload while preserving them in the index row.

@@ -156,6 +156,36 @@ func BuildTreeWithStateCache(rootDir string, matcher *ignore.Matcher, stateCache
 	return &Tree{Root: root, RootDir: rootDir}, nil
 }
 
+// BuildTreeFromState constructs a Merkle tree from an already-computed flat
+// file state map. It is used when a sync patches a small set of files without
+// walking the full source tree.
+func BuildTreeFromState(rootDir string, state map[string]models.FileState) (*Tree, error) {
+	rootDir = filepath.Clean(rootDir)
+	root := &Node{
+		Name:     filepath.Base(rootDir),
+		IsDir:    true,
+		Children: make(map[string]*Node),
+	}
+
+	paths := make([]string, 0, len(state))
+	for path := range state {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		cleanPath := filepath.ToSlash(filepath.Clean(path))
+		if cleanPath == "." || cleanPath == "" || strings.HasPrefix(cleanPath, "../") || filepath.IsAbs(cleanPath) {
+			return nil, fmt.Errorf("invalid state path %q", path)
+		}
+		st := state[path]
+		insertFile(root, cleanPath, st.ContentHash, st.Size, st.Mtime)
+	}
+
+	computeDirHash(root)
+	return &Tree{Root: root, RootDir: rootDir}, nil
+}
+
 // ensureDir creates directory nodes along a path.
 func ensureDir(root *Node, relPath string) {
 	parts := strings.Split(relPath, "/")

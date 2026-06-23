@@ -69,6 +69,33 @@ func TestMatcherScopesNestedGitignore(t *testing.T) {
 	}
 }
 
+func TestPathScopedMatcherLoadsOnlyRelevantAncestorIgnores(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "docs", "private"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "other"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "docs", ".gitignore"), []byte("private/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "other", ".gitignore"), []byte("*.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	matcher := NewMatcherForPathsWithPolicy(root, []string{"docs/private/a.md"}, PolicyPatternSet{})
+	if !matcher.ShouldIgnore("docs/private/a.md", false) {
+		t.Fatalf("path-scoped matcher did not apply ancestor ignore")
+	}
+	if matcher.ShouldIgnore("docs/public.md", false) {
+		t.Fatalf("path-scoped matcher applied unrelated ignore")
+	}
+	if matcher.ShouldIgnore("other/a.md", false) {
+		t.Fatalf("path-scoped matcher loaded ignore rules outside selected path ancestors")
+	}
+}
+
 func TestMatcherLoadsGlobalTpfsIgnore(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

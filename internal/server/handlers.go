@@ -3093,12 +3093,6 @@ func modalChunkPayload(row map[string]any) map[string]any {
 	if imagePath, ok := row["image_path"]; ok && imagePath != nil {
 		chunk["image_path"] = imagePath
 	}
-	if lineStart, ok := row["line_start"]; ok && lineStart != nil {
-		chunk["line_start"] = lineStart
-	}
-	if lineEnd, ok := row["line_end"]; ok && lineEnd != nil {
-		chunk["line_end"] = lineEnd
-	}
 	return chunk
 }
 

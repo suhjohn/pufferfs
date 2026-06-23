@@ -41,10 +41,12 @@ PufferFS CLI connected.`,
     name: "sync",
     usage: "pufferfs sync ./handbook --name handbook",
     detail:
-      "Scans the folder, computes a Merkle diff, uploads changed files, and blocks until the new generation is committed. With --dry-run, no API request is made.",
+      "Scans the folder, computes a Merkle diff, uploads changed files, and blocks until the new generation is committed. Use --root with one or more --only flags to update selected files inside an existing root without walking the full folder.",
     flags: [
       "--name, -n <name>: assign or reuse a root alias",
       "--id <root-id>: attach to an existing root",
+      "--root <path>: existing synced root path when using --only",
+      "--only <file>: sync one file under --root; can be repeated",
       "--scope org|user: choose root visibility when creating a root",
       "--dry-run: show what would change without uploading",
       "--json: print sync result as JSON",
@@ -71,8 +73,13 @@ Merkle diff found 1,284 changed files
 Syncing 1,284 changes to root root_8z7m...
 Sync job sync_2bd3 started; polling until committed...
 Sync status: indexing (912/1,284 files)
-Sync complete: 1,284 files processed, 14,602 chunks added`,
-    note: "Normal sync is blocking from the user's point of view: the command returns after the server commits or fails the sync.",
+Sync complete: 1,284 files processed, 14,602 chunks added
+
+$ pufferfs sync --root /Users/me/Documents/handbook --only policies/time-off.pdf --name handbook
+Syncing 1 changes to root root_8z7m...
+Sync job sync_4fa1 started; polling until committed...
+Sync complete: 1 files processed, 3 chunks added`,
+    note: "Normal sync is blocking from the user's point of view: the command returns after the server commits or fails the sync. Selected-file sync requires an existing root, accepts root-relative or absolute --only paths inside that root, and preserves unselected files in the next generation.",
   },
   {
     name: "query",
@@ -471,7 +478,7 @@ const ENDPOINTS = [
       ["changes[].content_hash", "string", "required for uploaded content", "SHA-256 content identity used for diffing, proof, and dedupe."],
       ["changes[].size", "number", "required for uploaded content", "File size in bytes. Single-file uploads are limited to 512 MiB."],
       ["changes[].source_key", "string", "required for uploaded content", "Object-storage key where the uploaded file bytes can be read by the server pipeline. New clients should use syncs/<generation_id>/sources/... keys."],
-      ["state_ref", "string", "required", "Object-storage reference for the serialized client sync state bundle."],
+      ["state_ref", "string", "required", "Object-storage reference for the serialized complete root state bundle. Selected-file clients must merge selected changes into the current committed state before uploading this ref."],
       ["content_proof.root_hash", "string", "required", "Merkle root hash for the submitted filesystem state."],
       ["content_proof.file_hashes", "object", "required", "Per-file proof data keyed by relative path when needed for filtering and validation."],
       ["content_proof.dir_hashes", "object", "required", "Per-directory proof data keyed by relative path."],
@@ -953,6 +960,13 @@ generated/client/
               partially indexed data is not visible. Upload limits are 512 MiB
               per single file and 1024 MiB per bundle. The default sync job
               timeout is 30 minutes.
+            </p>
+            <p>
+              Document-scoped CLI sync sends a small change set for selected
+              files, but the final request still includes a complete merged
+              root state. API clients should not submit a partial{" "}
+              <code>state_ref</code> unless omitted paths are meant to be
+              removed from the next visible generation.
             </p>
             <div className="docs-openapi-list">
               {ENDPOINTS.map((endpoint) => (

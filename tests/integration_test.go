@@ -59,12 +59,16 @@ var (
 	e2eCLIBinPath     string
 	e2eServerBinPath  string
 	e2eWorkerBinPath  string
+	e2eBinDir         string
 	e2ePgContainer    = "pufferfs-e2e-test-pg"
 	e2eMinioContainer = "pufferfs-e2e-test-minio"
 )
 
 func TestMain(m *testing.M) {
 	code := m.Run()
+	if e2eBinDir != "" {
+		_ = os.RemoveAll(e2eBinDir)
+	}
 	_ = exec.Command("docker", "rm", "-f", e2ePgContainer).Run()
 	_ = exec.Command("docker", "rm", "-f", e2eMinioContainer).Run()
 	os.Exit(code)
@@ -550,6 +554,135 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("sharded no-op sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
 		requireOutputContains(t, stdout, "No changes detected")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
+	t.Run("cli document-scoped sync updates selected file and preserves root state", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		projectDir := filepath.Join(homeDir, "document-scoped-workspace")
+		writeFile(t, projectDir, "docs/a.md", "# Alpha\n\nOriginal selected document token alpha-one.\n")
+		writeFile(t, projectDir, "docs/b.md", "# Beta\n\nStable unselected document token beta-two.\n")
+		writeFile(t, projectDir, "docs/c.md", "# Gamma\n\nStable unselected document token gamma-three.\n")
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("initial sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		namespaces := rootIndexNamespaces(t, rootID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
+		})
+
+		assertCLIQuery(t, homeDir, env, "alpha-one", env.rootName, "hybrid", "", "docs/a.md")
+		assertCLIQuery(t, homeDir, env, "beta-two", env.rootName, "hybrid", "", "docs/b.md")
+		assertCLIQuery(t, homeDir, env, "gamma-three", env.rootName, "hybrid", "", "docs/c.md")
+		aBefore := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/a.md"))
+		bBefore := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/b.md"))
+		cBefore := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/c.md"))
+
+		appendFile(t, projectDir, "docs/a.md", "\nDocument scoped update token alpha-updated.\n")
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs/a.md", "--name", env.rootName, "--json")
+		if err != nil {
+			t.Fatalf("document-scoped modify sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var syncResult struct {
+			Status      string              `json:"status"`
+			RootID      string              `json:"root_id"`
+			Changes     int                 `json:"changes"`
+			FileChanges []models.FileChange `json:"file_changes"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &syncResult); err != nil {
+			t.Fatalf("parsing document-scoped sync JSON: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if syncResult.Status != "synced" || syncResult.RootID != rootID || syncResult.Changes != 1 || len(syncResult.FileChanges) != 1 {
+			t.Fatalf("unexpected document-scoped sync result: %#v\nstderr: %s", syncResult, stderr)
+		}
+		if syncResult.FileChanges[0].Path != "docs/a.md" || syncResult.FileChanges[0].Status != models.StatusModified {
+			t.Fatalf("unexpected file change: %#v", syncResult.FileChanges[0])
+		}
+		requireOutputContains(t, stderr, "Syncing 1 changes")
+
+		aAfter := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/a.md"))
+		if aBefore.equal(aAfter) {
+			t.Fatalf("selected file digest did not change after document-scoped sync: %#v", aAfter)
+		}
+		if bAfter := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/b.md")); !bBefore.equal(bAfter) {
+			t.Fatalf("unselected docs/b.md was reindexed: before %#v after %#v", bBefore, bAfter)
+		}
+		if cAfter := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/c.md")); !cBefore.equal(cAfter) {
+			t.Fatalf("unselected docs/c.md was reindexed: before %#v after %#v", cBefore, cAfter)
+		}
+		state := loadRootStateForTest(t, env.serverURL, env.apiKey, rootID)
+		for _, relPath := range []string{"docs/a.md", "docs/b.md", "docs/c.md"} {
+			if _, ok := state[relPath]; !ok {
+				t.Fatalf("state after selected modify missing %s: %#v", relPath, state)
+			}
+		}
+		assertCLIQuery(t, homeDir, env, "beta-two", env.rootName, "hybrid", "", "docs/b.md")
+		assertCLIQuery(t, homeDir, env, "gamma-three", env.rootName, "hybrid", "", "docs/c.md")
+
+		beforeNoopGeneration := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", filepath.Join(projectDir, "docs", "b.md"), "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("document-scoped no-op sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "No changes detected for selected files")
+		afterNoopGeneration := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		if afterNoopGeneration != beforeNoopGeneration {
+			t.Fatalf("no-op document sync changed generation from %s to %s", beforeNoopGeneration, afterNoopGeneration)
+		}
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--only", "docs/a.md", "--name", env.rootName)
+		if err == nil {
+			t.Fatalf("--only without --root unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		requireOutputContains(t, stdout+stderr, "--only requires --root")
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", filepath.Join(homeDir, "outside.md"), "--name", env.rootName)
+		if err == nil {
+			t.Fatalf("outside --only unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		requireOutputContains(t, stdout+stderr, "outside root")
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs", "--name", env.rootName)
+		if err == nil {
+			t.Fatalf("directory --only unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		requireOutputContains(t, stdout+stderr, "directory")
+
+		if err := os.Remove(filepath.Join(projectDir, "docs", "a.md")); err != nil {
+			t.Fatalf("removing selected file: %v", err)
+		}
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs/a.md", "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("document-scoped removal sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Syncing 1 changes")
+		assertNoTPRows(t, services, namespaces, "docs/a.md")
+		assertClosedTPRows(t, services, namespaces, "docs/a.md")
+		assertHasTPRows(t, services, namespaces, "docs/b.md")
+		assertHasTPRows(t, services, namespaces, "docs/c.md")
+		state = loadRootStateForTest(t, env.serverURL, env.apiKey, rootID)
+		if _, ok := state["docs/a.md"]; ok {
+			t.Fatalf("state after selected removal still contains docs/a.md: %#v", state)
+		}
+		for _, relPath := range []string{"docs/b.md", "docs/c.md"} {
+			if _, ok := state[relPath]; !ok {
+				t.Fatalf("state after selected removal missing %s: %#v", relPath, state)
+			}
+		}
+		assertCLIQuery(t, homeDir, env, "beta-two", env.rootName, "hybrid", "", "docs/b.md")
+		assertCLIQuery(t, homeDir, env, "gamma-three", env.rootName, "hybrid", "", "docs/c.md")
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 		cleanupDone = true
@@ -1154,7 +1287,11 @@ func buildBinaries(t *testing.T) {
 	t.Helper()
 
 	repoRoot := repoRoot(t)
-	tmpDir := t.TempDir()
+	tmpDir, err := os.MkdirTemp("", "pufferfs-e2e-bin-*")
+	if err != nil {
+		t.Fatalf("creating e2e binary temp dir: %v", err)
+	}
+	e2eBinDir = tmpDir
 
 	e2eCLIBinPath = filepath.Join(tmpDir, "pufferfs")
 	cmd := exec.Command("go", "build", "-o", e2eCLIBinPath, "./cmd/pufferfs")
@@ -2964,6 +3101,33 @@ func visibleGenerationID(t *testing.T, serverURL, apiKey, rootID string) string 
 		t.Fatalf("root has empty visible generation: %s", string(body))
 	}
 	return root.VisibleGenerationID
+}
+
+func loadRootStateForTest(t *testing.T, serverURL, apiKey, rootID string) map[string]models.FileState {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, serverURL+"/roots/"+url.PathEscape(rootID)+"/state", nil)
+	if err != nil {
+		t.Fatalf("creating root state request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("getting root state: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading root state response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("getting root state: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var state map[string]models.FileState
+	if err := json.Unmarshal(body, &state); err != nil {
+		t.Fatalf("decoding root state response: %v\nbody: %s", err, string(body))
+	}
+	return state
 }
 
 func rootIndexNamespaces(t *testing.T, rootID string) []string {

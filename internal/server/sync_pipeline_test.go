@@ -57,6 +57,30 @@ func TestIndexedChunkCarriesAbsolutePath(t *testing.T) {
 	}
 }
 
+func TestModalChunkPayloadOmitsLineMetadataForEmbedCompatibility(t *testing.T) {
+	row := map[string]any{
+		"id":           "chunk-1",
+		"content":      "package main",
+		"file_path":    "src/main.go",
+		"chunk_index":  0,
+		"content_hash": "content-hash",
+		"file_type":    "go",
+		"root_id":      "root-1",
+		"line_start":   1,
+		"line_end":     10,
+	}
+	chunk := modalChunkPayload(row)
+	if _, ok := chunk["line_start"]; ok {
+		t.Fatalf("line_start leaked into Modal embed payload: %#v", chunk)
+	}
+	if _, ok := chunk["line_end"]; ok {
+		t.Fatalf("line_end leaked into Modal embed payload: %#v", chunk)
+	}
+	if chunk["content"] != row["content"] || chunk["file_path"] != row["file_path"] {
+		t.Fatalf("payload lost required fields: %#v", chunk)
+	}
+}
+
 func TestCleanupGenerationKeysIncludesTransientArtifactsOnly(t *testing.T) {
 	req := &models.SyncRequest{
 		GenerationID:    "gen-1",

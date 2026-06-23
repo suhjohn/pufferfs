@@ -119,6 +119,13 @@ Create or update a root:
 pufferfs sync ./workspace --name workspace
 ```
 
+Update selected files inside an existing root:
+
+```sh
+pufferfs sync --root /Users/me/workspace --only docs/spec.md --name workspace
+pufferfs sync --root /Users/me/workspace --only docs/spec.md --only docs/notes.md --name workspace
+```
+
 Create a user-owned root:
 
 ```sh
@@ -156,6 +163,9 @@ What to expect:
 - It uploads only changed content.
 - Small files are packed into bundle objects; large and empty files are
   uploaded individually.
+- With `--root <path> --only <file>`, the CLI resolves an existing root, hashes
+  only selected files, patches those changes into the current committed root
+  state, and uploads a complete merged state so unselected files stay visible.
 - Uploaded source objects are temporary transport for the sync generation. They
   are removed after the generation commits, is aborted, is rejected, fails, or
   expires incomplete.
@@ -181,6 +191,12 @@ and `~/.tpfs/.tpfsignore` files live on the syncing machine, so direct API
 clients must apply equivalent local filtering themselves before calling
 `POST /roots/{id}/sync`. The server still enforces authentication, org/user
 ignore policy, write ACLs, protocol validation, and upload limits.
+
+For selected-file updates, use `pufferfs sync --root <root-path> --only <file>`.
+`--root` is a local path for an existing synced root and may be absolute.
+`--only` may be root-relative or absolute inside that root. This mode hashes and
+uploads only selected files, but it still sends a complete merged root state to
+the server; direct API clients must do the same to preserve unselected files.
 
 ### Ignore rule sources (in evaluation order)
 
@@ -589,6 +605,8 @@ Storage expectations:
 If sync finds no changes:
 
 - Confirm you are syncing the expected path.
+- For selected-file sync, confirm `--root` points at an existing synced root and
+  each `--only` path is inside that root.
 - Check ignore rules.
 - Check whether the local cache already matches the visible generation.
 
@@ -611,6 +629,10 @@ If a sync fails repeatedly:
 - Run a normal `pufferfs sync` once to see the direct error.
 - Check upload size limits for very large files.
 - Check server-side Modal, Turbopuffer, object storage, and queue configuration.
+- If Modal embedding returns 500s for text/code chunks, verify the server is not
+  sending chunk metadata fields unsupported by the deployed Modal embed schema;
+  the server should preserve line metadata in index rows but omit it from the
+  embed request payload.
 - Check service logs if running as a background service.
 
 ## Upgrade Behavior

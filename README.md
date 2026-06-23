@@ -43,6 +43,13 @@ Sync a directory:
 pufferfs sync ./handbook --name handbook
 ```
 
+Sync one file inside an existing root:
+
+```sh
+pufferfs sync --root /Users/me/handbook --only policies/pto.md --name handbook
+pufferfs sync --root /Users/me/handbook --only policies/pto.md --only policies/leave.md --name handbook
+```
+
 Query the latest committed generation:
 
 ```sh

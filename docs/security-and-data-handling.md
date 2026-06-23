@@ -14,7 +14,7 @@ PufferFS stores derived copies and metadata across four systems:
 | --- | --- | --- |
 | Object storage (S3-compatible) | Temporary source transport copies, packed transport bundles, gzipped root state snapshots, sync artifacts, and rendered page/OCR images. | Data |
 | PostgreSQL | Orgs, users, API key hashes, roots, ACLs, sync jobs/generations, root state refs, embedding cache, content proofs, subscriptions. | Control |
-| Turbopuffer | Search index rows: extracted content, path metadata, file/chunk hashes, file type, generation metadata, and embedding vectors. | Index |
+| Turbopuffer | Search index rows: extracted content, path metadata, optional line/page metadata, file/chunk hashes, file type, generation metadata, and embedding vectors. | Index |
 | Modal | Transient compute for chunking, OCR/vision extraction, and embeddings. | Compute |
 
 Object storage object layout (by prefix): `syncs/<generationID>/sources/...`

@@ -53,3 +53,31 @@ func TestBuildTreeWithStateCacheReusesHashWhenMetadataMatches(t *testing.T) {
 		t.Fatalf("content hash = %q, want cached hash", got)
 	}
 }
+
+func TestBuildTreeFromStateRoundTripsStateAndProof(t *testing.T) {
+	root := t.TempDir()
+	input := map[string]models.FileState{
+		"docs/a.md": {Size: 10, Mtime: 100, ContentHash: "sha256:a"},
+		"docs/b.md": {Size: 20, Mtime: 200, ContentHash: "sha256:b"},
+	}
+	tree, err := BuildTreeFromState(root, input)
+	if err != nil {
+		t.Fatalf("BuildTreeFromState: %v", err)
+	}
+	state := tree.ToFileStateMap()
+	if len(state) != len(input) {
+		t.Fatalf("state len = %d, want %d: %#v", len(state), len(input), state)
+	}
+	for path, want := range input {
+		if got := state[path]; got != want {
+			t.Fatalf("state[%s] = %#v, want %#v", path, got, want)
+		}
+	}
+	proof := tree.BuildContentProof()
+	if !proof.HasFile("docs/a.md", "sha256:a") || !proof.HasFile("docs/b.md", "sha256:b") {
+		t.Fatalf("proof missing file hashes: %#v", proof.FileHashes)
+	}
+	if proof.RootHash == "" || proof.DirHashes["docs"] == "" {
+		t.Fatalf("proof missing root/dir hashes: %#v", proof)
+	}
+}

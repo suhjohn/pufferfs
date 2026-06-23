@@ -101,6 +101,73 @@ func NewMatcherWithPolicy(rootDir string, policy PolicyPatternSet) *Matcher {
 	return m
 }
 
+// NewMatcherForPathsWithPolicy builds a matcher for a limited set of paths.
+// It loads global/root rules plus .gitignore/.tpfsignore files along each
+// selected path's ancestor directories, avoiding a full root walk.
+func NewMatcherForPathsWithPolicy(rootDir string, relPaths []string, policy PolicyPatternSet) *Matcher {
+	m := &Matcher{checkSecrets: true}
+
+	for _, p := range alwaysIgnore {
+		m.patterns = append(m.patterns, gitignore.ParsePattern(p, nil))
+	}
+	for _, p := range defaultIgnore {
+		m.patterns = append(m.patterns, gitignore.ParsePattern(p, nil))
+	}
+
+	m.loadPatternText(policy.OrgPatterns, nil)
+	m.loadPatternText(policy.UserPatterns, nil)
+
+	home, err := os.UserHomeDir()
+	if err == nil {
+		m.loadIgnoreFile(filepath.Join(home, ".tpfs", ".tpfsignore"), nil)
+	}
+
+	rootDir = filepath.Clean(rootDir)
+	loaded := make(map[string]bool)
+	loadDir := func(relDir string) {
+		relDir = filepath.ToSlash(filepath.Clean(relDir))
+		if relDir == "." {
+			relDir = ""
+		}
+		if loaded[relDir] {
+			return
+		}
+		loaded[relDir] = true
+		var pathParts []string
+		if relDir != "" {
+			pathParts = strings.Split(relDir, "/")
+		}
+		absDir := rootDir
+		if relDir != "" {
+			absDir = filepath.Join(rootDir, filepath.FromSlash(relDir))
+		}
+		m.loadIgnoreFile(filepath.Join(absDir, ".gitignore"), pathParts)
+		m.loadIgnoreFile(filepath.Join(absDir, ".tpfsignore"), pathParts)
+	}
+
+	loadDir("")
+	for _, relPath := range relPaths {
+		relPath = filepath.ToSlash(filepath.Clean(relPath))
+		if relPath == "." || strings.HasPrefix(relPath, "../") || filepath.IsAbs(relPath) {
+			continue
+		}
+		dir := filepath.Dir(relPath)
+		for {
+			loadDir(dir)
+			if dir == "." || dir == "" {
+				break
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	return m
+}
+
 // NewPolicyMatcher builds a matcher for centrally managed policy only.
 func NewPolicyMatcher(policy PolicyPatternSet) *Matcher {
 	m := &Matcher{}

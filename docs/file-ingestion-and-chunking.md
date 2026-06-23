@@ -207,6 +207,11 @@ The local and Modal chunk sizes are not identical. The local path optimizes for
 avoiding Modal round trips for ordinary text/code, while Modal owns richer
 format extraction.
 
+Selected-file sync (`pufferfs sync --root <path> --only <file>`) uses the same
+classification and chunking rules for the selected paths only. The CLI merges
+the selected changes into the current committed root state before finalize, so
+unselected files keep their existing indexed rows and generation visibility.
+
 ## Embedding
 
 After extraction and chunking, PufferFS embeds each chunk's `content` with:
@@ -223,10 +228,16 @@ The embedding model version is part of the embedding cache key. Changing the
 model should also change `PUFFERFS_EMBEDDING_MODEL_VERSION` or the default model
 constant so old vectors are not reused.
 
+The Go server sends only the fields needed by the Modal chunk-embedding
+endpoint. Line metadata such as `line_start` and `line_end` is preserved on the
+index row, but omitted from the embed request for compatibility with deployed
+Modal containers that accept the older chunk schema.
+
 ## Search Index Rows
 
 Index rows include the chunk text, vector, path metadata, content hashes,
-file type, optional page/image metadata, and generation validity metadata.
+file type, optional line metadata, optional page/image metadata, and generation
+validity metadata.
 Turbopuffer stores `content` with full-text search enabled and `vector` for ANN
 search.
 

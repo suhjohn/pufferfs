@@ -58,6 +58,10 @@ The CLI root command is `pufferfs` and includes:
 
 - `sync [path]`: scan a directory, compute a diff, upload changed file content,
   submit a sync request, poll for async completion, and update local cache.
+- `sync --root <path> --only <file>`: update selected files inside an existing
+  root without walking/hashing the full root. The CLI patches those files into
+  the current committed root state and submits a normal generation sync with the
+  merged complete state.
 - `sync --dry-run`: show changes, total upload size, and ignored patterns
   without uploading.
 - `sync --background` / `sync --detach`: submit the same server-side sync job
@@ -231,6 +235,14 @@ a prior `sync/init` call. If the server reports a stale base generation, the CLI
 reloads remote state, recomputes the diff, and retries once against the latest
 generation.
 
+For document-scoped sync (`pufferfs sync --root <path> --only <file>`), the CLI
+resolves `<path>` to an existing root and accepts `--only` as either a
+root-relative path or an absolute path inside that root. It hashes only selected
+files, loads ignore files only along their ancestor directories, merges the
+selected changes into the current committed root state, and uploads only the
+selected file bytes. The server still receives and commits a complete root
+state, so unselected files remain visible in the new generation.
+
 ### Server-Side Sync
 
 Every sync creates a `sync_job` and a building `sync_generation`. The visible
@@ -346,7 +358,10 @@ Embeddings use `nomic-ai/nomic-embed-text-v1.5` through SentenceTransformers,
 with `search_document:` prefixes for document chunks and `search_query:`
 prefixes for query text. The Go server's embedding cache version is expected to
 match the Modal model and can be overridden with
-`PUFFERFS_EMBEDDING_MODEL_VERSION`.
+`PUFFERFS_EMBEDDING_MODEL_VERSION`. The server preserves line metadata on index
+rows, but strips `line_start` and `line_end` from the Modal embed payload so
+older deployed embed containers that only know the base chunk schema remain
+compatible.
 
 ## Authentication, Authorization, and Tenancy
 
@@ -444,6 +459,7 @@ PufferFS currently supports:
 - Optional NATS-backed queue workers for chunk/embed/index/commit/cleanup.
 - In-process object-storage queue fallback.
 - Local Go chunking for text/code/markdown-like files.
+- Selected-file sync for existing roots with `sync --root <path> --only <file>`.
 - Modal chunking for PDFs, Office docs, presentations, images, structured
   files, and media files.
 - Modal embeddings for chunks and query text.
@@ -470,6 +486,9 @@ PufferFS currently supports:
   must apply the same visible-generation window.
 - The embedding cache version must be bumped when the Modal embedding model
   changes.
+- Modal chunk-embedding payloads intentionally contain only fields needed for
+  embedding; path/line/page metadata remains on index rows unless the Modal
+  endpoint needs it for extraction.
 - OAuth login uses signed random state bound to a short-lived httpOnly state
   cookie for CSRF protection.
 - ACLs are modeled as entries but the implemented read/write checks primarily

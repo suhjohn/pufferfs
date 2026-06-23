@@ -264,6 +264,10 @@ These are baked into the static web build (Vite), not read at runtime by Go:
 
 ## Notes and gotchas
 
+- **Local `.env` is for development and integration runs.** From the repo root,
+  use `set -a; source .env; set +a` before commands that need Modal,
+  Turbopuffer, AWS, or other service credentials. Never print or commit secret
+  values; report variable names and presence only.
 - **Embedding cache version must be bumped** (`PUFFERFS_EMBEDDING_MODEL_VERSION`)
   whenever the Modal embedding model changes, or cached vectors will be
   inconsistent with new ones.
