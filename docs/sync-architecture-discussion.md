@@ -629,25 +629,23 @@ Key properties:
 This is the recommended path for any sync exceeding a few thousand files. The
 CLI uses this flow by default.
 
-## 18. Document-scoped sync
+## 18. Subset sync
 
-The current CLI also supports selected-file updates inside an existing root:
+The current CLI also supports subset updates:
 
 ```bash
-pufferfs sync --root /Users/me/workspace --only docs/spec.md --name workspace
+pufferfs sync --root /Users/me/workspace --include "docs/**" --exclude "docs/archive/**" --name workspace
 ```
 
-This is not a partial-generation commit. The client resolves `--root` to an
-existing synced root, accepts each `--only` path as root-relative or absolute
-inside that root, loads the current committed root state, hashes only selected
-files, and patches those entries into a complete merged state map. It then uses
-the same manifest-session flow as a normal sync: upload selected source bytes,
-upload change shards, upload content proof and state, then finalize the
-generation.
+This is not a partial-generation commit. The client treats repeated `--include`
+patterns as OR, subtracts any `--exclude` matches, loads the current committed
+root state when the root already exists, hashes selected files, and patches those
+entries into a complete merged state map. It then uses the same manifest-session
+flow as a normal sync: upload selected source bytes, upload change shards,
+upload content proof and state, then finalize the generation.
 
 Important invariants:
 
-- No root is created in `--only` mode; the root must already exist.
 - Unselected files remain in the merged root state and stay visible after the
   generation commits.
 - Missing selected files become removals only when they exist in the base state.

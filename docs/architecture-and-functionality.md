@@ -56,12 +56,14 @@ hybrid text/vector retrieval. The system is split into:
 
 The CLI root command is `pufferfs` and includes:
 
-- `sync [path]`: scan a directory, compute a diff, upload changed file content,
-  submit a sync request, poll for async completion, and update local cache.
-- `sync --root <path> --only <file>`: update selected files inside an existing
-  root without walking/hashing the full root. The CLI patches those files into
-  the current committed root state and submits a normal generation sync with the
-  merged complete state.
+- `sync [path]` / `sync --root <path>`: scan a directory, compute a diff,
+  upload changed file content, submit a sync request, poll for async
+  completion, and update local cache. If `--name` is omitted, the root name
+  defaults to the directory basename.
+- `sync --root <path> --include <glob> [--exclude <glob>]`: update a subset of
+  files. Multiple includes are additive, excludes win, and the CLI patches
+  selected changes into the current committed root state so unselected files
+  remain visible. `--only <file>` is kept as a deprecated literal include alias.
 - `sync --dry-run`: show changes, total upload size, and ignored patterns
   without uploading.
 - `sync --background` / `sync --detach`: submit the same server-side sync job
@@ -235,13 +237,12 @@ a prior `sync/init` call. If the server reports a stale base generation, the CLI
 reloads remote state, recomputes the diff, and retries once against the latest
 generation.
 
-For document-scoped sync (`pufferfs sync --root <path> --only <file>`), the CLI
-resolves `<path>` to an existing root and accepts `--only` as either a
-root-relative path or an absolute path inside that root. It hashes only selected
-files, loads ignore files only along their ancestor directories, merges the
-selected changes into the current committed root state, and uploads only the
-selected file bytes. The server still receives and commits a complete root
-state, so unselected files remain visible in the new generation.
+For subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`),
+the CLI matches root-relative glob patterns, treats repeated includes as OR, and
+lets excludes subtract from that set. It merges selected changes into the current
+committed root state and uploads only selected file bytes. The server still
+receives and commits a complete root state, so unselected files remain visible
+in the new generation.
 
 ### Server-Side Sync
 
@@ -459,7 +460,7 @@ PufferFS currently supports:
 - Optional NATS-backed queue workers for chunk/embed/index/commit/cleanup.
 - In-process object-storage queue fallback.
 - Local Go chunking for text/code/markdown-like files.
-- Selected-file sync for existing roots with `sync --root <path> --only <file>`.
+- Subset sync with `sync --root <path> --include <glob> [--exclude <glob>]`.
 - Modal chunking for PDFs, Office docs, presentations, images, structured
   files, and media files.
 - Modal embeddings for chunks and query text.

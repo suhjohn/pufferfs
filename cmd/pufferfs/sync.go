@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -33,6 +34,8 @@ func syncCmd() *cobra.Command {
 		rootID     string
 		rootPath   string
 		onlyPaths  []string
+		includes   []string
+		excludes   []string
 		scope      string
 		follow     bool
 		jsonOut    bool
@@ -46,22 +49,26 @@ func syncCmd() *cobra.Command {
 		Short: "Sync a directory or selected files to PufferFs",
 		Long: strings.TrimSpace(`Sync a directory to PufferFs.
 
-By default, sync scans PATH (or the current directory), computes a root diff,
-uploads changed file content, and commits a new root generation.
+By default, sync scans PATH, --root, or the current directory, computes a root
+diff, uploads changed file content, and commits a new root generation. If
+--name is omitted, the root name defaults to the directory basename.
 
-Use --root with one or more --only flags to sync selected files inside an
-existing root. In --only mode, --root is a local root path and each --only path
-may be root-relative or absolute inside that root. PufferFS uploads only selected
-file bytes but still commits a complete merged root state.`),
+Use --include to sync only files matching one or more root-relative glob
+patterns. Multiple --include flags are combined as OR, and --exclude always
+wins. In subset mode, PufferFS uploads only selected file bytes but still commits
+a complete merged root state so unselected files in existing roots stay visible.
+--only is a deprecated alias for a literal --include path.`),
 		Example: strings.TrimSpace(`  pufferfs sync ./handbook --name handbook
-  pufferfs sync ./handbook --name handbook --dry-run
-  pufferfs sync --root /Users/me/handbook --only policies/pto.md --name handbook
-  pufferfs sync --root /Users/me/handbook --only policies/pto.md --only policies/holidays.md --name handbook`),
+  pufferfs sync --root /Users/me/handbook
+  pufferfs sync --root /Users/me/handbook --include 'docs/**' --include README.md
+  pufferfs sync --root /Users/me/handbook --include 'docs/**' --exclude 'docs/archive/**'
+  pufferfs sync ./handbook --name handbook --dry-run`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dir := "."
-			if len(args) > 0 {
-				dir = args[0]
+			subsetMode := len(onlyPaths) > 0 || len(includes) > 0 || len(excludes) > 0
+			dir, err := resolveSyncDirectoryArg(args, rootPath, subsetMode)
+			if err != nil {
+				return err
 			}
 			absDir, err := filepath.Abs(dir)
 			if err != nil {
@@ -74,8 +81,8 @@ file bytes but still commits a complete merged root state.`),
 			}
 
 			if follow {
-				if len(onlyPaths) > 0 {
-					return fmt.Errorf("--only cannot be combined with --follow")
+				if subsetMode {
+					return fmt.Errorf("--include/--exclude/--only cannot be combined with --follow")
 				}
 				if jsonOut {
 					return fmt.Errorf("--json cannot be combined with --follow")
@@ -94,18 +101,13 @@ file bytes but still commits a complete merged root state.`),
 			if dryRun && (background || detach) {
 				return fmt.Errorf("--background/--detach cannot be combined with --dry-run")
 			}
-			if len(onlyPaths) > 0 {
-				if follow {
-					return fmt.Errorf("--only cannot be combined with --follow")
-				}
-				if rootPath == "" {
-					return fmt.Errorf("--only requires --root")
-				}
-				if len(args) > 0 {
-					return fmt.Errorf("sync [path] cannot be combined with --only; use --root to select the synced root")
-				}
+			if subsetMode {
 				log := syncLogWriter(jsonOut)
-				result, err := runSyncOnly(cfg, rootPath, onlyPaths, name, rootID, dryRun, !background && !detach, log)
+				result, err := runSyncSubset(cfg, absDir, syncSubsetSpec{
+					Includes: includes,
+					Excludes: excludes,
+					Only:     onlyPaths,
+				}, name, rootID, scope, dryRun, !background && !detach, log)
 				if err != nil {
 					return err
 				}
@@ -113,9 +115,6 @@ file bytes but still commits a complete merged root state.`),
 					return writePrettyJSON(os.Stdout, result)
 				}
 				return nil
-			}
-			if rootPath != "" {
-				return fmt.Errorf("--root is only supported with --only; use `pufferfs sync %s` for a full-root sync", rootPath)
 			}
 			log := syncLogWriter(jsonOut)
 			result, err := runSync(cfg, absDir, name, rootID, scope, dryRun, !background && !detach, log)
@@ -136,13 +135,40 @@ file bytes but still commits a complete merged root state.`),
 	cmd.Flags().BoolVar(&detach, "detach", false, "Alias for --background")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
-	cmd.Flags().StringVar(&rootPath, "root", "", "Existing synced root path to update when using --only")
+	cmd.Flags().StringVar(&rootPath, "root", "", "Root path to sync")
+	cmd.Flags().StringArrayVar(&includes, "include", nil, "Sync files matching this root-relative glob; can be repeated")
+	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "Skip files matching this root-relative glob; can be repeated")
 	cmd.Flags().StringArrayVar(&onlyPaths, "only", nil, "Sync only this file under --root; can be repeated")
 	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
 	addFollowFlags(cmd, &options)
 	cmd.AddCommand(syncStatusCmd(), syncJobsCmd(), syncWaitCmd())
 
 	return cmd
+}
+
+func resolveSyncDirectoryArg(args []string, rootPath string, onlyMode bool) (string, error) {
+	if onlyMode {
+		if rootPath != "" {
+			if len(args) > 0 {
+				return "", fmt.Errorf("sync path specified both as argument and --root")
+			}
+			return rootPath, nil
+		}
+		if len(args) > 0 {
+			return args[0], nil
+		}
+		return ".", nil
+	}
+	if rootPath != "" {
+		if len(args) > 0 {
+			return "", fmt.Errorf("sync path specified both as argument and --root")
+		}
+		return rootPath, nil
+	}
+	if len(args) > 0 {
+		return args[0], nil
+	}
+	return ".", nil
 }
 
 type syncCommandResult struct {
@@ -562,24 +588,101 @@ type syncOnlyRoot struct {
 	CanonicalSourcePath string
 }
 
-func runSyncOnly(cfg *appconfig.Config, rootPath string, onlyPaths []string, name, rootID string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+type syncSubsetSpec struct {
+	Includes []string
+	Excludes []string
+	Only     []string
+}
+
+type compiledSyncSubsetSpec struct {
+	includeGlobs []string
+	excludeGlobs []string
+	onlyPaths    []string
+}
+
+func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
 	if log == nil {
 		log = os.Stdout
 	}
-	if cfg.Server.URL == "" {
+	rootPath = filepath.Clean(rootPath)
+	canonicalRoot, err := canonicalLocalPath(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolving sync root: %w", err)
+	}
+	if name == "" {
+		name = filepath.Base(canonicalRoot)
+	}
+	if cfg.Server.URL == "" && !dryRun {
 		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 	}
 
-	client := newAPIClient(cfg)
-	root, err := resolveSyncOnlyRoot(client, rootPath, name, rootID)
-	if err != nil {
-		return nil, err
+	var (
+		client     *apiClient
+		localMeta  *rootMeta
+		remoteRoot *models.RootMetadata
+	)
+	if rootID == "" {
+		if meta, err := findLocalRootMeta(name, rootPath); err == nil {
+			rootID = meta.ID
+			localMeta = meta
+		} else if meta, err := findLocalRootMeta(name, canonicalRoot); err == nil {
+			rootID = meta.ID
+			localMeta = meta
+		} else if !dryRun {
+			client = newAPIClient(cfg)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, rootPath, rootScope, log)
+			if err != nil {
+				return nil, err
+			}
+			rootID = resolvedRoot.ID
+			remoteRoot = resolvedRoot
+		}
+	} else if meta, err := loadRootMeta(rootID); err == nil {
+		localMeta = meta
+	}
+	if !dryRun && cfg.Server.URL != "" && rootID != "" && remoteRoot == nil {
+		if client == nil {
+			client = newAPIClient(cfg)
+		}
+		remoteRoot, err = loadRemoteRoot(client, rootID)
+		if err != nil {
+			return nil, fmt.Errorf("loading remote root metadata: %w", err)
+		}
+	}
+
+	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
+	root := &syncOnlyRoot{
+		RootMetadata: models.RootMetadata{
+			ID:                   rootID,
+			Name:                 name,
+			SourcePath:           rootPath,
+			Scope:                rootScope,
+			VisibleGenerationID:  baseGenerationID,
+			VisibleGenerationSeq: baseGenerationSeq,
+		},
+		CanonicalSourcePath: canonicalRoot,
+	}
+	if remoteRoot != nil {
+		root.RootMetadata = *remoteRoot
+		root.CanonicalSourcePath = canonicalRoot
+		if name == "" {
+			name = remoteRoot.Name
+		}
+	}
+
+	if client == nil && cfg.Server.URL != "" {
+		client = newAPIClient(cfg)
 	}
 	policy, err := fetchSyncPolicy(client, dryRun)
 	if err != nil {
 		return nil, err
 	}
-	result, err := runSyncOnlyOnce(cfg, client, root, onlyPaths, policy, dryRun, waitForCompletion, log)
+	compiled, err := compileSyncSubsetSpec(canonicalRoot, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := runSyncSubsetOnce(cfg, client, root, compiled, policy, dryRun, waitForCompletion, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return result, err
@@ -594,20 +697,20 @@ func runSyncOnly(cfg *appconfig.Config, rootPath string, onlyPaths []string, nam
 		return nil, fmt.Errorf("loading remote root metadata after sync conflict: %w", loadErr)
 	}
 	root.RootMetadata = *latestRoot
-	return runSyncOnlyOnce(cfg, client, root, onlyPaths, policy, dryRun, waitForCompletion, log)
+	return runSyncSubsetOnce(cfg, client, root, compiled, policy, dryRun, waitForCompletion, log)
 }
 
-func runSyncOnlyOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoot, onlyPaths []string, policy ignore.PolicyPatternSet, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
-	baseState, err := loadSyncOnlyBaseState(client, root)
+func runSyncOnly(cfg *appconfig.Config, rootPath string, onlyPaths []string, name, rootID string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+	return runSyncSubset(cfg, rootPath, syncSubsetSpec{Only: onlyPaths}, name, rootID, "org", dryRun, waitForCompletion, log)
+}
+
+func runSyncSubsetOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoot, spec compiledSyncSubsetSpec, policy ignore.PolicyPatternSet, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+	baseState, err := loadSyncSubsetBaseState(client, root)
 	if err != nil {
 		return nil, err
 	}
-	relPaths, err := resolveOnlyRelativePaths(root.CanonicalSourcePath, onlyPaths)
-	if err != nil {
-		return nil, err
-	}
-	matcher := ignore.NewMatcherForPathsWithPolicy(root.CanonicalSourcePath, relPaths, policy)
-	diffResult, mergedState, err := buildSyncOnlyDiff(root.CanonicalSourcePath, onlyPaths, baseState, matcher)
+	matcher := ignore.NewMatcherWithPolicy(root.CanonicalSourcePath, policy)
+	diffResult, mergedState, err := buildSyncSubsetDiff(root.CanonicalSourcePath, spec, baseState, matcher)
 	if err != nil {
 		return nil, err
 	}
@@ -631,6 +734,27 @@ func runSyncOnlyOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoo
 	return syncResult, err
 }
 
+func loadSyncSubsetBaseState(client *apiClient, root *syncOnlyRoot) (map[string]models.FileState, error) {
+	if root == nil || root.ID == "" {
+		return map[string]models.FileState{}, nil
+	}
+	if localMeta, err := loadRootMeta(root.ID); err == nil && localCacheMatchesRemote(localMeta, &root.RootMetadata) {
+		if canonicalMetaPath, err := canonicalLocalPath(localMeta.SourcePath); err == nil && canonicalMetaPath == root.CanonicalSourcePath {
+			if state, err := loadLocalState(root.ID); err == nil {
+				return state, nil
+			}
+		}
+	}
+	if client == nil {
+		return map[string]models.FileState{}, nil
+	}
+	state, err := loadRemoteState(client, root.ID)
+	if err != nil {
+		return nil, fmt.Errorf("loading remote state: %w", err)
+	}
+	return state, nil
+}
+
 func loadSyncOnlyBaseState(client *apiClient, root *syncOnlyRoot) (map[string]models.FileState, error) {
 	if root != nil {
 		if localMeta, err := loadRootMeta(root.ID); err == nil && localCacheMatchesRemote(localMeta, &root.RootMetadata) {
@@ -650,6 +774,9 @@ func loadSyncOnlyBaseState(client *apiClient, root *syncOnlyRoot) (map[string]mo
 
 func fetchSyncPolicy(client *apiClient, dryRun bool) (ignore.PolicyPatternSet, error) {
 	var policy ignore.PolicyPatternSet
+	if client == nil {
+		return policy, nil
+	}
 	effectivePolicy, err := fetchEffectiveIgnorePolicy(client)
 	if err != nil {
 		if dryRun {
@@ -660,6 +787,79 @@ func fetchSyncPolicy(client *apiClient, dryRun bool) (ignore.PolicyPatternSet, e
 	policy.OrgPatterns = effectivePolicy.OrgPatterns
 	policy.UserPatterns = effectivePolicy.UserPatterns
 	return policy, nil
+}
+
+func compileSyncSubsetSpec(rootPath string, spec syncSubsetSpec) (compiledSyncSubsetSpec, error) {
+	compiled := compiledSyncSubsetSpec{}
+	for _, pattern := range spec.Includes {
+		clean, err := normalizeRootRelativePattern(rootPath, pattern, "--include")
+		if err != nil {
+			return compiled, err
+		}
+		compiled.includeGlobs = append(compiled.includeGlobs, clean)
+	}
+	for _, pattern := range spec.Excludes {
+		clean, err := normalizeRootRelativePattern(rootPath, pattern, "--exclude")
+		if err != nil {
+			return compiled, err
+		}
+		compiled.excludeGlobs = append(compiled.excludeGlobs, clean)
+	}
+	for _, requested := range spec.Only {
+		relPath, _, err := resolveOnlyPath(rootPath, requested)
+		if err != nil {
+			return compiled, err
+		}
+		compiled.onlyPaths = append(compiled.onlyPaths, relPath)
+	}
+	compiled.includeGlobs = dedupeStrings(compiled.includeGlobs)
+	compiled.excludeGlobs = dedupeStrings(compiled.excludeGlobs)
+	compiled.onlyPaths = dedupeStrings(compiled.onlyPaths)
+	return compiled, nil
+}
+
+func normalizeRootRelativePattern(rootPath, pattern, flagName string) (string, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "", fmt.Errorf("%s pattern is empty", flagName)
+	}
+	if filepath.IsAbs(pattern) {
+		if hasGlobMeta(pattern) {
+			return "", fmt.Errorf("%s pattern %q must be root-relative when it contains glob metacharacters", flagName, pattern)
+		}
+		relPath, _, err := resolveOnlyPath(rootPath, pattern)
+		if err != nil {
+			return "", err
+		}
+		return relPath, nil
+	}
+	pattern = filepath.ToSlash(pattern)
+	pattern = strings.TrimPrefix(pattern, "./")
+	pattern = path.Clean(pattern)
+	if pattern == "." || strings.HasPrefix(pattern, "../") || strings.HasPrefix(pattern, "/") {
+		return "", fmt.Errorf("%s pattern %q must stay inside the sync root", flagName, pattern)
+	}
+	return pattern, nil
+}
+
+func hasGlobMeta(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
+}
+
+func dedupeStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func resolveSyncOnlyRoot(client *apiClient, rootPath, name, rootID string) (*syncOnlyRoot, error) {
@@ -770,7 +970,7 @@ func buildSyncOnlyDiff(rootPath string, onlyPaths []string, baseState map[string
 			continue
 		}
 		if info.IsDir() {
-			return result, nil, fmt.Errorf("--only %s is a directory; document-scoped sync currently accepts files only", requested)
+			return result, nil, fmt.Errorf("--only %s is a directory; use --include %q to sync files below it", requested, filepath.ToSlash(filepath.Join(requested, "**")))
 		}
 		if err := ensureResolvedPathInsideRoot(rootPath, absPath); err != nil {
 			return result, nil, err
@@ -808,6 +1008,172 @@ func buildSyncOnlyDiff(rootPath string, onlyPaths []string, baseState map[string
 		}
 	}
 	return result, merged, nil
+}
+
+func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState map[string]models.FileState, matcher *ignore.Matcher) (models.DiffResult, map[string]models.FileState, error) {
+	merged := make(map[string]models.FileState, len(baseState))
+	for path, state := range baseState {
+		merged[path] = state
+	}
+
+	current := make(map[string]models.FileState)
+	selected := make(map[string]bool)
+	rootPath = filepath.Clean(rootPath)
+
+	err := filepath.WalkDir(rootPath, func(absPath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(rootPath, absPath)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		if matcher != nil && matcher.ShouldIgnore(relPath, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if !spec.matches(relPath) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", relPath, err)
+		}
+		state, err := fileStateForPath(absPath, info)
+		if err != nil {
+			return fmt.Errorf("hash %s: %w", relPath, err)
+		}
+		selected[relPath] = true
+		current[relPath] = state
+		return nil
+	})
+	if err != nil {
+		return models.DiffResult{}, nil, err
+	}
+
+	for relPath := range baseState {
+		if spec.matches(relPath) {
+			selected[relPath] = true
+		}
+	}
+
+	result := models.DiffResult{}
+	paths := make([]string, 0, len(selected))
+	for relPath := range selected {
+		paths = append(paths, relPath)
+	}
+	sort.Strings(paths)
+
+	for _, relPath := range paths {
+		currentState, hasCurrent := current[relPath]
+		base, hadBase := baseState[relPath]
+		switch {
+		case !hasCurrent && hadBase:
+			delete(merged, relPath)
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusRemoved,
+				ContentHash: base.ContentHash,
+				Size:        base.Size,
+			})
+			result.Stats.Removed++
+		case hasCurrent && !hadBase:
+			merged[relPath] = currentState
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusAdded,
+				ContentHash: currentState.ContentHash,
+				Size:        currentState.Size,
+			})
+			result.Stats.Added++
+		case hasCurrent && (base.ContentHash != currentState.ContentHash || base.Size != currentState.Size):
+			merged[relPath] = currentState
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusModified,
+				ContentHash: currentState.ContentHash,
+				Size:        currentState.Size,
+			})
+			result.Stats.Modified++
+		case hasCurrent:
+			merged[relPath] = base
+			result.Stats.Unchanged++
+		}
+	}
+
+	return result, merged, nil
+}
+
+func (spec compiledSyncSubsetSpec) matches(relPath string) bool {
+	relPath = path.Clean(filepath.ToSlash(relPath))
+	included := len(spec.includeGlobs) == 0 && len(spec.onlyPaths) == 0
+	for _, onlyPath := range spec.onlyPaths {
+		if relPath == onlyPath {
+			included = true
+			break
+		}
+	}
+	if !included {
+		for _, pattern := range spec.includeGlobs {
+			if matchRootRelativeGlob(pattern, relPath) {
+				included = true
+				break
+			}
+		}
+	}
+	if !included {
+		return false
+	}
+	for _, pattern := range spec.excludeGlobs {
+		if matchRootRelativeGlob(pattern, relPath) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchRootRelativeGlob(pattern, relPath string) bool {
+	pattern = path.Clean(filepath.ToSlash(pattern))
+	relPath = path.Clean(filepath.ToSlash(relPath))
+	if pattern == relPath {
+		return true
+	}
+	return matchGlobParts(strings.Split(pattern, "/"), strings.Split(relPath, "/"))
+}
+
+func matchGlobParts(patternParts, pathParts []string) bool {
+	if len(patternParts) == 0 {
+		return len(pathParts) == 0
+	}
+	if patternParts[0] == "**" {
+		if matchGlobParts(patternParts[1:], pathParts) {
+			return true
+		}
+		for i := range pathParts {
+			if matchGlobParts(patternParts[1:], pathParts[i+1:]) {
+				return true
+			}
+		}
+		return false
+	}
+	if len(pathParts) == 0 {
+		return false
+	}
+	matched, err := path.Match(patternParts[0], pathParts[0])
+	if err != nil || !matched {
+		return false
+	}
+	return matchGlobParts(patternParts[1:], pathParts[1:])
 }
 
 func resolveOnlyRelativePaths(rootPath string, onlyPaths []string) ([]string, error) {

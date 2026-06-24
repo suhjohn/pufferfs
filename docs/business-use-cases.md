@@ -244,8 +244,8 @@ What this enables:
 
 - Run sync and search from the command line.
 - Keep selected folders current with `sync --follow`.
-- Refresh one changed document quickly with `sync --root <folder> --only <file>`
-  without scanning the full folder.
+- Refresh a selected subset quickly with
+  `sync --root <folder> --include "docs/**" --exclude "docs/archive/**"`.
 - Install background sync services on macOS or Linux.
 - Use a web console for lightweight visibility into available roots, members,
   and billing.

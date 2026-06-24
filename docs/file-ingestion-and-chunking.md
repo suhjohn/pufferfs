@@ -207,10 +207,11 @@ The local and Modal chunk sizes are not identical. The local path optimizes for
 avoiding Modal round trips for ordinary text/code, while Modal owns richer
 format extraction.
 
-Selected-file sync (`pufferfs sync --root <path> --only <file>`) uses the same
-classification and chunking rules for the selected paths only. The CLI merges
-the selected changes into the current committed root state before finalize, so
-unselected files keep their existing indexed rows and generation visibility.
+Subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`)
+uses the same classification and chunking rules for the selected paths only. The
+CLI merges the selected changes into the current committed root state before
+finalize, so unselected files keep their existing indexed rows and generation
+visibility.
 
 ## Embedding
 

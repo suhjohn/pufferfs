@@ -644,11 +644,6 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("no-op document sync changed generation from %s to %s", beforeNoopGeneration, afterNoopGeneration)
 		}
 
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--only", "docs/a.md", "--name", env.rootName)
-		if err == nil {
-			t.Fatalf("--only without --root unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
-		}
-		requireOutputContains(t, stdout+stderr, "--only requires --root")
 		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", filepath.Join(homeDir, "outside.md"), "--name", env.rootName)
 		if err == nil {
 			t.Fatalf("outside --only unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
@@ -683,6 +678,141 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		assertCLIQuery(t, homeDir, env, "beta-two", env.rootName, "hybrid", "", "docs/b.md")
 		assertCLIQuery(t, homeDir, env, "gamma-three", env.rootName, "hybrid", "", "docs/c.md")
+
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
+	t.Run("cli include exclude subset sync updates matching paths and preserves omitted state", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		projectDir := filepath.Join(homeDir, "subset-workspace")
+		writeFile(t, projectDir, "README.md", "# Readme\n\nOriginal readme subset token subset-readme-old.\n")
+		writeFile(t, projectDir, "docs/a.md", "# Alpha\n\nOriginal docs subset token subset-docs-old.\n")
+		writeFile(t, projectDir, "docs/private.md", "# Private\n\nOriginal private subset token subset-private-old.\n")
+		writeFile(t, projectDir, "src/main.go", "package main\n\n// Original src subset token subset-src-old.\n")
+		writeFile(t, projectDir, "notes/todo.md", "# Todo\n\nOriginal notes subset token subset-notes-old.\n")
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--name", env.rootName)
+		if err != nil {
+			t.Fatalf("initial subset workspace sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Sync complete")
+
+		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
+		namespaces := rootIndexNamespaces(t, rootID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+				deleteTPNamespaces(t, services, namespaces)
+			}
+		})
+
+		tracked := []string{"README.md", "docs/a.md", "docs/private.md", "src/main.go", "notes/todo.md"}
+		before := map[string]rowDigest{}
+		for _, relPath := range tracked {
+			before[relPath] = rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
+		}
+
+		writeFile(t, projectDir, "README.md", "# Readme\n\nUpdated readme subset token subset-readme-new.\n")
+		writeFile(t, projectDir, "docs/a.md", "# Alpha\n\nUpdated docs subset token subset-docs-new.\n")
+		writeFile(t, projectDir, "docs/private.md", "# Private\n\nUpdated private subset token subset-private-new.\n")
+		writeFile(t, projectDir, "src/main.go", "package main\n\n// Updated src subset token subset-src-new.\n")
+		writeFile(t, projectDir, "notes/todo.md", "# Todo\n\nUpdated notes subset token subset-notes-new.\n")
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"sync", "--root", projectDir,
+			"--include", "docs/**",
+			"--include", "README.md",
+			"--exclude", "docs/private.md",
+			"--name", env.rootName,
+			"--json")
+		if err != nil {
+			t.Fatalf("include/exclude subset sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var syncResult struct {
+			Status      string              `json:"status"`
+			RootID      string              `json:"root_id"`
+			Changes     int                 `json:"changes"`
+			FileChanges []models.FileChange `json:"file_changes"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &syncResult); err != nil {
+			t.Fatalf("parsing subset sync JSON: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if syncResult.Status != "synced" || syncResult.RootID != rootID || syncResult.Changes != 2 || len(syncResult.FileChanges) != 2 {
+			t.Fatalf("unexpected subset sync result: %#v\nstderr: %s", syncResult, stderr)
+		}
+		gotChanged := map[string]models.FileChangeStatus{}
+		for _, change := range syncResult.FileChanges {
+			gotChanged[change.Path] = change.Status
+		}
+		for _, relPath := range []string{"README.md", "docs/a.md"} {
+			if gotChanged[relPath] != models.StatusModified {
+				t.Fatalf("changed path %s status = %q; all changes %#v", relPath, gotChanged[relPath], gotChanged)
+			}
+		}
+		for _, relPath := range []string{"docs/private.md", "src/main.go", "notes/todo.md"} {
+			if _, ok := gotChanged[relPath]; ok {
+				t.Fatalf("unselected/excluded path %s changed in subset result: %#v", relPath, syncResult.FileChanges)
+			}
+		}
+		requireOutputContains(t, stderr, "Syncing 2 changes")
+
+		for _, relPath := range []string{"README.md", "docs/a.md"} {
+			after := rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
+			if before[relPath].equal(after) {
+				t.Fatalf("included path %s digest did not change after subset sync", relPath)
+			}
+		}
+		for _, relPath := range []string{"docs/private.md", "src/main.go", "notes/todo.md"} {
+			after := rowsDigest(queryTPRowsForPath(t, services, namespaces, relPath))
+			if !before[relPath].equal(after) {
+				t.Fatalf("unselected/excluded path %s digest changed: before %#v after %#v", relPath, before[relPath], after)
+			}
+		}
+		state := loadRootStateForTest(t, env.serverURL, env.apiKey, rootID)
+		for _, relPath := range tracked {
+			if _, ok := state[relPath]; !ok {
+				t.Fatalf("state after subset modify missing %s: %#v", relPath, state)
+			}
+		}
+		assertCLIQuery(t, homeDir, env, "subset-readme-new", env.rootName, "hybrid", "", "README.md")
+		assertCLIQuery(t, homeDir, env, "subset-docs-new", env.rootName, "hybrid", "", "docs/a.md")
+		assertCLIQuery(t, homeDir, env, "subset-private-old", env.rootName, "hybrid", "", "docs/private.md")
+		assertCLIQuery(t, homeDir, env, "subset-src-old", env.rootName, "hybrid", "", "src/main.go")
+		assertCLIQueryOutputOmits(t, homeDir, env, "subset-private-new", env.rootName, "subset-private-new")
+		assertCLIQueryOutputOmits(t, homeDir, env, "subset-src-new", env.rootName, "subset-src-new")
+
+		for _, relPath := range []string{"docs/a.md", "docs/private.md", "src/main.go"} {
+			if err := os.Remove(filepath.Join(projectDir, filepath.FromSlash(relPath))); err != nil {
+				t.Fatalf("removing %s before subset deletion sync: %v", relPath, err)
+			}
+		}
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"sync", "--root", projectDir,
+			"--include", "docs/**",
+			"--exclude", "docs/private.md",
+			"--name", env.rootName)
+		if err != nil {
+			t.Fatalf("include/exclude subset removal sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Syncing 1 changes")
+		assertNoTPRows(t, services, namespaces, "docs/a.md")
+		assertClosedTPRows(t, services, namespaces, "docs/a.md")
+		assertHasTPRows(t, services, namespaces, "docs/private.md")
+		assertHasTPRows(t, services, namespaces, "src/main.go")
+		state = loadRootStateForTest(t, env.serverURL, env.apiKey, rootID)
+		if _, ok := state["docs/a.md"]; ok {
+			t.Fatalf("state after subset removal still contains docs/a.md: %#v", state)
+		}
+		for _, relPath := range []string{"docs/private.md", "src/main.go", "notes/todo.md"} {
+			if _, ok := state[relPath]; !ok {
+				t.Fatalf("state after subset removal missing preserved path %s: %#v", relPath, state)
+			}
+		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 		cleanupDone = true
@@ -3005,6 +3135,18 @@ func assertCLIQuery(t *testing.T, homeDir string, env *e2eEnv, query, rootName, 
 	}
 	if expectedPath != "" && !strings.Contains(stdout, expectedPath) {
 		t.Fatalf("expected query output to contain %s, got: %s", expectedPath, stdout)
+	}
+}
+
+func assertCLIQueryOutputOmits(t *testing.T, homeDir string, env *e2eEnv, query, rootName, absentText string) {
+	t.Helper()
+
+	stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "query", query, "--root", rootName, "--mode", "hybrid", "--top-k", "50")
+	if err != nil {
+		t.Fatalf("query %q failed: %v\nstdout: %s\nstderr: %s", query, err, stdout, stderr)
+	}
+	if strings.Contains(stdout, absentText) {
+		t.Fatalf("query %q unexpectedly returned %q:\n%s", query, absentText, stdout)
 	}
 }
 

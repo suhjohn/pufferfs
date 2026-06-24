@@ -543,8 +543,8 @@ When using the manifest-session flow (recommended for large trees):
 For backward compatibility, inline `changes` without a `generation_id` still works
 for small syncs.
 
-The CLI's document-scoped sync (`pufferfs sync --root <path> --only <file>`) uses
-the same endpoint. It sends a small change set for selected files but still
+The CLI's subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`)
+uses the same endpoint. It sends a small change set for selected files but still
 uploads a complete root `state_ref` produced by merging those selected changes
 into the current committed state. API clients must follow the same rule: never
 finalize a partial state map unless the intent is to remove every omitted path

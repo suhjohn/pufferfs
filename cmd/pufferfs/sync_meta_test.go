@@ -92,6 +92,43 @@ func TestWithAbsolutePaths(t *testing.T) {
 	}
 }
 
+func TestResolveSyncDirectoryArg(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		rootPath string
+		onlyMode bool
+		want     string
+		wantErr  string
+	}{
+		{name: "default current directory", want: "."},
+		{name: "positional path", args: []string{"./handbook"}, want: "./handbook"},
+		{name: "root path full sync", rootPath: "/Users/me/handbook", want: "/Users/me/handbook"},
+		{name: "only mode uses root path", rootPath: "/Users/me/handbook", onlyMode: true, want: "/Users/me/handbook"},
+		{name: "only mode defaults current directory", onlyMode: true, want: "."},
+		{name: "positional and root conflict", args: []string{"./handbook"}, rootPath: "/Users/me/handbook", wantErr: "both as argument and --root"},
+		{name: "only mode positional path", args: []string{"./handbook"}, onlyMode: true, want: "./handbook"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveSyncDirectoryArg(tt.args, tt.rootPath, tt.onlyMode)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSyncDirectoryArg: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("dir = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLargeMovesFallBackToRemoveAndAdd(t *testing.T) {
 	t.Setenv("PUFFERFS_MOVE_REUSE_MAX_BYTES", "1024")
 	result := merkleChangesToDiffResult([]merkle.DiffChange{
@@ -233,6 +270,123 @@ func TestBuildSyncOnlyDiffRejectsIgnoredFile(t *testing.T) {
 	_, _, err := buildSyncOnlyDiff(root, []string{"private/a.md"}, nil, ignore.NewMatcher(root))
 	if err == nil || !strings.Contains(err.Error(), "ignored") {
 		t.Fatalf("ignored err = %v, want ignored rejection", err)
+	}
+}
+
+func TestCompiledSyncSubsetSpecMatchesIncludesAndExcludes(t *testing.T) {
+	root := t.TempDir()
+	spec, err := compileSyncSubsetSpec(root, syncSubsetSpec{
+		Includes: []string{"docs/**", "README.md", "src/**/*.go"},
+		Excludes: []string{"docs/private/**", "src/**/testdata/**"},
+	})
+	if err != nil {
+		t.Fatalf("compileSyncSubsetSpec: %v", err)
+	}
+
+	for _, path := range []string{
+		"docs/a.md",
+		"docs/nested/a.md",
+		"README.md",
+		"src/main.go",
+		"src/pkg/worker.go",
+	} {
+		if !spec.matches(path) {
+			t.Fatalf("matches(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{
+		"docs/private/a.md",
+		"src/pkg/testdata/input.go",
+		"notes/todo.md",
+	} {
+		if spec.matches(path) {
+			t.Fatalf("matches(%q) = true, want false", path)
+		}
+	}
+}
+
+func TestBuildSyncSubsetDiffPreservesUnselectedAndExcludedState(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "README.md", "new readme\n")
+	writeTestFile(t, root, "docs/a.md", "new docs\n")
+	writeTestFile(t, root, "docs/private.md", "new private\n")
+	writeTestFile(t, root, "src/main.go", "new src\n")
+
+	baseState := map[string]models.FileState{
+		"README.md":       {Size: 3, ContentHash: "sha256:old-readme", Mtime: 1},
+		"docs/a.md":       {Size: 3, ContentHash: "sha256:old-docs", Mtime: 1},
+		"docs/private.md": {Size: 3, ContentHash: "sha256:old-private", Mtime: 1},
+		"src/main.go":     {Size: 3, ContentHash: "sha256:old-src", Mtime: 1},
+	}
+	spec, err := compileSyncSubsetSpec(root, syncSubsetSpec{
+		Includes: []string{"docs/**", "README.md"},
+		Excludes: []string{"docs/private.md"},
+	})
+	if err != nil {
+		t.Fatalf("compileSyncSubsetSpec: %v", err)
+	}
+
+	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root))
+	if err != nil {
+		t.Fatalf("buildSyncSubsetDiff: %v", err)
+	}
+	if countChanges(result) != 2 || result.Stats.Modified != 2 {
+		t.Fatalf("result = %#v, want two modified changes", result)
+	}
+	changed := map[string]bool{}
+	for _, change := range filterChanges(result) {
+		changed[change.Path] = true
+	}
+	for _, path := range []string{"README.md", "docs/a.md"} {
+		if !changed[path] {
+			t.Fatalf("missing changed path %s in %#v", path, result.Changes)
+		}
+		if merged[path].ContentHash == baseState[path].ContentHash {
+			t.Fatalf("selected path %s was not updated in merged state", path)
+		}
+	}
+	for _, path := range []string{"docs/private.md", "src/main.go"} {
+		if changed[path] {
+			t.Fatalf("unselected/excluded path %s changed: %#v", path, result.Changes)
+		}
+		if merged[path] != baseState[path] {
+			t.Fatalf("path %s was not preserved: got %#v want %#v", path, merged[path], baseState[path])
+		}
+	}
+}
+
+func TestBuildSyncSubsetDiffRemovesOnlySelectedMissingPaths(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "docs/private.md", "private still exists\n")
+	writeTestFile(t, root, "src/main.go", "src still exists\n")
+
+	baseState := map[string]models.FileState{
+		"docs/a.md":       {Size: 3, ContentHash: "sha256:old-docs", Mtime: 1},
+		"docs/private.md": {Size: 3, ContentHash: "sha256:old-private", Mtime: 1},
+		"src/main.go":     {Size: 3, ContentHash: "sha256:old-src", Mtime: 1},
+	}
+	spec, err := compileSyncSubsetSpec(root, syncSubsetSpec{
+		Includes: []string{"docs/**"},
+		Excludes: []string{"docs/private.md"},
+	})
+	if err != nil {
+		t.Fatalf("compileSyncSubsetSpec: %v", err)
+	}
+
+	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root))
+	if err != nil {
+		t.Fatalf("buildSyncSubsetDiff: %v", err)
+	}
+	if countChanges(result) != 1 || result.Stats.Removed != 1 {
+		t.Fatalf("result = %#v, want one removal", result)
+	}
+	if _, ok := merged["docs/a.md"]; ok {
+		t.Fatalf("selected missing path was preserved: %#v", merged)
+	}
+	for _, path := range []string{"docs/private.md", "src/main.go"} {
+		if got := merged[path]; got != baseState[path] {
+			t.Fatalf("path %s was not preserved: got %#v want %#v", path, got, baseState[path])
+		}
 	}
 }
 
