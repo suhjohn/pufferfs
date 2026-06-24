@@ -975,6 +975,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 		projectDir := filepath.Join(homeDir, "background-workspace")
 		writeFile(t, projectDir, "docs/background.md", "# Background Sync\n\nDetached sync jobs can be inspected before querying committed generations.\n")
+		writeFile(t, projectDir, "docs/archive/skip.md", "Initial archived note.\n")
 
 		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName, "--background", "--json")
 		if err != nil {
@@ -1037,6 +1038,50 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 
 		rootID := started.RootID
+		writeFile(t, projectDir, "docs/background.md", "# Background Sync\n\nPattern waits should observe committed file state.\n")
+		writeFile(t, projectDir, "docs/archive/skip.md", "Locally stale archived note that is excluded from the wait.\n")
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"sync", "--root", projectDir, "--name", env.rootName, "--include", "docs/background.md", "--background", "--json")
+		if err != nil {
+			t.Fatalf("background subset sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var subsetStarted struct {
+			Status    string `json:"status"`
+			SyncJobID string `json:"sync_job_id"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &subsetStarted); err != nil {
+			t.Fatalf("parsing background subset sync JSON: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		if subsetStarted.Status != "started" || subsetStarted.SyncJobID == "" {
+			t.Fatalf("unexpected background subset sync result: %#v\nstderr: %s", subsetStarted, stderr)
+		}
+
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey,
+			"sync", "wait", "--root", projectDir, "--include", "docs/**", "--exclude", "docs/archive/**", "--timeout", "2m", "--interval", "500ms", "--json")
+		if err != nil {
+			t.Fatalf("sync wait include/exclude failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var selectionWait struct {
+			Status  string   `json:"status"`
+			RootID  string   `json:"root_id"`
+			Matched int      `json:"matched"`
+			Total   int      `json:"total"`
+			Missing []string `json:"missing"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &selectionWait); err != nil {
+			t.Fatalf("parsing sync wait include/exclude JSON: %v\nstdout: %s", err, stdout)
+		}
+		if selectionWait.Status != "synced" || selectionWait.RootID != rootID || selectionWait.Matched != 1 || selectionWait.Total != 1 || len(selectionWait.Missing) != 0 {
+			t.Fatalf("unexpected sync wait include/exclude result: %#v\nstderr: %s", selectionWait, stderr)
+		}
+		committedState := loadRootStateForTest(t, env.serverURL, env.apiKey, rootID)
+		wantHash := sha256.Sum256([]byte("# Background Sync\n\nPattern waits should observe committed file state.\n"))
+		gotState := committedState["docs/background.md"]
+		if gotState.ContentHash != "sha256:"+hex.EncodeToString(wantHash[:]) {
+			t.Fatalf("committed background hash = %q, want latest local hash", gotState.ContentHash)
+		}
+
 		namespaces := rootIndexNamespaces(t, rootID)
 		cleanupDone := false
 		t.Cleanup(func() {

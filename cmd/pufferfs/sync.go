@@ -285,15 +285,34 @@ func syncWaitCmd() *cobra.Command {
 		jobID    string
 		jsonOut  bool
 		interval time.Duration
+		timeout  time.Duration
+		includes []string
+		excludes []string
 	)
 	cmd := &cobra.Command{
 		Use:   "wait [root-id-or-name]",
-		Short: "Wait for a sync job to complete",
-		Args:  cobra.MaximumNArgs(1),
+		Short: "Wait for a sync job or selected committed files",
+		Long: strings.TrimSpace(`Wait for sync completion.
+
+With no --include or --exclude filters, this waits for the latest or specified
+sync job to complete. With filters, it repeatedly hashes matching local files
+and waits until the latest committed root state contains those exact file
+versions. Filters use the same root-relative glob semantics as subset sync:
+multiple --include flags are additive, and --exclude wins.`),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := appconfig.Load()
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
+			}
+			if len(includes) > 0 || len(excludes) > 0 {
+				result, err := waitForCommittedSelection(cfg, rootRef, args, syncSubsetSpec{Includes: includes, Excludes: excludes}, jobID, interval, timeout, !jsonOut)
+				if jsonOut && result != nil {
+					if writeErr := writePrettyJSON(os.Stdout, result); writeErr != nil {
+						return writeErr
+					}
+				}
+				return err
 			}
 			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
 			if err != nil {
@@ -313,6 +332,9 @@ func syncWaitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&jobID, "job-id", "", "Specific sync job ID (defaults to latest)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print final sync job JSON")
 	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval")
+	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Maximum time to wait (defaults to PUFFERFS_SYNC_POLL_TIMEOUT or 35m)")
+	cmd.Flags().StringArrayVar(&includes, "include", nil, "Wait for files matching this root-relative glob; can be repeated")
+	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "Ignore matching files while waiting; can be repeated")
 	return cmd
 }
 
@@ -413,6 +435,284 @@ func waitForSyncJob(client *apiClient, rootID, jobID string, interval time.Durat
 			time.Sleep(normalizeSyncPollInterval(interval))
 		}
 	}
+}
+
+type syncSelectionWaitResult struct {
+	Status               string               `json:"status"`
+	RootID               string               `json:"root_id"`
+	RootName             string               `json:"root_name,omitempty"`
+	SourcePath           string               `json:"source_path"`
+	VisibleGenerationID  string               `json:"visible_generation_id,omitempty"`
+	VisibleGenerationSeq int64                `json:"visible_generation_seq,omitempty"`
+	Matched              int                  `json:"matched"`
+	Total                int                  `json:"total"`
+	Missing              []string             `json:"missing,omitempty"`
+	Stale                []syncSelectionStale `json:"stale,omitempty"`
+	LatestJob            *models.SyncJob      `json:"latest_job,omitempty"`
+	Includes             []string             `json:"include,omitempty"`
+	Excludes             []string             `json:"exclude,omitempty"`
+}
+
+type syncSelectionStale struct {
+	Path     string `json:"path"`
+	Expected string `json:"expected"`
+	Actual   string `json:"actual,omitempty"`
+}
+
+func waitForCommittedSelection(cfg *appconfig.Config, rootRef string, args []string, spec syncSubsetSpec, jobID string, interval, timeout time.Duration, logProgress bool) (*syncSelectionWaitResult, error) {
+	if cfg.Server.URL == "" {
+		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
+	}
+	client := newAPIClient(cfg)
+	root, err := resolveSyncWaitRoot(client, rootRef, args)
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := compileSyncSubsetSpec(root.CanonicalSourcePath, spec)
+	if err != nil {
+		return nil, err
+	}
+	policy, err := fetchSyncPolicy(client, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if timeout <= 0 {
+		timeout = syncPollTimeout()
+	}
+	interval = normalizeSyncPollInterval(interval)
+	deadline := time.Now().Add(timeout)
+	var last *syncSelectionWaitResult
+	for {
+		localState, err := selectedLocalState(root.CanonicalSourcePath, compiled, policy)
+		if err != nil {
+			return last, err
+		}
+		remoteRoot, err := loadRemoteRoot(client, root.ID)
+		if err != nil {
+			return last, fmt.Errorf("loading remote root metadata: %w", err)
+		}
+		remoteState, err := loadRemoteState(client, root.ID)
+		if err != nil {
+			return last, fmt.Errorf("loading remote state: %w", err)
+		}
+		latestJob, jobErr := getOptionalSyncJob(client, root.ID, jobID)
+		if jobErr != nil {
+			return last, jobErr
+		}
+		result := compareCommittedSelection(remoteRoot, root.CanonicalSourcePath, localState, remoteState, latestJob, spec)
+		last = result
+		if result.Status == "synced" {
+			if logProgress {
+				fmt.Fprintf(os.Stdout, "All selected files are synced (%d/%d).\n", result.Matched, result.Total)
+			}
+			return result, nil
+		}
+		if result.Status == "empty" {
+			return result, fmt.Errorf("no local files matched the selected sync filters")
+		}
+		if latestJob != nil && latestJob.Status == "failed" {
+			result.Status = "failed"
+			return result, fmt.Errorf("sync job failed: %s", string(latestJob.Errors))
+		}
+		if jobID != "" && latestJob != nil && latestJob.Status == "completed" {
+			result.Status = "unsynced"
+			return result, fmt.Errorf("sync job %s completed but selected files are not committed (%d/%d matched)", jobID, result.Matched, result.Total)
+		}
+		if time.Now().After(deadline) {
+			result.Status = "timeout"
+			return result, fmt.Errorf("timed out waiting for selected files to sync (%d/%d matched)", result.Matched, result.Total)
+		}
+		if logProgress {
+			printSelectionWaitProgress(os.Stdout, result)
+		}
+		time.Sleep(interval)
+	}
+}
+
+func resolveSyncWaitRoot(client *apiClient, rootRef string, args []string) (*syncOnlyRoot, error) {
+	if rootRef != "" && len(args) > 0 {
+		return nil, fmt.Errorf("root specified both as argument and --root")
+	}
+	if rootRef == "" && len(args) > 0 {
+		rootRef = args[0]
+	}
+	if rootRef == "" {
+		rootID, err := detectRootFromCwd()
+		if err != nil {
+			return nil, fmt.Errorf("could not detect root from cwd; use --root to specify: %w", err)
+		}
+		rootRef = rootID
+	}
+	if pathLooksLocal(rootRef) {
+		return resolveSyncOnlyRoot(client, rootRef, "", "")
+	}
+	rootID := rootRef
+	if !isUUID(rootID) {
+		resolvedID, err := resolveRootName(client, rootRef)
+		if err != nil {
+			return nil, fmt.Errorf("resolving root %q: %w", rootRef, err)
+		}
+		rootID = resolvedID
+	}
+	root, err := loadRemoteRoot(client, rootID)
+	if err != nil {
+		return nil, fmt.Errorf("loading root %s: %w", rootID, err)
+	}
+	canonicalSource, err := canonicalLocalPath(root.SourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("resolving root source path %s: %w", root.SourcePath, err)
+	}
+	return &syncOnlyRoot{RootMetadata: *root, CanonicalSourcePath: canonicalSource}, nil
+}
+
+func pathLooksLocal(value string) bool {
+	if value == "" {
+		return false
+	}
+	return filepath.IsAbs(value) || strings.HasPrefix(value, ".") || strings.ContainsAny(value, `/\`)
+}
+
+func selectedLocalState(rootPath string, spec compiledSyncSubsetSpec, policy ignore.PolicyPatternSet) (map[string]models.FileState, error) {
+	state := make(map[string]models.FileState)
+	matcher := ignore.NewMatcherWithPolicy(rootPath, policy)
+	rootPath = filepath.Clean(rootPath)
+	err := filepath.WalkDir(rootPath, func(absPath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(rootPath, absPath)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil
+		}
+		relPath = filepath.ToSlash(relPath)
+		if matcher.ShouldIgnore(relPath, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() || !spec.matches(relPath) {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("stat %s: %w", relPath, err)
+		}
+		fileState, err := fileStateForPath(absPath, info)
+		if err != nil {
+			return fmt.Errorf("hash %s: %w", relPath, err)
+		}
+		state[relPath] = fileState
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func getOptionalSyncJob(client *apiClient, rootID, jobID string) (*models.SyncJob, error) {
+	job, _, err := getSyncJob(client, rootID, jobID)
+	if err == nil {
+		return job, nil
+	}
+	if jobID != "" {
+		return nil, err
+	}
+	var apiErr *apiError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	return nil, err
+}
+
+func compareCommittedSelection(root *models.RootMetadata, sourcePath string, localState, remoteState map[string]models.FileState, latestJob *models.SyncJob, spec syncSubsetSpec) *syncSelectionWaitResult {
+	result := &syncSelectionWaitResult{
+		Status:               "pending",
+		RootID:               root.ID,
+		RootName:             root.Name,
+		SourcePath:           sourcePath,
+		VisibleGenerationID:  root.VisibleGenerationID,
+		VisibleGenerationSeq: root.VisibleGenerationSeq,
+		Total:                len(localState),
+		LatestJob:            latestJob,
+		Includes:             dedupeStrings(spec.Includes),
+		Excludes:             dedupeStrings(spec.Excludes),
+	}
+	if len(localState) == 0 {
+		result.Status = "empty"
+		return result
+	}
+	paths := make([]string, 0, len(localState))
+	for relPath := range localState {
+		paths = append(paths, relPath)
+	}
+	sort.Strings(paths)
+	for _, relPath := range paths {
+		local := localState[relPath]
+		remote, ok := remoteState[relPath]
+		if !ok {
+			result.Missing = append(result.Missing, relPath)
+			continue
+		}
+		if remote.ContentHash != local.ContentHash || remote.Size != local.Size {
+			result.Stale = append(result.Stale, syncSelectionStale{
+				Path:     relPath,
+				Expected: local.ContentHash,
+				Actual:   remote.ContentHash,
+			})
+			continue
+		}
+		result.Matched++
+	}
+	if result.Matched == result.Total {
+		result.Status = "synced"
+	}
+	return result
+}
+
+func printSelectionWaitProgress(w io.Writer, result *syncSelectionWaitResult) {
+	if result == nil {
+		return
+	}
+	jobStatus := "no active sync job"
+	if result.LatestJob != nil {
+		jobStatus = fmt.Sprintf("latest job: %s (%d/%d files)", result.LatestJob.Status, result.LatestJob.Processed, result.LatestJob.TotalFiles)
+	}
+	fmt.Fprintf(w, "Waiting for selected files to sync: %d/%d matched; %s\n", result.Matched, result.Total, jobStatus)
+	if len(result.Missing) > 0 {
+		fmt.Fprintf(w, "missing: %s\n", strings.Join(limitStrings(result.Missing, 5), ", "))
+	}
+	if len(result.Stale) > 0 {
+		paths := make([]string, 0, minInt(len(result.Stale), 5))
+		for i, stale := range result.Stale {
+			if i >= 5 {
+				break
+			}
+			paths = append(paths, stale.Path)
+		}
+		fmt.Fprintf(w, "stale: %s\n", strings.Join(paths, ", "))
+	}
+}
+
+func limitStrings(values []string, limit int) []string {
+	if len(values) <= limit {
+		return values
+	}
+	out := append([]string{}, values[:limit]...)
+	out = append(out, fmt.Sprintf("...+%d more", len(values)-limit))
+	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func syncJobTerminal(status string) bool {

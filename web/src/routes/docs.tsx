@@ -120,6 +120,32 @@ content: Parental leave provides 12 weeks paid for the primary caregiver and
     note: "Use --json when another program or agent needs structured output instead of the human terminal view.",
   },
   {
+    name: "sync wait",
+    usage: "pufferfs sync wait --root handbook --include 'docs/**'",
+    detail:
+      "Waits for sync completion. Without include/exclude filters it waits for the latest or specified sync job. With filters, it hashes matching local files and waits until the latest committed root state contains those exact file versions.",
+    flags: [
+      "--root <path|id|name>: local root path, root ID, or root name",
+      "--job-id <sync-job-id>: wait against a specific job for progress/failure",
+      "--include <glob>: wait for files matching this root-relative glob; can be repeated",
+      "--exclude <glob>: ignore matching files while waiting; can be repeated",
+      "--timeout <duration>: maximum wait time",
+      "--interval <duration>: polling interval",
+      "--json: print final result as JSON",
+    ],
+    transcript: `$ pufferfs sync ./handbook --name handbook --background
+Sync job sync_2bd3 started for root root_8z7m.
+
+$ pufferfs sync wait --root handbook --job-id sync_2bd3
+Sync status: embedding (418/1,284 files)
+Sync job sync_2bd3 completed (1,284/1,284 files).
+
+$ pufferfs sync wait --root /Users/me/Documents/handbook --include 'policies/time-off.pdf'
+Waiting for selected files to sync: 0/1 matched; latest job: chunking (0/1 files)
+All selected files are synced (1/1).`,
+    note: "Filtered wait succeeds only when the selected local files match the latest committed generation by size and sha256 content hash, so it works with sync --follow and installed services.",
+  },
+  {
     name: "service",
     usage: "pufferfs service install ./handbook --name handbook",
     detail:

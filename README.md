@@ -85,6 +85,7 @@ pufferfs sync ./handbook --name handbook --background
 pufferfs sync status --root handbook
 pufferfs sync jobs --root handbook
 pufferfs sync wait --root handbook --job-id <sync-job-id>
+pufferfs sync wait --root /Users/me/handbook --include "policies/**" --exclude "policies/archive/**"
 pufferfs root current
 pufferfs root delete --yes
 pufferfs root delete handbook --yes

@@ -390,6 +390,82 @@ func TestBuildSyncSubsetDiffRemovesOnlySelectedMissingPaths(t *testing.T) {
 	}
 }
 
+func TestSelectedLocalStateUsesSyncIncludeExcludeSemantics(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "docs/a.md", "a\n")
+	writeTestFile(t, root, "docs/nested/b.md", "b\n")
+	writeTestFile(t, root, "docs/archive/old.md", "old\n")
+	writeTestFile(t, root, "README.md", "readme\n")
+
+	spec, err := compileSyncSubsetSpec(root, syncSubsetSpec{
+		Includes: []string{"docs/**", "README.md"},
+		Excludes: []string{"docs/archive/**"},
+	})
+	if err != nil {
+		t.Fatalf("compileSyncSubsetSpec: %v", err)
+	}
+	state, err := selectedLocalState(root, spec, ignore.PolicyPatternSet{})
+	if err != nil {
+		t.Fatalf("selectedLocalState: %v", err)
+	}
+	for _, path := range []string{"docs/a.md", "docs/nested/b.md", "README.md"} {
+		if _, ok := state[path]; !ok {
+			t.Fatalf("selected state missing %s: %#v", path, state)
+		}
+	}
+	if _, ok := state["docs/archive/old.md"]; ok {
+		t.Fatalf("excluded path was selected: %#v", state)
+	}
+}
+
+func TestCompareCommittedSelectionReportsSyncedMissingAndStale(t *testing.T) {
+	local := map[string]models.FileState{
+		"docs/a.md":       {Size: 10, ContentHash: "sha256:a"},
+		"docs/missing.md": {Size: 20, ContentHash: "sha256:missing"},
+		"docs/stale.md":   {Size: 30, ContentHash: "sha256:new"},
+	}
+	remote := map[string]models.FileState{
+		"docs/a.md":     {Size: 10, ContentHash: "sha256:a"},
+		"docs/stale.md": {Size: 30, ContentHash: "sha256:old"},
+	}
+
+	result := compareCommittedSelection(&models.RootMetadata{
+		ID:                   "root-1",
+		Name:                 "workspace",
+		VisibleGenerationID:  "gen-1",
+		VisibleGenerationSeq: 4,
+	}, "/tmp/workspace", local, remote, nil, syncSubsetSpec{Includes: []string{"docs/**"}})
+
+	if result.Status != "pending" || result.Matched != 1 || result.Total != 3 {
+		t.Fatalf("result status/match = %#v", result)
+	}
+	if len(result.Missing) != 1 || result.Missing[0] != "docs/missing.md" {
+		t.Fatalf("missing = %#v", result.Missing)
+	}
+	if len(result.Stale) != 1 || result.Stale[0].Path != "docs/stale.md" || result.Stale[0].Expected != "sha256:new" || result.Stale[0].Actual != "sha256:old" {
+		t.Fatalf("stale = %#v", result.Stale)
+	}
+	if result.VisibleGenerationID != "gen-1" || result.VisibleGenerationSeq != 4 {
+		t.Fatalf("generation = %s/%d", result.VisibleGenerationID, result.VisibleGenerationSeq)
+	}
+}
+
+func TestCompareCommittedSelectionSyncedAndEmpty(t *testing.T) {
+	root := &models.RootMetadata{ID: "root-1", Name: "workspace"}
+	state := map[string]models.FileState{
+		"README.md": {Size: 7, ContentHash: "sha256:readme"},
+	}
+	synced := compareCommittedSelection(root, "/tmp/workspace", state, state, nil, syncSubsetSpec{Includes: []string{"README.md"}})
+	if synced.Status != "synced" || synced.Matched != 1 || synced.Total != 1 {
+		t.Fatalf("synced result = %#v", synced)
+	}
+
+	empty := compareCommittedSelection(root, "/tmp/workspace", nil, state, nil, syncSubsetSpec{Includes: []string{"missing/**"}})
+	if empty.Status != "empty" || empty.Total != 0 {
+		t.Fatalf("empty result = %#v", empty)
+	}
+}
+
 func TestResolveSyncOnlyRootByPathAndName(t *testing.T) {
 	rootPath := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

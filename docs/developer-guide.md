@@ -154,6 +154,14 @@ pufferfs sync jobs --root workspace
 pufferfs sync wait --root workspace --job-id <sync-job-id>
 ```
 
+Wait until selected local files are visible in the latest committed generation:
+
+```sh
+pufferfs sync wait --root /Users/me/workspace --include "docs/policy.md"
+pufferfs sync wait --root /Users/me/workspace --include "docs/**" --exclude "docs/archive/**"
+pufferfs sync wait --root workspace --include "docs/**" --json
+```
+
 What to expect:
 
 - The CLI hashes the folder and builds a Merkle tree.
@@ -179,6 +187,12 @@ What to expect:
   `--background`/`--detach`, it prints the `sync_job_id` and exits; use
   `pufferfs sync status`, `pufferfs sync jobs`, or `pufferfs sync wait` to
   inspect completion.
+- `pufferfs sync wait --include ...` is different from job wait: it hashes the
+  current local files matching the same root-relative include/exclude semantics
+  as subset sync, fetches the latest committed root state, and returns only when
+  every selected local file has the same size and `sha256:` content hash in the
+  visible generation. This works with `sync --follow` and installed services
+  because it waits for committed state, not for a particular process.
 - If the server generation changed during sync, the CLI reloads state,
   recomputes the diff, and retries.
 
@@ -626,6 +640,8 @@ If `sync --follow` does not pick up files:
 
 - Confirm the files are not ignored.
 - Confirm the followed directory still exists.
+- Use `pufferfs sync wait --root <root-path> --include <path-or-glob>` to check
+  whether the latest local file content has reached the committed server state.
 - Restart `sync --follow` after large directory moves.
 
 If a sync fails repeatedly:

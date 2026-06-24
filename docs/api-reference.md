@@ -361,7 +361,10 @@ Response `{"key": "..."}`.
 
 Return the root's current committed file-state map
 (`{ "<path>": { "size", "content_hash", "mtime" } }`). Requires read access.
-Used by the CLI to diff against the server when local cache is stale.
+Used by the CLI to diff against the server when local cache is stale and by
+`pufferfs sync wait --include ...` to verify that selected local files are
+present in the latest visible generation with matching size and `sha256:`
+content hash.
 
 ### `POST /roots/{id}/read`
 
@@ -504,6 +507,11 @@ root. Jobs that exceed the server sync timeout are transitioned to `failed`.
 Returns a `SyncJob` object. In-flight statuses include `queued`, `chunking`,
 `embedding`, `indexing`/`upserting`, and `committing`; terminal statuses are
 `completed` and `failed`.
+
+The CLI's filtered wait mode (`pufferfs sync wait --include <glob>`) combines
+this endpoint with `GET /roots/{id}/state`: it polls job status for progress and
+failure, but success is based on committed file state rather than an in-flight
+job phase.
 
 ### `GET /roots/{id}/sync/jobs`
 
