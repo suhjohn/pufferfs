@@ -19,18 +19,30 @@ import modal
 from models import Chunk, ChunkWithEmbedding
 
 app = modal.App(os.getenv("PUFFERFS_MODAL_APP_NAME", "pufferfs"))
+PDF_RENDERER_INSTALL_URL = os.getenv(
+    "PUFFERFS_PDF_RENDERER_INSTALL_URL",
+    "https://raw.githubusercontent.com/suhjohn/frpdf-renderer/main/install.sh",
+)
+PDF_RENDERER_VERSION = os.getenv("PUFFERFS_PDF_RENDERER_VERSION", "v0.1.1")
 
 # ---------------------------------------------------------------------------
 # Container images
 # ---------------------------------------------------------------------------
 
 chunking_image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("python:3.12-slim-trixie")
     .apt_install(
+        "ca-certificates",
+        "curl",
         "ffmpeg",
         "libreoffice-core",
         "libreoffice-writer",
         "libreoffice-impress",
+    )
+    .run_commands(
+        f"curl -fsSL {PDF_RENDERER_INSTALL_URL} "
+        f"| FRPDF_VERSION={PDF_RENDERER_VERSION} INSTALL_DIR=/usr/local/bin sh "
+        "&& (/usr/local/bin/frpdf 2>&1 || true) | grep -q 'Usage: frpdf'"
     )
     .pip_install(
         "boto3>=1.34.0",
@@ -153,29 +165,34 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     """Render PDF bytes to per-page JPEG images plus fallback native text."""
     import time
 
-    import fitz
-    from chunkers import _page_image_dpi, _page_image_jpeg_quality, render_page_jpeg
+    from chunkers import _page_image_dpi, _page_image_jpeg_quality, extract_pdf_page_texts, render_pdf_pages_jpeg
 
     render_start = time.perf_counter()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages: list[dict] = []
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        extracted_text = page.get_text("text")
-        pages.append(
-            {
-                "page_num": page_num,
-                "image_bytes": render_page_jpeg(page),
-                "fallback_text": extracted_text,
-            }
-        )
-    doc.close()
+    rendered_pages = render_pdf_pages_jpeg(pdf_bytes)
     print(
-        f"timing file={file_path} stage=pdf_render pages={len(pages)} "
+        f"timing file={file_path} stage=pdf_render renderer=frpdf-renderer pages={len(rendered_pages)} "
         f"dpi={_page_image_dpi()} jpeg_quality={_page_image_jpeg_quality()} "
         f"elapsed={time.perf_counter() - render_start:.3f}s",
         flush=True,
     )
+
+    text_start = time.perf_counter()
+    page_texts = extract_pdf_page_texts(pdf_bytes)
+    print(
+        f"timing file={file_path} stage=pdf_text_extract engine=pymupdf pages={len(page_texts)} "
+        f"elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
+
+    pages: list[dict] = []
+    for page_num, image_bytes in rendered_pages:
+        pages.append(
+            {
+                "page_num": page_num,
+                "image_bytes": image_bytes,
+                "fallback_text": page_texts[page_num] if page_num < len(page_texts) else "",
+            }
+        )
     return pages
 
 
@@ -881,6 +898,7 @@ class Embedder:
     def embed_shard_endpoint(self, item: dict) -> dict:
         """HTTP endpoint: POST {job:{...}} -> {result_ref,count}."""
         job = item["job"]
+        disable_vector = bool(job.get("disable_vector"))
         s3 = _s3_client()
         artifacts = _read_jsonl(s3, job["payload_ref"])
         out: list[dict] = []
@@ -893,6 +911,10 @@ class Embedder:
                     out.append({"op": "close", "close_path": path})
             elif op == "row" and artifact.get("row"):
                 row = artifact["row"]
+                if disable_vector:
+                    row.pop("vector", None)
+                    out.append({"op": "upsert", "row": row})
+                    continue
                 if row.get("vector") is not None:
                     out.append({"op": "upsert", "row": row})
                 else:
@@ -917,7 +939,11 @@ class Embedder:
                     )
             elif op == "chunk" and artifact.get("chunk"):
                 row = _row_from_chunk(job, artifact.get("change", {}).get("content_hash", ""), artifact["chunk"])
-                pending.append((artifact["chunk"], row))
+                if disable_vector:
+                    row.pop("vector", None)
+                    out.append({"op": "upsert", "row": row})
+                else:
+                    pending.append((artifact["chunk"], row))
         if pending:
             embedded = self._embed_chunks([chunk for chunk, _ in pending])
             if len(embedded) != len(pending):

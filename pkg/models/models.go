@@ -134,6 +134,7 @@ type RootMetadata struct {
 	SourcePath           string    `json:"source_path" db:"source_path"`
 	Scope                string    `json:"scope" db:"scope"`
 	OwnerUserID          string    `json:"owner_user_id,omitempty" db:"owner_user_id"`
+	VectorDisabled       bool      `json:"vector_disabled" db:"vector_disabled"`
 	Access               []string  `json:"access,omitempty" db:"-"`
 	AccessSource         string    `json:"access_source,omitempty" db:"-"`
 	VisibleGenerationID  string    `json:"visible_generation_id" db:"visible_generation_id"`
@@ -295,6 +296,7 @@ type SyncRequest struct {
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
 	ContentProofRef   string               `json:"content_proof_ref,omitempty"`
 	ManifestRef       string               `json:"manifest_ref,omitempty"`
+	DisableVector     bool                 `json:"disable_vector,omitempty"`
 }
 
 type SyncInitRequest struct {

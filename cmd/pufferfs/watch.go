@@ -51,7 +51,7 @@ func watchCmd() *cobra.Command {
 				return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 			}
 
-			return runFollow(cfg, absDir, name, rootID, options)
+			return runFollow(cfg, absDir, name, rootID, false, options)
 		},
 	}
 
@@ -86,7 +86,7 @@ func addFollowFlags(cmd *cobra.Command, options *followOptions) {
 	cmd.Flags().DurationVar(&options.MaxSameFailureWindow, "max-same-failure-window", options.MaxSameFailureWindow, "Exit after identical sync failures persist for this long")
 }
 
-func runFollow(cfg *appconfig.Config, dir, name, rootID string, options followOptions) error {
+func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, options followOptions) error {
 	if name == "" {
 		name = filepath.Base(dir)
 	}
@@ -98,7 +98,7 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, options followOp
 	fmt.Println("Running initial sync...")
 	failures := followFailureTracker{}
 	for {
-		if err := runFollowSync(cfg, dir, name, rootID, &failures, options); err != nil {
+		if err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options); err != nil {
 			return fmt.Errorf("initial sync: %w", err)
 		}
 		if !failures.Active {
@@ -184,7 +184,7 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, options followOp
 				return fmt.Errorf("watched directory unavailable: %w", err)
 			}
 			fmt.Println("\nChanges detected, syncing...")
-			if err := runFollowSync(cfg, dir, name, rootID, &failures, options); err != nil {
+			if err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options); err != nil {
 				return err
 			}
 			if failures.Active {
@@ -229,8 +229,8 @@ func resetFollowTimer(timer *time.Timer, pending *bool, delay time.Duration) {
 	*pending = true
 }
 
-func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, failures *followFailureTracker, options followOptions) error {
-	_, err := runSync(cfg, dir, name, rootID, "org", false, true, os.Stdout)
+func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions) error {
+	_, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, true, os.Stdout)
 	if err == nil {
 		failures.Reset()
 		return nil

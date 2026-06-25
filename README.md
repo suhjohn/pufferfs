@@ -51,6 +51,14 @@ pufferfs sync --root /Users/me/handbook --include "policies/**" --name handbook
 pufferfs sync --root /Users/me/handbook --include "policies/**" --exclude "policies/archive/**" --name handbook
 ```
 
+Force a re-sync/reindex when committed state exists but index propagation needs
+repair:
+
+```sh
+pufferfs sync --root /Users/me/handbook --force
+pufferfs sync --root /Users/me/handbook --include "policies/**" --force
+```
+
 Query the latest committed generation:
 
 ```sh

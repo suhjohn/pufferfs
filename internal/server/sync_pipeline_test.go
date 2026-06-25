@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -78,6 +80,54 @@ func TestModalChunkPayloadOmitsLineMetadataForEmbedCompatibility(t *testing.T) {
 	}
 	if chunk["content"] != row["content"] || chunk["file_path"] != row["file_path"] {
 		t.Fatalf("payload lost required fields: %#v", chunk)
+	}
+}
+
+func TestProcessEmbedJobSkipsVectorsWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	store := newMemoryObjectStore()
+	srv := NewWithStore(nil, store, nil, nil)
+	p := &syncPipeline{
+		server:     srv,
+		orgID:      "org-1",
+		rootID:     "root-1",
+		generation: &SyncGeneration{ID: "gen-1", Seq: 1},
+		req:        &models.SyncRequest{RootID: "root-1", DisableVector: true},
+	}
+	inputRef, err := p.writeJSONL(ctx, "chunks", "embed-input", []syncChunkArtifact{{
+		Op: "row",
+		Row: map[string]any{
+			"id":           "chunk-1",
+			"root_id":      "root-1",
+			"file_path":    "docs/a.md",
+			"chunk_index":  0,
+			"content":      "hello world",
+			"content_hash": "hash-1",
+			"file_type":    "markdown",
+			"vector":       []float64{0.1, 0.2},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	resultRef, err := p.processEmbedJob(ctx, objectQueueJob{JobID: "embed-job", PayloadRef: inputRef})
+	if err != nil {
+		t.Fatalf("processEmbedJob: %v", err)
+	}
+	data, err := store.Download(ctx, resultRef)
+	if err != nil {
+		t.Fatalf("download result: %v", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var row syncIndexArtifact
+	if err := dec.Decode(&row); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+	if row.Op != "upsert" {
+		t.Fatalf("op = %q, want upsert", row.Op)
+	}
+	if _, ok := row.Row["vector"]; ok {
+		t.Fatalf("vector should be omitted for vector-disabled root: %#v", row.Row)
 	}
 }
 

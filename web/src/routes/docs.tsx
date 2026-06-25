@@ -49,6 +49,8 @@ PufferFS CLI connected.`,
       "--include <glob>: sync files matching this root-relative glob; can be repeated",
       "--exclude <glob>: skip files matching this root-relative glob; can be repeated",
       "--scope org|user|restricted: choose root visibility when creating a root",
+      "--no-vector: create the root without vector search support; indexing stores full-text rows without embeddings",
+      "--force: re-sync and reindex selected/current files even when the committed root state already matches",
       "--dry-run: show what would change without uploading",
       "--json: print sync result as JSON",
       "--follow, -f: keep syncing on file changes",
@@ -84,8 +86,17 @@ Sync complete: 1,284 files processed, 14,602 chunks added
 $ pufferfs sync --root /Users/me/Documents/handbook --include 'policies/**' --exclude 'policies/archive/**' --name handbook
 Syncing 1 changes to root root_8z7m...
 Sync job sync_4fa1 started; polling until committed...
-Sync complete: 1 files processed, 3 chunks added`,
-    note: "Normal sync is blocking from the user's point of view: the command returns after the server commits or fails the sync. Subset sync accepts root-relative glob includes/excludes and preserves unselected files in existing roots.",
+Sync complete: 1 files processed, 3 chunks added
+
+$ pufferfs sync ./logs --name logs --no-vector
+Created root: logs (root_91kq)
+Sync complete: 318 files processed, 982 chunks added
+
+$ pufferfs sync ./handbook --name handbook --force
+Building Merkle tree for /Users/me/Documents/handbook...
+Syncing 1,284 changes to root root_8z7m...
+Sync complete: 1,284 files processed, 14,602 chunks added`,
+    note: "Normal sync is blocking from the user's point of view: the command returns after the server commits or fails the sync. Subset sync accepts root-relative glob includes/excludes and preserves unselected files in existing roots. --force is a one-shot recovery path for rebuilding index rows after propagation failures; it cannot be combined with --follow. --no-vector is a root creation setting: existing vector-enabled roots reject it instead of changing capabilities during sync.",
   },
   {
     name: "query",
@@ -116,7 +127,7 @@ chunk_index: 4
 file_type: docx
 content: Parental leave provides 12 weeks paid for the primary caregiver and
 6 weeks for secondary caregivers.`,
-    note: "Use --json when another program or agent needs structured output instead of the human terminal view.",
+    note: "Use --json when another program or agent needs structured output instead of the human terminal view. Roots created with --no-vector reject --mode vector; the default hybrid mode falls back to full-text for those roots.",
   },
   {
     name: "sync wait",
@@ -153,6 +164,7 @@ All selected files are synced (1/1).`,
       "--name, -n <name>: root alias",
       "--id <root-id>: attach to an existing root",
       "--service-name <name>: override generated service name",
+      "--no-vector: create the root without vector search support when the service performs its first sync",
       "--debounce <duration>: quiet period before syncing changes",
       "--max-backoff <duration>: maximum retry backoff",
       "--max-same-failures <n>: stop after repeated identical failures",
@@ -167,7 +179,7 @@ $ pufferfs service logs handbook
 watching /Users/me/Documents/handbook (debounce 2s)
 change: policies/time-off.pdf (modified)    -> 11 chunks updated
 change: contracts/acme-msa.pdf (added)      -> 24 chunks added`,
-    note: "Use service status, restart, stop, logs, and uninstall to manage the installed watcher.",
+    note: "Use service status, restart, stop, logs, and uninstall to manage the installed watcher. --no-vector is written into the installed sync --follow command so service-created roots stay full-text only.",
   },
   {
     name: "root delete",
@@ -517,12 +529,14 @@ const ENDPOINTS = [
     requestBody: `{
   "name": "handbook",
   "source_path": "/Users/me/Documents/handbook",
-  "scope": "org"
+  "scope": "org",
+  "vector_disabled": false
 }`,
     requestFields: [
       ["name", "string", "required", "Stable root name used by CLI commands and users, for example --root handbook."],
       ["source_path", "string", "required", "Original filesystem path on the syncing machine. PufferFS stores this for context; it does not read from this path on the server."],
       ["scope", "\"org\" | \"user\" | \"restricted\"", "required", "Visibility boundary. org roots are shared by role, user roots belong to one user, and restricted roots require explicit root grants."],
+      ["vector_disabled", "boolean", "optional", "When true, sync indexes full-text rows without embeddings and the root does not support vector search. The CLI sets this through sync/service --no-vector."],
     ],
     responses: [
       ["201", "Root metadata.", `{
@@ -531,6 +545,7 @@ const ENDPOINTS = [
   "source_path": "/Users/me/Documents/handbook",
   "scope": "org",
   "owner_user_id": "",
+  "vector_disabled": false,
   "visible_generation_id": "",
   "visible_generation_seq": 0
 }`],
@@ -797,7 +812,7 @@ const ENDPOINTS = [
     requestFields: [
       ["root_id", "string", "required", "Root to query. The caller must be able to read this root; unreadable roots return 404."],
       ["query", "string", "required", "Natural-language or keyword query text."],
-      ["mode", "\"hybrid\" | \"vector\" | \"text\"", "optional", "Search strategy. hybrid combines vector and full-text signals and is the normal default."],
+      ["mode", "\"hybrid\" | \"vector\" | \"fts\"", "optional", "Search strategy. hybrid combines vector and full-text signals by default. For vector-disabled roots, hybrid falls back to full-text and vector mode returns 400."],
       ["glob", "string", "optional", "File path filter applied within the root, for example *.pdf or policies/**."],
       ["top_k", "number", "optional", "Maximum number of chunks to return. Use a small value for agent context and latency."],
     ],

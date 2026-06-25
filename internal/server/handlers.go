@@ -970,10 +970,12 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 
 	orgID := r.PathValue("orgId")
 	var req struct {
-		Name        string `json:"name"`
-		SourcePath  string `json:"source_path"`
-		Scope       string `json:"scope"`
-		OwnerUserID string `json:"owner_user_id"`
+		Name           string `json:"name"`
+		SourcePath     string `json:"source_path"`
+		Scope          string `json:"scope"`
+		OwnerUserID    string `json:"owner_user_id"`
+		VectorDisabled bool   `json:"vector_disabled"`
+		DisableVector  bool   `json:"disable_vector"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -1007,7 +1009,7 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 		ownerUserID = ""
 	}
 
-	root, err := s.db.CreateRootWithScope(r.Context(), orgID, req.Name, req.SourcePath, scope, ownerUserID)
+	root, err := s.db.CreateRootWithScopeAndFeatures(r.Context(), orgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1262,10 +1264,12 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		Name        string `json:"name"`
-		SourcePath  string `json:"source_path"`
-		Scope       string `json:"scope"`
-		OwnerUserID string `json:"owner_user_id"`
+		Name           string `json:"name"`
+		SourcePath     string `json:"source_path"`
+		Scope          string `json:"scope"`
+		OwnerUserID    string `json:"owner_user_id"`
+		VectorDisabled bool   `json:"vector_disabled"`
+		DisableVector  bool   `json:"disable_vector"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -1308,15 +1312,16 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		ownerUserID = ""
 	}
 
-	root, err := s.db.CreateRootWithScope(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID)
+	root, err := s.db.CreateRootWithScopeAndFeatures(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
 	s.captureBackendEvent(r.Context(), id, "root_created", map[string]any{
-		"root_scope":     rootScopeProperty(root),
-		"owned_by_actor": root.OwnerUserID == "" || root.OwnerUserID == id.UserID,
+		"root_scope":      rootScopeProperty(root),
+		"owned_by_actor":  root.OwnerUserID == "" || root.OwnerUserID == id.UserID,
+		"vector_disabled": root.VectorDisabled,
 	})
 	writeJSON(w, http.StatusCreated, root)
 }
@@ -1801,6 +1806,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.RootID = rootID
+	req.DisableVector = root.VectorDisabled
 	if req.ProtocolVersion != models.SyncProtocolVersion {
 		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion))
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -3456,8 +3462,27 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var embedding []float64
+	if req.Mode == "vector" {
+		for _, root := range selection.roots {
+			if root.VectorDisabled {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("root %s has vector search disabled", root.ID)})
+				return
+			}
+		}
+	}
+
+	var needsEmbedding bool
 	if req.Mode == "vector" || req.Mode == "hybrid" {
+		for _, root := range selection.roots {
+			if !root.VectorDisabled {
+				needsEmbedding = true
+				break
+			}
+		}
+	}
+
+	var embedding []float64
+	if needsEmbedding {
 		var embedErr error
 		embedding, embedErr = s.modal.EmbedQuery(req.Query)
 		if embedErr != nil {
@@ -3608,14 +3633,24 @@ func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *model
 			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 		})
 	case "vector":
+		if root.VectorDisabled {
+			return nil, stats, fmt.Errorf("root %s has vector search disabled", root.ID)
+		}
 		rankBy := []any{"vector", "ANN", embedding}
 		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
 			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
 		})
 	case "hybrid":
-		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-			return s.tp.HybridSearch(namespace, req.Query, embedding, queryLimit, tpAndFilter(filters))
-		})
+		if root.VectorDisabled {
+			rankBy := []any{"content", "BM25", req.Query}
+			rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+				return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
+			})
+		} else {
+			rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+				return s.tp.HybridSearch(namespace, req.Query, embedding, queryLimit, tpAndFilter(filters))
+			})
+		}
 	default:
 		return nil, stats, fmt.Errorf("mode must be fts, vector, or hybrid")
 	}

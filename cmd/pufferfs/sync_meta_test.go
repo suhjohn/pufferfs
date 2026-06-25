@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -83,6 +84,53 @@ func TestSyncConflictFromAPIError(t *testing.T) {
 	}
 }
 
+func TestResolveOrCreateRootCreatesVectorDisabledRoot(t *testing.T) {
+	requests := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/roots":
+			_ = json.NewEncoder(w).Encode([]models.RootMetadata{})
+		case r.Method == http.MethodPost && r.URL.Path == "/roots":
+			var req map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode create root: %v", err)
+			}
+			requests <- req
+			_ = json.NewEncoder(w).Encode(models.RootMetadata{ID: "root-1", Name: "workspace", VectorDisabled: true})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	root, err := resolveOrCreateRoot(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "workspace", "/tmp/workspace", "org", true, io.Discard)
+	if err != nil {
+		t.Fatalf("resolveOrCreateRoot: %v", err)
+	}
+	if !root.VectorDisabled {
+		t.Fatalf("root should be vector-disabled: %#v", root)
+	}
+	req := <-requests
+	if req["vector_disabled"] != true {
+		t.Fatalf("vector_disabled payload = %#v", req["vector_disabled"])
+	}
+}
+
+func TestResolveOrCreateRootRejectsNoVectorForVectorEnabledRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/roots" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode([]models.RootMetadata{{ID: "root-1", Name: "workspace"}})
+	}))
+	defer server.Close()
+
+	_, err := resolveOrCreateRoot(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "workspace", "/tmp/workspace", "org", true, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "already supports vector search") {
+		t.Fatalf("err = %v, want vector-enabled root rejection", err)
+	}
+}
+
 func TestWithAbsolutePaths(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "workspace")
 	changes := withAbsolutePaths(root, []models.FileChange{{Path: "src/main.go", Status: models.StatusAdded}})
@@ -144,6 +192,41 @@ func TestLargeMovesFallBackToRemoveAndAdd(t *testing.T) {
 	}
 	if !statuses[models.StatusRemoved] || !statuses[models.StatusAdded] || statuses[models.StatusMoved] {
 		t.Fatalf("changes = %#v", result.Changes)
+	}
+}
+
+func TestForcedSyncDiffMarksCurrentFilesForReindex(t *testing.T) {
+	previous := map[string]models.FileState{
+		"same.md":    {Size: 5, ContentHash: "sha256:same"},
+		"changed.md": {Size: 3, ContentHash: "sha256:old"},
+		"removed.md": {Size: 7, ContentHash: "sha256:removed"},
+	}
+	current := map[string]models.FileState{
+		"same.md":    {Size: 5, ContentHash: "sha256:same"},
+		"changed.md": {Size: 4, ContentHash: "sha256:new"},
+		"added.md":   {Size: 2, ContentHash: "sha256:added"},
+	}
+
+	result := forcedSyncDiff(previous, current)
+
+	if result.Stats.Modified != 2 || result.Stats.Added != 1 || result.Stats.Removed != 1 || result.Stats.Unchanged != 0 {
+		t.Fatalf("stats = %#v", result.Stats)
+	}
+	statuses := map[string]models.FileChangeStatus{}
+	for _, change := range result.Changes {
+		statuses[change.Path] = change.Status
+	}
+	if statuses["same.md"] != models.StatusModified {
+		t.Fatalf("same.md status = %s, want MODIFIED", statuses["same.md"])
+	}
+	if statuses["changed.md"] != models.StatusModified {
+		t.Fatalf("changed.md status = %s, want MODIFIED", statuses["changed.md"])
+	}
+	if statuses["added.md"] != models.StatusAdded {
+		t.Fatalf("added.md status = %s, want ADDED", statuses["added.md"])
+	}
+	if statuses["removed.md"] != models.StatusRemoved {
+		t.Fatalf("removed.md status = %s, want REMOVED", statuses["removed.md"])
 	}
 }
 
@@ -262,7 +345,7 @@ func TestBuildSyncSubsetDiffPreservesUnselectedAndExcludedState(t *testing.T) {
 		t.Fatalf("compileSyncSubsetSpec: %v", err)
 	}
 
-	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root))
+	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root), false)
 	if err != nil {
 		t.Fatalf("buildSyncSubsetDiff: %v", err)
 	}
@@ -309,7 +392,7 @@ func TestBuildSyncSubsetDiffRemovesOnlySelectedMissingPaths(t *testing.T) {
 		t.Fatalf("compileSyncSubsetSpec: %v", err)
 	}
 
-	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root))
+	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root), false)
 	if err != nil {
 		t.Fatalf("buildSyncSubsetDiff: %v", err)
 	}
@@ -323,6 +406,46 @@ func TestBuildSyncSubsetDiffRemovesOnlySelectedMissingPaths(t *testing.T) {
 		if got := merged[path]; got != baseState[path] {
 			t.Fatalf("path %s was not preserved: got %#v want %#v", path, got, baseState[path])
 		}
+	}
+}
+
+func TestBuildSyncSubsetDiffForceReindexesSelectedUnchangedFiles(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, root, "docs/a.md", "same\n")
+	writeTestFile(t, root, "docs/private.md", "same\n")
+
+	stateA, err := fileStateForPath(filepath.Join(root, "docs", "a.md"), mustStat(t, filepath.Join(root, "docs", "a.md")))
+	if err != nil {
+		t.Fatalf("file state a: %v", err)
+	}
+	privateState, err := fileStateForPath(filepath.Join(root, "docs", "private.md"), mustStat(t, filepath.Join(root, "docs", "private.md")))
+	if err != nil {
+		t.Fatalf("file state private: %v", err)
+	}
+	baseState := map[string]models.FileState{
+		"docs/a.md":       stateA,
+		"docs/private.md": privateState,
+	}
+	spec, err := compileSyncSubsetSpec(root, syncSubsetSpec{
+		Includes: []string{"docs/**"},
+		Excludes: []string{"docs/private.md"},
+	})
+	if err != nil {
+		t.Fatalf("compileSyncSubsetSpec: %v", err)
+	}
+
+	result, merged, err := buildSyncSubsetDiff(root, spec, baseState, ignore.NewMatcher(root), true)
+	if err != nil {
+		t.Fatalf("buildSyncSubsetDiff: %v", err)
+	}
+	if result.Stats.Modified != 1 || countChanges(result) != 1 {
+		t.Fatalf("result = %#v, want one forced modified file", result)
+	}
+	if len(result.Changes) != 1 || result.Changes[0].Path != "docs/a.md" || result.Changes[0].Status != models.StatusModified {
+		t.Fatalf("changes = %#v", result.Changes)
+	}
+	if merged["docs/private.md"] != privateState {
+		t.Fatalf("excluded path changed in merged state")
 	}
 }
 
@@ -494,4 +617,13 @@ func writeTestFile(t *testing.T, root, relPath, content string) {
 	if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", relPath, err)
 	}
+}
+
+func mustStat(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return info
 }

@@ -126,6 +126,14 @@ pufferfs sync --root /Users/me/workspace --include "docs/**" --name workspace
 pufferfs sync --root /Users/me/workspace --include "docs/**" --exclude "docs/archive/**" --name workspace
 ```
 
+Force a re-sync and reindex when committed root state already matches local
+files but chunking/index propagation needs repair:
+
+```sh
+pufferfs sync --root /Users/me/workspace --force
+pufferfs sync --root /Users/me/workspace --include "docs/**" --force
+```
+
 Create a user-owned root:
 
 ```sh
@@ -178,6 +186,11 @@ What to expect:
   subset. Multiple includes are additive, excludes win, and selected changes are
   patched into the current committed root state so unselected files stay visible
   in existing roots.
+- With `--force`, the CLI uploads and reindexes the current files even when the
+  committed root state already has matching size/content hashes. For full-root
+  sync, all current files are treated as modified and deleted paths are closed.
+  For subset sync, only selected files are forced. `--force` is intended for
+  one-shot recovery and cannot be combined with `--follow`.
 - Uploaded source objects are temporary transport for the sync generation. They
   are removed after the generation commits, is aborted, is rejected, fails, or
   expires incomplete.

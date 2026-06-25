@@ -283,7 +283,7 @@ func (d *SyncDispatcher) pipelineFor(msg queue.JobMessage) *syncPipeline {
 		generation:            generation,
 		job:                   job,
 		userID:                msg.UserID,
-		req:                   &models.SyncRequest{RootID: msg.RootID},
+		req:                   &models.SyncRequest{RootID: msg.RootID, DisableVector: msg.DisableVector},
 		indexNamespaces:       modelIndexNamespaces(msg.IndexNamespaces, msg.OrgID, msg.RootID),
 		indexNamespacesLoaded: len(msg.IndexNamespaces) > 0,
 		resp: &models.SyncResponse{
@@ -384,6 +384,7 @@ func modalJob(msg queue.JobMessage) map[string]any {
 		"shard_index":         msg.ShardIndex,
 		"total_shards":        msg.TotalShards,
 		"files_in_shard":      msg.FilesInShard,
+		"disable_vector":      msg.DisableVector,
 		"priority":            msg.Priority,
 		"enqueued_at":         msg.EnqueuedAt.Format(time.RFC3339Nano),
 	}

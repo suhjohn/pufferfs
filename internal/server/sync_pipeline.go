@@ -182,6 +182,7 @@ func (p *syncPipeline) jobMessage(stage, jobID, payloadRef string, shardIndex, t
 		ShardIndex:        shardIndex,
 		TotalShards:       totalShards,
 		FilesInShard:      filesInShard,
+		DisableVector:     p.req != nil && p.req.DisableVector,
 		EnqueuedAt:        time.Now().UTC(),
 	}
 }
@@ -527,6 +528,15 @@ func (p *syncPipeline) processEmbedJob(ctx context.Context, job objectQueueJob) 
 			indexRows = append(indexRows, syncIndexArtifact{Op: "upsert", Row: row})
 		}
 	}
+	if p.req != nil && p.req.DisableVector {
+		for i := range indexRows {
+			if indexRows[i].Op == "upsert" {
+				delete(indexRows[i].Row, "vector")
+			}
+		}
+		return p.writeJSONL(ctx, "index_rows", job.JobID, indexRows)
+	}
+
 	cached, err := p.server.db.GetCachedEmbeddings(ctx, p.orgID, p.server.modal.EmbeddingModelVersion(), contentHashes)
 	if err != nil {
 		log.Printf("warning: embedding cache lookup failed: %v", err)

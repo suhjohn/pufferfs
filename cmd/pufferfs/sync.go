@@ -36,6 +36,8 @@ func syncCmd() *cobra.Command {
 		includes   []string
 		excludes   []string
 		scope      string
+		noVector   bool
+		force      bool
 		follow     bool
 		jsonOut    bool
 		background bool
@@ -88,13 +90,16 @@ a complete merged root state so unselected files in existing roots stay visible.
 				if dryRun {
 					return fmt.Errorf("--follow cannot be combined with --dry-run")
 				}
+				if force {
+					return fmt.Errorf("--follow cannot be combined with --force")
+				}
 				if background || detach {
 					return fmt.Errorf("--background/--detach cannot be combined with --follow")
 				}
 				if cfg.Server.URL == "" {
 					return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 				}
-				return runFollow(cfg, absDir, name, rootID, options)
+				return runFollow(cfg, absDir, name, rootID, noVector, options)
 			}
 			if dryRun && (background || detach) {
 				return fmt.Errorf("--background/--detach cannot be combined with --dry-run")
@@ -104,7 +109,7 @@ a complete merged root state so unselected files in existing roots stay visible.
 				result, err := runSyncSubset(cfg, absDir, syncSubsetSpec{
 					Includes: includes,
 					Excludes: excludes,
-				}, name, rootID, scope, dryRun, !background && !detach, log)
+				}, name, rootID, scope, noVector, force, dryRun, !background && !detach, log)
 				if err != nil {
 					return err
 				}
@@ -114,7 +119,7 @@ a complete merged root state so unselected files in existing roots stay visible.
 				return nil
 			}
 			log := syncLogWriter(jsonOut)
-			result, err := runSync(cfg, absDir, name, rootID, scope, dryRun, !background && !detach, log)
+			result, err := runSync(cfg, absDir, name, rootID, scope, noVector, force, dryRun, !background && !detach, log)
 			if err != nil {
 				return err
 			}
@@ -136,6 +141,8 @@ a complete merged root state so unselected files in existing roots stay visible.
 	cmd.Flags().StringArrayVar(&includes, "include", nil, "Sync files matching this root-relative glob; can be repeated")
 	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "Skip files matching this root-relative glob; can be repeated")
 	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
+	cmd.Flags().BoolVar(&noVector, "no-vector", false, "Create the root without vector search support")
+	cmd.Flags().BoolVar(&force, "force", false, "Force re-sync and reindex even when local files match the committed root state")
 	addFollowFlags(cmd, &options)
 	cmd.AddCommand(syncStatusCmd(), syncJobsCmd(), syncWaitCmd())
 
@@ -749,7 +756,7 @@ func printSyncJobs(w io.Writer, jobs []models.SyncJob) {
 	}
 }
 
-func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
 	if log == nil {
 		log = os.Stdout
 	}
@@ -769,7 +776,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 			localMeta = meta
 		} else if !dryRun {
 			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, log)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, noVector, log)
 			if err != nil {
 				return nil, err
 			}
@@ -787,6 +794,9 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 		remoteRoot, err = loadRemoteRoot(client, rootID)
 		if err != nil {
 			return nil, fmt.Errorf("loading remote root metadata: %w", err)
+		}
+		if err := validateNoVectorRoot(remoteRoot, noVector); err != nil {
+			return nil, err
 		}
 	}
 	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
@@ -833,14 +843,37 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 			return nil, fmt.Errorf("loading remote state: %w", err)
 		}
 		result := diff.Compute(previousState, currentState)
+		if force {
+			result = forcedSyncDiff(previousState, currentState)
+		}
 		if countChanges(result) == 0 {
-			fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
+			if force {
+				fmt.Fprintln(log, "No files to force sync.")
+			} else {
+				fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
+			}
 			if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq); err != nil {
 				return nil, err
 			}
 			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
 		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+	}
+
+	if force {
+		previousState := hashCache
+		if previousState == nil {
+			previousState, _ = loadLocalState(rootID)
+		}
+		if previousState == nil && rootID != "" && !dryRun && cfg.Server.URL != "" {
+			previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
+		}
+		result := forcedSyncDiff(previousState, currentState)
+		if countChanges(result) == 0 {
+			fmt.Fprintln(log, "No files to force sync.")
+			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
+		}
+		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 	}
 
 	// Load previous tree — try local first, then fall back to flat state
@@ -858,7 +891,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 		if previousState != nil {
 			// Use flat diff as fallback
 			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 		}
 		// No previous state at all — everything is new
 		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
@@ -876,7 +909,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun,
 	// Convert Merkle changes to DiffResult for compatibility
 	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
 
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 }
 
 type syncOnlyRoot struct {
@@ -894,7 +927,7 @@ type compiledSyncSubsetSpec struct {
 	excludeGlobs []string
 }
 
-func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
 	if log == nil {
 		log = os.Stdout
 	}
@@ -924,7 +957,7 @@ func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, 
 			localMeta = meta
 		} else if !dryRun {
 			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, rootPath, rootScope, log)
+			resolvedRoot, err := resolveOrCreateRoot(client, name, rootPath, rootScope, noVector, log)
 			if err != nil {
 				return nil, err
 			}
@@ -941,6 +974,9 @@ func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, 
 		remoteRoot, err = loadRemoteRoot(client, rootID)
 		if err != nil {
 			return nil, fmt.Errorf("loading remote root metadata: %w", err)
+		}
+		if err := validateNoVectorRoot(remoteRoot, noVector); err != nil {
+			return nil, err
 		}
 	}
 
@@ -976,7 +1012,7 @@ func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, 
 		return nil, err
 	}
 
-	result, err := runSyncSubsetOnce(cfg, client, root, compiled, policy, dryRun, waitForCompletion, log)
+	result, err := runSyncSubsetOnce(cfg, client, root, compiled, policy, force, dryRun, waitForCompletion, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return result, err
@@ -991,21 +1027,25 @@ func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, 
 		return nil, fmt.Errorf("loading remote root metadata after sync conflict: %w", loadErr)
 	}
 	root.RootMetadata = *latestRoot
-	return runSyncSubsetOnce(cfg, client, root, compiled, policy, dryRun, waitForCompletion, log)
+	return runSyncSubsetOnce(cfg, client, root, compiled, policy, force, dryRun, waitForCompletion, log)
 }
 
-func runSyncSubsetOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoot, spec compiledSyncSubsetSpec, policy ignore.PolicyPatternSet, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
+func runSyncSubsetOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoot, spec compiledSyncSubsetSpec, policy ignore.PolicyPatternSet, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
 	baseState, err := loadSyncSubsetBaseState(client, root)
 	if err != nil {
 		return nil, err
 	}
 	matcher := ignore.NewMatcherWithPolicy(root.CanonicalSourcePath, policy)
-	diffResult, mergedState, err := buildSyncSubsetDiff(root.CanonicalSourcePath, spec, baseState, matcher)
+	diffResult, mergedState, err := buildSyncSubsetDiff(root.CanonicalSourcePath, spec, baseState, matcher, force)
 	if err != nil {
 		return nil, err
 	}
 	if countChanges(diffResult) == 0 {
-		fmt.Fprintln(log, "No changes detected for selected files.")
+		if force {
+			fmt.Fprintln(log, "No selected files to force sync.")
+		} else {
+			fmt.Fprintln(log, "No changes detected for selected files.")
+		}
 		return unchangedSyncResult(root.ID, root.Name, root.CanonicalSourcePath, root.VisibleGenerationID, root.VisibleGenerationSeq), nil
 	}
 
@@ -1013,7 +1053,7 @@ func runSyncSubsetOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyR
 	if err != nil {
 		return nil, fmt.Errorf("building merged root tree: %w", err)
 	}
-	syncResult, err := runSyncWithResult(cfg, root.CanonicalSourcePath, root.Name, root.ID, root.Scope, dryRun, waitForCompletion, diffResult, mergedState, currentTree, root.VisibleGenerationID, root.VisibleGenerationSeq, policy, log)
+	syncResult, err := runSyncWithResult(cfg, root.CanonicalSourcePath, root.Name, root.ID, root.Scope, root.VectorDisabled, dryRun, waitForCompletion, diffResult, mergedState, currentTree, root.VisibleGenerationID, root.VisibleGenerationSeq, policy, log)
 	if syncResult != nil {
 		syncResult.FileChanges = filterChanges(diffResult)
 		stats := diffResult.Stats
@@ -1198,7 +1238,7 @@ func canonicalLocalPath(path string) (string, error) {
 	return abs, nil
 }
 
-func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState map[string]models.FileState, matcher *ignore.Matcher) (models.DiffResult, map[string]models.FileState, error) {
+func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState map[string]models.FileState, matcher *ignore.Matcher, force bool) (models.DiffResult, map[string]models.FileState, error) {
 	merged := make(map[string]models.FileState, len(baseState))
 	for path, state := range baseState {
 		merged[path] = state
@@ -1293,6 +1333,15 @@ func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState
 				Size:        currentState.Size,
 			})
 			result.Stats.Modified++
+		case hasCurrent && force:
+			merged[relPath] = currentState
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusModified,
+				ContentHash: currentState.ContentHash,
+				Size:        currentState.Size,
+			})
+			result.Stats.Modified++
 		case hasCurrent:
 			merged[relPath] = base
 			result.Stats.Unchanged++
@@ -1300,6 +1349,57 @@ func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState
 	}
 
 	return result, merged, nil
+}
+
+func forcedSyncDiff(previousState, currentState map[string]models.FileState) models.DiffResult {
+	result := models.DiffResult{}
+	seen := make(map[string]bool, len(previousState)+len(currentState))
+	paths := make([]string, 0, len(previousState)+len(currentState))
+	for relPath := range previousState {
+		if !seen[relPath] {
+			seen[relPath] = true
+			paths = append(paths, relPath)
+		}
+	}
+	for relPath := range currentState {
+		if !seen[relPath] {
+			seen[relPath] = true
+			paths = append(paths, relPath)
+		}
+	}
+	sort.Strings(paths)
+
+	for _, relPath := range paths {
+		current, hasCurrent := currentState[relPath]
+		previous, hadPrevious := previousState[relPath]
+		switch {
+		case hasCurrent && hadPrevious:
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusModified,
+				ContentHash: current.ContentHash,
+				Size:        current.Size,
+			})
+			result.Stats.Modified++
+		case hasCurrent:
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusAdded,
+				ContentHash: current.ContentHash,
+				Size:        current.Size,
+			})
+			result.Stats.Added++
+		case hadPrevious:
+			result.Changes = append(result.Changes, models.FileChange{
+				Path:        relPath,
+				Status:      models.StatusRemoved,
+				ContentHash: previous.ContentHash,
+				Size:        previous.Size,
+			})
+			result.Stats.Removed++
+		}
+	}
+	return result
 }
 
 func (spec compiledSyncSubsetSpec) matches(relPath string) bool {
@@ -1429,7 +1529,7 @@ func fileStateForPath(path string, info os.FileInfo) (models.FileState, error) {
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
+func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
 	var err error
 
 	// Detect secrets
@@ -1449,7 +1549,7 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 
 	// Get or create root
 	if rootID == "" {
-		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, log)
+		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, noVector, log)
 		if err != nil {
 			return nil, err
 		}
@@ -1589,8 +1689,8 @@ func syncConflictFromError(err error) (*syncConflictError, bool) {
 	return &syncConflictError{SyncConflictResponse: resp}, true
 }
 
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
-	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
+	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, noVector, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 	var conflict *syncConflictError
 	if !errors.As(err, &conflict) {
 		return syncResult, err
@@ -1606,6 +1706,9 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 		return nil, fmt.Errorf("loading remote state after sync conflict: %w", loadErr)
 	}
 	reconciled := diff.Compute(previousState, currentState)
+	if force {
+		reconciled = forcedSyncDiff(previousState, currentState)
+	}
 	if countChanges(reconciled) == 0 {
 		fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
 		if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq); err != nil {
@@ -1613,7 +1716,7 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 		}
 		return unchangedSyncResult(rootID, name, dir, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq), nil
 	}
-	return runSyncWithResult(cfg, dir, name, rootID, rootScope, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, policy, log)
+	return runSyncWithResult(cfg, dir, name, rootID, rootScope, noVector, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, policy, log)
 }
 
 func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*models.SyncJob, error) {
@@ -1803,7 +1906,7 @@ func moveReuseMaxBytes() int64 {
 	return value
 }
 
-func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, log io.Writer) (*models.RootMetadata, error) {
+func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, noVector bool, log io.Writer) (*models.RootMetadata, error) {
 	// Try to find existing root by name
 	respBody, err := client.get("/roots")
 	if err != nil {
@@ -1817,16 +1920,20 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, 
 
 	for _, r := range roots {
 		if r.Name == name {
+			if err := validateNoVectorRoot(&r, noVector); err != nil {
+				return nil, err
+			}
 			fmt.Fprintf(log, "Using existing root: %s (%s)\n", r.Name, r.ID)
 			return &r, nil
 		}
 	}
 
 	// Create new root
-	createReq := map[string]string{
-		"name":        name,
-		"source_path": sourcePath,
-		"scope":       rootScope,
+	createReq := map[string]any{
+		"name":            name,
+		"source_path":     sourcePath,
+		"scope":           rootScope,
+		"vector_disabled": noVector,
 	}
 	respBody, err = client.post("/roots", createReq)
 	if err != nil {
@@ -1840,6 +1947,13 @@ func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, 
 
 	fmt.Fprintf(log, "Created root: %s (%s)\n", root.Name, root.ID)
 	return &root, nil
+}
+
+func validateNoVectorRoot(root *models.RootMetadata, noVector bool) error {
+	if root == nil || !noVector || root.VectorDisabled {
+		return nil
+	}
+	return fmt.Errorf("--no-vector only applies when creating a new root or syncing a vector-disabled root; root %s (%s) already supports vector search", root.Name, root.ID)
 }
 
 type rootMeta struct {

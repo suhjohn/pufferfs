@@ -67,25 +67,25 @@ Supported document inputs:
 Pipeline:
 
 1. DOC/DOCX and PPT/PPTX files are converted to PDF with headless LibreOffice.
-2. PDF pages are opened with PyMuPDF.
-3. Each page is rendered to a compressed JPEG image. Rendering defaults to
+2. PDF pages are rendered directly to compressed JPEG images with `frpdf-renderer`.
+   Rendering defaults to
    `PUFFERFS_MODAL_PAGE_IMAGE_DPI=160` and
    `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY=75`.
-4. Native PDF text is extracted as the first text source when available.
-5. Rendered page JPEGs are uploaded to S3-compatible storage in parallel,
+3. Native PDF text is extracted separately as the first text source when available.
+4. Rendered page JPEGs are uploaded to S3-compatible storage in parallel,
    capped per chunking container by
    `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY`.
-6. Pages with no native text are submitted to the shared Modal
-   `page_image_to_text` function pool for LLM OCR. Pages with native MuPDF text
+5. Pages with no native text are submitted to the shared Modal
+   `page_image_to_text` function pool for LLM OCR. Pages with native PDF text
    skip LLM OCR. Global OCR fan-out is capped by
    `PUFFERFS_MODAL_OCR_MAX_CONTAINERS`, not by each document.
    `PUFFERFS_VLLM_MODELS` uses `provider/model:weight` entries to split
    traffic by quota capacity, for example Fireworks, OpenAI, and Gemini models
    in one weighted pool. If Gemini OCR fails, including recitation blocks, OCR
    retries that page with `openai/gpt-5.4-nano`.
-7. If no configured image provider key is available, PufferFS falls back to
+6. If no configured image provider key is available, PufferFS falls back to
    native extracted text.
-8. The rendered page JPEG is uploaded to S3-compatible storage at:
+7. The rendered page JPEG is uploaded to S3-compatible storage at:
 
    ```text
    chunks/<root_id>/<file_path>.<page_number>.jpg

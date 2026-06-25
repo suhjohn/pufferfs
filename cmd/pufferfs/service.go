@@ -35,6 +35,7 @@ type serviceInstallOptions struct {
 	RootName             string
 	RootID               string
 	ServiceName          string
+	NoVector             bool
 	Debounce             string
 	MaxBackoff           string
 	MaxSameFailures      int
@@ -48,6 +49,7 @@ type serviceSpec struct {
 	Executable           string
 	RootName             string
 	RootID               string
+	NoVector             bool
 	Debounce             string
 	MaxBackoff           string
 	MaxSameFailures      int
@@ -93,6 +95,7 @@ func serviceInstallCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&options.RootName, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&options.RootID, "id", "", "Root ID to re-attach to")
 	cmd.Flags().StringVar(&options.ServiceName, "service-name", "", "Service name; defaults to the root name")
+	cmd.Flags().BoolVar(&options.NoVector, "no-vector", false, "Create the root without vector search support")
 	cmd.Flags().StringVar(&options.Debounce, "debounce", options.Debounce, "Debounce interval for file changes")
 	cmd.Flags().StringVar(&options.MaxBackoff, "max-backoff", options.MaxBackoff, "Maximum retry backoff")
 	cmd.Flags().IntVar(&options.MaxSameFailures, "max-same-failures", options.MaxSameFailures, "Exit after this many consecutive identical sync failures")
@@ -174,6 +177,7 @@ func buildServiceSpec(absDir string, options serviceInstallOptions) (serviceSpec
 		Executable:           exe,
 		RootName:             rootName,
 		RootID:               options.RootID,
+		NoVector:             options.NoVector,
 		Debounce:             options.Debounce,
 		MaxBackoff:           options.MaxBackoff,
 		MaxSameFailures:      options.MaxSameFailures,
@@ -501,6 +505,9 @@ func serviceProgramArgs(spec serviceSpec) []string {
 	args := []string{spec.Executable, "sync", spec.Path, "--follow", "--name", spec.RootName}
 	if spec.RootID != "" {
 		args = append(args, "--id", spec.RootID)
+	}
+	if spec.NoVector {
+		args = append(args, "--no-vector")
 	}
 	args = append(args,
 		"--debounce", spec.Debounce,

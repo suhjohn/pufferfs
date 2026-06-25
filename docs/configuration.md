@@ -169,6 +169,10 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
 | `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY` | JPEG quality for rendered page images. Lower values reduce upload size; valid values are clamped between 30 and 95. | 75 |
 | `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY` | Concurrent S3 page-image uploads per document chunking container. This overlaps with OCR fan-out and is separate from Modal OCR container concurrency. | 512 |
+| `PUFFERFS_PDF_RENDERER_INSTALL_URL` | Installer script URL for the `frpdf` binary installed into the Modal chunking image. | `https://raw.githubusercontent.com/suhjohn/frpdf-renderer/main/install.sh` |
+| `PUFFERFS_PDF_RENDERER_VERSION` | `frpdf-renderer` release version passed to the installer. Set to `latest` to install the latest release. | `v0.1.1` |
+| `PUFFERFS_PDF_RENDERER_PATH` | Runtime path to the installed PDF renderer binary. | `/usr/local/bin/frpdf` |
+| `PUFFERFS_PDF_RENDERER_JOBS` | Parallel render jobs passed to `frpdf-renderer --jobs`. Defaults to container CPU count. | CPU count |
 | `PUFFERFS_MODAL_PAGE_TEXT_MIN_CONTAINERS` | Warm Modal containers kept for page image-to-text calls. | 4 |
 | `PUFFERFS_MODAL_OCR_MAX_CONTAINERS` | Global max Modal containers for OCR/image-to-text calls. This caps OCR fan-out across all documents using the shared `page_image_to_text` function pool. | 100 |
 | `PUFFERFS_MODAL_SECRET_NAME` | Single Modal secret name used by all Modal functions. It contains storage, Turbopuffer, and model-provider credentials. | `pufferfs` |
@@ -204,7 +208,9 @@ Standalone conversion endpoints accept JSON and are protected by
 
 `office_to_pdf` responds with `pdf_b64`. `pdf_to_page_images` accepts
 `pdf_b64` and responds with one entry per page containing `image_b64`,
-`image_bytes`, and `fallback_text` extracted by MuPDF.
+`image_bytes`, and `fallback_text`. Page images are rendered by
+`frpdf-renderer`; `fallback_text` is extracted separately from the PDF text
+layer.
 
 ### Transactional email (AWS SES, optional)
 

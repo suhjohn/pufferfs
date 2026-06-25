@@ -242,6 +242,7 @@ func (db *DB) migrateFallback() error {
 				org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
 			name        TEXT NOT NULL,
 			source_path TEXT NOT NULL,
+			vector_disabled BOOLEAN NOT NULL DEFAULT FALSE,
 			scope       TEXT NOT NULL DEFAULT 'org',
 			owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
 			simhash     TEXT NOT NULL DEFAULT '',
@@ -249,6 +250,7 @@ func (db *DB) migrateFallback() error {
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+		ALTER TABLE roots ADD COLUMN IF NOT EXISTS vector_disabled BOOLEAN NOT NULL DEFAULT FALSE;
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS visible_generation_id TEXT NOT NULL DEFAULT '';
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'org';
 			ALTER TABLE roots ADD COLUMN IF NOT EXISTS owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
@@ -1352,6 +1354,10 @@ func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*
 }
 
 func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string) (*models.RootMetadata, error) {
+	return db.CreateRootWithScopeAndFeatures(ctx, orgID, name, sourcePath, scope, ownerUserID, true)
+}
+
+func (db *DB) CreateRootWithScopeAndFeatures(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string, vectorDisabled bool) (*models.RootMetadata, error) {
 	if scope == "" {
 		scope = models.RootScopeOrg
 	}
@@ -1365,6 +1371,7 @@ func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, 
 		SourcePath:           sourcePath,
 		Scope:                scope,
 		OwnerUserID:          ownerUserID,
+		VectorDisabled:       vectorDisabled,
 		VisibleGenerationID:  "",
 		VisibleGenerationSeq: 0,
 		CreatedAt:            time.Now(),
@@ -1382,9 +1389,9 @@ func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, 
 	}()
 
 	_, err = tx.Exec(ctx,
-		`INSERT INTO roots (id, org_id, name, source_path, scope, owner_user_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8)`,
-		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.CreatedAt, root.UpdatedAt,
+		`INSERT INTO roots (id, org_id, name, source_path, scope, owner_user_id, vector_disabled, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9)`,
+		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.VectorDisabled, root.CreatedAt, root.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -1399,11 +1406,11 @@ func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, 
 	return root, nil
 }
 
-const rootSelectColumns = `r.id, r.org_id, r.name, r.source_path, r.scope, COALESCE(r.owner_user_id, ''), r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at`
+const rootSelectColumns = `r.id, r.org_id, r.name, r.source_path, r.scope, COALESCE(r.owner_user_id, ''), r.vector_disabled, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at`
 
 func scanRoot(row pgx.Row) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
-	err := row.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope, &root.OwnerUserID, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
+	err := row.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope, &root.OwnerUserID, &root.VectorDisabled, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1455,7 +1462,7 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
@@ -1500,7 +1507,7 @@ func (db *DB) ListRootsOwnedByUser(ctx context.Context, userID string) ([]models
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)

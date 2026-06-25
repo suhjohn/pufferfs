@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import email
 from email import policy
+import glob
 from html.parser import HTMLParser
 import os
 import quopri
@@ -143,10 +144,67 @@ def _page_image_jpeg_quality() -> int:
     return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY", 75, 30, 95)
 
 
-def render_page_jpeg(page) -> bytes:
-    """Render one PDF page to a compact JPEG for OCR and page previews."""
-    pix = page.get_pixmap(dpi=_page_image_dpi(), alpha=False)
-    return pix.tobytes("jpeg", jpg_quality=_page_image_jpeg_quality())
+def _pdf_renderer_path() -> str:
+    return os.getenv("PUFFERFS_PDF_RENDERER_PATH", "/usr/local/bin/frpdf")
+
+
+def _pdf_renderer_jobs() -> int:
+    return _env_int("PUFFERFS_PDF_RENDERER_JOBS", max(os.cpu_count() or 1, 1), 1, 256)
+
+
+def render_pdf_pages_jpeg(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
+    """Render PDF pages with frpdf-renderer and return compact JPEG bytes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = os.path.join(tmpdir, "input.pdf")
+        output_dir = os.path.join(tmpdir, "pages")
+        with open(input_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        cmd = [
+            _pdf_renderer_path(),
+            "--input",
+            input_path,
+            "--pages",
+            "all",
+            "--output",
+            output_dir,
+            "--dpi",
+            str(_page_image_dpi()),
+            "--jobs",
+            str(_pdf_renderer_jobs()),
+            "--format",
+            "jpeg",
+            "--jpeg-quality",
+            str(_page_image_jpeg_quality()),
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"PDF renderer not found at {_pdf_renderer_path()}") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise RuntimeError(f"PDF renderer failed: {stderr or exc}") from exc
+
+        pages: list[tuple[int, bytes]] = []
+        for jpg_path in sorted(glob.glob(os.path.join(output_dir, "page_*.jpg"))):
+            match = re.search(r"page_(\d+)\.jpg$", os.path.basename(jpg_path))
+            page_num = int(match.group(1)) - 1 if match else len(pages)
+            with open(jpg_path, "rb") as f:
+                pages.append((page_num, f.read()))
+        if not pages:
+            raise RuntimeError("PDF renderer produced no page images")
+        return pages
+
+
+def extract_pdf_page_texts(pdf_bytes: bytes) -> list[str]:
+    """Extract native PDF page text without using the renderer."""
+    import fitz  # pymupdf
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return [doc[page_num].get_text("text") for page_num in range(len(doc))]
+    finally:
+        doc.close()
 
 
 def _gemini_image_to_text(image_bytes: bytes, gemini_api_key: str, model: str, mime_type: str) -> str:
@@ -414,7 +472,6 @@ def chunk_document_via_images(
     gemini_api_key: str,
 ) -> list[Chunk]:
     """Unified pipeline: PDF/DOCX/PPTX → PDF pages → JPEG images → Gemini → text chunks."""
-    import fitz  # pymupdf
     import time
 
     total_start = time.perf_counter()
@@ -431,21 +488,25 @@ def chunk_document_via_images(
     else:
         pdf_bytes = file_bytes
 
-    render_start = time.perf_counter()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: list[tuple[int, bytes, str]] = []
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        img_bytes = render_page_jpeg(page)
-        fallback_text = page.get_text("text")
-        pages.append((page_num, img_bytes, fallback_text))
-    doc.close()
+    render_start = time.perf_counter()
+    rendered_pages = render_pdf_pages_jpeg(pdf_bytes)
     print(
-        f"timing file={file_path} stage=pdf_render pages={len(pages)} "
+        f"timing file={file_path} stage=pdf_render renderer=frpdf-renderer pages={len(rendered_pages)} "
         f"dpi={_page_image_dpi()} jpeg_quality={_page_image_jpeg_quality()} "
         f"elapsed={time.perf_counter() - render_start:.3f}s",
         flush=True,
     )
+    text_start = time.perf_counter()
+    page_texts = extract_pdf_page_texts(pdf_bytes)
+    print(
+        f"timing file={file_path} stage=pdf_text_extract engine=pymupdf pages={len(page_texts)} "
+        f"elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
+    for page_num, img_bytes in rendered_pages:
+        fallback_text = page_texts[page_num] if page_num < len(page_texts) else ""
+        pages.append((page_num, img_bytes, fallback_text))
 
     def page_to_chunk(page_data: tuple[int, bytes, str]) -> Chunk:
         page_start = time.perf_counter()

@@ -349,8 +349,8 @@ Chunking strategies:
 
 - Code: line-based chunks with overlap.
 - Markdown/plain text: heading/section-aware chunks with overlap.
-- PDF: render pages with PyMuPDF, use native text when quality checks pass,
-  otherwise call Gemini vision.
+- PDF: render pages with `frpdf-renderer`, extract native PDF text separately,
+  and call vision OCR only for pages without native text.
 - DOC/DOCX and PPT/PPTX: convert to PDF with LibreOffice, then use the PDF path.
 - Images: upload image artifact and use Gemini vision/captioning when available,
   otherwise store a placeholder description.

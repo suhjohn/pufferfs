@@ -18,7 +18,7 @@ from chunkers import (
     chunk_image,
     detect_file_type,
     image_to_text,
-    render_page_jpeg,
+    render_pdf_pages_jpeg,
 )
 
 
@@ -137,29 +137,44 @@ class ChunkersTest(unittest.TestCase):
             chunkers._available_image_providers = old_available
             chunkers.image_to_text = old_image_to_text
 
-    def test_render_page_jpeg_uses_configured_dpi_and_quality(self):
+    def test_render_pdf_pages_jpeg_uses_frpdf_renderer_jpeg_output(self):
         import os
+        import subprocess
+
+        import chunkers
 
         old_dpi = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_DPI")
         old_quality = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY")
+        old_jobs = os.environ.get("PUFFERFS_PDF_RENDERER_JOBS")
+        old_run = chunkers.subprocess.run
         calls = []
 
-        class FakePixmap:
-            def tobytes(self, output, jpg_quality):
-                calls.append(("tobytes", output, jpg_quality))
-                return b"jpeg"
-
-        class FakePage:
-            def get_pixmap(self, dpi, alpha):
-                calls.append(("get_pixmap", dpi, alpha))
-                return FakePixmap()
+        def fake_run(cmd, check, capture_output, text):
+            calls.append((cmd, check, capture_output, text))
+            output_dir = cmd[cmd.index("--output") + 1]
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "page_001.jpg"), "wb") as f:
+                f.write(b"\xff\xd8page1\xff\xd9")
+            with open(os.path.join(output_dir, "page_002.jpg"), "wb") as f:
+                f.write(b"\xff\xd8page2\xff\xd9")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
 
         os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = "144"
         os.environ["PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY"] = "70"
+        os.environ["PUFFERFS_PDF_RENDERER_JOBS"] = "3"
+        chunkers.subprocess.run = fake_run
         try:
-            self.assertEqual(render_page_jpeg(FakePage()), b"jpeg")
-            self.assertEqual(calls, [("get_pixmap", 144, False), ("tobytes", "jpeg", 70)])
+            pages = render_pdf_pages_jpeg(b"%PDF")
+            self.assertEqual([page_num for page_num, _ in pages], [0, 1])
+            self.assertEqual([img[:2] for _, img in pages], [b"\xff\xd8", b"\xff\xd8"])
+            cmd = calls[0][0]
+            self.assertEqual(cmd[cmd.index("--dpi") + 1], "144")
+            self.assertEqual(cmd[cmd.index("--jobs") + 1], "3")
+            self.assertEqual(cmd[cmd.index("--pages") + 1], "all")
+            self.assertEqual(cmd[cmd.index("--format") + 1], "jpeg")
+            self.assertEqual(cmd[cmd.index("--jpeg-quality") + 1], "70")
         finally:
+            chunkers.subprocess.run = old_run
             if old_dpi is None:
                 os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_DPI", None)
             else:
@@ -168,6 +183,10 @@ class ChunkersTest(unittest.TestCase):
                 os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY", None)
             else:
                 os.environ["PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY"] = old_quality
+            if old_jobs is None:
+                os.environ.pop("PUFFERFS_PDF_RENDERER_JOBS", None)
+            else:
+                os.environ["PUFFERFS_PDF_RENDERER_JOBS"] = old_jobs
 
     def test_page_image_uploads_run_concurrently(self):
         import os

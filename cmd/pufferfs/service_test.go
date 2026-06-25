@@ -99,6 +99,7 @@ func TestRenderSystemdUserService(t *testing.T) {
 		Path:                 "/tmp/my repo",
 		Executable:           "/usr/local/bin/pufferfs",
 		RootName:             "repo",
+		NoVector:             true,
 		Debounce:             "2s",
 		MaxBackoff:           "1m",
 		MaxSameFailures:      8,
@@ -111,6 +112,7 @@ func TestRenderSystemdUserService(t *testing.T) {
 	for _, want := range []string{
 		"ExecStart=/usr/local/bin/pufferfs sync",
 		"--follow",
+		"--no-vector",
 		"--max-same-failures 8",
 		`WorkingDirectory="/tmp/my repo"`,
 		`Environment=HOME="/home/test user"`,
