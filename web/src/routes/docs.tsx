@@ -48,7 +48,6 @@ PufferFS CLI connected.`,
       "--root <path>: folder to sync",
       "--include <glob>: sync files matching this root-relative glob; can be repeated",
       "--exclude <glob>: skip files matching this root-relative glob; can be repeated",
-      "--only <file>: deprecated alias for a literal --include path",
       "--scope org|user|restricted: choose root visibility when creating a root",
       "--dry-run: show what would change without uploading",
       "--json: print sync result as JSON",
@@ -185,6 +184,50 @@ Deleted 1,246 storage objects
 $ pufferfs root delete handbook --yes
 Deleted root handbook (root_8z7m)`,
     note: "With no root argument, the CLI detects the root containing the current working directory. Without --yes, confirmation requires the root ID. Deletion can return 409 if a sync is active, so stop background services before deleting a root.",
+  },
+  {
+    name: "admin provisioning",
+    usage: "pufferfs admin root create --org org_acme --name finance-private --scope restricted",
+    detail:
+      "Provisions restricted roots, groups, group membership, and root grants through the platform admin API. These commands require a platform admin key, not a normal user key.",
+    flags: [
+      "--admin-key <key>: platform admin API key; can also use PUFFERFS_ADMIN_API_KEY",
+      "--org <org-id>: organization to provision inside",
+      "--root <root-id>: root to grant or inspect",
+      "--group <group-id>: group to list or modify",
+      "--user <user-id>: user to add/remove from a group",
+      "--permission read|sync|delete|admin: root grant permission; can be repeated",
+      "--json: print raw JSON responses",
+    ],
+    transcript: `$ export PUFFERFS_ADMIN_API_KEY=pfs_admin_...
+
+$ pufferfs admin root create --org org_acme \\
+  --name finance-private-alice \\
+  --source-path /tenant/finance/alice \\
+  --scope restricted
+Root finance-private-alice (root_8z7m) scope=restricted
+
+$ pufferfs admin root grant create --org org_acme \\
+  --root root_8z7m \\
+  --principal-type user \\
+  --principal-id user_alice \\
+  --permission read \\
+  --permission sync
+Grant grant_123 user:user_alice -> read,sync
+
+$ pufferfs admin group create --org org_acme --name Finance --external-id okta-finance
+Group Finance (group_finance)
+
+$ pufferfs admin group member add --org org_acme --group group_finance --user user_alice
+Added user_alice to group_finance
+
+$ pufferfs admin root grant create --org org_acme \\
+  --root root_8z7m \\
+  --principal-type group \\
+  --principal-id group_finance \\
+  --permission read
+Grant grant_456 group:group_finance -> read`,
+    note: "Use direct user grants when a restricted root should be visible only to org admins plus one selected user. Use group grants when the whole group should receive the same root permission.",
   },
   {
     name: "upgrade",
@@ -443,6 +486,29 @@ const ENDPOINTS = [
     ],
   },
   {
+    operationId: "listRoots",
+    method: "GET",
+    path: "/roots",
+    summary: "List roots the caller can read.",
+    auth: "Bearer API key or session with query/read/sync/write.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Readable roots with effective permissions.", `[
+  {
+    "id": "root_8z7m",
+    "name": "finance-shared",
+    "source_path": "/Users/me/Documents/finance",
+    "scope": "restricted",
+    "access": ["read", "sync"],
+    "access_source": "group",
+    "visible_generation_id": "gen_12",
+    "visible_generation_seq": 12
+  }
+]`],
+    ],
+  },
+  {
     operationId: "createRoot",
     method: "POST",
     path: "/roots",
@@ -470,6 +536,169 @@ const ENDPOINTS = [
 }`],
       ["403", "Caller cannot create this root scope.", `{
   "error": "editor role required for org root"
+}`],
+    ],
+  },
+  {
+    operationId: "adminCreateGroup",
+    method: "POST",
+    path: "/admin/orgs/{orgId}/groups",
+    summary: "Create or update an organization group.",
+    auth: "Platform admin key only.",
+    requestBody: `{
+  "id": "group_finance",
+  "name": "Finance",
+  "external_id": "okta-group-finance"
+}`,
+    requestFields: [
+      ["id", "string", "optional", "Stable group ID. If omitted, PufferFS generates one."],
+      ["name", "string", "required", "Group name. Group names are unique within an organization."],
+      ["external_id", "string", "optional", "External identity-provider group ID for idempotent provisioning."],
+    ],
+    responses: [
+      ["201", "Created or updated group.", `{
+  "id": "group_finance",
+  "org_id": "org_acme",
+  "name": "Finance",
+  "external_id": "okta-group-finance",
+  "created_at": "2026-06-25T05:00:00Z",
+  "updated_at": "2026-06-25T05:00:00Z"
+}`],
+    ],
+  },
+  {
+    operationId: "adminListGroups",
+    method: "GET",
+    path: "/admin/orgs/{orgId}/groups",
+    summary: "List organization groups.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Groups in name order.", `[
+  {
+    "id": "group_finance",
+    "org_id": "org_acme",
+    "name": "Finance",
+    "external_id": "okta-group-finance"
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "adminListGroupMembers",
+    method: "GET",
+    path: "/admin/orgs/{orgId}/groups/{groupId}/members",
+    summary: "List members of a group.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Group members.", `[
+  {
+    "group_id": "group_finance",
+    "user_id": "user_alice",
+    "email": "alice@example.com",
+    "name": "Alice",
+    "joined_at": "2026-06-25T05:00:00Z"
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "adminAddGroupMember",
+    method: "PUT",
+    path: "/admin/orgs/{orgId}/groups/{groupId}/members/{userId}",
+    summary: "Add an existing org member to a group.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Membership created or already present.", `{
+  "group_id": "group_finance",
+  "user_id": "user_alice",
+  "joined_at": "2026-06-25T05:00:00Z"
+}`],
+      ["400", "User is not an org member or group does not exist.", `{
+  "error": "user must be a member of the org"
+}`],
+    ],
+  },
+  {
+    operationId: "adminDeleteGroupMember",
+    method: "DELETE",
+    path: "/admin/orgs/{orgId}/groups/{groupId}/members/{userId}",
+    summary: "Remove a user from a group.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Membership removed.", `{
+  "status": "deleted"
+}`],
+    ],
+  },
+  {
+    operationId: "adminCreateRootGrant",
+    method: "POST",
+    path: "/admin/orgs/{orgId}/roots/{rootId}/grants",
+    summary: "Create or update a root grant.",
+    auth: "Platform admin key only.",
+    requestBody: `{
+  "principal_type": "group",
+  "principal_id": "group_finance",
+  "permissions": ["read", "sync"]
+}`,
+    requestFields: [
+      ["principal_type", "\"org\" | \"user\" | \"group\"", "required", "Principal kind receiving root access."],
+      ["principal_id", "string", "required", "Org ID, user ID, or group ID. User and group principals must belong to the org."],
+      ["permissions", "string[]", "required", "Any of read, sync, delete, admin. sync/delete imply read; admin implies all root permissions."],
+    ],
+    responses: [
+      ["201", "Created or updated grant.", `{
+  "id": "grant_123",
+  "org_id": "org_acme",
+  "root_id": "root_8z7m",
+  "principal_type": "group",
+  "principal_id": "group_finance",
+  "permissions": ["read", "sync"],
+  "created_at": "2026-06-25T05:00:00Z",
+  "updated_at": "2026-06-25T05:00:00Z"
+}`],
+    ],
+  },
+  {
+    operationId: "adminListRootGrants",
+    method: "GET",
+    path: "/admin/orgs/{orgId}/roots/{rootId}/grants",
+    summary: "List grants for a root.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Root grants.", `[
+  {
+    "id": "grant_123",
+    "org_id": "org_acme",
+    "root_id": "root_8z7m",
+    "principal_type": "group",
+    "principal_id": "group_finance",
+    "permissions": ["read", "sync"]
+  }
+]`],
+    ],
+  },
+  {
+    operationId: "adminDeleteRootGrant",
+    method: "DELETE",
+    path: "/admin/orgs/{orgId}/roots/{rootId}/grants/{grantId}",
+    summary: "Delete a root grant.",
+    auth: "Platform admin key only.",
+    requestBody: "No request body.",
+    requestFields: [],
+    responses: [
+      ["200", "Grant removed.", `{
+  "status": "deleted"
 }`],
     ],
   },

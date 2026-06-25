@@ -147,9 +147,9 @@ func TestLargeMovesFallBackToRemoveAndAdd(t *testing.T) {
 	}
 }
 
-func TestResolveOnlyPathRelativeAndAbsolute(t *testing.T) {
+func TestResolveSelectedPathRelativeAndAbsolute(t *testing.T) {
 	root := t.TempDir()
-	rel, abs, err := resolveOnlyPath(root, "docs/a.md")
+	rel, abs, err := resolveSelectedPath(root, "docs/a.md", "--include")
 	if err != nil {
 		t.Fatalf("resolve relative: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestResolveOnlyPathRelativeAndAbsolute(t *testing.T) {
 	}
 
 	absoluteInput := filepath.Join(root, "docs", "b.md")
-	rel, abs, err = resolveOnlyPath(root, absoluteInput)
+	rel, abs, err = resolveSelectedPath(root, absoluteInput, "--include")
 	if err != nil {
 		t.Fatalf("resolve absolute: %v", err)
 	}
@@ -175,15 +175,15 @@ func TestResolveOnlyPathRelativeAndAbsolute(t *testing.T) {
 	}
 }
 
-func TestResolveOnlyPathRejectsOutsideRoot(t *testing.T) {
+func TestResolveSelectedPathRejectsOutsideRoot(t *testing.T) {
 	root := t.TempDir()
-	_, _, err := resolveOnlyPath(root, filepath.Join(filepath.Dir(root), "outside.md"))
+	_, _, err := resolveSelectedPath(root, filepath.Join(filepath.Dir(root), "outside.md"), "--include")
 	if err == nil || !strings.Contains(err.Error(), "outside root") {
 		t.Fatalf("resolve outside err = %v, want outside root", err)
 	}
 }
 
-func TestResolveOnlyPathCanonicalizesAbsoluteSymlinkPath(t *testing.T) {
+func TestResolveSelectedPathCanonicalizesAbsoluteSymlinkPath(t *testing.T) {
 	realRoot := filepath.Join(t.TempDir(), "real")
 	if err := os.MkdirAll(filepath.Join(realRoot, "docs"), 0o755); err != nil {
 		t.Fatalf("mkdir real root: %v", err)
@@ -197,7 +197,7 @@ func TestResolveOnlyPathCanonicalizesAbsoluteSymlinkPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canonicalLocalPath: %v", err)
 	}
-	rel, abs, err := resolveOnlyPath(canonicalRoot, filepath.Join(linkRoot, "docs", "a.md"))
+	rel, abs, err := resolveSelectedPath(canonicalRoot, filepath.Join(linkRoot, "docs", "a.md"), "--include")
 	if err != nil {
 		t.Fatalf("resolve symlink absolute path: %v", err)
 	}
@@ -206,70 +206,6 @@ func TestResolveOnlyPathCanonicalizesAbsoluteSymlinkPath(t *testing.T) {
 	}
 	if !strings.HasPrefix(abs, canonicalRoot) {
 		t.Fatalf("abs = %q, want under canonical root %q", abs, canonicalRoot)
-	}
-}
-
-func TestBuildSyncOnlyDiffPatchesModifiedAndPreservesState(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, "docs/a.md", "new content\n")
-	baseState := map[string]models.FileState{
-		"docs/a.md": {Size: 3, ContentHash: "sha256:old", Mtime: 1},
-		"docs/b.md": {Size: 4, ContentHash: "sha256:stable", Mtime: 2},
-	}
-	result, merged, err := buildSyncOnlyDiff(root, []string{"docs/a.md"}, baseState, ignore.NewMatcher(root))
-	if err != nil {
-		t.Fatalf("buildSyncOnlyDiff: %v", err)
-	}
-	if countChanges(result) != 1 || result.Stats.Modified != 1 {
-		t.Fatalf("result = %#v, want one modified change", result)
-	}
-	if got := merged["docs/b.md"]; got != baseState["docs/b.md"] {
-		t.Fatalf("stable entry changed: %#v", got)
-	}
-	if got := merged["docs/a.md"]; got.ContentHash == "sha256:old" || got.Size == 0 {
-		t.Fatalf("modified entry was not patched: %#v", got)
-	}
-}
-
-func TestBuildSyncOnlyDiffRemovedAndMissingNoop(t *testing.T) {
-	root := t.TempDir()
-	baseState := map[string]models.FileState{
-		"docs/a.md": {Size: 3, ContentHash: "sha256:a", Mtime: 1},
-		"docs/b.md": {Size: 4, ContentHash: "sha256:b", Mtime: 2},
-	}
-	result, merged, err := buildSyncOnlyDiff(root, []string{"docs/a.md", "docs/missing.md"}, baseState, nil)
-	if err != nil {
-		t.Fatalf("buildSyncOnlyDiff: %v", err)
-	}
-	if countChanges(result) != 1 || result.Stats.Removed != 1 {
-		t.Fatalf("result = %#v, want one removed change", result)
-	}
-	if _, ok := merged["docs/a.md"]; ok {
-		t.Fatalf("removed entry still in merged state: %#v", merged)
-	}
-	if got := merged["docs/b.md"]; got != baseState["docs/b.md"] {
-		t.Fatalf("unselected entry changed: %#v", got)
-	}
-}
-
-func TestBuildSyncOnlyDiffRejectsDirectory(t *testing.T) {
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
-		t.Fatalf("mkdir docs: %v", err)
-	}
-	_, _, err := buildSyncOnlyDiff(root, []string{"docs"}, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "directory") {
-		t.Fatalf("directory err = %v, want directory rejection", err)
-	}
-}
-
-func TestBuildSyncOnlyDiffRejectsIgnoredFile(t *testing.T) {
-	root := t.TempDir()
-	writeTestFile(t, root, ".tpfsignore", "private/\n")
-	writeTestFile(t, root, "private/a.md", "secret\n")
-	_, _, err := buildSyncOnlyDiff(root, []string{"private/a.md"}, nil, ignore.NewMatcher(root))
-	if err == nil || !strings.Contains(err.Error(), "ignored") {
-		t.Fatalf("ignored err = %v, want ignored rejection", err)
 	}
 }
 
@@ -508,7 +444,7 @@ func TestResolveSyncOnlyRootIDMismatch(t *testing.T) {
 	}
 }
 
-func TestLoadSyncOnlyBaseStateUsesMatchingLocalCache(t *testing.T) {
+func TestLoadSyncSubsetBaseStateUsesMatchingLocalCache(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	rootPath := t.TempDir()
@@ -531,7 +467,7 @@ func TestLoadSyncOnlyBaseStateUsesMatchingLocalCache(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := loadSyncOnlyBaseState(&apiClient{baseURL: server.URL, httpClient: server.Client()}, &syncOnlyRoot{
+	state, err := loadSyncSubsetBaseState(&apiClient{baseURL: server.URL, httpClient: server.Client()}, &syncOnlyRoot{
 		RootMetadata: models.RootMetadata{
 			ID:                   rootID,
 			Name:                 "workspace",
@@ -542,7 +478,7 @@ func TestLoadSyncOnlyBaseStateUsesMatchingLocalCache(t *testing.T) {
 		CanonicalSourcePath: canonicalRoot,
 	})
 	if err != nil {
-		t.Fatalf("loadSyncOnlyBaseState: %v", err)
+		t.Fatalf("loadSyncSubsetBaseState: %v", err)
 	}
 	if got := state["docs/a.md"]; got != localState["docs/a.md"] {
 		t.Fatalf("state = %#v, want local cache %#v", state, localState)

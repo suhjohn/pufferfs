@@ -3,17 +3,139 @@ from __future__ import annotations
 import unittest
 
 from chunkers import (
+    DEFAULT_VLLM_MODELS,
+    GeminiRecitationError,
     _extract_eml_text,
     _extract_ics_text,
     _extract_vcf_text,
     _format_timestamp,
+    _choose_vllm_model,
+    _openai_compatible_base_url,
+    _vllm_model_weights,
+    _vllm_models,
     _media_time_ranges,
     chunk_structured_file,
+    chunk_image,
     detect_file_type,
+    image_to_text,
 )
 
 
 class ChunkersTest(unittest.TestCase):
+    def test_vllm_models_default_to_flash_lite_pair(self):
+        import os
+
+        old = os.environ.pop("PUFFERFS_VLLM_MODELS", None)
+        try:
+            self.assertEqual(
+                _vllm_models(),
+                [f"{provider}/{model}" for provider, model in DEFAULT_VLLM_MODELS],
+            )
+        finally:
+            if old is not None:
+                os.environ["PUFFERFS_VLLM_MODELS"] = old
+
+    def test_vllm_models_can_be_configured(self):
+        import os
+
+        old = os.environ.get("PUFFERFS_VLLM_MODELS")
+        os.environ["PUFFERFS_VLLM_MODELS"] = " gemini/gemini-a,openai/gpt-test ,, "
+        try:
+            self.assertEqual(_vllm_models(), ["gemini/gemini-a", "openai/gpt-test"])
+        finally:
+            if old is None:
+                os.environ.pop("PUFFERFS_VLLM_MODELS", None)
+            else:
+                os.environ["PUFFERFS_VLLM_MODELS"] = old
+
+    def test_vllm_models_support_weights(self):
+        import os
+
+        old = os.environ.get("PUFFERFS_VLLM_MODELS")
+        os.environ["PUFFERFS_VLLM_MODELS"] = "gemini/gemini-a:10, openai/gpt-test:2, gemini/gemini-c"
+        try:
+            self.assertEqual(_vllm_models(), ["gemini/gemini-a", "openai/gpt-test", "gemini/gemini-c"])
+            self.assertEqual(
+                _vllm_model_weights(),
+                [("gemini", "gemini-a", 10.0), ("openai", "gpt-test", 2.0), ("gemini", "gemini-c", 1.0)],
+            )
+        finally:
+            if old is None:
+                os.environ.pop("PUFFERFS_VLLM_MODELS", None)
+            else:
+                os.environ["PUFFERFS_VLLM_MODELS"] = old
+
+    def test_vllm_model_selection_filters_unavailable_providers(self):
+        import os
+
+        old = os.environ.get("PUFFERFS_VLLM_MODELS")
+        os.environ["PUFFERFS_VLLM_MODELS"] = "gemini/gemini-a:10, fireworks/accounts/fireworks/models/vision-test:2"
+        try:
+            self.assertEqual(_choose_vllm_model({"fireworks"}), ("fireworks", "accounts/fireworks/models/vision-test"))
+        finally:
+            if old is None:
+                os.environ.pop("PUFFERFS_VLLM_MODELS", None)
+            else:
+                os.environ["PUFFERFS_VLLM_MODELS"] = old
+
+    def test_fireworks_defaults_to_openai_compatible_base_url(self):
+        self.assertEqual(_openai_compatible_base_url("fireworks"), "https://api.fireworks.ai/inference/v1")
+
+    def test_gemini_recitation_falls_back_to_gpt_54_nano(self):
+        import chunkers
+        import os
+
+        old_models = os.environ.get("PUFFERFS_VLLM_MODELS")
+        old_openai_key = os.environ.get("OPENAI_API_KEY")
+        old_gemini = chunkers._gemini_image_to_text
+        old_openai = chunkers._openai_compatible_image_to_text
+        calls = []
+
+        def recitation(*args, **kwargs):
+            raise GeminiRecitationError("recitation")
+
+        def fallback(provider, image_bytes, model, mime_type):
+            calls.append((provider, image_bytes, model, mime_type))
+            return "fallback text"
+
+        os.environ["PUFFERFS_VLLM_MODELS"] = "gemini/gemini-2.5-flash-lite:1"
+        os.environ["OPENAI_API_KEY"] = "test-key"
+        chunkers._gemini_image_to_text = recitation
+        chunkers._openai_compatible_image_to_text = fallback
+        try:
+            self.assertEqual(image_to_text(b"img", "gemini-key", "image/jpeg"), "fallback text")
+            self.assertEqual(calls, [("openai", b"img", "gpt-5.4-nano", "image/jpeg")])
+        finally:
+            chunkers._gemini_image_to_text = old_gemini
+            chunkers._openai_compatible_image_to_text = old_openai
+            if old_models is None:
+                os.environ.pop("PUFFERFS_VLLM_MODELS", None)
+            else:
+                os.environ["PUFFERFS_VLLM_MODELS"] = old_models
+            if old_openai_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = old_openai_key
+
+    def test_chunk_image_uses_placeholder_when_vllm_fails(self):
+        import chunkers
+
+        old_available = chunkers._available_image_providers
+        old_image_to_text = chunkers.image_to_text
+
+        def fail_vllm(*args, **kwargs):
+            raise RuntimeError("provider failed")
+
+        chunkers._available_image_providers = lambda _key: {"gemini"}
+        chunkers.image_to_text = fail_vllm
+        try:
+            chunks = chunk_image(b"img", "root", "scan.png", None, "", "gemini-key")
+            self.assertEqual(len(chunks), 1)
+            self.assertEqual(chunks[0].content, "[Image: scan.png]")
+        finally:
+            chunkers._available_image_providers = old_available
+            chunkers.image_to_text = old_image_to_text
+
     def test_detect_file_type_structured_and_media(self):
         self.assertEqual(detect_file_type("mail/message.eml"), "eml")
         self.assertEqual(detect_file_type("mail/message.msg"), "msg")

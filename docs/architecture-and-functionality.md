@@ -63,7 +63,7 @@ The CLI root command is `pufferfs` and includes:
 - `sync --root <path> --include <glob> [--exclude <glob>]`: update a subset of
   files. Multiple includes are additive, excludes win, and the CLI patches
   selected changes into the current committed root state so unselected files
-  remain visible. `--only <file>` is kept as a deprecated literal include alias.
+  remain visible.
 - `sync --dry-run`: show changes, total upload size, and ignored patterns
   without uploading.
 - `sync --background` / `sync --detach`: submit the same server-side sync job

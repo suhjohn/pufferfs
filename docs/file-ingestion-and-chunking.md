@@ -70,10 +70,15 @@ Pipeline:
 2. PDF pages are opened with PyMuPDF.
 3. Each page is rendered to a JPEG image at 200 DPI.
 4. Native PDF text is extracted only as fallback text.
-5. The rendered page image is sent to Gemini vision to extract text or describe
-   the page.
-6. If no Gemini API key is configured, PufferFS falls back to native extracted
-   text.
+5. Rendered page images are submitted to the shared Modal `page_image_to_text`
+   function pool to extract text or describe each page. Global OCR fan-out is
+   capped by `PUFFERFS_MODAL_OCR_MAX_CONTAINERS`, not by each document.
+   `PUFFERFS_VLLM_MODELS` uses `provider/model:weight` entries to split
+   traffic by quota capacity, for example Fireworks, OpenAI, and Gemini models
+   in one weighted pool. If Gemini OCR fails, including recitation blocks, OCR
+   retries that page with `openai/gpt-5.4-nano`.
+6. If no configured image provider key is available, PufferFS falls back to
+   native extracted text.
 7. The rendered page JPEG is uploaded to S3-compatible storage at:
 
    ```text

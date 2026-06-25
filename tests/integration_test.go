@@ -646,7 +646,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		cBefore := rowsDigest(queryTPRowsForPath(t, services, namespaces, "docs/c.md"))
 
 		appendFile(t, projectDir, "docs/a.md", "\nDocument scoped update token alpha-updated.\n")
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs/a.md", "--name", env.rootName, "--json")
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--include", "docs/a.md", "--name", env.rootName, "--json")
 		if err != nil {
 			t.Fatalf("document-scoped modify sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
@@ -687,7 +687,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertCLIQuery(t, homeDir, env, "gamma-three", env.rootName, "hybrid", "", "docs/c.md")
 
 		beforeNoopGeneration := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", filepath.Join(projectDir, "docs", "b.md"), "--name", env.rootName)
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--include", filepath.Join(projectDir, "docs", "b.md"), "--name", env.rootName)
 		if err != nil {
 			t.Fatalf("document-scoped no-op sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
@@ -697,21 +697,16 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("no-op document sync changed generation from %s to %s", beforeNoopGeneration, afterNoopGeneration)
 		}
 
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", filepath.Join(homeDir, "outside.md"), "--name", env.rootName)
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--include", filepath.Join(homeDir, "outside.md"), "--name", env.rootName)
 		if err == nil {
-			t.Fatalf("outside --only unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
+			t.Fatalf("outside --include unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
 		}
 		requireOutputContains(t, stdout+stderr, "outside root")
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs", "--name", env.rootName)
-		if err == nil {
-			t.Fatalf("directory --only unexpectedly succeeded\nstdout: %s\nstderr: %s", stdout, stderr)
-		}
-		requireOutputContains(t, stdout+stderr, "directory")
 
 		if err := os.Remove(filepath.Join(projectDir, "docs", "a.md")); err != nil {
 			t.Fatalf("removing selected file: %v", err)
 		}
-		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--only", "docs/a.md", "--name", env.rootName)
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", "--root", projectDir, "--include", "docs/a.md", "--name", env.rootName)
 		if err != nil {
 			t.Fatalf("document-scoped removal sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
@@ -1637,13 +1632,21 @@ func newMinioClient(t *testing.T) *s3sdk.Client {
 	endpoint := fmt.Sprintf("http://localhost:%s", e2eMinioPort)
 	accessKey := e2eMinioUser
 	secretKey := e2eMinioPass
+	region := "us-east-1"
 	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
 		endpoint = os.Getenv("AWS_ENDPOINT_URL")
 		accessKey = os.Getenv("AWS_ACCESS_KEY_ID")
 		secretKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
+		region = os.Getenv("AWS_REGION")
+		if region == "" {
+			region = os.Getenv("AWS_DEFAULT_REGION")
+		}
+		if region == "" {
+			region = "us-east-1"
+		}
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
-		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithRegion(region),
 		awsconfig.WithCredentialsProvider(awscreds.NewStaticCredentialsProvider(accessKey, secretKey, "")),
 	)
 	if err != nil {
@@ -1806,21 +1809,19 @@ func startServerWithExtraEnv(t *testing.T, services realServices, turbopufferKey
 
 	dbURL := fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", e2eDBUser, e2eDBPass, e2eDBPort, e2eDBName)
 	cmd := exec.Command(e2eServerBinPath)
-	cmd.Env = append(os.Environ(),
-		"DATABASE_URL="+dbURL,
-		"LISTEN_ADDR="+addr,
-		"JWT_SECRET="+e2eJWTSecret,
-		"PUFFERFS_ADMIN_KEY="+e2eAdminKey,
-		"PUFFERFS_TP_NAMESPACE_SHARDS="+e2eTPNamespaceShards,
-		"MIGRATIONS_DIR="+filepath.Join(repoRoot(t), "migrations"),
-		"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
-		"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
-		"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
-		"TURBOPUFFER_API_KEY="+tpKey,
-		"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
-	)
-	cmd.Env = append(cmd.Env, services.storageEnv...)
-	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.Env = mergedEnv(os.Environ(), []string{
+		"DATABASE_URL=" + dbURL,
+		"LISTEN_ADDR=" + addr,
+		"JWT_SECRET=" + e2eJWTSecret,
+		"PUFFERFS_ADMIN_KEY=" + e2eAdminKey,
+		"PUFFERFS_TP_NAMESPACE_SHARDS=" + e2eTPNamespaceShards,
+		"MIGRATIONS_DIR=" + filepath.Join(repoRoot(t), "migrations"),
+		"MODAL_CHUNK_ENDPOINT=" + services.modalChunkURL,
+		"MODAL_EMBED_ENDPOINT=" + services.modalEmbedURL,
+		"MODAL_QUERY_EMBED_ENDPOINT=" + services.modalQueryEmbedURL,
+		"TURBOPUFFER_API_KEY=" + tpKey,
+		"TURBOPUFFER_API_URL=" + services.turbopufferAPIURL,
+	}, services.storageEnv, extraEnv)
 	cmd.Dir = repoRoot(t)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -1848,6 +1849,34 @@ func startServerWithExtraEnv(t *testing.T, services realServices, turbopufferKey
 	}
 	t.Fatalf("server health check did not pass")
 	return nil
+}
+
+func mergedEnv(base []string, overrideGroups ...[]string) []string {
+	values := make(map[string]string, len(base))
+	order := make([]string, 0, len(base))
+	set := func(item string) {
+		key, _, ok := strings.Cut(item, "=")
+		if !ok {
+			return
+		}
+		if _, exists := values[key]; !exists {
+			order = append(order, key)
+		}
+		values[key] = item
+	}
+	for _, item := range base {
+		set(item)
+	}
+	for _, group := range overrideGroups {
+		for _, item := range group {
+			set(item)
+		}
+	}
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		out = append(out, values[key])
+	}
+	return out
 }
 
 func (p *serverProcess) stop(t *testing.T) {
@@ -1892,21 +1921,20 @@ func startStageWorkers(t *testing.T, services realServices, natsURL string, stag
 	workers := make([]*exec.Cmd, 0, len(stages))
 	for _, stage := range stages {
 		cmd := exec.Command(e2eWorkerBinPath, "--stage="+stage, "--concurrency=2")
-		cmd.Env = append(os.Environ(),
-			"DATABASE_URL="+fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", e2eDBUser, e2eDBPass, e2eDBPort, e2eDBName),
-			"NATS_URL="+natsURL,
-			"JWT_SECRET="+e2eJWTSecret,
-			"MODAL_CHUNK_ENDPOINT="+services.modalChunkURL,
-			"MODAL_EMBED_ENDPOINT="+services.modalEmbedURL,
-			"MODAL_QUERY_EMBED_ENDPOINT="+services.modalQueryEmbedURL,
-			"MODAL_CHUNK_SHARD_ENDPOINT="+services.modalChunkShardURL,
-			"MODAL_EMBED_SHARD_ENDPOINT="+services.modalEmbedShardURL,
-			"MODAL_INDEX_SHARD_ENDPOINT="+services.modalIndexShardURL,
-			"TURBOPUFFER_API_KEY="+services.turbopufferAPIKey,
-			"TURBOPUFFER_API_URL="+services.turbopufferAPIURL,
-			"PUFFERFS_TP_NAMESPACE_SHARDS="+e2eTPNamespaceShards,
-		)
-		cmd.Env = append(cmd.Env, services.storageEnv...)
+		cmd.Env = mergedEnv(os.Environ(), []string{
+			"DATABASE_URL=" + fmt.Sprintf("postgres://%s:%s@localhost:%s/%s?sslmode=disable", e2eDBUser, e2eDBPass, e2eDBPort, e2eDBName),
+			"NATS_URL=" + natsURL,
+			"JWT_SECRET=" + e2eJWTSecret,
+			"MODAL_CHUNK_ENDPOINT=" + services.modalChunkURL,
+			"MODAL_EMBED_ENDPOINT=" + services.modalEmbedURL,
+			"MODAL_QUERY_EMBED_ENDPOINT=" + services.modalQueryEmbedURL,
+			"MODAL_CHUNK_SHARD_ENDPOINT=" + services.modalChunkShardURL,
+			"MODAL_EMBED_SHARD_ENDPOINT=" + services.modalEmbedShardURL,
+			"MODAL_INDEX_SHARD_ENDPOINT=" + services.modalIndexShardURL,
+			"TURBOPUFFER_API_KEY=" + services.turbopufferAPIKey,
+			"TURBOPUFFER_API_URL=" + services.turbopufferAPIURL,
+			"PUFFERFS_TP_NAMESPACE_SHARDS=" + e2eTPNamespaceShards,
+		}, services.storageEnv)
 		cmd.Dir = repoRoot(t)
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr

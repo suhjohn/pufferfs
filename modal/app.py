@@ -24,13 +24,19 @@ app = modal.App(os.getenv("PUFFERFS_MODAL_APP_NAME", "pufferfs"))
 
 chunking_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("ffmpeg", "libreoffice-core", "libreoffice-writer", "libreoffice-impress")
+    .apt_install(
+        "ffmpeg",
+        "libreoffice-core",
+        "libreoffice-writer",
+        "libreoffice-impress",
+    )
     .pip_install(
         "boto3>=1.34.0",
         "extract-msg>=0.50.0",
         "pymupdf>=1.24.0",
         "Pillow>=10.0.0",
         "google-genai>=1.0.0",
+        "openai>=1.0.0",
         "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py", copy=True)
@@ -50,27 +56,11 @@ embedding_image = (
 )
 
 # ---------------------------------------------------------------------------
-# Secrets (S3 credentials)
+# Secrets
 # ---------------------------------------------------------------------------
 
-s3_secret = modal.Secret.from_name(
-    os.getenv("PUFFERFS_MODAL_S3_SECRET_NAME", "pufferfs-s3"),
-    required_keys=[
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_ENDPOINT_URL",
-        "AWS_BUCKET_NAME",
-    ],
-)
-
-gemini_secret = modal.Secret.from_name(
-    os.getenv("PUFFERFS_MODAL_GEMINI_SECRET_NAME", "pufferfs-gemini"),
-    required_keys=["GEMINI_API_KEY"],
-)
-
-turbopuffer_secret = modal.Secret.from_name(
-    os.getenv("PUFFERFS_MODAL_TURBOPUFFER_SECRET_NAME", "pufferfs-turbopuffer"),
-    required_keys=["TURBOPUFFER_API_KEY"],
+modal_secret = modal.Secret.from_name(
+    os.getenv("PUFFERFS_MODAL_SECRET_NAME", "pufferfs"),
 )
 
 # ---------------------------------------------------------------------------
@@ -134,25 +124,33 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
 
 @app.function(
     image=chunking_image,
-    secrets=[gemini_secret],
+    secrets=[modal_secret],
     timeout=600,
     memory=2048,
     min_containers=int(os.getenv("PUFFERFS_MODAL_PAGE_TEXT_MIN_CONTAINERS", "4")),
-    max_containers=int(os.getenv("PUFFERFS_MODAL_PAGE_TEXT_MAX_CONTAINERS", "32")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_OCR_MAX_CONTAINERS", "100")),
     scaledown_window=900,
 )
 def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallback_text: str) -> str:
-    """Extract text from one rendered page image, falling back to native text without a Gemini key."""
+    """Extract text from one rendered page image with VLLM, then native text fallback."""
     import time
 
-    from chunkers import image_to_text
+    from chunkers import _available_image_providers, image_to_text
 
     text_start = time.perf_counter()
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    if gemini_key:
-        text = image_to_text(image_bytes, gemini_key, mime_type="image/jpeg")
-        source = "gemini"
-    else:
+    text = ""
+    source = ""
+    if _available_image_providers(gemini_key):
+        try:
+            text = image_to_text(image_bytes, gemini_key, mime_type="image/jpeg")
+            source = "vllm"
+        except Exception as exc:
+            print(
+                f"timing file={file_path} page={page_num} stage=image_to_text_vllm_error error={type(exc).__name__}",
+                flush=True,
+            )
+    if not text.strip():
         text = fallback_text
         source = "native_fallback"
     print(
@@ -172,8 +170,6 @@ def chunk_document_with_stage_functions(
     bucket: str,
 ) -> list[Chunk]:
     """Orchestrate split Modal functions for PDF/DOCX/PPTX chunking."""
-    import concurrent.futures
-    import os
     import time
 
     from chunkers import _page_image_key
@@ -192,12 +188,14 @@ def chunk_document_with_stage_functions(
         )
         return []
 
-    def page_to_chunk(page_data: dict) -> Chunk:
-        page_start = time.perf_counter()
+    page_inputs: list[tuple[str, int, bytes, str]] = []
+    page_image_keys: dict[int, str] = {}
+    for page_data in pages:
         page_num = int(page_data["page_num"])
         img_bytes = page_data["image_bytes"]
         fallback_text = page_data.get("fallback_text") or ""
         image_key = _page_image_key(root_id, file_path, page_num)
+        page_image_keys[page_num] = image_key
         if s3_client and bucket:
             upload_start = time.perf_counter()
             s3_client.put_object(
@@ -212,7 +210,19 @@ def chunk_document_with_stage_functions(
                 flush=True,
             )
 
-        text = page_image_to_text.remote(file_path, page_num, img_bytes, fallback_text)
+        page_inputs.append((file_path, page_num, img_bytes, fallback_text))
+
+    text_start = time.perf_counter()
+    page_texts = list(page_image_to_text.starmap(page_inputs, order_outputs=True))
+    print(
+        f"timing file={file_path} stage=parallel_image_to_text pages={len(page_inputs)} elapsed={time.perf_counter() - text_start:.3f}s",
+        flush=True,
+    )
+
+    chunks: list[Chunk] = []
+    for page_data, text in zip(pages, page_texts):
+        page_start = time.perf_counter()
+        page_num = int(page_data["page_num"])
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
@@ -225,23 +235,14 @@ def chunk_document_with_stage_functions(
             content_hash=Chunk.hash_content(text),
             file_type=file_type,
             page_number=page_num,
-            image_path=image_key,
+            image_path=page_image_keys[page_num],
         )
         print(
             f"timing file={file_path} page={page_num} stage=page_total elapsed={time.perf_counter() - page_start:.3f}s",
             flush=True,
         )
-        return chunk
+        chunks.append(chunk)
 
-    max_workers = max(1, int(os.getenv("PUFFERFS_PAGE_TEXT_WORKERS", "8")))
-    max_workers = min(max_workers, len(pages))
-    text_start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        chunks = list(executor.map(page_to_chunk, pages))
-    print(
-        f"timing file={file_path} stage=parallel_image_to_text pages={len(pages)} workers={max_workers} elapsed={time.perf_counter() - text_start:.3f}s",
-        flush=True,
-    )
     chunks.sort(key=lambda chunk: chunk.chunk_index)
     print(
         f"timing file={file_path} stage=document_chunk_total pages={len(pages)} chunks={len(chunks)} elapsed={time.perf_counter() - total_start:.3f}s",
@@ -252,7 +253,7 @@ def chunk_document_with_stage_functions(
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret, gemini_secret],
+    secrets=[modal_secret],
     timeout=3600,
     memory=2048,
 )
@@ -605,7 +606,7 @@ def _source_key_is_bundle(s3_key: str) -> bool:
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret, gemini_secret, turbopuffer_secret],
+    secrets=[modal_secret],
     timeout=3600,
     memory=2048,
 )
@@ -670,7 +671,7 @@ EMBEDDING_DIM = 768
 
 @app.cls(
     image=embedding_image,
-    secrets=[s3_secret],
+    secrets=[modal_secret],
     gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
     cpu=4,
     timeout=600,
@@ -837,7 +838,7 @@ def _tp_patch_rows(namespace: str, rows: list[dict]) -> None:
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret, turbopuffer_secret],
+    secrets=[modal_secret],
     timeout=900,
     memory=2048,
 )
@@ -874,7 +875,7 @@ def index_shard_endpoint(item: dict) -> dict:
 
 @app.function(
     image=chunking_image,
-    secrets=[s3_secret, gemini_secret],
+    secrets=[modal_secret],
     timeout=3600,
     memory=2048,
 )

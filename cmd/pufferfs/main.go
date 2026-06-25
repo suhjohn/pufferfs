@@ -27,6 +27,7 @@ func main() {
 	root.AddCommand(readCmd())
 	root.AddCommand(watchCmd())
 	root.AddCommand(rootCmd())
+	root.AddCommand(adminCmd())
 	root.AddCommand(ignorePolicyCmd())
 	root.AddCommand(serviceCmd())
 	root.AddCommand(initCmd())

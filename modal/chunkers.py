@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import email
 from email import policy
 from html.parser import HTMLParser
@@ -16,31 +17,171 @@ import time
 from models import Chunk
 
 # ---------------------------------------------------------------------------
-# Gemini vision: image → text
+# Vision model routing: image/media → text
 # ---------------------------------------------------------------------------
 
-GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+DEFAULT_VLLM_MODELS = [("gemini", "gemini-2.5-flash-lite"), ("gemini", "gemini-3.1-flash-lite")]
+GEMINI_FAILURE_FALLBACK = ("openai", "gpt-5.4-nano")
+
+
+class GeminiRecitationError(RuntimeError):
+    """Gemini declined a response because the output looked like recitation."""
+
+
+def _vllm_models() -> list[str]:
+    return [f"{provider}/{model}" for provider, model, _weight in _vllm_model_weights()]
+
+
+def _vllm_model_weights() -> list[tuple[str, str, float]]:
+    raw = os.getenv("PUFFERFS_VLLM_MODELS", "")
+    weights: list[tuple[str, str, float]] = []
+    for item in raw.split(","):
+        spec = item.strip()
+        if not spec:
+            continue
+        provider_model, sep, weight_text = spec.rpartition(":")
+        if not sep:
+            provider_model = spec
+            weight = 1.0
+        else:
+            provider_model = provider_model.strip()
+            try:
+                weight = float(weight_text.strip())
+            except ValueError:
+                continue
+        provider, slash, model = provider_model.partition("/")
+        provider = provider.strip().lower()
+        model = model.strip()
+        if not slash or not provider or not model or weight <= 0:
+            continue
+        weights.append((provider, model, weight))
+    if weights:
+        return weights
+    return [(provider, model, 1.0) for provider, model in DEFAULT_VLLM_MODELS]
+
+
+def _choose_vllm_model(available_providers: set[str] | None = None) -> tuple[str, str]:
+    weights = _vllm_model_weights()
+    if available_providers is not None:
+        weights = [(provider, model, weight) for provider, model, weight in weights if provider in available_providers]
+    if not weights:
+        configured = ", ".join(_vllm_models())
+        available = ", ".join(sorted(available_providers or [])) or "none"
+        raise RuntimeError(f"no configured VLLM models are available; configured={configured}; available_providers={available}")
+    return random.choices(
+        [(provider, model) for provider, model, _weight in weights],
+        weights=[weight for _provider, _model, weight in weights],
+        k=1,
+    )[0]
+
+
+def _available_image_providers(gemini_api_key: str) -> set[str]:
+    providers: set[str] = set()
+    if gemini_api_key:
+        providers.add("gemini")
+    for provider, _model, _weight in _vllm_model_weights():
+        if provider != "gemini" and _openai_compatible_api_key(provider):
+            providers.add(provider)
+    return providers
+
+
+def _provider_env_prefix(provider: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", provider).upper()
+
+
+def _openai_compatible_api_key(provider: str) -> str:
+    return os.getenv(f"{_provider_env_prefix(provider)}_API_KEY", "")
+
+
+def _openai_compatible_base_url(provider: str) -> str | None:
+    configured = os.getenv(f"{_provider_env_prefix(provider)}_BASE_URL", "").strip()
+    if configured:
+        return configured
+    defaults = {
+        "openai": "https://api.openai.com/v1",
+        "fireworks": "https://api.fireworks.ai/inference/v1",
+    }
+    return defaults.get(provider)
+
+
+def _image_prompt() -> str:
+    return (
+        "Extract all text from this image. If it contains a document page, "
+        "return the full text content preserving structure. If it is a photo "
+        "or diagram, describe what you see in detail. Return only the extracted "
+        "text or description, no preamble."
+    )
 
 
 def image_to_text(image_bytes: bytes, gemini_api_key: str, mime_type: str = "image/jpeg") -> str:
-    """Call Gemini vision to extract text / describe an image."""
+    """Call a configured vision model to extract text / describe an image."""
+    provider, model = _choose_vllm_model(_available_image_providers(gemini_api_key))
+    if provider == "gemini":
+        try:
+            return _gemini_image_to_text(image_bytes, gemini_api_key, model, mime_type)
+        except Exception:
+            fallback_provider, fallback_model = GEMINI_FAILURE_FALLBACK
+            return _openai_compatible_image_to_text(fallback_provider, image_bytes, fallback_model, mime_type)
+    if _openai_compatible_base_url(provider):
+        return _openai_compatible_image_to_text(provider, image_bytes, model, mime_type)
+    raise RuntimeError(f"unsupported image-to-text provider {provider!r}")
+
+
+def _gemini_image_to_text(image_bytes: bytes, gemini_api_key: str, model: str, mime_type: str) -> str:
     from google import genai
     from google.genai.types import Part
 
     client = genai.Client(api_key=gemini_api_key)
-    model = random.choice(GEMINI_MODELS)
-
     response = client.models.generate_content(
         model=model,
         contents=[
             Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            "Extract all text from this image. If it contains a document page, "
-            "return the full text content preserving structure. If it is a photo "
-            "or diagram, describe what you see in detail. Return only the extracted "
-            "text or description, no preamble.",
+            _image_prompt(),
         ],
     )
+    _raise_if_gemini_recitation(response)
     return response.text or ""
+
+
+def _raise_if_gemini_recitation(response) -> None:
+    for candidate in getattr(response, "candidates", []) or []:
+        reason = getattr(candidate, "finish_reason", None)
+        reason_name = getattr(reason, "name", reason)
+        if str(reason_name).upper() == "RECITATION":
+            raise GeminiRecitationError("Gemini response blocked for recitation")
+
+
+def _openai_compatible_image_to_text(provider: str, image_bytes: bytes, model: str, mime_type: str) -> str:
+    from openai import OpenAI
+
+    data = base64.b64encode(image_bytes).decode("ascii")
+    api_key = _openai_compatible_api_key(provider)
+    if not api_key:
+        raise RuntimeError(f"missing {_provider_env_prefix(provider)}_API_KEY for provider {provider!r}")
+    base_url = _openai_compatible_base_url(provider)
+    if not base_url:
+        raise RuntimeError(f"missing {_provider_env_prefix(provider)}_BASE_URL for provider {provider!r}")
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _image_prompt()},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{data}"}},
+                ],
+            }
+        ],
+    )
+    if not response.choices:
+        return ""
+    content = response.choices[0].message.content
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return ""
 
 
 def media_segment_to_text(
@@ -51,8 +192,12 @@ def media_segment_to_text(
     end_seconds: float,
     mime_type: str,
 ) -> str:
-    """Call Gemini to describe an audio/video segment for retrieval."""
+    """Call a configured vision/media model to describe an audio/video segment for retrieval."""
     from google import genai
+
+    provider, model = _choose_vllm_model({"gemini"} if gemini_api_key else set())
+    if provider != "gemini":
+        raise RuntimeError(f"unsupported media-to-text provider {provider!r}")
 
     client = genai.Client(api_key=gemini_api_key)
     uploaded = client.files.upload(file=segment_path, config={"mime_type": mime_type})
@@ -69,7 +214,6 @@ def media_segment_to_text(
     if media_type == "video":
         prompt += "\nInclude visible content if it helps explain what the segment is about."
 
-    model = random.choice(GEMINI_MODELS)
     response = client.models.generate_content(model=model, contents=[uploaded, prompt])
     return response.text or ""
 
@@ -248,9 +392,7 @@ def chunk_document_via_images(
     gemini_api_key: str,
 ) -> list[Chunk]:
     """Unified pipeline: PDF/DOCX/PPTX → PDF pages → JPEG images → Gemini → text chunks."""
-    import concurrent.futures
     import fitz  # pymupdf
-    import os
     import time
 
     total_start = time.perf_counter()
@@ -301,10 +443,18 @@ def chunk_document_via_images(
             )
 
         text_start = time.perf_counter()
-        if gemini_api_key:
-            text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
-            source = "gemini"
-        else:
+        text = ""
+        source = ""
+        if _available_image_providers(gemini_api_key):
+            try:
+                text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
+                source = "vllm"
+            except Exception as exc:
+                print(
+                    f"timing file={file_path} page={page_num} stage=image_to_text_vllm_error error={type(exc).__name__}",
+                    flush=True,
+                )
+        if not text.strip():
             text = fallback_text
             source = "native_fallback"
         print(
@@ -340,13 +490,10 @@ def chunk_document_via_images(
         )
         return []
 
-    max_workers = max(1, int(os.getenv("PUFFERFS_PAGE_TEXT_WORKERS", "8")))
-    max_workers = min(max_workers, len(pages))
     text_start = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        chunks = list(executor.map(page_to_chunk, pages))
+    chunks = [page_to_chunk(page) for page in pages]
     print(
-        f"timing file={file_path} stage=parallel_image_to_text pages={len(pages)} workers={max_workers} elapsed={time.perf_counter() - text_start:.3f}s",
+        f"timing file={file_path} stage=image_to_text_pages pages={len(pages)} elapsed={time.perf_counter() - text_start:.3f}s",
         flush=True,
     )
     chunks.sort(key=lambda chunk: chunk.chunk_index)
@@ -357,7 +504,7 @@ def chunk_document_via_images(
     return chunks
 
 # ---------------------------------------------------------------------------
-# Standalone image chunking: image → Gemini → text
+# Standalone image chunking: image → VLLM → text
 # ---------------------------------------------------------------------------
 
 
@@ -369,7 +516,7 @@ def chunk_image(
     bucket: str,
     gemini_api_key: str,
 ) -> list[Chunk]:
-    """For images: optionally upload to S3, call Gemini for text extraction/captioning."""
+    """For images: optionally upload to S3, call a vision model for text extraction/captioning."""
     image_key = f"chunks/{root_id}/{file_path}"
     content_type = _guess_image_content_type(file_path)
 
@@ -382,11 +529,16 @@ def chunk_image(
             ContentType=content_type,
         )
 
-    # Call Gemini for text extraction / captioning
-    if gemini_api_key:
-        content = image_to_text(file_bytes, gemini_api_key, mime_type=content_type)
-    else:
-        content = f"[Image: {file_path}]"
+    # Call the configured vision model for text extraction / captioning.
+    content = ""
+    if _available_image_providers(gemini_api_key):
+        try:
+            content = image_to_text(file_bytes, gemini_api_key, mime_type=content_type)
+        except Exception as exc:
+            print(
+                f"timing file={file_path} stage=image_to_text_vllm_error error={type(exc).__name__}",
+                flush=True,
+            )
 
     if not content.strip():
         content = f"[Image: {file_path}]"
@@ -733,6 +885,8 @@ def chunk_media(
     file_type: str,
     gemini_api_key: str,
 ) -> list[Chunk]:
+    # Media uses Gemini file upload processing today; image/page OCR can use
+    # either Gemini or OpenAI through PUFFERFS_VLLM_MODELS.
     if not gemini_api_key:
         return [_placeholder_media_chunk(root_id, file_path, file_type)]
 

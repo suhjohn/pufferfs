@@ -730,6 +730,8 @@ otherwise these routes return `404`.
 ## Platform admin (`/admin/*`)
 
 Require the platform admin key. Used for provisioning, not normal operation.
+The same routes can be called from the CLI with `pufferfs admin ...` by passing
+`--admin-key` or setting `PUFFERFS_ADMIN_API_KEY`.
 
 | Route | Description |
 | --- | --- |

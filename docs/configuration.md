@@ -156,15 +156,33 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 
 ### Modal compute
 
-| Variable | Meaning |
-| --- | --- |
-| `MODAL_CHUNK_ENDPOINT` | File → chunks endpoint. |
-| `MODAL_EMBED_ENDPOINT` | Chunks → embeddings endpoint. |
-| `MODAL_QUERY_EMBED_ENDPOINT` | Query text → embedding endpoint. |
-| `MODAL_CHUNK_SHARD_ENDPOINT` | Sync shard → chunk artifact (queued pipeline). |
-| `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). |
-| `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). |
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `MODAL_CHUNK_ENDPOINT` | File → chunks endpoint. | — |
+| `MODAL_EMBED_ENDPOINT` | Chunks → embeddings endpoint. | — |
+| `MODAL_QUERY_EMBED_ENDPOINT` | Query text → embedding endpoint. | — |
+| `MODAL_CHUNK_SHARD_ENDPOINT` | Sync shard → chunk artifact (queued pipeline). | — |
+| `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). | — |
+| `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). | — |
+| `PUFFERFS_MODAL_PAGE_TEXT_MIN_CONTAINERS` | Warm Modal containers kept for page image-to-text calls. | 4 |
+| `PUFFERFS_MODAL_OCR_MAX_CONTAINERS` | Global max Modal containers for OCR/image-to-text calls. This caps OCR fan-out across all documents using the shared `page_image_to_text` function pool. | 100 |
+| `PUFFERFS_MODAL_SECRET_NAME` | Single Modal secret name used by all Modal functions. It contains storage, Turbopuffer, and model-provider credentials. | `pufferfs` |
+| `PUFFERFS_VLLM_MODELS` | Comma-separated provider-qualified vision model specs for image/page OCR. Entries use `provider/model` and may include weights as `provider/model:weight`; choose weights from usable capacity, for example `min(RPM, TPM / estimated_tokens_per_page)`. `gemini/...` uses the Gemini SDK; other providers use OpenAI-compatible chat completions when `<PROVIDER>_API_KEY` and a base URL are available. Fireworks defaults to `https://api.fireworks.ai/inference/v1`. If Gemini OCR fails, including recitation blocks, OCR falls back to `openai/gpt-5.4-nano`. | `fireworks/accounts/fireworks/models/qwen3p7-plus:5,openai/gpt-5.4-nano:40,openai/gpt-5.4-mini:15,gemini/gemini-3.1-flash-lite:10,gemini/gemini-2.5-flash-lite:30` |
 | `PUFFERFS_EMBEDDING_MODEL_VERSION` | Embedding cache version; must be bumped when the Modal embedding model changes. | — |
+
+The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
+
+| Secret variable | Required when |
+| --- | --- |
+| `AWS_ACCESS_KEY_ID` | Modal reads/writes S3-compatible storage. |
+| `AWS_SECRET_ACCESS_KEY` | Modal reads/writes S3-compatible storage. |
+| `AWS_ENDPOINT_URL` | Required for non-AWS S3-compatible storage; omit for AWS S3. |
+| `AWS_BUCKET_NAME` | Modal reads/writes source files, chunk artifacts, and page images. |
+| `TURBOPUFFER_API_KEY` | Modal index shard writes Turbopuffer rows. |
+| `GEMINI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `gemini/...`, or media OCR is enabled. |
+| `OPENAI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `openai/...`. |
+| `FIREWORKS_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `fireworks/...`. |
+| `<PROVIDER>_BASE_URL` | Optional for OpenAI-compatible providers; Fireworks defaults to `https://api.fireworks.ai/inference/v1`, OpenAI defaults to `https://api.openai.com/v1`. |
 
 ### Transactional email (AWS SES, optional)
 
