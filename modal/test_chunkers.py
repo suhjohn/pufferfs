@@ -18,6 +18,7 @@ from chunkers import (
     chunk_image,
     detect_file_type,
     image_to_text,
+    render_page_jpeg,
 )
 
 
@@ -135,6 +136,170 @@ class ChunkersTest(unittest.TestCase):
         finally:
             chunkers._available_image_providers = old_available
             chunkers.image_to_text = old_image_to_text
+
+    def test_render_page_jpeg_uses_configured_dpi_and_quality(self):
+        import os
+
+        old_dpi = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_DPI")
+        old_quality = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY")
+        calls = []
+
+        class FakePixmap:
+            def tobytes(self, output, jpg_quality):
+                calls.append(("tobytes", output, jpg_quality))
+                return b"jpeg"
+
+        class FakePage:
+            def get_pixmap(self, dpi, alpha):
+                calls.append(("get_pixmap", dpi, alpha))
+                return FakePixmap()
+
+        os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = "144"
+        os.environ["PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY"] = "70"
+        try:
+            self.assertEqual(render_page_jpeg(FakePage()), b"jpeg")
+            self.assertEqual(calls, [("get_pixmap", 144, False), ("tobytes", "jpeg", 70)])
+        finally:
+            if old_dpi is None:
+                os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_DPI", None)
+            else:
+                os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = old_dpi
+            if old_quality is None:
+                os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY", None)
+            else:
+                os.environ["PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY"] = old_quality
+
+    def test_page_image_uploads_run_concurrently(self):
+        import os
+        import threading
+        import time
+
+        import app
+
+        old_concurrency = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY")
+        os.environ["PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY"] = "12"
+
+        class FakeS3:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+                self.calls = []
+                self.lock = threading.Lock()
+
+            def put_object(self, Bucket, Key, Body, ContentType):
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    self.calls.append((Bucket, Key, Body, ContentType))
+                time.sleep(0.02)
+                with self.lock:
+                    self.active -= 1
+
+        fake_s3 = FakeS3()
+        uploads = [(i, f"page-{i}.jpg", b"image") for i in range(12)]
+        try:
+            app._upload_page_images(fake_s3, "bucket", "doc.pdf", uploads)
+            self.assertEqual(len(fake_s3.calls), 12)
+            self.assertGreater(fake_s3.max_active, 1)
+        finally:
+            if old_concurrency is None:
+                os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY", None)
+            else:
+                os.environ["PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY"] = old_concurrency
+
+    def test_page_image_to_text_prefers_native_text_over_ocr(self):
+        import app
+        import chunkers
+
+        old_available = chunkers._available_image_providers
+        old_image_to_text = chunkers.image_to_text
+        vllm_calls = []
+
+        chunkers._available_image_providers = lambda _key: {"gemini"}
+
+        def fail_if_called(*args, **kwargs):
+            vllm_calls.append((args, kwargs))
+            raise AssertionError("VLLM should not run when native text exists")
+
+        chunkers.image_to_text = fail_if_called
+        try:
+            text = app.page_image_to_text.local("doc.pdf", 0, b"img", "native text")
+            self.assertEqual(text, "native text")
+            self.assertEqual(vllm_calls, [])
+        finally:
+            chunkers._available_image_providers = old_available
+            chunkers.image_to_text = old_image_to_text
+
+    def test_page_image_to_text_uses_vllm_when_native_text_is_blank(self):
+        import app
+        import chunkers
+        import os
+
+        old_available = chunkers._available_image_providers
+        old_image_to_text = chunkers.image_to_text
+        old_gemini_key = os.environ.get("GEMINI_API_KEY")
+        calls = []
+
+        chunkers._available_image_providers = lambda _key: {"gemini"}
+        os.environ.pop("GEMINI_API_KEY", None)
+
+        def vllm(image_bytes, gemini_key, mime_type):
+            calls.append((image_bytes, gemini_key, mime_type))
+            return "vllm text"
+
+        chunkers.image_to_text = vllm
+        try:
+            text = app.page_image_to_text.local("doc.pdf", 1, b"img", " ")
+            self.assertEqual(text, "vllm text")
+            self.assertEqual(calls, [(b"img", "", "image/jpeg")])
+        finally:
+            chunkers._available_image_providers = old_available
+            chunkers.image_to_text = old_image_to_text
+            if old_gemini_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = old_gemini_key
+
+    def test_document_chunking_ocr_only_blank_native_text_pages(self):
+        import app
+
+        old_pdf_to_page_images = app.pdf_to_page_images
+        old_page_image_to_text = app.page_image_to_text
+        old_upload_page_images = app._upload_page_images
+        ocr_inputs = []
+        uploaded = []
+        test_case = self
+
+        class FakePdfToPageImages:
+            def remote(self, pdf_bytes, file_path):
+                return [
+                    {"page_num": 0, "image_bytes": b"image-0", "fallback_text": "native page 0"},
+                    {"page_num": 1, "image_bytes": b"image-1", "fallback_text": " "},
+                    {"page_num": 2, "image_bytes": b"image-2", "fallback_text": "native page 2"},
+                    {"page_num": 3, "image_bytes": b"image-3", "fallback_text": ""},
+                ]
+
+        class FakePageImageToText:
+            def starmap(self, inputs, order_outputs=True):
+                ocr_inputs.extend(inputs)
+                test_case.assertTrue(order_outputs)
+                return [f"ocr page {page_num}" for _file_path, page_num, _image_bytes, _fallback_text in inputs]
+
+        def fake_upload(_s3_client, _bucket, _file_path, uploads):
+            uploaded.extend(uploads)
+
+        app.pdf_to_page_images = FakePdfToPageImages()
+        app.page_image_to_text = FakePageImageToText()
+        app._upload_page_images = fake_upload
+        try:
+            chunks = app.chunk_document_with_stage_functions(b"pdf", "root", "doc.pdf", "pdf", object(), "bucket")
+            self.assertEqual([chunk.content for chunk in chunks], ["native page 0", "ocr page 1", "native page 2", "ocr page 3"])
+            self.assertEqual([input_[1] for input_ in ocr_inputs], [1, 3])
+            self.assertEqual([upload[0] for upload in uploaded], [0, 1, 2, 3])
+        finally:
+            app.pdf_to_page_images = old_pdf_to_page_images
+            app.page_image_to_text = old_page_image_to_text
+            app._upload_page_images = old_upload_page_images
 
     def test_detect_file_type_structured_and_media(self):
         self.assertEqual(detect_file_type("mail/message.eml"), "eml")

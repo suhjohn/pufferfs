@@ -164,6 +164,9 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `MODAL_CHUNK_SHARD_ENDPOINT` | Sync shard → chunk artifact (queued pipeline). | — |
 | `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). | — |
 | `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). | — |
+| `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
+| `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY` | JPEG quality for rendered page images. Lower values reduce upload size; valid values are clamped between 30 and 95. | 75 |
+| `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY` | Concurrent S3 page-image uploads per document chunking container. This overlaps with OCR fan-out and is separate from Modal OCR container concurrency. | 512 |
 | `PUFFERFS_MODAL_PAGE_TEXT_MIN_CONTAINERS` | Warm Modal containers kept for page image-to-text calls. | 4 |
 | `PUFFERFS_MODAL_OCR_MAX_CONTAINERS` | Global max Modal containers for OCR/image-to-text calls. This caps OCR fan-out across all documents using the shared `page_image_to_text` function pool. | 100 |
 | `PUFFERFS_MODAL_SECRET_NAME` | Single Modal secret name used by all Modal functions. It contains storage, Turbopuffer, and model-provider credentials. | `pufferfs` |

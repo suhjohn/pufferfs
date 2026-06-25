@@ -127,6 +127,28 @@ def image_to_text(image_bytes: bytes, gemini_api_key: str, mime_type: str = "ima
     raise RuntimeError(f"unsupported image-to-text provider {provider!r}")
 
 
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _page_image_dpi() -> int:
+    return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_DPI", 160, 72, 300)
+
+
+def _page_image_jpeg_quality() -> int:
+    return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY", 75, 30, 95)
+
+
+def render_page_jpeg(page) -> bytes:
+    """Render one PDF page to a compact JPEG for OCR and page previews."""
+    pix = page.get_pixmap(dpi=_page_image_dpi(), alpha=False)
+    return pix.tobytes("jpeg", jpg_quality=_page_image_jpeg_quality())
+
+
 def _gemini_image_to_text(image_bytes: bytes, gemini_api_key: str, model: str, mime_type: str) -> str:
     from google import genai
     from google.genai.types import Part
@@ -414,13 +436,14 @@ def chunk_document_via_images(
     pages: list[tuple[int, bytes, str]] = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=200)
-        img_bytes = pix.tobytes("jpeg")
+        img_bytes = render_page_jpeg(page)
         fallback_text = page.get_text("text")
         pages.append((page_num, img_bytes, fallback_text))
     doc.close()
     print(
-        f"timing file={file_path} stage=pdf_render pages={len(pages)} elapsed={time.perf_counter() - render_start:.3f}s",
+        f"timing file={file_path} stage=pdf_render pages={len(pages)} "
+        f"dpi={_page_image_dpi()} jpeg_quality={_page_image_jpeg_quality()} "
+        f"elapsed={time.perf_counter() - render_start:.3f}s",
         flush=True,
     )
 
@@ -443,20 +466,18 @@ def chunk_document_via_images(
             )
 
         text_start = time.perf_counter()
-        text = ""
-        source = ""
-        if _available_image_providers(gemini_api_key):
+        text = fallback_text
+        source = "native" if text.strip() else "none"
+        if not text.strip() and _available_image_providers(gemini_api_key):
             try:
                 text = image_to_text(img_bytes, gemini_api_key, mime_type="image/jpeg")
-                source = "vllm"
+                if text.strip():
+                    source = "vllm"
             except Exception as exc:
                 print(
                     f"timing file={file_path} page={page_num} stage=image_to_text_vllm_error error={type(exc).__name__}",
                     flush=True,
                 )
-        if not text.strip():
-            text = fallback_text
-            source = "native_fallback"
         print(
             f"timing file={file_path} page={page_num} stage=image_to_text "
             f"source={source} chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",

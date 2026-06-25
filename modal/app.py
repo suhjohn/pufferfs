@@ -99,24 +99,26 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     import time
 
     import fitz
+    from chunkers import _page_image_dpi, _page_image_jpeg_quality, render_page_jpeg
 
     render_start = time.perf_counter()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: list[dict] = []
     for page_num in range(len(doc)):
         page = doc[page_num]
-        pix = page.get_pixmap(dpi=200)
         extracted_text = page.get_text("text")
         pages.append(
             {
                 "page_num": page_num,
-                "image_bytes": pix.tobytes("jpeg"),
+                "image_bytes": render_page_jpeg(page),
                 "fallback_text": extracted_text,
             }
         )
     doc.close()
     print(
-        f"timing file={file_path} stage=pdf_render pages={len(pages)} elapsed={time.perf_counter() - render_start:.3f}s",
+        f"timing file={file_path} stage=pdf_render pages={len(pages)} "
+        f"dpi={_page_image_dpi()} jpeg_quality={_page_image_jpeg_quality()} "
+        f"elapsed={time.perf_counter() - render_start:.3f}s",
         flush=True,
     )
     return pages
@@ -132,33 +134,86 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
     scaledown_window=900,
 )
 def page_image_to_text(file_path: str, page_num: int, image_bytes: bytes, fallback_text: str) -> str:
-    """Extract text from one rendered page image with VLLM, then native text fallback."""
+    """Extract page text with native PDF text first, then VLLM OCR."""
     import time
 
     from chunkers import _available_image_providers, image_to_text
 
     text_start = time.perf_counter()
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    text = ""
-    source = ""
-    if _available_image_providers(gemini_key):
+    text = fallback_text
+    source = "native" if text.strip() else "none"
+
+    if not text.strip() and _available_image_providers(gemini_key):
         try:
             text = image_to_text(image_bytes, gemini_key, mime_type="image/jpeg")
-            source = "vllm"
+            if text.strip():
+                source = "vllm"
         except Exception as exc:
             print(
                 f"timing file={file_path} page={page_num} stage=image_to_text_vllm_error error={type(exc).__name__}",
                 flush=True,
             )
-    if not text.strip():
-        text = fallback_text
-        source = "native_fallback"
     print(
         f"timing file={file_path} page={page_num} stage=image_to_text "
         f"source={source} chars={len(text)} elapsed={time.perf_counter() - text_start:.3f}s",
         flush=True,
     )
     return text
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _page_image_upload_concurrency() -> int:
+    return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY", 512, 1, 2048)
+
+
+def _s3_max_pool_connections() -> int:
+    return max(10, _page_image_upload_concurrency() + 8)
+
+
+def _upload_page_images(s3_client, bucket: str, file_path: str, uploads: list[tuple[int, str, bytes]]) -> None:
+    """Upload rendered page images with bounded parallelism."""
+    if not s3_client or not bucket or not uploads:
+        return
+
+    import concurrent.futures
+    import time
+
+    upload_all_start = time.perf_counter()
+
+    def upload_one(upload: tuple[int, str, bytes]) -> None:
+        page_num, image_key, img_bytes = upload
+        upload_start = time.perf_counter()
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=image_key,
+            Body=img_bytes,
+            ContentType="image/jpeg",
+        )
+        print(
+            f"timing file={file_path} page={page_num} stage=page_image_upload "
+            f"bytes={len(img_bytes)} elapsed={time.perf_counter() - upload_start:.3f}s",
+            flush=True,
+        )
+
+    max_workers = min(_page_image_upload_concurrency(), len(uploads))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(upload_one, upload) for upload in uploads]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+
+    print(
+        f"timing file={file_path} stage=parallel_page_image_upload pages={len(uploads)} "
+        f"concurrency={max_workers} elapsed={time.perf_counter() - upload_all_start:.3f}s",
+        flush=True,
+    )
 
 
 def chunk_document_with_stage_functions(
@@ -189,40 +244,42 @@ def chunk_document_with_stage_functions(
         return []
 
     page_inputs: list[tuple[str, int, bytes, str]] = []
+    page_texts_by_num: dict[int, str] = {}
     page_image_keys: dict[int, str] = {}
+    page_uploads: list[tuple[int, str, bytes]] = []
     for page_data in pages:
         page_num = int(page_data["page_num"])
         img_bytes = page_data["image_bytes"]
         fallback_text = page_data.get("fallback_text") or ""
         image_key = _page_image_key(root_id, file_path, page_num)
         page_image_keys[page_num] = image_key
-        if s3_client and bucket:
-            upload_start = time.perf_counter()
-            s3_client.put_object(
-                Bucket=bucket,
-                Key=image_key,
-                Body=img_bytes,
-                ContentType="image/jpeg",
-            )
-            print(
-                f"timing file={file_path} page={page_num} stage=page_image_upload "
-                f"bytes={len(img_bytes)} elapsed={time.perf_counter() - upload_start:.3f}s",
-                flush=True,
-            )
+        page_uploads.append((page_num, image_key, img_bytes))
+        if fallback_text.strip():
+            page_texts_by_num[page_num] = fallback_text
+        else:
+            page_inputs.append((file_path, page_num, img_bytes, fallback_text))
 
-        page_inputs.append((file_path, page_num, img_bytes, fallback_text))
+    import concurrent.futures
 
-    text_start = time.perf_counter()
-    page_texts = list(page_image_to_text.starmap(page_inputs, order_outputs=True))
-    print(
-        f"timing file={file_path} stage=parallel_image_to_text pages={len(page_inputs)} elapsed={time.perf_counter() - text_start:.3f}s",
-        flush=True,
-    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as upload_executor:
+        upload_future = upload_executor.submit(_upload_page_images, s3_client, bucket, file_path, page_uploads)
+
+        text_start = time.perf_counter()
+        page_texts = list(page_image_to_text.starmap(page_inputs, order_outputs=True)) if page_inputs else []
+        print(
+            f"timing file={file_path} stage=parallel_image_to_text pages={len(page_inputs)} elapsed={time.perf_counter() - text_start:.3f}s",
+            flush=True,
+        )
+        for page_input, text in zip(page_inputs, page_texts):
+            page_texts_by_num[page_input[1]] = text
+
+        upload_future.result()
 
     chunks: list[Chunk] = []
-    for page_data, text in zip(pages, page_texts):
+    for page_data in pages:
         page_start = time.perf_counter()
         page_num = int(page_data["page_num"])
+        text = page_texts_by_num.get(page_num, "")
         if not text.strip():
             text = f"[Page {page_num + 1}: no extractable text]"
 
@@ -267,8 +324,6 @@ def file_to_chunks(
 ) -> list[dict]:
     """Chunk a file. If content_b64 is provided, uses it directly; otherwise downloads from S3."""
     import base64
-
-    import boto3
     from chunkers import (
         CODE_EXTENSIONS,
         chunk_code,
@@ -288,12 +343,7 @@ def file_to_chunks(
     if content_b64:
         file_bytes = base64.b64decode(content_b64)
     else:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
-            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        )
+        s3 = _s3_client()
         bucket = os.environ["AWS_BUCKET_NAME"]
         resp = s3.get_object(Bucket=bucket, Key=s3_key)
         file_bytes = resp["Body"].read()
@@ -302,12 +352,7 @@ def file_to_chunks(
     def _ensure_s3():
         nonlocal s3, bucket
         if not s3:
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
-                aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-                aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-            )
+            s3 = _s3_client()
             bucket = os.environ["AWS_BUCKET_NAME"]
         return s3, bucket
 
@@ -347,12 +392,14 @@ def file_to_chunks(
 
 def _s3_client():
     import boto3
+    from botocore.config import Config
 
     return boto3.client(
         "s3",
         endpoint_url=os.environ.get("AWS_ENDPOINT_URL"),
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        config=Config(max_pool_connections=_s3_max_pool_connections()),
     )
 
 
