@@ -386,6 +386,9 @@ Authorization layers:
 - Root scopes:
   - `org`: visible to org members; write/delete require elevated roles.
   - `user`: visible to owner and org admins/owners.
+- Groups and root grants: reusable org groups can receive root-level `read`,
+  `sync`, `delete`, or `admin` permissions. Restricted roots are visible through
+  these grants plus org admin override.
 - Root ACLs: path-prefix entries currently behave as deny filters when
   `permission` is `none`.
 - Admin routes use a separate platform key via `PUFFERFS_ADMIN_KEY` or

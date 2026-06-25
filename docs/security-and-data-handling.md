@@ -83,9 +83,15 @@ deletes (admin+).
 - **`org` roots**: any org member can read; editor+ can write; admin+ can
   delete.
 - **`user` roots**: only the owner or an org admin+ can read, write, or delete.
+- **`restricted` roots**: only explicit root grants can read/write/delete, plus
+  org admin+ override.
 
 Unreadable roots return `404` (not `403`), so callers cannot probe for the
 existence of roots they cannot access.
+
+Root grants assign root-level `read`, `sync`, `delete`, or `admin` permissions
+to an org, user, or group. They are evaluated before folder ACL deny-prefix
+rules.
 
 ### 4. Folder ACLs (deny-prefix)
 
@@ -98,8 +104,8 @@ ACLs are modeled with a `permission` field, but the implemented behavior is
 - With no ACLs configured, all org members can read and editor+ can write,
   subject to the role/scope rules above.
 
-There is currently **no positive/grant ACL** that narrows default access; ACLs
-subtract from, not add to, the role/scope baseline.
+There is currently **no positive folder ACL** that narrows default access; ACLs
+subtract from, not add to, the role/scope/root-grant baseline.
 
 ### 5. Content-proof filtering (user roots)
 
@@ -182,8 +188,9 @@ exfiltrate data beyond what is necessary to prove the issue.
 
 These are real, in-code limitations to account for in a deployment:
 
-- **ACLs are deny-only.** Do not rely on ACLs to *grant* narrower-than-default
-  access; they can only subtract prefixes.
+- **Folder ACLs are deny-only.** Do not rely on folder ACLs to grant root
+  access; they can only subtract prefixes. Use root grants for root-level
+  org/user/group sharing.
 - **Legacy empty-scope API keys are unrestricted.** New user-created keys
   require explicit scopes, but old empty-scope keys should be rotated.
 - **Secret filtering is filename-based** (see above).

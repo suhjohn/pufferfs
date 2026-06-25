@@ -21,6 +21,7 @@ func TestWriteRootList(t *testing.T) {
 			Name:                 "workspace",
 			SourcePath:           "/tmp/workspace",
 			Scope:                models.RootScopeOrg,
+			Access:               []string{"read", "sync"},
 			VisibleGenerationID:  "gen-1",
 			VisibleGenerationSeq: 3,
 		},
@@ -35,6 +36,7 @@ func TestWriteRootList(t *testing.T) {
 		"workspace",
 		"root-1",
 		"org",
+		"read,sync",
 		"gen-1/3",
 		"/tmp/workspace",
 	} {

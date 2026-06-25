@@ -553,6 +553,7 @@ What a caller can do depends on:
 - Organization role.
 - Root scope.
 - Root ownership.
+- Root grants.
 - Deny-prefix ACLs.
 
 General expectations:
@@ -561,6 +562,10 @@ General expectations:
 - Sync/write access is needed to create roots, upload files, and sync.
 - Org roots require editor-or-higher role to create or write.
 - User roots can be written by their owner or org admins.
+- Restricted roots are visible only through explicit root grants, plus org
+  admin override.
+- Root grants can give `read`, `sync`, `delete`, or `admin` access to an org,
+  user, or group.
 - Org roots require admin-or-higher role to delete.
 - User roots can be deleted by their owner or org admins.
 - Denied path prefixes are filtered out of search and block writes.

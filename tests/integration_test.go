@@ -140,24 +140,77 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			"scope":         "user",
 			"owner_user_id": memberB.ID,
 		})
+		restrictedRoot := adminCreateRoot(t, serverURL, org.ID, map[string]any{
+			"name":        "finance-root-" + suffix,
+			"source_path": "/tenant/finance",
+			"scope":       "restricted",
+		})
+		financeGroup := adminCreateGroup(t, serverURL, org.ID, map[string]any{
+			"name":        "Finance " + suffix,
+			"external_id": "finance-" + suffix,
+		})
+		adminAddGroupMember(t, serverURL, org.ID, financeGroup.ID, memberA.ID)
+		adminCreateRootGrant(t, serverURL, org.ID, restrictedRoot.ID, map[string]any{
+			"principal_type": "group",
+			"principal_id":   financeGroup.ID,
+			"permissions":    []string{"read"},
+		})
 
 		assertVisibleRoots(t, serverURL, memberAKey,
-			[]string{orgRoot.Name, memberARoot.Name},
+			[]string{orgRoot.Name, memberARoot.Name, restrictedRoot.Name},
 			[]string{memberBRoot.Name},
 		)
 		assertVisibleRoots(t, serverURL, memberBKey,
 			[]string{orgRoot.Name, memberBRoot.Name},
-			[]string{memberARoot.Name},
+			[]string{memberARoot.Name, restrictedRoot.Name},
 		)
 		assertVisibleRoots(t, serverURL, adminMemberKey,
-			[]string{orgRoot.Name, memberARoot.Name, memberBRoot.Name},
+			[]string{orgRoot.Name, memberARoot.Name, memberBRoot.Name, restrictedRoot.Name},
 			nil,
 		)
 		assertRootStatus(t, serverURL, memberAKey, memberBRoot.ID, http.StatusNotFound)
 		assertRootStatus(t, serverURL, adminMemberKey, memberBRoot.ID, http.StatusOK)
 
+		status, body := jsonRequest(t, http.MethodPost, serverURL+"/roots/"+url.PathEscape(restrictedRoot.ID)+"/sync/init", memberASyncKey, models.SyncInitRequest{
+			ProtocolVersion:   models.SyncProtocolVersion,
+			BaseGenerationID:  "",
+			BaseGenerationSeq: 0,
+			TotalFiles:        1,
+		}, nil)
+		if status != http.StatusNotFound {
+			t.Fatalf("read-only group grant unexpectedly allowed sync init: HTTP %d: %s", status, string(body))
+		}
+		adminCreateRootGrant(t, serverURL, org.ID, restrictedRoot.ID, map[string]any{
+			"principal_type": "group",
+			"principal_id":   financeGroup.ID,
+			"permissions":    []string{"read", "sync"},
+		})
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, serverURL+"/roots/"+url.PathEscape(restrictedRoot.ID)+"/sync/init", memberASyncKey, models.SyncInitRequest{
+			ProtocolVersion:   models.SyncProtocolVersion,
+			BaseGenerationID:  "",
+			BaseGenerationSeq: 0,
+			TotalFiles:        1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync group grant did not allow sync init: HTTP %d: %s", status, string(body))
+		}
+		status, body = jsonRequest(t, http.MethodGet, serverURL+"/roots/"+url.PathEscape(restrictedRoot.ID)+"/sync/status", memberBKey, nil, nil)
+		if status != http.StatusNotFound {
+			t.Fatalf("outsider could read restricted root sync status: HTTP %d: %s", status, string(body))
+		}
+		status, body = jsonRequest(t, http.MethodDelete, serverURL+"/roots/"+url.PathEscape(restrictedRoot.ID)+"/sync/"+url.PathEscape(syncInit.GenerationID), memberASyncKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("group sync grant could not abort sync: HTTP %d: %s", status, string(body))
+		}
+		adminDeleteGroupMember(t, serverURL, org.ID, financeGroup.ID, memberA.ID)
+		assertVisibleRoots(t, serverURL, memberAKey,
+			[]string{orgRoot.Name, memberARoot.Name},
+			[]string{restrictedRoot.Name, memberBRoot.Name},
+		)
+
 		var memberCreatedRoot models.RootMetadata
-		status, body := jsonRequest(t, http.MethodPost, serverURL+"/roots", memberASyncKey, map[string]any{
+		status, body = jsonRequest(t, http.MethodPost, serverURL+"/roots", memberASyncKey, map[string]any{
 			"name":        "member-a-created-" + suffix,
 			"source_path": "/tenant/member-a-created",
 			"scope":       "user",
@@ -204,7 +257,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 		deleteCreatedDataAndAssertGone(t, serverURL, org.ID,
 			[]string{adminUser.ID, memberA.ID, memberB.ID},
-			[]string{orgRoot.ID, memberARoot.ID, memberBRoot.ID, memberCreatedRoot.ID},
+			[]string{orgRoot.ID, memberARoot.ID, memberBRoot.ID, restrictedRoot.ID, memberCreatedRoot.ID},
 		)
 		cleanupDone = true
 	})
@@ -1902,6 +1955,40 @@ func adminUpsertMember(t *testing.T, serverURL, orgID, userID, role string) {
 	}
 }
 
+func adminCreateGroup(t *testing.T, serverURL, orgID string, payload map[string]any) models.Group {
+	t.Helper()
+	var group models.Group
+	adminJSON(t, http.MethodPost, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/groups", payload, http.StatusCreated, &group)
+	if group.ID == "" {
+		t.Fatalf("admin group creation returned empty group: %#v", group)
+	}
+	return group
+}
+
+func adminAddGroupMember(t *testing.T, serverURL, orgID, groupID, userID string) {
+	t.Helper()
+	var member models.GroupMember
+	adminJSON(t, http.MethodPut, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/groups/"+url.PathEscape(groupID)+"/members/"+url.PathEscape(userID), nil, http.StatusOK, &member)
+	if member.GroupID != groupID || member.UserID != userID {
+		t.Fatalf("unexpected group member response: %#v", member)
+	}
+}
+
+func adminDeleteGroupMember(t *testing.T, serverURL, orgID, groupID, userID string) {
+	t.Helper()
+	adminJSON(t, http.MethodDelete, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/groups/"+url.PathEscape(groupID)+"/members/"+url.PathEscape(userID), nil, http.StatusOK, nil)
+}
+
+func adminCreateRootGrant(t *testing.T, serverURL, orgID, rootID string, payload map[string]any) models.RootGrant {
+	t.Helper()
+	var grant models.RootGrant
+	adminJSON(t, http.MethodPost, serverURL, "/admin/orgs/"+url.PathEscape(orgID)+"/roots/"+url.PathEscape(rootID)+"/grants", payload, http.StatusCreated, &grant)
+	if grant.ID == "" {
+		t.Fatalf("admin root grant creation returned empty grant: %#v", grant)
+	}
+	return grant
+}
+
 func adminCreateMemberAPIKey(t *testing.T, serverURL, orgID, userID string, scopes []string) string {
 	t.Helper()
 	var resp struct {
@@ -1999,7 +2086,10 @@ func deleteCreatedDataAndAssertGone(t *testing.T, serverURL, orgID string, userI
 	assertDBCountZero(t, "organization", `SELECT COUNT(*) FROM organizations WHERE id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org roots", `SELECT COUNT(*) FROM roots WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org members", `SELECT COUNT(*) FROM org_members WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org groups", `SELECT COUNT(*) FROM groups WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org group members", `SELECT COUNT(*) FROM group_members WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org API keys", `SELECT COUNT(*) FROM api_keys WHERE org_id = `+sqlQuote(orgID))
+	assertDBCountZero(t, "org root grants", `SELECT COUNT(*) FROM root_grants WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org ACLs", `SELECT COUNT(*) FROM root_acls WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "org ignore policies", `SELECT COUNT(*) FROM org_ignore_policies WHERE org_id = `+sqlQuote(orgID))
 	assertDBCountZero(t, "user ignore policies", `SELECT COUNT(*) FROM user_ignore_policies WHERE org_id = `+sqlQuote(orgID))

@@ -68,6 +68,8 @@ Root visibility additionally depends on root scope and ownership:
 - `org` roots: readable by any org member; writable by editor+, deletable by
   admin+.
 - `user` roots: readable/writable/deletable by the owner or an org admin+.
+- `restricted` roots: readable/writable/deletable through explicit root grants
+  to an org, user, or group, plus org admin+ override.
 
 See [security-and-data-handling.md](./security-and-data-handling.md) for the
 full model.
@@ -301,10 +303,12 @@ Request:
 { "name": "workspace", "source_path": "/Users/me/workspace", "scope": "org", "owner_user_id": "" }
 ```
 
-- `scope`: `org` (default) or `user`.
+- `scope`: `org` (default), `user`, or `restricted`.
 - `org` scope requires editor+.
 - `user` scope defaults the owner to the caller; setting another `owner_user_id`
   requires admin+, and the owner must be an org member.
+- `restricted` scope requires org admin authority through the normal API and is
+  intended for roots exposed by explicit root grants.
 
 Response `201`: the `RootMetadata` object (see [Schemas](#schemas)).
 
@@ -321,7 +325,8 @@ Get one root. `404` if it does not exist or the caller cannot read it.
 
 Delete a root and all its PufferFS artifacts. Requires
 `root:delete` / `delete` / `write` **and** delete rights on the root
-(admin+ for org roots; owner or admin+ for user roots).
+(admin+ for org roots; owner or admin+ for user roots; grant/admin access for
+restricted roots).
 
 - `409` if the root has active sync jobs.
 - Removes Turbopuffer namespaces and S3 objects under `files/`, `bundles/`,
@@ -731,8 +736,16 @@ Require the platform admin key. Used for provisioning, not normal operation.
 | `POST /admin/orgs` | Provision an org. Body: `{id?, name, slug?, external_id?}`. |
 | `POST /admin/users` | Provision a user. Body requires `email`. |
 | `PUT /admin/orgs/{orgId}/members/{userId}` | Upsert org membership. Body: `{role}`. |
+| `POST /admin/orgs/{orgId}/groups` | Create/upsert a group. Body: `{id?, name, external_id?}`. |
+| `GET /admin/orgs/{orgId}/groups` | List groups. |
+| `GET /admin/orgs/{orgId}/groups/{groupId}/members` | List group members. |
+| `PUT /admin/orgs/{orgId}/groups/{groupId}/members/{userId}` | Add a group member. User must already be an org member. |
+| `DELETE /admin/orgs/{orgId}/groups/{groupId}/members/{userId}` | Remove a group member. |
 | `POST /admin/orgs/{orgId}/users/{userId}/api-keys` | Create a key for a member. Body: `{name?, scopes?}` (defaults to `["query"]`). |
-| `POST /admin/orgs/{orgId}/roots` | Create a root in any org. |
+| `POST /admin/orgs/{orgId}/roots` | Create a root in any org, including `restricted` roots. |
+| `POST /admin/orgs/{orgId}/roots/{rootId}/grants` | Create/upsert a root grant. Body: `{principal_type:"org|user|group", principal_id, permissions:["read"|"sync"|"delete"|"admin"]}`. |
+| `GET /admin/orgs/{orgId}/roots/{rootId}/grants` | List root grants. |
+| `DELETE /admin/orgs/{orgId}/roots/{rootId}/grants/{grantId}` | Delete a root grant. |
 | `DELETE /admin/roots/{id}` | Delete any root (across orgs). |
 | `DELETE /admin/orgs/{id}` | Delete an org and all its roots/artifacts. |
 | `DELETE /admin/users/{id}` | Delete a user and the roots they own. |
@@ -749,8 +762,29 @@ Deletes return `409` while sync jobs are active and report
 ```json
 {
   "id": "string", "org_id": "string", "name": "string",
-  "source_path": "string", "scope": "org|user", "owner_user_id": "string?",
+  "source_path": "string", "scope": "org|user|restricted", "owner_user_id": "string?",
+  "access": ["read", "sync"], "access_source": "org|owner|role|user|group",
   "visible_generation_id": "string", "visible_generation_seq": 0,
+  "created_at": "RFC3339", "updated_at": "RFC3339"
+}
+```
+
+### Group
+
+```json
+{
+  "id": "string", "org_id": "string", "name": "string",
+  "external_id": "string?", "created_at": "RFC3339", "updated_at": "RFC3339"
+}
+```
+
+### RootGrant
+
+```json
+{
+  "id": "string", "org_id": "string", "root_id": "string",
+  "principal_type": "org|user|group", "principal_id": "string",
+  "permissions": ["read", "sync", "delete", "admin"],
   "created_at": "RFC3339", "updated_at": "RFC3339"
 }
 ```

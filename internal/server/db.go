@@ -177,6 +177,29 @@ func (db *DB) migrateFallback() error {
 			PRIMARY KEY (org_id, user_id)
 		);
 
+		CREATE TABLE IF NOT EXISTS groups (
+			id          TEXT PRIMARY KEY,
+			org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			name        TEXT NOT NULL,
+			external_id TEXT NOT NULL DEFAULT '',
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE(org_id, name)
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_org_external
+			ON groups(org_id, external_id)
+			WHERE external_id <> '';
+
+		CREATE TABLE IF NOT EXISTS group_members (
+			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			group_id  TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+			user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (org_id, group_id, user_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_group_members_user
+			ON group_members(org_id, user_id);
+
 		CREATE TABLE IF NOT EXISTS org_invites (
 			id                 TEXT PRIMARY KEY,
 			org_id             TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -295,6 +318,22 @@ func (db *DB) migrateFallback() error {
 			permission  TEXT NOT NULL DEFAULT 'read',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		);
+
+		CREATE TABLE IF NOT EXISTS root_grants (
+			id             TEXT PRIMARY KEY,
+			org_id         TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+			root_id        TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+			principal_type TEXT NOT NULL,
+			principal_id   TEXT NOT NULL,
+			permissions    TEXT[] NOT NULL DEFAULT '{}',
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE(root_id, principal_type, principal_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_root_grants_org_principal
+			ON root_grants(org_id, principal_type, principal_id);
+		CREATE INDEX IF NOT EXISTS idx_root_grants_root
+			ON root_grants(root_id);
 
 		CREATE TABLE IF NOT EXISTS sync_jobs (
 			id           TEXT PRIMARY KEY,
@@ -1162,6 +1201,147 @@ func (db *DB) RemoveOrgMember(ctx context.Context, orgID, userID string) error {
 	return err
 }
 
+// CreateGroup creates or updates an organization group used for root grants.
+func (db *DB) CreateGroup(ctx context.Context, orgID, id, name, externalID string) (*models.Group, error) {
+	name = strings.TrimSpace(name)
+	externalID = strings.TrimSpace(externalID)
+	if id == "" {
+		id = uuid.New().String()
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if externalID != "" {
+		var existingID string
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM groups WHERE org_id = $1 AND external_id = $2`,
+			orgID, externalID,
+		).Scan(&existingID)
+		if err == nil {
+			id = existingID
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
+	group := &models.Group{}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO groups (id, org_id, name, external_id, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, NOW(), NOW())
+		 ON CONFLICT (id) DO UPDATE SET
+		   name = EXCLUDED.name,
+		   external_id = EXCLUDED.external_id,
+		   updated_at = NOW()
+		 RETURNING id, org_id, name, external_id, created_at, updated_at`,
+		id, orgID, name, externalID,
+	).Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	tx = nil
+	return group, nil
+}
+
+func (db *DB) GetGroup(ctx context.Context, orgID, groupID string) (*models.Group, error) {
+	group := &models.Group{}
+	err := db.pool.QueryRow(ctx,
+		`SELECT id, org_id, name, external_id, created_at, updated_at
+		 FROM groups WHERE org_id = $1 AND id = $2`,
+		orgID, groupID,
+	).Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return group, nil
+}
+
+func (db *DB) ListGroups(ctx context.Context, orgID string) ([]models.Group, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, name, external_id, created_at, updated_at
+		 FROM groups WHERE org_id = $1 ORDER BY name`,
+		orgID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var groups []models.Group
+	for rows.Next() {
+		var group models.Group
+		if err := rows.Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt); err != nil {
+			return nil, err
+		}
+		groups = append(groups, group)
+	}
+	return groups, rows.Err()
+}
+
+func (db *DB) AddGroupMember(ctx context.Context, orgID, groupID, userID string) (*models.GroupMember, error) {
+	member := &models.GroupMember{}
+	err := db.pool.QueryRow(ctx,
+		`INSERT INTO group_members (org_id, group_id, user_id, joined_at)
+		 VALUES ($1, $2, $3, NOW())
+		 ON CONFLICT (org_id, group_id, user_id) DO UPDATE SET joined_at = group_members.joined_at
+		 RETURNING group_id, user_id, joined_at`,
+		orgID, groupID, userID,
+	).Scan(&member.GroupID, &member.UserID, &member.JoinedAt)
+	if err != nil {
+		return nil, err
+	}
+	return member, nil
+}
+
+func (db *DB) DeleteGroupMember(ctx context.Context, orgID, groupID, userID string) error {
+	tag, err := db.pool.Exec(ctx,
+		`DELETE FROM group_members WHERE org_id = $1 AND group_id = $2 AND user_id = $3`,
+		orgID, groupID, userID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (db *DB) ListGroupMembers(ctx context.Context, orgID, groupID string) ([]models.GroupMember, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT gm.group_id, gm.user_id, u.email, u.name, gm.joined_at
+		 FROM group_members gm
+		 JOIN users u ON u.id = gm.user_id
+		 WHERE gm.org_id = $1 AND gm.group_id = $2
+		 ORDER BY u.email`,
+		orgID, groupID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []models.GroupMember
+	for rows.Next() {
+		var member models.GroupMember
+		if err := rows.Scan(&member.GroupID, &member.UserID, &member.Email, &member.Name, &member.JoinedAt); err != nil {
+			return nil, err
+		}
+		members = append(members, member)
+	}
+	return members, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // Roots
 // ---------------------------------------------------------------------------
@@ -1175,7 +1355,7 @@ func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, 
 	if scope == "" {
 		scope = models.RootScopeOrg
 	}
-	if scope == models.RootScopeOrg {
+	if scope != models.RootScopeUser {
 		ownerUserID = ""
 	}
 	root := &models.RootMetadata{
@@ -1284,35 +1464,23 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 }
 
 func (db *DB) ListAccessibleRoots(ctx context.Context, orgID, userID string, role auth.Role) ([]models.RootMetadata, error) {
-	where := `r.org_id = $1 AND (r.scope = 'org' OR r.owner_user_id = $2`
-	args := []any{orgID, userID}
-	if auth.HasMinRole(role, auth.RoleAdmin) {
-		where += ` OR r.scope = 'user'`
-	}
-	where += `)`
-
-	rows, err := db.pool.Query(ctx,
-		`SELECT `+rootSelectColumns+`
-		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
-		 WHERE `+where+`
-		 ORDER BY r.created_at DESC`,
-		args...,
-	)
+	allRoots, err := db.ListRoots(ctx, orgID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var roots []models.RootMetadata
-	for rows.Next() {
-		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	roots := make([]models.RootMetadata, 0, len(allRoots))
+	for _, root := range allRoots {
+		perms, source, err := db.RootPermissions(ctx, &root, userID, role)
+		if err != nil {
 			return nil, err
 		}
-		roots = append(roots, r)
+		if rootPermissionAllowed(perms, models.RootPermissionRead) {
+			root.Access = perms
+			root.AccessSource = source
+			roots = append(roots, root)
+		}
 	}
-	return roots, rows.Err()
+	return roots, nil
 }
 
 func (db *DB) ListRootsOwnedByUser(ctx context.Context, userID string) ([]models.RootMetadata, error) {
@@ -1351,6 +1519,172 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 		return pgx.ErrNoRows
 	}
 	return nil
+}
+
+func (db *DB) CreateRootGrant(ctx context.Context, orgID, rootID, principalType, principalID string, permissions []string) (*models.RootGrant, error) {
+	grant := &models.RootGrant{}
+	err := db.pool.QueryRow(ctx,
+		`INSERT INTO root_grants (id, org_id, root_id, principal_type, principal_id, permissions, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+		 ON CONFLICT (root_id, principal_type, principal_id) DO UPDATE SET
+		   permissions = EXCLUDED.permissions,
+		   updated_at = NOW()
+		 RETURNING id, org_id, root_id, principal_type, principal_id, permissions, created_at, updated_at`,
+		uuid.New().String(), orgID, rootID, principalType, principalID, permissions,
+	).Scan(&grant.ID, &grant.OrgID, &grant.RootID, &grant.PrincipalType, &grant.PrincipalID, &grant.Permissions, &grant.CreatedAt, &grant.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return grant, nil
+}
+
+func (db *DB) ListRootGrants(ctx context.Context, orgID, rootID string) ([]models.RootGrant, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id, org_id, root_id, principal_type, principal_id, permissions, created_at, updated_at
+		 FROM root_grants WHERE org_id = $1 AND root_id = $2
+		 ORDER BY principal_type, principal_id`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var grants []models.RootGrant
+	for rows.Next() {
+		var grant models.RootGrant
+		if err := rows.Scan(&grant.ID, &grant.OrgID, &grant.RootID, &grant.PrincipalType, &grant.PrincipalID, &grant.Permissions, &grant.CreatedAt, &grant.UpdatedAt); err != nil {
+			return nil, err
+		}
+		grants = append(grants, grant)
+	}
+	return grants, rows.Err()
+}
+
+func (db *DB) DeleteRootGrant(ctx context.Context, orgID, rootID, grantID string) error {
+	tag, err := db.pool.Exec(ctx,
+		`DELETE FROM root_grants WHERE id = $1 AND org_id = $2 AND root_id = $3`,
+		grantID, orgID, rootID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (db *DB) RootPermissions(ctx context.Context, root *models.RootMetadata, userID string, role auth.Role) ([]string, string, error) {
+	if root == nil {
+		return nil, "", nil
+	}
+	permissions := map[string]bool{}
+	source := ""
+	add := func(nextSource string, perms ...string) {
+		for _, perm := range perms {
+			addRootPermission(permissions, perm)
+		}
+		if source == "" && len(perms) > 0 {
+			source = nextSource
+		}
+	}
+
+	switch root.Scope {
+	case "", models.RootScopeOrg:
+		add("org", models.RootPermissionRead)
+		if auth.HasMinRole(role, auth.RoleEditor) {
+			add("role", models.RootPermissionSync)
+		}
+		if auth.HasMinRole(role, auth.RoleAdmin) {
+			add("role", models.RootPermissionDelete, models.RootPermissionAdmin)
+		}
+	case models.RootScopeUser:
+		if root.OwnerUserID == userID {
+			add("owner", models.RootPermissionRead, models.RootPermissionSync, models.RootPermissionDelete, models.RootPermissionAdmin)
+		} else if auth.HasMinRole(role, auth.RoleAdmin) {
+			add("role", models.RootPermissionRead, models.RootPermissionSync, models.RootPermissionDelete, models.RootPermissionAdmin)
+		}
+	case models.RootScopeRestricted:
+		if auth.HasMinRole(role, auth.RoleAdmin) {
+			add("role", models.RootPermissionRead, models.RootPermissionSync, models.RootPermissionDelete, models.RootPermissionAdmin)
+		}
+	}
+
+	rows, err := db.pool.Query(ctx,
+		`SELECT principal_type, permissions
+		 FROM root_grants rg
+		 WHERE rg.org_id = $1 AND rg.root_id = $2
+		   AND (
+		     (rg.principal_type = 'org' AND rg.principal_id = $1)
+		     OR (rg.principal_type = 'user' AND rg.principal_id = $3)
+		     OR (rg.principal_type = 'group' AND EXISTS (
+		       SELECT 1 FROM group_members gm
+		       WHERE gm.org_id = rg.org_id
+		         AND gm.group_id = rg.principal_id
+		         AND gm.user_id = $3
+		     ))
+		   )`,
+		root.OrgID, root.ID, userID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var principalType string
+		var grantPerms []string
+		if err := rows.Scan(&principalType, &grantPerms); err != nil {
+			return nil, "", err
+		}
+		add(principalType, grantPerms...)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", err
+	}
+	return sortedRootPermissions(permissions), source, nil
+}
+
+func addRootPermission(permissions map[string]bool, permission string) {
+	switch strings.TrimSpace(permission) {
+	case models.RootPermissionAdmin:
+		permissions[models.RootPermissionRead] = true
+		permissions[models.RootPermissionSync] = true
+		permissions[models.RootPermissionDelete] = true
+		permissions[models.RootPermissionAdmin] = true
+	case models.RootPermissionDelete:
+		permissions[models.RootPermissionRead] = true
+		permissions[models.RootPermissionDelete] = true
+	case models.RootPermissionSync:
+		permissions[models.RootPermissionRead] = true
+		permissions[models.RootPermissionSync] = true
+	case models.RootPermissionRead:
+		permissions[models.RootPermissionRead] = true
+	}
+}
+
+func sortedRootPermissions(permissions map[string]bool) []string {
+	order := []string{models.RootPermissionRead, models.RootPermissionSync, models.RootPermissionDelete, models.RootPermissionAdmin}
+	out := make([]string, 0, len(order))
+	for _, permission := range order {
+		if permissions[permission] {
+			out = append(out, permission)
+		}
+	}
+	return out
+}
+
+func rootPermissionAllowed(permissions []string, action string) bool {
+	for _, permission := range permissions {
+		if permission == action || permission == models.RootPermissionAdmin {
+			return true
+		}
+		if action == models.RootPermissionRead && (permission == models.RootPermissionSync || permission == models.RootPermissionDelete) {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *DB) insertRootIndexNamespacesTx(ctx context.Context, tx pgx.Tx, root *models.RootMetadata, shardCount int) error {

@@ -252,7 +252,7 @@ pufferfs init --api-key ${newKey}`}</pre>
           <div className="data-list">
             <div className="data-row data-row-head root-data-row">
               <span>name</span>
-              <span>scope</span>
+              <span>access</span>
               <span>last synced</span>
               <span>status</span>
               <span />
@@ -260,7 +260,7 @@ pufferfs init --api-key ${newKey}`}</pre>
             {rootSummaries.map(({ root, latestJob }) => (
               <div key={root.id} className="data-row root-data-row">
                 <strong>{root.name}</strong>
-                <span className="tag">{root.scope}</span>
+                <span className="tag">{formatAccess(root)}</span>
                 <span className="muted">
                   {formatDateTime(latestJob?.finished_at ?? latestJob?.started_at)}
                 </span>
@@ -349,4 +349,9 @@ function formatDateTime(value?: string) {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function formatAccess(root: Root) {
+  if (root.access?.length) return root.access.join(",");
+  return root.scope;
 }

@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/internal/ignore"
@@ -157,8 +158,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /admin/orgs", s.handleAdminProvisionOrg)
 	s.mux.HandleFunc("POST /admin/users", s.handleAdminProvisionUser)
 	s.mux.HandleFunc("PUT /admin/orgs/{orgId}/members/{userId}", s.handleAdminUpsertMember)
+	s.mux.HandleFunc("POST /admin/orgs/{orgId}/groups", s.handleAdminCreateGroup)
+	s.mux.HandleFunc("GET /admin/orgs/{orgId}/groups", s.handleAdminListGroups)
+	s.mux.HandleFunc("GET /admin/orgs/{orgId}/groups/{groupId}/members", s.handleAdminListGroupMembers)
+	s.mux.HandleFunc("PUT /admin/orgs/{orgId}/groups/{groupId}/members/{userId}", s.handleAdminAddGroupMember)
+	s.mux.HandleFunc("DELETE /admin/orgs/{orgId}/groups/{groupId}/members/{userId}", s.handleAdminDeleteGroupMember)
 	s.mux.HandleFunc("POST /admin/orgs/{orgId}/users/{userId}/api-keys", s.handleAdminCreateAPIKey)
 	s.mux.HandleFunc("POST /admin/orgs/{orgId}/roots", s.handleAdminCreateRoot)
+	s.mux.HandleFunc("POST /admin/orgs/{orgId}/roots/{rootId}/grants", s.handleAdminCreateRootGrant)
+	s.mux.HandleFunc("GET /admin/orgs/{orgId}/roots/{rootId}/grants", s.handleAdminListRootGrants)
+	s.mux.HandleFunc("DELETE /admin/orgs/{orgId}/roots/{rootId}/grants/{grantId}", s.handleAdminDeleteRootGrant)
 	s.mux.HandleFunc("DELETE /admin/roots/{id}", s.handleAdminDeleteRoot)
 	s.mux.HandleFunc("DELETE /admin/orgs/{id}", s.handleAdminDeleteOrg)
 	s.mux.HandleFunc("DELETE /admin/users/{id}", s.handleAdminDeleteUser)
@@ -797,6 +806,118 @@ func (s *Server) handleAdminUpsertMember(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, member)
 }
 
+func (s *Server) handleAdminCreateGroup(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	var req struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		ExternalID string `json:"external_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		return
+	}
+	group, err := s.db.CreateGroup(r.Context(), orgID, strings.TrimSpace(req.ID), req.Name, strings.TrimSpace(req.ExternalID))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, group)
+}
+
+func (s *Server) handleAdminListGroups(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		return
+	}
+	groups, err := s.db.ListGroups(r.Context(), orgID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, groups)
+}
+
+func (s *Server) handleAdminListGroupMembers(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	groupID := r.PathValue("groupId")
+	if _, err := s.db.GetGroup(r.Context(), orgID, groupID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
+		return
+	}
+	members, err := s.db.ListGroupMembers(r.Context(), orgID, groupID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, members)
+}
+
+func (s *Server) handleAdminAddGroupMember(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	groupID := r.PathValue("groupId")
+	userID := r.PathValue("userId")
+	if _, err := s.db.GetGroup(r.Context(), orgID, groupID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
+		return
+	}
+	if _, err := s.db.GetOrgMember(r.Context(), orgID, userID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
+		return
+	}
+	member, err := s.db.AddGroupMember(r.Context(), orgID, groupID, userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, member)
+}
+
+func (s *Server) handleAdminDeleteGroupMember(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	groupID := r.PathValue("groupId")
+	userID := r.PathValue("userId")
+	if err := s.db.DeleteGroupMember(r.Context(), orgID, groupID, userID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "group member not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
 func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	if !auth.IsAdmin(r.Context()) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
@@ -892,6 +1013,82 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, root)
+}
+
+func (s *Server) handleAdminCreateRootGrant(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	rootID := r.PathValue("rootId")
+	root, err := s.db.GetRoot(r.Context(), orgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	var req struct {
+		PrincipalType string   `json:"principal_type"`
+		PrincipalID   string   `json:"principal_id"`
+		Permissions   []string `json:"permissions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	principalType, principalID, ok := s.validateRootGrantPrincipal(w, r, orgID, req.PrincipalType, req.PrincipalID)
+	if !ok {
+		return
+	}
+	permissions, err := normalizeRootGrantPermissions(req.Permissions)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	grant, err := s.db.CreateRootGrant(r.Context(), orgID, root.ID, principalType, principalID, permissions)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, grant)
+}
+
+func (s *Server) handleAdminListRootGrants(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	rootID := r.PathValue("rootId")
+	if _, err := s.db.GetRoot(r.Context(), orgID, rootID); err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	grants, err := s.db.ListRootGrants(r.Context(), orgID, rootID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, grants)
+}
+
+func (s *Server) handleAdminDeleteRootGrant(w http.ResponseWriter, r *http.Request) {
+	if !auth.IsAdmin(r.Context()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
+		return
+	}
+	orgID := r.PathValue("orgId")
+	rootID := r.PathValue("rootId")
+	grantID := r.PathValue("grantId")
+	if err := s.db.DeleteRootGrant(r.Context(), orgID, rootID, grantID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "grant not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
 func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
@@ -1103,6 +1300,12 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be a member of the org"})
 			return
 		}
+	case models.RootScopeRestricted:
+		if !auth.HasMinRole(id.Role, auth.RoleAdmin) || !auth.HasScope(id, "org:admin", "admin", "write") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required for restricted roots"})
+			return
+		}
+		ownerUserID = ""
 	}
 
 	root, err := s.db.CreateRootWithScope(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID)
@@ -1143,8 +1346,8 @@ func (s *Server) handleGetRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1167,8 +1370,8 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canDeleteRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionDelete)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1285,8 +1488,8 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1329,8 +1532,8 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1399,8 +1602,8 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 	}
 	rootID := r.PathValue("id")
 	generationID := r.PathValue("generation_id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1451,8 +1654,8 @@ func (s *Server) handleSyncAbort(w http.ResponseWriter, r *http.Request) {
 	}
 	rootID := r.PathValue("id")
 	generationID := r.PathValue("generation_id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1483,8 +1686,8 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	}
 	rootID := r.PathValue("id")
 
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1509,8 +1712,8 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1586,8 +1789,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	rootID := r.PathValue("id")
 
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canWriteRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -1950,7 +2153,15 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
+	if !auth.HasScope(id, "query", "sync", "read", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
+		return
+	}
 	rootID := r.PathValue("id")
+	if _, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead); err != nil || !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
 
 	var (
 		job *models.SyncJob
@@ -2031,8 +2242,8 @@ func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2184,8 +2395,8 @@ func (s *Server) handleCreateACL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2235,8 +2446,8 @@ func (s *Server) handleListACLs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2260,8 +2471,8 @@ func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2290,8 +2501,8 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2343,8 +2554,8 @@ func (s *Server) handleGetRootAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rootID := r.PathValue("id")
-	root, err := s.db.GetRoot(r.Context(), id.OrgID, rootID)
-	if err != nil || !canReadRoot(id, root) {
+	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
+	if err != nil || !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
@@ -2621,8 +2832,8 @@ func rootAssetURL(r *http.Request, rootID, key string) string {
 func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
 	if err != nil || len(acls) == 0 {
-		root, rootErr := s.db.GetRoot(ctx, id.OrgID, rootID)
-		return rootErr == nil && canWriteRoot(id, root)
+		_, ok, rootErr := s.rootForPermission(ctx, id, rootID, models.RootPermissionSync)
+		return rootErr == nil && ok
 	}
 
 	return checkPermission(acls, filePath, "write")
@@ -2631,8 +2842,8 @@ func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, f
 func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
 	if err != nil || len(acls) == 0 {
-		root, rootErr := s.db.GetRoot(ctx, id.OrgID, rootID)
-		if rootErr == nil && canWriteRoot(id, root) {
+		_, ok, rootErr := s.rootForPermission(ctx, id, rootID, models.RootPermissionSync)
+		if rootErr == nil && ok {
 			return nil
 		}
 		return fmt.Errorf("write permission required")
@@ -3331,8 +3542,8 @@ func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *
 	}
 
 	if strings.TrimSpace(req.RootID) != "" {
-		root, err := s.db.GetRoot(ctx, id.OrgID, strings.TrimSpace(req.RootID))
-		if err != nil || !canReadRoot(id, root) {
+		root, ok, err := s.rootForPermission(ctx, id, strings.TrimSpace(req.RootID), models.RootPermissionRead)
+		if err != nil || !ok {
 			return queryRootSelection{}, errQueryRootNotFound
 		}
 		return queryRootSelection{roots: []models.RootMetadata{*root}, scope: "single_root"}, nil
@@ -3349,8 +3560,8 @@ func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *
 			continue
 		}
 		seen[rootID] = struct{}{}
-		root, err := s.db.GetRoot(ctx, id.OrgID, rootID)
-		if err != nil || !canReadRoot(id, root) {
+		root, ok, err := s.rootForPermission(ctx, id, rootID, models.RootPermissionRead)
+		if err != nil || !ok {
 			return queryRootSelection{}, errQueryRootNotFound
 		}
 		roots = append(roots, *root)
@@ -3546,11 +3757,62 @@ func parseRootScope(raw string) (string, error) {
 		scope = models.RootScopeOrg
 	}
 	switch scope {
-	case models.RootScopeOrg, models.RootScopeUser:
+	case models.RootScopeOrg, models.RootScopeUser, models.RootScopeRestricted:
 		return scope, nil
 	default:
-		return "", fmt.Errorf("scope must be org or user")
+		return "", fmt.Errorf("scope must be org, user, or restricted")
 	}
+}
+
+func normalizeRootGrantPermissions(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("permissions are required")
+	}
+	seen := map[string]bool{}
+	for _, value := range raw {
+		permission := strings.TrimSpace(value)
+		switch permission {
+		case models.RootPermissionRead, models.RootPermissionSync, models.RootPermissionDelete, models.RootPermissionAdmin:
+			seen[permission] = true
+		case "":
+		default:
+			return nil, fmt.Errorf("unsupported root permission %q", permission)
+		}
+	}
+	if len(seen) == 0 {
+		return nil, fmt.Errorf("permissions are required")
+	}
+	return sortedRootPermissions(seen), nil
+}
+
+func (s *Server) validateRootGrantPrincipal(w http.ResponseWriter, r *http.Request, orgID, rawType, rawID string) (string, string, bool) {
+	principalType := strings.TrimSpace(rawType)
+	principalID := strings.TrimSpace(rawID)
+	if principalType == "" || principalID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "principal_type and principal_id are required"})
+		return "", "", false
+	}
+	switch principalType {
+	case "org":
+		if principalID != orgID {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "org principal_id must match orgId"})
+			return "", "", false
+		}
+	case "user":
+		if _, err := s.db.GetOrgMember(r.Context(), orgID, principalID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user principal must be an org member"})
+			return "", "", false
+		}
+	case "group":
+		if _, err := s.db.GetGroup(r.Context(), orgID, principalID); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group principal not found"})
+			return "", "", false
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "principal_type must be org, user, or group"})
+		return "", "", false
+	}
+	return principalType, principalID, true
 }
 
 func cleanSlug(raw string) string {
@@ -3577,46 +3839,21 @@ func cleanSlug(raw string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func canReadRoot(id *auth.Identity, root *models.RootMetadata) bool {
-	if id == nil || root == nil || id.OrgID != root.OrgID {
-		return false
+func (s *Server) rootForPermission(ctx context.Context, id *auth.Identity, rootID, permission string) (*models.RootMetadata, bool, error) {
+	if id == nil {
+		return nil, false, nil
 	}
-	switch root.Scope {
-	case "", models.RootScopeOrg:
-		return true
-	case models.RootScopeUser:
-		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
-	default:
-		return false
+	root, err := s.db.GetRoot(ctx, id.OrgID, rootID)
+	if err != nil {
+		return nil, false, err
 	}
-}
-
-func canWriteRoot(id *auth.Identity, root *models.RootMetadata) bool {
-	if !canReadRoot(id, root) {
-		return false
+	perms, source, err := s.db.RootPermissions(ctx, root, id.UserID, id.Role)
+	if err != nil {
+		return nil, false, err
 	}
-	switch root.Scope {
-	case "", models.RootScopeOrg:
-		return auth.HasMinRole(id.Role, auth.RoleEditor)
-	case models.RootScopeUser:
-		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
-	default:
-		return false
-	}
-}
-
-func canDeleteRoot(id *auth.Identity, root *models.RootMetadata) bool {
-	if !canReadRoot(id, root) {
-		return false
-	}
-	switch root.Scope {
-	case "", models.RootScopeOrg:
-		return auth.HasMinRole(id.Role, auth.RoleAdmin)
-	case models.RootScopeUser:
-		return root.OwnerUserID == id.UserID || auth.HasMinRole(id.Role, auth.RoleAdmin)
-	default:
-		return false
-	}
+	root.Access = perms
+	root.AccessSource = source
+	return root, rootPermissionAllowed(perms, permission), nil
 }
 
 func detectFileType(path string) string {

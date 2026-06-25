@@ -49,7 +49,7 @@ PufferFS CLI connected.`,
       "--include <glob>: sync files matching this root-relative glob; can be repeated",
       "--exclude <glob>: skip files matching this root-relative glob; can be repeated",
       "--only <file>: deprecated alias for a literal --include path",
-      "--scope org|user: choose root visibility when creating a root",
+      "--scope org|user|restricted: choose root visibility when creating a root",
       "--dry-run: show what would change without uploading",
       "--json: print sync result as JSON",
       "--follow, -f: keep syncing on file changes",
@@ -446,7 +446,7 @@ const ENDPOINTS = [
     operationId: "createRoot",
     method: "POST",
     path: "/roots",
-    summary: "Create an org or user-scoped root.",
+    summary: "Create an org, user, or restricted root.",
     auth: "Bearer API key or session with sync/root:create/write and sufficient org role.",
     requestBody: `{
   "name": "handbook",
@@ -456,7 +456,7 @@ const ENDPOINTS = [
     requestFields: [
       ["name", "string", "required", "Stable root name used by CLI commands and users, for example --root handbook."],
       ["source_path", "string", "required", "Original filesystem path on the syncing machine. PufferFS stores this for context; it does not read from this path on the server."],
-      ["scope", "\"org\" | \"user\"", "required", "Visibility boundary. org roots are shared with the organization according to role; user roots belong to the creating user."],
+      ["scope", "\"org\" | \"user\" | \"restricted\"", "required", "Visibility boundary. org roots are shared by role, user roots belong to one user, and restricted roots require explicit root grants."],
     ],
     responses: [
       ["201", "Root metadata.", `{
@@ -616,11 +616,24 @@ const API_KEY_SCOPES = [
   ["read / write / admin / *", "Compatibility aliases for broader trusted automation."],
 ];
 
+const ROOT_PERMISSIONS = [
+  ["read", "List, inspect, query, and read committed content for the root."],
+  ["sync", "Create or update sync jobs for the root."],
+  ["delete", "Delete the root when the API key also has root delete scope."],
+  ["admin", "Root-level grant that implies read, sync, and delete."],
+];
+
+const ROOT_GRANT_EXAMPLES = [
+  ["Team read, selected writers", "Grant the group read, then grant specific users sync."],
+  ["Reader and writer groups", "Grant one group read and a second group sync. sync also implies read."],
+  ["Admin override", "Organization admins and owners can administer restricted roots even without an explicit grant."],
+];
+
 const ROLE_RULES = [
   ["owner", "Can invite any role, assign any role, and manage every member except their own role/removal. The organization must keep at least one owner."],
   ["admin", "Can invite, change, or remove editor and viewer members only. Admins cannot grant owner/admin or manage owner/admin members."],
-  ["editor", "Can create and update org roots, depending on root ACLs and API key scopes."],
-  ["viewer", "Can read and query accessible org roots."],
+  ["editor", "Can create and update org roots, depending on root grants, folder ACLs, and API key scopes."],
+  ["viewer", "Can read and query roots available through org scope, ownership, or root grants."],
 ];
 
 const SECURITY_SECTIONS = [
@@ -819,6 +832,62 @@ PUFFERFS_API_KEY=pfs_... pufferfs sync . --name workspace`}</pre>
                         <tr key={scope}>
                           <td>{scope}</td>
                           <td>{allows}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <article className="docs-command">
+                <h3>root permissions</h3>
+                <p>
+                  Root grants assign access to an org, user, or group. Groups
+                  are identity sets; read/write tiers come from grants, not
+                  from roles on group membership.
+                </p>
+                <p>
+                  Effective access is additive: PufferFS combines grants for
+                  the caller's org, direct user ID, and groups, then applies the
+                  admin override. For example, a finance group can have read
+                  access while selected users in that group receive an
+                  additional sync grant.
+                </p>
+                <p>
+                  Folder ACLs can still deny path prefixes inside a granted
+                  root.
+                </p>
+                <div className="docs-security-table-wrap">
+                  <table className="docs-security-table">
+                    <thead>
+                      <tr>
+                        <th>Permission</th>
+                        <th>Allows</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ROOT_PERMISSIONS.map(([permission, allows]) => (
+                        <tr key={permission}>
+                          <td>{permission}</td>
+                          <td>{allows}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="docs-security-table-wrap">
+                  <table className="docs-security-table">
+                    <thead>
+                      <tr>
+                        <th>Pattern</th>
+                        <th>How to model it</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ROOT_GRANT_EXAMPLES.map(([pattern, model]) => (
+                        <tr key={pattern}>
+                          <td>{pattern}</td>
+                          <td>{model}</td>
                         </tr>
                       ))}
                     </tbody>

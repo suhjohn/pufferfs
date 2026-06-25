@@ -61,6 +61,25 @@ type OrgMember struct {
 	JoinedAt  time.Time `json:"joined_at"`
 }
 
+// Group is an organization-scoped collection of users used for root grants.
+type Group struct {
+	ID         string    `json:"id"`
+	OrgID      string    `json:"org_id"`
+	Name       string    `json:"name"`
+	ExternalID string    `json:"external_id,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// GroupMember is a user's membership in an organization group.
+type GroupMember struct {
+	GroupID  string    `json:"group_id"`
+	UserID   string    `json:"user_id"`
+	Email    string    `json:"email,omitempty"`
+	Name     string    `json:"name,omitempty"`
+	JoinedAt time.Time `json:"joined_at"`
+}
+
 // OrgInvite is a pending email invitation to join an org.
 type OrgInvite struct {
 	ID              string    `json:"id"`
@@ -115,6 +134,8 @@ type RootMetadata struct {
 	SourcePath           string    `json:"source_path" db:"source_path"`
 	Scope                string    `json:"scope" db:"scope"`
 	OwnerUserID          string    `json:"owner_user_id,omitempty" db:"owner_user_id"`
+	Access               []string  `json:"access,omitempty" db:"-"`
+	AccessSource         string    `json:"access_source,omitempty" db:"-"`
 	VisibleGenerationID  string    `json:"visible_generation_id" db:"visible_generation_id"`
 	VisibleGenerationSeq int64     `json:"visible_generation_seq" db:"visible_generation_seq"`
 	CreatedAt            time.Time `json:"created_at" db:"created_at"`
@@ -134,9 +155,29 @@ type RootIndexNamespace struct {
 }
 
 const (
-	RootScopeOrg  = "org"
-	RootScopeUser = "user"
+	RootScopeOrg        = "org"
+	RootScopeUser       = "user"
+	RootScopeRestricted = "restricted"
 )
+
+const (
+	RootPermissionRead   = "read"
+	RootPermissionSync   = "sync"
+	RootPermissionDelete = "delete"
+	RootPermissionAdmin  = "admin"
+)
+
+// RootGrant gives a principal access to a root.
+type RootGrant struct {
+	ID            string    `json:"id"`
+	OrgID         string    `json:"org_id"`
+	RootID        string    `json:"root_id"`
+	PrincipalType string    `json:"principal_type"`
+	PrincipalID   string    `json:"principal_id"`
+	Permissions   []string  `json:"permissions"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
 
 // FileState stores the last-known state of a single file for diff computation.
 type FileState struct {

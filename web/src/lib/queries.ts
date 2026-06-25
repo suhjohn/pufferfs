@@ -7,6 +7,8 @@ export interface Root {
   source_path: string;
   scope: "org" | "user" | string;
   owner_user_id?: string;
+  access?: string[];
+  access_source?: string;
   visible_generation_id: string;
   visible_generation_seq: number;
   created_at: string;

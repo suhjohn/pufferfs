@@ -100,17 +100,25 @@ func writeRootList(w io.Writer, roots []models.RootMetadata) {
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tID\tSCOPE\tGENERATION\tSOURCE_PATH")
+	fmt.Fprintln(tw, "NAME\tID\tSCOPE\tACCESS\tGENERATION\tSOURCE_PATH")
 	for _, root := range roots {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			root.Name,
 			root.ID,
 			root.Scope,
+			formatRootAccess(root.Access),
 			formatGeneration(root.VisibleGenerationID, root.VisibleGenerationSeq),
 			root.SourcePath,
 		)
 	}
 	_ = tw.Flush()
+}
+
+func formatRootAccess(access []string) string {
+	if len(access) == 0 {
+		return "-"
+	}
+	return strings.Join(access, ",")
 }
 
 func writeRootMeta(w io.Writer, meta *rootMeta) {

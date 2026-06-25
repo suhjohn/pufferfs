@@ -15,7 +15,7 @@ Try it at [pufferfs.com](https://pufferfs.com).
 - Query synced files with hybrid, full-text, or vector search.
 - Keep folders current with `sync --follow` or an installed user service.
 - Issue scoped API keys for agents and automation.
-- Separate user-owned roots from organization roots.
+- Separate user-owned, organization-wide, and grant-restricted shared roots.
 
 ## Getting Started
 
