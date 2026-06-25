@@ -640,7 +640,11 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job objectQueueJob) 
 			upsertsByNamespace[ns.Namespace] = append(upsertsByNamespace[ns.Namespace], row)
 		}
 		for namespace, rows := range upsertsByNamespace {
-			if err := p.server.upsertRowsInBatches(namespace, rows); err != nil {
+			distanceMetric := "cosine_distance"
+			if p.req != nil && p.req.DisableVector {
+				distanceMetric = ""
+			}
+			if err := p.server.upsertRowsInBatches(namespace, rows, distanceMetric); err != nil {
 				return 0, err
 			}
 		}

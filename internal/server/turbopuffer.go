@@ -80,8 +80,7 @@ func namespaceName(rootID string) string {
 // UpsertRows writes documents to a namespace.
 func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric string) error {
 	body := map[string]any{
-		"upsert_rows":     rows,
-		"distance_metric": distanceMetric,
+		"upsert_rows": rows,
 		"schema": map[string]any{
 			"content": map[string]any{
 				"type":             "string",
@@ -103,6 +102,9 @@ func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric s
 			"valid_to_generation":       map[string]any{"type": "string"},
 			"valid_to_generation_seq":   map[string]any{"type": "uint"},
 		},
+	}
+	if strings.TrimSpace(distanceMetric) != "" {
+		body["distance_metric"] = distanceMetric
 	}
 	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
 	return err

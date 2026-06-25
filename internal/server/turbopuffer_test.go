@@ -7,6 +7,60 @@ import (
 	"testing"
 )
 
+func TestUpsertRowsIncludesDistanceMetricWhenProvided(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/namespaces/ns-1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if got := body["distance_metric"]; got != "cosine_distance" {
+			t.Fatalf("distance_metric = %#v, want cosine_distance", got)
+		}
+		if body["upsert_rows"] == nil {
+			t.Fatalf("missing upsert_rows in %#v", body)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewTPClientWithURL("test-key", server.URL)
+	if err := client.UpsertRows("ns-1", []map[string]any{{"id": "row-1", "vector": []float32{1, 0}}}, "cosine_distance"); err != nil {
+		t.Fatalf("upsert rows: %v", err)
+	}
+}
+
+func TestUpsertRowsOmitsDistanceMetricWhenEmpty(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/namespaces/ns-1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s", r.Method)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if _, ok := body["distance_metric"]; ok {
+			t.Fatalf("distance_metric should be omitted for no-vector upserts: %#v", body["distance_metric"])
+		}
+		if body["upsert_rows"] == nil {
+			t.Fatalf("missing upsert_rows in %#v", body)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := NewTPClientWithURL("test-key", server.URL)
+	if err := client.UpsertRows("ns-1", []map[string]any{{"id": "row-1", "content": "hello"}}, ""); err != nil {
+		t.Fatalf("upsert rows without vectors: %v", err)
+	}
+}
+
 func TestPatchByFilterParsesAffectedRows(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v2/namespaces/ns-1", func(w http.ResponseWriter, r *http.Request) {

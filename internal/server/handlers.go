@@ -3224,7 +3224,7 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 	return nil
 }
 
-func (s *Server) upsertRowsInBatches(ns string, rows []map[string]any) error {
+func (s *Server) upsertRowsInBatches(ns string, rows []map[string]any, distanceMetric string) error {
 	batchSize := tpWriteBatchSize()
 	for start := 0; start < len(rows); start += batchSize {
 		end := start + batchSize
@@ -3232,7 +3232,7 @@ func (s *Server) upsertRowsInBatches(ns string, rows []map[string]any) error {
 			end = len(rows)
 		}
 		writeStart := time.Now()
-		if err := s.tp.UpsertRows(ns, rows[start:end], "cosine_distance"); err != nil {
+		if err := s.tp.UpsertRows(ns, rows[start:end], distanceMetric); err != nil {
 			return err
 		}
 		log.Printf("timing stage=tp_upsert_batch batch=%d/%d rows=%d elapsed=%s", start/batchSize+1, (len(rows)+batchSize-1)/batchSize, end-start, time.Since(writeStart))

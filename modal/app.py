@@ -958,12 +958,11 @@ class Embedder:
         return {"result_ref": result_ref, "count": len(out)}
 
 
-def _tp_upsert_rows(namespace: str, rows: list[dict]) -> None:
+def _tp_upsert_rows(namespace: str, rows: list[dict], *, disable_vector: bool = False) -> None:
     if not rows:
         return
     body = {
         "upsert_rows": rows,
-        "distance_metric": "cosine_distance",
         "schema": {
             "content": {"type": "string", "full_text_search": True},
             "file_path": {"type": "string"},
@@ -984,6 +983,8 @@ def _tp_upsert_rows(namespace: str, rows: list[dict]) -> None:
             "valid_to_generation_seq": {"type": "uint"},
         },
     }
+    if not disable_vector:
+        body["distance_metric"] = "cosine_distance"
     ns = urllib.parse.quote(namespace, safe="")
     _tp_request("POST", f"/v2/namespaces/{ns}", body)
 
@@ -1005,6 +1006,7 @@ def _tp_patch_rows(namespace: str, rows: list[dict]) -> None:
 def index_shard_endpoint(item: dict) -> dict:
     """HTTP endpoint: POST {job:{...}} -> {count}."""
     job = item["job"]
+    disable_vector = bool(job.get("disable_vector"))
     s3 = _s3_client()
     records = _read_jsonl(s3, job["payload_ref"])
     upserts: list[dict] = []
@@ -1020,7 +1022,7 @@ def index_shard_endpoint(item: dict) -> dict:
         namespace = _namespace_for_path(job, file_path)
         upserts_by_namespace.setdefault(namespace, []).append(row)
     for namespace, rows in upserts_by_namespace.items():
-        _tp_upsert_rows(namespace, rows)
+        _tp_upsert_rows(namespace, rows, disable_vector=disable_vector)
     closed = 0
     for path in close_paths:
         closed += _close_rows_for_path(job, path)
