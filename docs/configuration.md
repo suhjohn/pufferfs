@@ -164,6 +164,8 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `MODAL_CHUNK_SHARD_ENDPOINT` | Sync shard → chunk artifact (queued pipeline). | — |
 | `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). | — |
 | `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). | — |
+| `MODAL_OFFICE_TO_PDF_ENDPOINT` | Optional public Office → PDF conversion endpoint for direct callers. Not used by the API server. | — |
+| `MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT` | Optional public PDF → page JPEG endpoint for direct callers. Not used by the API server. | — |
 | `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
 | `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY` | JPEG quality for rendered page images. Lower values reduce upload size; valid values are clamped between 30 and 95. | 75 |
 | `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY` | Concurrent S3 page-image uploads per document chunking container. This overlaps with OCR fan-out and is separate from Modal OCR container concurrency. | 512 |
@@ -182,10 +184,27 @@ The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 | `AWS_ENDPOINT_URL` | Required for non-AWS S3-compatible storage; omit for AWS S3. |
 | `AWS_BUCKET_NAME` | Modal reads/writes source files, chunk artifacts, and page images. |
 | `TURBOPUFFER_API_KEY` | Modal index shard writes Turbopuffer rows. |
+| `MODAL_SECRET_KEY` | Required to authorize direct calls to the public `office_to_pdf` and `pdf_to_page_images` Modal endpoints. |
 | `GEMINI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `gemini/...`, or media OCR is enabled. |
 | `OPENAI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `openai/...`. |
 | `FIREWORKS_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `fireworks/...`. |
 | `<PROVIDER>_BASE_URL` | Optional for OpenAI-compatible providers; Fireworks defaults to `https://api.fireworks.ai/inference/v1`, OpenAI defaults to `https://api.openai.com/v1`. |
+
+Standalone conversion endpoints accept JSON and are protected by
+`MODAL_SECRET_KEY` in the request body:
+
+```json
+{
+  "secret_key": "shared secret",
+  "content_b64": "base64-encoded docx or pptx bytes",
+  "file_type": "docx",
+  "file_path": "slides.docx"
+}
+```
+
+`office_to_pdf` responds with `pdf_b64`. `pdf_to_page_images` accepts
+`pdf_b64` and responds with one entry per page containing `image_b64`,
+`image_bytes`, and `fallback_text` extracted by MuPDF.
 
 ### Transactional email (AWS SES, optional)
 

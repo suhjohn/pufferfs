@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import base64
+import binascii
+import hmac
 import hashlib
 import json
 import time
@@ -62,6 +64,33 @@ embedding_image = (
 modal_secret = modal.Secret.from_name(
     os.getenv("PUFFERFS_MODAL_SECRET_NAME", "pufferfs"),
 )
+public_endpoint_secret = modal.Secret.from_dict(
+    {"MODAL_SECRET_KEY": os.getenv("MODAL_SECRET_KEY", "")},
+)
+
+
+def _require_modal_secret(item: dict) -> None:
+    from fastapi import HTTPException
+
+    expected = os.environ.get("MODAL_SECRET_KEY", "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="MODAL_SECRET_KEY is not configured")
+    provided = str(item.get("secret_key") or item.get("modal_secret_key") or "")
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="invalid secret_key")
+
+
+def _decode_b64_field(item: dict, field: str) -> bytes:
+    from fastapi import HTTPException
+
+    value = item.get(field)
+    if not isinstance(value, str) or not value:
+        raise HTTPException(status_code=400, detail=f"{field} is required")
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{field} must be valid base64") from exc
+
 
 # ---------------------------------------------------------------------------
 # file_to_chunks: convert a file to a list of Chunk dicts
@@ -87,6 +116,32 @@ def office_to_pdf(file_bytes: bytes, file_type: str, file_path: str) -> bytes:
         flush=True,
     )
     return pdf_bytes
+
+
+@app.function(
+    image=chunking_image,
+    secrets=[modal_secret, public_endpoint_secret],
+    timeout=600,
+    memory=2048,
+)
+@modal.fastapi_endpoint(method="POST", label="pufferfs-office-to-pdf-endpoint")
+def office_to_pdf_endpoint(item: dict) -> dict:
+    """HTTP endpoint: POST {secret_key, content_b64, file_type, file_path} -> {pdf_b64, bytes}."""
+    _require_modal_secret(item)
+    file_bytes = _decode_b64_field(item, "content_b64")
+    file_type = str(item.get("file_type") or "")
+    file_path = str(item.get("file_path") or "document")
+    if file_type not in ("docx", "pptx"):
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=400, detail="file_type must be docx or pptx")
+    pdf_bytes = office_to_pdf.local(file_bytes, file_type, file_path)
+    return {
+        "file_path": file_path,
+        "file_type": file_type,
+        "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        "bytes": len(pdf_bytes),
+    }
 
 
 @app.function(
@@ -122,6 +177,37 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
         flush=True,
     )
     return pages
+
+
+@app.function(
+    image=chunking_image,
+    secrets=[modal_secret, public_endpoint_secret],
+    timeout=600,
+    memory=2048,
+)
+@modal.fastapi_endpoint(method="POST", label="pufferfs-pdf-to-page-images-endpoint")
+def pdf_to_page_images_endpoint(item: dict) -> dict:
+    """HTTP endpoint: POST {secret_key, pdf_b64, file_path} -> {pages:[...]}."""
+    _require_modal_secret(item)
+    pdf_bytes = _decode_b64_field(item, "pdf_b64")
+    file_path = str(item.get("file_path") or "document.pdf")
+    pages = pdf_to_page_images.local(pdf_bytes, file_path)
+    out_pages: list[dict] = []
+    for page in pages:
+        image_bytes = page["image_bytes"]
+        out_pages.append(
+            {
+                "page_num": page["page_num"],
+                "image_b64": base64.b64encode(image_bytes).decode("ascii"),
+                "image_bytes": len(image_bytes),
+                "fallback_text": page.get("fallback_text", ""),
+            }
+        )
+    return {
+        "file_path": file_path,
+        "page_count": len(out_pages),
+        "pages": out_pages,
+    }
 
 
 @app.function(

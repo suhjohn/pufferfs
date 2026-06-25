@@ -260,6 +260,99 @@ class ChunkersTest(unittest.TestCase):
             else:
                 os.environ["GEMINI_API_KEY"] = old_gemini_key
 
+    def test_modal_public_endpoint_secret_required(self):
+        import app
+        import os
+        from fastapi import HTTPException
+
+        old_secret = os.environ.get("MODAL_SECRET_KEY")
+        os.environ["MODAL_SECRET_KEY"] = "expected"
+        try:
+            with self.assertRaises(HTTPException) as cm:
+                app._require_modal_secret({"secret_key": "wrong"})
+            self.assertEqual(cm.exception.status_code, 401)
+
+            app._require_modal_secret({"secret_key": "expected"})
+        finally:
+            if old_secret is None:
+                os.environ.pop("MODAL_SECRET_KEY", None)
+            else:
+                os.environ["MODAL_SECRET_KEY"] = old_secret
+
+    def test_office_to_pdf_endpoint_returns_base64_pdf(self):
+        import app
+        import base64
+        import os
+
+        old_secret = os.environ.get("MODAL_SECRET_KEY")
+        old_office_to_pdf = app.office_to_pdf
+
+        class FakeOfficeToPDF:
+            def local(self, file_bytes, file_type, file_path):
+                self.call = (file_bytes, file_type, file_path)
+                return b"%PDF fake"
+
+        fake = FakeOfficeToPDF()
+        app.office_to_pdf = fake
+        os.environ["MODAL_SECRET_KEY"] = "secret"
+        try:
+            resp = app.office_to_pdf_endpoint.local(
+                {
+                    "secret_key": "secret",
+                    "content_b64": base64.b64encode(b"doc bytes").decode("ascii"),
+                    "file_type": "docx",
+                    "file_path": "deck.docx",
+                }
+            )
+            self.assertEqual(fake.call, (b"doc bytes", "docx", "deck.docx"))
+            self.assertEqual(base64.b64decode(resp["pdf_b64"]), b"%PDF fake")
+            self.assertEqual(resp["bytes"], len(b"%PDF fake"))
+        finally:
+            app.office_to_pdf = old_office_to_pdf
+            if old_secret is None:
+                os.environ.pop("MODAL_SECRET_KEY", None)
+            else:
+                os.environ["MODAL_SECRET_KEY"] = old_secret
+
+    def test_pdf_to_page_images_endpoint_returns_base64_images(self):
+        import app
+        import base64
+        import os
+
+        old_secret = os.environ.get("MODAL_SECRET_KEY")
+        old_pdf_to_page_images = app.pdf_to_page_images
+
+        class FakePDFToPageImages:
+            def local(self, pdf_bytes, file_path):
+                self.call = (pdf_bytes, file_path)
+                return [
+                    {"page_num": 0, "image_bytes": b"jpg-0", "fallback_text": "page text"},
+                    {"page_num": 1, "image_bytes": b"jpg-1", "fallback_text": ""},
+                ]
+
+        fake = FakePDFToPageImages()
+        app.pdf_to_page_images = fake
+        os.environ["MODAL_SECRET_KEY"] = "secret"
+        try:
+            resp = app.pdf_to_page_images_endpoint.local(
+                {
+                    "secret_key": "secret",
+                    "pdf_b64": base64.b64encode(b"%PDF input").decode("ascii"),
+                    "file_path": "doc.pdf",
+                }
+            )
+            self.assertEqual(fake.call, (b"%PDF input", "doc.pdf"))
+            self.assertEqual(resp["page_count"], 2)
+            self.assertEqual(base64.b64decode(resp["pages"][0]["image_b64"]), b"jpg-0")
+            self.assertEqual(resp["pages"][0]["fallback_text"], "page text")
+            self.assertEqual(resp["pages"][1]["image_bytes"], len(b"jpg-1"))
+        finally:
+            app.pdf_to_page_images = old_pdf_to_page_images
+            if old_secret is None:
+                os.environ.pop("MODAL_SECRET_KEY", None)
+            else:
+                os.environ["MODAL_SECRET_KEY"] = old_secret
+
     def test_document_chunking_ocr_only_blank_native_text_pages(self):
         import app
 

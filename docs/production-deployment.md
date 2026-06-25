@@ -51,6 +51,8 @@ MODAL_QUERY_EMBED_ENDPOINT
 MODAL_CHUNK_SHARD_ENDPOINT
 MODAL_EMBED_SHARD_ENDPOINT
 MODAL_INDEX_SHARD_ENDPOINT
+MODAL_OFFICE_TO_PDF_ENDPOINT
+MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
 ```
 
 Modal endpoints may be stored as variables instead of secrets.
@@ -113,6 +115,17 @@ MODAL_CHUNK_SHARD_ENDPOINT
 MODAL_EMBED_SHARD_ENDPOINT
 MODAL_INDEX_SHARD_ENDPOINT
 ```
+
+The public Modal conversion endpoints are optional for direct callers and are
+not required by the API server:
+
+```text
+MODAL_OFFICE_TO_PDF_ENDPOINT
+MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
+```
+
+Add `MODAL_SECRET_KEY` to the Modal secret named by `PUFFERFS_MODAL_SECRET_NAME`
+to authorize direct calls to those conversion endpoints.
 
 Optional CLI release variables:
 
