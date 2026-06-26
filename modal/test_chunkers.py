@@ -188,6 +188,45 @@ class ChunkersTest(unittest.TestCase):
             else:
                 os.environ["PUFFERFS_PDF_RENDERER_JOBS"] = old_jobs
 
+    def test_render_pdf_pages_jpeg_falls_back_to_mupdf_cli(self):
+        import os
+        import subprocess
+
+        import chunkers
+
+        old_dpi = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_DPI")
+        old_run = chunkers.subprocess.run
+        calls = []
+
+        def fake_run(cmd, check, capture_output, text):
+            calls.append((cmd, check, capture_output, text))
+            if cmd[0].endswith("frpdf"):
+                raise subprocess.CalledProcessError(1, cmd, stderr="invalid pdf")
+            output_pattern = cmd[cmd.index("-o") + 1]
+            output_dir = os.path.dirname(output_pattern)
+            os.makedirs(output_dir, exist_ok=True)
+            with open(os.path.join(output_dir, "page_10.jpg"), "wb") as f:
+                f.write(b"\xff\xd8page10\xff\xd9")
+            with open(os.path.join(output_dir, "page_2.jpg"), "wb") as f:
+                f.write(b"\xff\xd8page2\xff\xd9")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = "144"
+        chunkers.subprocess.run = fake_run
+        try:
+            pages = render_pdf_pages_jpeg(b"%PDF")
+            self.assertEqual([page_num for page_num, _ in pages], [1, 9])
+            self.assertEqual(calls[1][0][:2], ["mutool", "draw"])
+            self.assertIn("-i", calls[1][0])
+            self.assertEqual(calls[1][0][calls[1][0].index("-r") + 1], "144")
+            self.assertEqual(calls[1][0][calls[1][0].index("-F") + 1], "jpeg")
+        finally:
+            chunkers.subprocess.run = old_run
+            if old_dpi is None:
+                os.environ.pop("PUFFERFS_MODAL_PAGE_IMAGE_DPI", None)
+            else:
+                os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = old_dpi
+
     def test_page_image_uploads_run_concurrently(self):
         import os
         import threading

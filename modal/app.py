@@ -38,6 +38,7 @@ chunking_image = (
         "libreoffice-core",
         "libreoffice-writer",
         "libreoffice-impress",
+        "mupdf-tools",
     )
     .run_commands(
         f"curl -fsSL {PDF_RENDERER_INSTALL_URL} "

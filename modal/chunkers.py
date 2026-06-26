@@ -148,51 +148,99 @@ def _pdf_renderer_path() -> str:
     return os.getenv("PUFFERFS_PDF_RENDERER_PATH", "/usr/local/bin/frpdf")
 
 
+def _mupdf_renderer_path() -> str:
+    return os.getenv("PUFFERFS_MUPDF_RENDERER_PATH", "mutool")
+
+
 def _pdf_renderer_jobs() -> int:
     return _env_int("PUFFERFS_PDF_RENDERER_JOBS", max(os.cpu_count() or 1, 1), 1, 256)
 
 
+def _collect_rendered_jpeg_pages(output_dir: str) -> list[tuple[int, bytes]]:
+    pages: list[tuple[int, bytes]] = []
+    for jpg_path in glob.glob(os.path.join(output_dir, "page_*.jpg")):
+        match = re.search(r"page_(\d+)\.jpg$", os.path.basename(jpg_path))
+        page_num = int(match.group(1)) - 1 if match else len(pages)
+        with open(jpg_path, "rb") as f:
+            pages.append((page_num, f.read()))
+    pages.sort(key=lambda page: page[0])
+    return pages
+
+
+def _run_frpdf_renderer(input_path: str, output_dir: str) -> list[tuple[int, bytes]]:
+    cmd = [
+        _pdf_renderer_path(),
+        "--input",
+        input_path,
+        "--pages",
+        "all",
+        "--output",
+        output_dir,
+        "--dpi",
+        str(_page_image_dpi()),
+        "--jobs",
+        str(_pdf_renderer_jobs()),
+        "--format",
+        "jpeg",
+        "--jpeg-quality",
+        str(_page_image_jpeg_quality()),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return _collect_rendered_jpeg_pages(output_dir)
+
+
+def _run_mupdf_renderer(input_path: str, output_dir: str) -> list[tuple[int, bytes]]:
+    os.makedirs(output_dir, exist_ok=True)
+    cmd = [
+        _mupdf_renderer_path(),
+        "draw",
+        "-q",
+        "-i",
+        "-r",
+        str(_page_image_dpi()),
+        "-F",
+        "jpeg",
+        "-o",
+        os.path.join(output_dir, "page_%d.jpg"),
+        input_path,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    return _collect_rendered_jpeg_pages(output_dir)
+
+
 def render_pdf_pages_jpeg(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
-    """Render PDF pages with frpdf-renderer and return compact JPEG bytes."""
+    """Render PDF pages to JPEG bytes, falling back from frpdf to the MuPDF CLI."""
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = os.path.join(tmpdir, "input.pdf")
         output_dir = os.path.join(tmpdir, "pages")
         with open(input_path, "wb") as f:
             f.write(pdf_bytes)
 
-        cmd = [
-            _pdf_renderer_path(),
-            "--input",
-            input_path,
-            "--pages",
-            "all",
-            "--output",
-            output_dir,
-            "--dpi",
-            str(_page_image_dpi()),
-            "--jobs",
-            str(_pdf_renderer_jobs()),
-            "--format",
-            "jpeg",
-            "--jpeg-quality",
-            str(_page_image_jpeg_quality()),
-        ]
         try:
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            pages = _run_frpdf_renderer(input_path, output_dir)
+            renderer = "frpdf-renderer"
         except FileNotFoundError as exc:
             raise RuntimeError(f"PDF renderer not found at {_pdf_renderer_path()}") from exc
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").strip()
-            raise RuntimeError(f"PDF renderer failed: {stderr or exc}") from exc
+        except subprocess.CalledProcessError as frpdf_exc:
+            stderr = (frpdf_exc.stderr or "").strip()
+            print(
+                f"timing stage=pdf_render_fallback from=frpdf-renderer to=mupdf-cli error={stderr or frpdf_exc}",
+                flush=True,
+            )
+            fallback_output_dir = os.path.join(tmpdir, "mupdf-pages")
+            try:
+                pages = _run_mupdf_renderer(input_path, fallback_output_dir)
+                renderer = "mupdf-cli"
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"MuPDF renderer not found at {_mupdf_renderer_path()}") from exc
+            except subprocess.CalledProcessError as mupdf_exc:
+                fallback_stderr = (mupdf_exc.stderr or "").strip()
+                raise RuntimeError(
+                    f"PDF renderer failed: frpdf={stderr or frpdf_exc}; mupdf={fallback_stderr or mupdf_exc}"
+                ) from mupdf_exc
 
-        pages: list[tuple[int, bytes]] = []
-        for jpg_path in sorted(glob.glob(os.path.join(output_dir, "page_*.jpg"))):
-            match = re.search(r"page_(\d+)\.jpg$", os.path.basename(jpg_path))
-            page_num = int(match.group(1)) - 1 if match else len(pages)
-            with open(jpg_path, "rb") as f:
-                pages.append((page_num, f.read()))
         if not pages:
-            raise RuntimeError("PDF renderer produced no page images")
+            raise RuntimeError(f"PDF renderer produced no page images using {renderer}")
         return pages
 
 
