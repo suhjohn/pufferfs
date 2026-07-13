@@ -347,8 +347,10 @@ func (db *DB) migrateFallback() error {
 			processed    INT NOT NULL DEFAULT 0,
 			errors       JSONB NOT NULL DEFAULT '[]',
 			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			finished_at  TIMESTAMPTZ
 		);
+		ALTER TABLE sync_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 		ALTER TABLE sync_jobs ALTER COLUMN root_id DROP NOT NULL;
 		DO $$
 		BEGIN
@@ -2503,9 +2505,10 @@ func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, t
 		Processed:  0,
 		StartedAt:  time.Now(),
 	}
+	job.UpdatedAt = job.StartedAt
 	_, err := db.pool.Exec(ctx,
-		`INSERT INTO sync_jobs (id, org_id, root_id, user_id, status, total_files, processed, started_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		`INSERT INTO sync_jobs (id, org_id, root_id, user_id, status, total_files, processed, started_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
 		job.ID, job.OrgID, job.RootID, job.UserID, job.Status, job.TotalFiles, job.Processed, job.StartedAt,
 	)
 	if err != nil {
@@ -2517,8 +2520,22 @@ func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, t
 // UpdateSyncJobStatus updates only the phase/status of a sync job.
 func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) error {
 	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1 WHERE id = $2`,
+		`UPDATE sync_jobs SET status = $1, updated_at = NOW() WHERE id = $2`,
 		status, jobID,
+	)
+	return err
+}
+
+// TouchSyncJob persists liveness for a worker that is still processing a
+// potentially long-running shard.
+func (db *DB) TouchSyncJob(ctx context.Context, jobID string) error {
+	if jobID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_jobs SET updated_at = NOW()
+		 WHERE id = $1 AND status NOT IN ('completed', 'failed')`,
+		jobID,
 	)
 	return err
 }
@@ -2558,6 +2575,9 @@ func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shard
 			return err
 		}
 	}
+	if _, err := tx.Exec(ctx, `UPDATE sync_jobs SET updated_at = NOW() WHERE id = $1`, jobID); err != nil {
+		return err
+	}
 
 	return tx.Commit(ctx)
 }
@@ -2568,7 +2588,7 @@ func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors 
 		errors = []map[string]string{}
 	}
 	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1, finished_at = NOW(), errors = $2 WHERE id = $3`,
+		`UPDATE sync_jobs SET status = $1, finished_at = NOW(), updated_at = NOW(), errors = $2 WHERE id = $3`,
 		status, errors, jobID,
 	)
 	return err
@@ -2578,10 +2598,10 @@ func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors 
 func (db *DB) GetSyncJob(ctx context.Context, orgID, jobID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE id = $1 AND org_id = $2`, jobID, orgID,
 	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Errors, &job.StartedAt, &job.FinishedAt)
+		&job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -2594,7 +2614,7 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 		limit = 20
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT $3`,
 		orgID, rootID, limit,
@@ -2608,7 +2628,7 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 	for rows.Next() {
 		var j models.SyncJob
 		if err := rows.Scan(&j.ID, &j.OrgID, &j.RootID, &j.UserID, &j.Status, &j.TotalFiles,
-			&j.Processed, &j.Errors, &j.StartedAt, &j.FinishedAt); err != nil {
+			&j.Processed, &j.Errors, &j.StartedAt, &j.UpdatedAt, &j.FinishedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -2620,16 +2640,54 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT 1`,
 		orgID, rootID,
 	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Errors, &job.StartedAt, &job.FinishedAt)
+		&job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
 	return job, nil
+}
+
+// ListSyncJobsForReconciliation returns active jobs whose persisted progress
+// heartbeat is stale, or whose generation has already failed.
+func (db *DB) ListSyncJobsForReconciliation(ctx context.Context, staleBefore time.Time, limit int) ([]models.SyncJob, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT j.id, j.org_id, COALESCE(j.root_id, ''), j.user_id, j.status,
+		        j.total_files, j.processed, j.errors, j.started_at, j.updated_at, j.finished_at
+		 FROM sync_jobs j
+		 WHERE j.status NOT IN ('completed', 'failed')
+		   AND (
+		     j.updated_at < $1
+		     OR EXISTS (
+		       SELECT 1 FROM sync_generations g
+		       WHERE g.sync_job_id = j.id AND g.status = 'failed'
+		     )
+		   )
+		 ORDER BY j.updated_at ASC
+		 LIMIT $2`,
+		staleBefore, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	jobs := make([]models.SyncJob, 0)
+	for rows.Next() {
+		var job models.SyncJob
+		if err := rows.Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status,
+			&job.TotalFiles, &job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

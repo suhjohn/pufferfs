@@ -25,7 +25,12 @@ const enableBilling = cfg.getBoolean("enableBilling") ?? false;
 const frontendUrl = cfg.get("frontendUrl");
 const posthogEnabled = cfg.getBoolean("posthogEnabled") ?? false;
 const posthogHost = cfg.get("posthogHost");
-const natsImage = cfg.get("natsImage") ?? "nats:2-alpine";
+const queueBackend = cfg.get("queueBackend") ?? "sqs";
+if (queueBackend !== "sqs" && queueBackend !== "nats") {
+  throw new Error('pufferfs:queueBackend must be either "sqs" or "nats"');
+}
+const alarmTopicArn = cfg.get("alarmTopicArn");
+const natsImage = cfg.get("natsImage") ?? "nats:2.12.2-alpine";
 const natsClusterName = cfg.get("natsClusterName") ?? "pufferfs";
 const natsNodes = ["nats-1", "nats-2", "nats-3"] as const;
 const natsDnsZone = `${project}-${stack}.local`;
@@ -336,6 +341,67 @@ const logGroup = new aws.cloudwatch.LogGroup(name("logs"), {
   tags,
 });
 
+// Each pipeline stage gets an independent FIFO queue so a wedged indexing
+// workload cannot consume chunk/embed/lesson capacity. Ordering is scoped to
+// one root by the application-provided MessageGroupId.
+const syncStages = ["chunk", "embed", "index", "commit", "cleanup"] as const;
+const syncQueues = syncStages.map((stage) => {
+  const dlq = new aws.sqs.Queue(name(`${stage}-dlq`), {
+    name: `${name(`sync-${stage}-dlq`)}.fifo`,
+    fifoQueue: true,
+    messageRetentionSeconds: 14 * 24 * 60 * 60,
+    tags,
+  });
+  // Commit-not-ready is normal while large roots finish their final shards;
+  // retain those retries through the 30-minute watchdog window.
+  const maxReceiveCount = stage === "commit" ? 400 : stage === "cleanup" ? 35 : 5;
+  const queue = new aws.sqs.Queue(name(`${stage}-queue`), {
+    name: `${name(`sync-${stage}`)}.fifo`,
+    fifoQueue: true,
+    contentBasedDeduplication: false,
+    visibilityTimeoutSeconds: 5 * 60,
+    receiveWaitTimeSeconds: 20,
+    messageRetentionSeconds: 14 * 24 * 60 * 60,
+    redrivePolicy: dlq.arn.apply((arn) => JSON.stringify({
+      deadLetterTargetArn: arn,
+      maxReceiveCount,
+    })),
+    tags,
+  });
+  return { stage, queue, dlq };
+});
+
+for (const { stage, queue, dlq } of syncQueues) {
+  new aws.cloudwatch.MetricAlarm(name(`${stage}-queue-age-alarm`), {
+    alarmDescription: `PufferFS ${stage} queue has work older than 10 minutes`,
+    namespace: "AWS/SQS",
+    metricName: "ApproximateAgeOfOldestMessage",
+    statistic: "Maximum",
+    period: 60,
+    evaluationPeriods: 2,
+    threshold: 10 * 60,
+    comparisonOperator: "GreaterThanThreshold",
+    dimensions: { QueueName: queue.name },
+    treatMissingData: "notBreaching",
+    alarmActions: alarmTopicArn ? [alarmTopicArn] : undefined,
+    tags,
+  });
+  new aws.cloudwatch.MetricAlarm(name(`${stage}-dlq-alarm`), {
+    alarmDescription: `PufferFS ${stage} dead-letter queue is not empty`,
+    namespace: "AWS/SQS",
+    metricName: "ApproximateNumberOfMessagesVisible",
+    statistic: "Maximum",
+    period: 60,
+    evaluationPeriods: 1,
+    threshold: 0,
+    comparisonOperator: "GreaterThanThreshold",
+    dimensions: { QueueName: dlq.name },
+    treatMissingData: "notBreaching",
+    alarmActions: alarmTopicArn ? [alarmTopicArn] : undefined,
+    tags,
+  });
+}
+
 const executionRole = new aws.iam.Role(name("ecs-execution-role"), {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
     Service: "ecs-tasks.amazonaws.com",
@@ -358,8 +424,8 @@ const taskRole = new aws.iam.Role(name("ecs-task-role"), {
 new aws.iam.RolePolicy(name("ecs-task-policy"), {
   role: taskRole.id,
   policy: pulumi
-    .all([bucket.arn, sesSendResource ?? ""])
-    .apply(([bucketArn, sesResource]) => {
+    .all([bucket.arn, sesSendResource ?? "", ...syncQueues.map(({ queue }) => queue.arn)])
+    .apply(([bucketArn, sesResource, ...queueArns]) => {
       const statements: Record<string, unknown>[] = [
         {
           Effect: "Allow",
@@ -370,6 +436,17 @@ new aws.iam.RolePolicy(name("ecs-task-policy"), {
           Effect: "Allow",
           Action: ["secretsmanager:GetSecretValue"],
           Resource: "*",
+        },
+        {
+          Effect: "Allow",
+          Action: [
+            "sqs:SendMessage",
+            "sqs:ReceiveMessage",
+            "sqs:DeleteMessage",
+            "sqs:ChangeMessageVisibility",
+            "sqs:GetQueueAttributes",
+          ],
+          Resource: queueArns,
         },
       ];
       if (sesResource) {
@@ -607,6 +684,7 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "AWS_ENDPOINT_URL", value: "" },
   { name: "NATS_URL", value: natsURL },
   { name: "PUFFERFS_QUEUE_REPLICAS", value: natsNodes.length.toString() },
+  { name: "PUFFERFS_QUEUE_BACKEND", value: queueBackend },
   { name: "MODAL_CHUNK_ENDPOINT", value: cfg.require("modalChunkEndpoint") },
   { name: "MODAL_EMBED_ENDPOINT", value: cfg.require("modalEmbedEndpoint") },
   { name: "MODAL_QUERY_EMBED_ENDPOINT", value: cfg.require("modalQueryEmbedEndpoint") },
@@ -617,6 +695,13 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
 ];
+
+for (const { stage, queue } of syncQueues) {
+  appEnv.push({
+    name: `PUFFERFS_SQS_${stage.toUpperCase()}_QUEUE_URL`,
+    value: queue.url,
+  });
+}
 
 if (posthogHost) {
   appEnv.push({ name: "POSTHOG_HOST", value: posthogHost });
@@ -881,7 +966,8 @@ const workerServices = Object.entries(workerDefaults).map(([stage, defaultConcur
   });
 });
 
-const natsServices = natsNodes.map((node, i) => {
+const natsServices: aws.ecs.Service[] = [];
+natsNodes.forEach((node, i) => {
   const task = new aws.ecs.TaskDefinition(name(`${node}-task`), {
     family: name(`${node}-task`),
     requiresCompatibilities: ["FARGATE"],
@@ -931,20 +1017,37 @@ const natsServices = natsNodes.map((node, i) => {
           { containerPort: 8222, protocol: "tcp" },
         ],
         mountPoints: [{ sourceVolume: "nats-data", containerPath: "/data" }],
+        healthCheck: {
+          command: [
+            "CMD-SHELL",
+            "wget -q -O /dev/null 'http://127.0.0.1:8222/healthz?js-enabled-only=true' || exit 1",
+          ],
+          interval: 10,
+          timeout: 5,
+          retries: 6,
+          startPeriod: 20,
+        },
+        stopTimeout: 120,
         logConfiguration: logConfig(node),
       },
     ]),
     tags,
   });
 
-  return new aws.ecs.Service(
+  const dependencies: pulumi.Resource[] = [...mountTargets, natsDiscoveryServices[i]];
+  if (i > 0) {
+    dependencies.push(natsServices[i - 1]);
+  }
+  const service = new aws.ecs.Service(
     name(node),
     {
       cluster: cluster.arn,
       taskDefinition: task.arn,
       desiredCount: 1,
       launchType: "FARGATE",
-      waitForSteadyState: false,
+      waitForSteadyState: true,
+      deploymentMinimumHealthyPercent: 0,
+      deploymentMaximumPercent: 100,
       networkConfiguration: {
         subnets: [privateSubnets[i % privateSubnets.length].id],
         securityGroups: [natsSg.id],
@@ -955,8 +1058,9 @@ const natsServices = natsNodes.map((node, i) => {
       },
       tags,
     },
-    { dependsOn: [...mountTargets, natsDiscoveryServices[i]] },
+    { dependsOn: dependencies },
   );
+  natsServices.push(service);
 });
 
 // Maps an ACM cert's DNS validation option to the CNAME you add in Cloudflare.
@@ -1015,6 +1119,9 @@ export const artifactBucket = bucket.bucket;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;
 export const natsUrl = natsURL;
+export const syncQueueBackend = queueBackend;
+export const syncQueueUrls = Object.fromEntries(syncQueues.map(({ stage, queue }) => [stage, queue.url]));
+export const syncDeadLetterQueueUrls = Object.fromEntries(syncQueues.map(({ stage, dlq }) => [stage, dlq.url]));
 export const apiServiceArn = apiService.id;
 export const workerServiceArns = workerServices.map((service) => service.id);
 export const natsServiceArns = natsServices.map((service) => service.id);

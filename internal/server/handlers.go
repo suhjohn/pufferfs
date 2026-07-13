@@ -76,7 +76,7 @@ func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Ser
 	return s
 }
 
-// SetQueue enables the JetStream-backed sync path. Without a queue the server
+// SetQueue enables the durable queued sync path. Without a queue the server
 // keeps using the legacy in-process sync pipeline.
 func (s *Server) SetQueue(q queue.Queue) {
 	s.queue = q
@@ -2195,18 +2195,25 @@ func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *m
 		return job
 	}
 	timeout := syncJobTimeout()
-	if time.Since(job.StartedAt) <= timeout {
+	if time.Since(syncJobLastProgress(job)) <= timeout {
 		return job
 	}
 
-	message := fmt.Sprintf("sync job expired after %s; background worker is no longer running", timeout)
+	message := fmt.Sprintf("sync job expired after %s without progress", timeout)
+	return s.failSyncJob(ctx, job, message)
+}
+
+func (s *Server) failSyncJob(ctx context.Context, job *models.SyncJob, message string) *models.SyncJob {
+	if job == nil || job.Status == "completed" || job.Status == "failed" {
+		return job
+	}
 	errors := []map[string]string{{"error": message}}
 	if err := s.db.CompleteSyncJob(ctx, job.ID, "failed", errors); err != nil {
-		log.Printf("warning: failed to expire sync job %s: %v", job.ID, err)
+		log.Printf("warning: failed to reconcile sync job %s: %v", job.ID, err)
 		return job
 	}
 	if err := s.db.MarkSyncGenerationFailedForJob(ctx, job.ID); err != nil {
-		log.Printf("warning: failed to expire sync generation for job %s: %v", job.ID, err)
+		log.Printf("warning: failed to reconcile sync generation for job %s: %v", job.ID, err)
 	}
 	if generation, err := s.db.GetSyncGenerationForJob(ctx, job.OrgID, job.RootID, job.ID); err == nil {
 		req := s.syncRequestForCleanup(ctx, generation.ID)
@@ -2220,8 +2227,81 @@ func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *m
 	now := time.Now()
 	job.Status = "failed"
 	job.Errors = errBytes
+	job.UpdatedAt = now
 	job.FinishedAt = &now
 	return job
+}
+
+func syncJobLastProgress(job *models.SyncJob) time.Time {
+	if job != nil && !job.UpdatedAt.IsZero() {
+		return job.UpdatedAt
+	}
+	if job != nil {
+		return job.StartedAt
+	}
+	return time.Time{}
+}
+
+// ReconcileSyncJobs resolves jobs that can no longer complete without relying
+// on a status-page read to trigger cleanup.
+func (s *Server) ReconcileSyncJobs(ctx context.Context) (int, error) {
+	timeout := syncJobTimeout()
+	jobs, err := s.db.ListSyncJobsForReconciliation(ctx, time.Now().Add(-timeout), 100)
+	if err != nil {
+		return 0, err
+	}
+	for i := range jobs {
+		message := fmt.Sprintf("sync job expired after %s without progress", timeout)
+		if generation, generationErr := s.db.GetSyncGenerationForJob(ctx, jobs[i].OrgID, jobs[i].RootID, jobs[i].ID); generationErr == nil {
+			if status, statusErr := s.db.GetSyncGenerationStatus(ctx, generation.ID); statusErr == nil && status == "failed" {
+				message = "sync generation failed before the job reached a terminal state"
+			}
+		}
+		s.failSyncJob(ctx, &jobs[i], message)
+	}
+	return len(jobs), nil
+}
+
+// RunSyncJobWatchdog periodically reconciles stalled jobs. It is intended to
+// run in the singleton cleanup worker.
+func (s *Server) RunSyncJobWatchdog(ctx context.Context) {
+	interval := syncJobWatchdogInterval()
+	reconcile := func() {
+		count, err := s.ReconcileSyncJobs(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("sync job watchdog: %v", err)
+			}
+			return
+		}
+		if count > 0 {
+			log.Printf("sync job watchdog reconciled %d jobs", count)
+		}
+	}
+	reconcile()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reconcile()
+		}
+	}
+}
+
+func syncJobWatchdogInterval() time.Duration {
+	const defaultInterval = time.Minute
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL"))
+	if raw == "" {
+		return defaultInterval
+	}
+	interval, err := time.ParseDuration(raw)
+	if err != nil || interval < time.Second {
+		return defaultInterval
+	}
+	return interval
 }
 
 func syncJobTimeout() time.Duration {

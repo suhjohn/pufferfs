@@ -242,7 +242,8 @@ compatibility aliases, but new deployments should use the transactional names.
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `PUFFERFS_SYNC_WORKERS` | In-process sync worker concurrency. | 64 (max 64) |
-| `PUFFERFS_SYNC_JOB_TIMEOUT` | Max wall-clock per async sync job before it is marked failed. Go duration. | 30m |
+| `PUFFERFS_SYNC_JOB_TIMEOUT` | Max time without persisted job progress before an async sync job is marked failed. Go duration. | 30m |
+| `PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL` | How often the cleanup worker reconciles stalled or inconsistent jobs. Go duration. | 1m |
 | `PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS` | Max concurrent in-flight shards in the queued pipeline. | 32 |
 | `PUFFERFS_EMBED_BATCH_SIZE` | Chunks per Modal embed batch. | 16 |
 | `PUFFERFS_EMBED_BATCH_CONCURRENCY` | Concurrent embed batches. | 4 |
@@ -251,14 +252,21 @@ compatibility aliases, but new deployments should use the transactional names.
 | `PUFFERFS_CLEANUP_BATCH_SIZE` | Rows per cleanup batch. | 1000 |
 | `PUFFERFS_CLEANUP_SYNC_ARTIFACTS` | Whether terminal syncs delete transient source/sync artifacts. Set `0`, `false`, `no`, or `off` to disable. | enabled |
 
-### Queue (NATS JetStream)
+### Queue (Amazon SQS FIFO or NATS JetStream)
 
-The server uses the in-process object-storage queue unless a NATS queue is
-attached. Workers always require NATS.
+The server uses the in-process object-storage path unless a durable backend is
+selected. Workers require either SQS or NATS. Production uses one SQS FIFO queue
+per stage so failures and capacity are isolated.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `NATS_URL` | JetStream URL. Enables the queued sync path when set. | unset (in-process) |
+| `PUFFERFS_QUEUE_BACKEND` | Durable queue backend: `sqs` or `nats`. | unset |
+| `PUFFERFS_SQS_CHUNK_QUEUE_URL` | SQS FIFO URL for chunk jobs. Required for SQS. | unset |
+| `PUFFERFS_SQS_EMBED_QUEUE_URL` | SQS FIFO URL for embed jobs. Required for SQS. | unset |
+| `PUFFERFS_SQS_INDEX_QUEUE_URL` | SQS FIFO URL for index jobs. Required for SQS. | unset |
+| `PUFFERFS_SQS_COMMIT_QUEUE_URL` | SQS FIFO URL for commit jobs. Required for SQS. | unset |
+| `PUFFERFS_SQS_CLEANUP_QUEUE_URL` | SQS FIFO URL for cleanup jobs. Required for SQS. | unset |
+| `NATS_URL` | JetStream URL. Selects NATS when the backend is unset. | unset (in-process) |
 | `PUFFERFS_QUEUE_DEDUPE_WINDOW` | JetStream message dedupe window. Go duration. | 24h |
 | `PUFFERFS_QUEUE_REPLICAS` | JetStream stream replicas. | 0 |
 
@@ -317,9 +325,9 @@ These are baked into the static web build (Vite), not read at runtime by Go:
 - **Embedding cache version must be bumped** (`PUFFERFS_EMBEDDING_MODEL_VERSION`)
   whenever the Modal embedding model changes, or cached vectors will be
   inconsistent with new ones.
-- **NATS toggles execution mode.** With `NATS_URL` set, sync runs through queued
-  workers; without it, the server runs the same pipeline in-process. Workers are
-  only meaningful in the NATS configuration.
+- **The durable backend toggles execution mode.** With SQS selected or
+  `NATS_URL` set, sync runs through queued workers; without either, the server
+  runs the same pipeline in-process.
 - **Admin key**: prefer `PUFFERFS_ADMIN_KEY_HASH` over `PUFFERFS_ADMIN_KEY` so
   the plaintext key is never present in the environment.
 - For the production AWS/Pulumi deployment and which of these belong in Secrets

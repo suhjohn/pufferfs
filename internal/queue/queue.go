@@ -52,7 +52,7 @@ type IndexNamespace struct {
 type ReceivedMessage struct {
 	Job      JobMessage
 	Attempts int
-	msg      *nats.Msg
+	receipt  any
 }
 
 type Queue interface {
@@ -194,11 +194,7 @@ func consumerReplicasNeedUpdate(current, desired nats.ConsumerConfig) bool {
 
 func consumerConfig(stage, consumer, subject string, replicas int) nats.ConsumerConfig {
 	ackWait := 5 * time.Minute
-	maxDeliver := 5
-	if stage == StageCommit || stage == StageCleanup {
-		ackWait = 30 * time.Second
-		maxDeliver = 30
-	}
+	maxDeliver := 1000
 	cfg := nats.ConsumerConfig{
 		Durable:       consumer,
 		AckPolicy:     nats.AckExplicitPolicy,
@@ -302,25 +298,41 @@ func (q *NATSQueue) Pull(ctx context.Context, stage string, batchSize int, timeo
 			_ = msg.Term()
 			return nil, err
 		}
-		out = append(out, ReceivedMessage{Job: job, Attempts: deliveryCount(msg), msg: msg})
+		out = append(out, ReceivedMessage{Job: job, Attempts: deliveryCount(msg), receipt: msg})
 	}
 	return out, nil
 }
 
 func (q *NATSQueue) Ack(msg ReceivedMessage) error {
-	return msg.msg.Ack()
+	receipt, err := natsReceipt(msg)
+	if err != nil {
+		return err
+	}
+	return receipt.Ack()
 }
 
 func (q *NATSQueue) Nak(msg ReceivedMessage) error {
-	return msg.msg.Nak()
+	receipt, err := natsReceipt(msg)
+	if err != nil {
+		return err
+	}
+	return receipt.Nak()
 }
 
 func (q *NATSQueue) NakWithDelay(msg ReceivedMessage, delay time.Duration) error {
-	return msg.msg.NakWithDelay(delay)
+	receipt, err := natsReceipt(msg)
+	if err != nil {
+		return err
+	}
+	return receipt.NakWithDelay(delay)
 }
 
 func (q *NATSQueue) InProgress(msg ReceivedMessage) error {
-	return msg.msg.InProgress()
+	receipt, err := natsReceipt(msg)
+	if err != nil {
+		return err
+	}
+	return receipt.InProgress()
 }
 
 func (q *NATSQueue) Close() {
@@ -358,4 +370,12 @@ func deliveryCount(msg *nats.Msg) int {
 		return 1
 	}
 	return int(meta.NumDelivered)
+}
+
+func natsReceipt(msg ReceivedMessage) (*nats.Msg, error) {
+	receipt, ok := msg.receipt.(*nats.Msg)
+	if !ok || receipt == nil {
+		return nil, errors.New("queue message does not contain a NATS receipt")
+	}
+	return receipt, nil
 }

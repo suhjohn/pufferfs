@@ -6,7 +6,10 @@ This stack deploys PufferFS to AWS:
 - VPC with public ALB subnets, private ECS subnets, and NAT egress.
 - ECS/Fargate API service behind an Application Load Balancer.
 - ECS/Fargate worker services for `chunk`, `embed`, `index`, `commit`, and `cleanup`.
-- 3 private NATS JetStream nodes using ECS service discovery and EFS-backed storage.
+- Isolated SQS FIFO queues and dead-letter queues for each worker stage.
+- CloudWatch alarms for queue age and dead-letter messages; set
+  `pufferfs:alarmTopicArn` to route alarms to an SNS topic.
+- 3 private NATS JetStream nodes retained as a rollback backend.
 - S3 artifact bucket.
 - Secrets Manager entries for `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, and optional `PUFFERFS_ADMIN_KEY_HASH`.
 - CloudWatch logs.
@@ -209,6 +212,8 @@ aws s3 sync dist/client/ "s3://$(cd ../infra/pulumi && pulumi stack output webBu
 
 ## Notes
 
-- NATS is private to the VPC. App services connect through Cloud Map DNS using `NATS_URL`.
+- Production defaults to managed SQS via `pufferfs:queueBackend=sqs`. NATS is
+  private to the VPC and can be selected as a rollback with
+  `pufferfs:queueBackend=nats`.
 - The S3 bucket is managed by this stack. Set `pufferfs:forceDestroyBucket=true` only for throwaway environments.
 - The default topology includes one NAT Gateway. For a lower-cost dev stack, we can add a config flag to run tasks in public subnets instead.

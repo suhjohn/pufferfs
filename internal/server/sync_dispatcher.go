@@ -138,6 +138,9 @@ func (d *SyncDispatcher) startHeartbeat(ctx context.Context, msg queue.ReceivedM
 			select {
 			case <-ticker.C:
 				_ = d.queue.InProgress(msg)
+				if d.server != nil && d.server.db != nil {
+					_ = d.server.db.TouchSyncJob(ctx, msg.Job.SyncJobID)
+				}
 			case <-ctx.Done():
 				return
 			case <-done:

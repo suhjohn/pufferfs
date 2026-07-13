@@ -38,10 +38,9 @@ func main() {
 	modalClient := server.NewModalClient()
 	tpClient := server.NewTPClient(cfg.Turbopuffer.APIKey, cfg.Turbopuffer.Region)
 
-	natsURL := getenv("NATS_URL", "nats://127.0.0.1:4222")
-	q, err := queue.NewNATSQueue(natsURL)
+	q, backend, err := queue.NewFromEnv(context.Background(), true)
 	if err != nil {
-		log.Fatalf("connecting to NATS JetStream: %v", err)
+		log.Fatalf("connecting to sync queue: %v", err)
 	}
 	defer q.Close()
 
@@ -50,7 +49,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Printf("pufferfs worker running stage=%s concurrency=%d nats=%s", *stage, *concurrency, natsURL)
+	if *stage == queue.StageCleanup {
+		go srv.RunSyncJobWatchdog(ctx)
+	}
+	log.Printf("pufferfs worker running stage=%s concurrency=%d queue=%s", *stage, *concurrency, backend)
 	if err := worker.Run(ctx); err != nil && err != context.Canceled {
 		log.Fatalf("worker stopped: %v", err)
 	}

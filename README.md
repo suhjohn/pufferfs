@@ -108,7 +108,8 @@ PufferFS depends on a few external systems:
   snapshots, rendered file artifacts, and sync artifacts.
 - Turbopuffer for hybrid search namespaces.
 - Modal for chunking, embeddings, OCR/image processing, and shard workers.
-- NATS JetStream for the optional queued sync pipeline.
+- Amazon SQS FIFO (production) or NATS JetStream (self-hosted) for the optional
+  queued sync pipeline.
 - Email-code and Google OAuth for hosted web login.
 - AWS SES for transactional login-code and invite email.
 - Stripe for optional billing.
@@ -123,7 +124,7 @@ Use PufferFS in one of two ways:
   [pufferfs.com](https://pufferfs.com). Install the CLI, run `pufferfs init`,
   and sync/query roots without operating the backend.
 - **Self-hosted**: run the Go API server with PostgreSQL, S3-compatible object
-  storage, Turbopuffer, Modal endpoints, and optional NATS workers. The web
+  storage, Turbopuffer, Modal endpoints, and optional queue workers. The web
   console, installer, and workers can be deployed alongside the API when needed.
 
 Self-hosted production setup is documented in

@@ -453,5 +453,6 @@ type SyncJob struct {
 	Processed  int             `json:"processed"`
 	Errors     json.RawMessage `json:"errors"`
 	StartedAt  time.Time       `json:"started_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
 	FinishedAt *time.Time      `json:"finished_at,omitempty"`
 }

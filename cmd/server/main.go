@@ -64,14 +64,12 @@ func main() {
 		log.Println("POSTHOG_ENABLED is set but POSTHOG_KEY is missing; analytics disabled")
 	}
 
-	if natsURL := os.Getenv("NATS_URL"); natsURL != "" {
-		q, err := queue.NewNATSQueue(natsURL)
-		if err != nil {
-			log.Fatalf("connecting to NATS JetStream: %v", err)
-		}
+	if q, backend, err := queue.NewFromEnv(context.Background(), false); err != nil {
+		log.Fatalf("connecting to sync queue: %v", err)
+	} else if q != nil {
 		defer q.Close()
 		srv.SetQueue(q)
-		log.Printf("NATS JetStream sync queue enabled: %s", natsURL)
+		log.Printf("sync queue enabled: backend=%s", backend)
 	}
 
 	// JWT secret
