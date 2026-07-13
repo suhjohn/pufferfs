@@ -170,7 +170,7 @@ jobs:
         working-directory: infra/pulumi
         run: |
           npm run build
-          pulumi preview --diff
+          pulumi preview --diff --refresh
 
       - name: Retire legacy us-east-1 service discovery services
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
@@ -242,7 +242,7 @@ jobs:
       - name: Deploy backend and infrastructure
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
-        run: pulumi up --yes
+        run: pulumi up --yes --refresh
 
       - name: Build frontend
         if: ${{ inputs.component == 'frontend' || inputs.component == 'all' }}
