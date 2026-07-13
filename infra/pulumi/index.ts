@@ -1048,6 +1048,10 @@ natsNodes.forEach((node, i) => {
       waitForSteadyState: true,
       deploymentMinimumHealthyPercent: 0,
       deploymentMaximumPercent: 100,
+      // Each NATS node is intentionally pinned to one subnet/AZ. ECS AZ
+      // rebalancing requires >100% surge capacity, which would start a second
+      // task against the same JetStream store and duplicate the server name.
+      availabilityZoneRebalancing: "DISABLED",
       networkConfiguration: {
         subnets: [privateSubnets[i % privateSubnets.length].id],
         securityGroups: [natsSg.id],
