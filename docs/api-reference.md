@@ -362,6 +362,12 @@ temporary transport at `syncs/<generationID>/sources/bundles/<bundleID>`.
 Without `generation_id`, stored at legacy `bundles/<rootID>/<bundleID>`.
 Response `{"key": "..."}`.
 
+All raw upload endpoints stream into bounded-memory multipart object-storage
+uploads. Known oversized bodies are rejected before reading; unknown-length
+bodies are capped while streaming. An oversized body returns `413`, and a body
+that remains idle during a read for two minutes returns `408`. Failed multipart
+uploads are aborted before the error response is returned.
+
 ### `GET /roots/{id}/state`
 
 Return the root's current committed file-state map
@@ -486,7 +492,7 @@ POST /roots/{id}/sync/{generation_id}/upload?kind=state&name=state.json.gz
 ```
 
 Body is the raw artifact bytes (gzipped JSONL for manifests, gzipped JSON for
-state/proof). **Max 512 MiB.** Returns `200` with the stored object key:
+state/proof). **Max 1024 MiB.** Returns `200` with the stored object key:
 
 ```json
 { "ref": "syncs/<generation_id>/manifests/000000.jsonl" }
@@ -829,6 +835,8 @@ Deletes return `409` while sync jobs are active and report
 | --- | --- | --- |
 | Single file upload | 512 MiB | `handleUpload` |
 | Bundle upload | 1024 MiB | `handleUploadBundle` |
+| Sync artifact upload | 1024 MiB | `handleSyncArtifactUpload` |
+| Upload body idle timeout | 2 min per blocking read | `streamingUploadBody` |
 | Default `top_k` | 10 | `handleQuery` |
 | Sync job timeout | 30 min (configurable via `PUFFERFS_SYNC_JOB_TIMEOUT`) | `syncJobTimeout` |
 | Namespace shards per root | 1 default, 256 max | `PUFFERFS_TP_NAMESPACE_SHARDS` |

@@ -210,10 +210,22 @@ server:
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
 - Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` and empty files are
   uploaded as generation-scoped standalone objects.
+- Replayable upload requests are retried up to three times for transport
+  failures, `408`, `429`, and `5xx` responses. Every retry replays the same
+  bytes to the same generation-scoped object key.
 - Each file change carries `source_key`, `source_offset`, and `source_length`
   so server/Modal can read exact bytes.
 - The complete root state is gzip-compressed and uploaded through the bundle
   endpoint as a `state_ref`.
+
+Upload handlers stream request bodies into bounded-memory S3 multipart uploads
+instead of first copying the complete body to local disk. Each request uses at
+most two concurrent object-storage part uploads with bounded read-ahead,
+partial multipart uploads are explicitly aborted with a cleanup context that
+survives client disconnection, and abort failures are returned rather than
+silently leaving unknown cleanup state. Per-read idle deadlines stop stalled
+clients without imposing a total-duration limit on an active or
+storage-backpressured upload.
 
 For large trees, the CLI uses the manifest-session flow:
 

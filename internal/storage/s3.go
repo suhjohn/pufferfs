@@ -4,13 +4,16 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -19,9 +22,21 @@ import (
 
 // Client wraps an S3 client with the configured bucket.
 type Client struct {
-	s3     *s3.Client
-	bucket string
+	s3       *s3.Client
+	uploader streamUploader
+	aborter  multipartAborter
+	bucket   string
 }
+
+type streamUploader interface {
+	Upload(context.Context, *s3.PutObjectInput, ...func(*manager.Uploader)) (*manager.UploadOutput, error)
+}
+
+type multipartAborter interface {
+	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+}
+
+const multipartAbortTimeout = 30 * time.Second
 
 // NewClient creates a new S3-compatible storage client.
 func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
@@ -58,8 +73,22 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 			o.UsePathStyle = true
 		}
 	})
+	uploader := newStreamUploader(client)
 
-	return &Client{s3: client, bucket: cfg.Bucket}, nil
+	return &Client{s3: client, uploader: uploader, aborter: client, bucket: cfg.Bucket}, nil
+}
+
+func newStreamUploader(client manager.UploadAPIClient, options ...func(*manager.Uploader)) *manager.Uploader {
+	baseOptions := []func(*manager.Uploader){func(u *manager.Uploader) {
+		// Keep the checksum behavior consistent with the S3 client. This also
+		// avoids requiring optional checksum support from S3-compatible stores.
+		u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		// Bound per-request buffering and let UploadStream abort explicitly so
+		// cleanup can use a context that survives client disconnection.
+		u.Concurrency = 2
+		u.LeavePartsOnError = true
+	}}
+	return manager.NewUploader(client, append(baseOptions, options...)...)
 }
 
 // Upload puts an object into S3.
@@ -68,44 +97,35 @@ func (c *Client) Upload(ctx context.Context, key string, data []byte, contentTyp
 }
 
 func (c *Client) UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error {
-	seekableBody, cleanup, err := seekableUploadBody(body)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	_, err = c.s3.PutObject(ctx, &s3.PutObjectInput{
+	_, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:      &c.bucket,
 		Key:         &key,
-		Body:        seekableBody,
+		Body:        body,
 		ContentType: &contentType,
 	})
+	if err == nil {
+		return nil
+	}
+
+	var multipartFailure manager.MultiUploadFailure
+	if !errors.As(err, &multipartFailure) || multipartFailure.UploadID() == "" || c.aborter == nil {
+		return err
+	}
+
+	// Request cancellation is a common upload failure mode, but using the
+	// canceled request context for cleanup would leave orphaned multipart
+	// parts. Preserve context values while giving the abort a short deadline.
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartAbortTimeout)
+	defer cancel()
+	_, abortErr := c.aborter.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+		Bucket:   &c.bucket,
+		Key:      &key,
+		UploadId: aws.String(multipartFailure.UploadID()),
+	})
+	if abortErr != nil {
+		return errors.Join(err, fmt.Errorf("aborting failed multipart upload: %w", abortErr))
+	}
 	return err
-}
-
-func seekableUploadBody(body io.Reader) (io.Reader, func(), error) {
-	if seeker, ok := body.(io.ReadSeeker); ok {
-		return seeker, func() {}, nil
-	}
-
-	f, err := os.CreateTemp("", "pufferfs-upload-*")
-	if err != nil {
-		return nil, func() {}, fmt.Errorf("creating upload spool file: %w", err)
-	}
-	cleanup := func() {
-		name := f.Name()
-		_ = f.Close()
-		_ = os.Remove(name)
-	}
-	if _, err := io.Copy(f, body); err != nil {
-		cleanup()
-		return nil, func() {}, fmt.Errorf("spooling upload body: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		cleanup()
-		return nil, func() {}, fmt.Errorf("rewinding upload body: %w", err)
-	}
-	return f, cleanup, nil
 }
 
 // UploadCAS puts an object only if the supplied ETag precondition matches.

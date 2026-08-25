@@ -1506,7 +1506,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const maxUploadSize = 512 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if !prepareStreamingUpload(w, r, maxUploadSize) {
+		return
+	}
 
 	generationID := strings.TrimSpace(r.URL.Query().Get("generation_id"))
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
@@ -1518,7 +1520,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		s3Key = syncSourceFileKey(generationID, filePath)
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, "application/octet-stream"); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		writeUploadFailure(w, r, err)
 		return
 	}
 
@@ -1555,7 +1557,9 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	const maxUploadSize = 1024 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if !prepareStreamingUpload(w, r, maxUploadSize) {
+		return
+	}
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
@@ -1571,7 +1575,7 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 		s3Key = syncSourceBundleKey(generationID, bundleID)
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		writeUploadFailure(w, r, err)
 		return
 	}
 
@@ -1593,6 +1597,68 @@ func safeObjectName(name string) string {
 		}
 	}
 	return b.String()
+}
+
+const uploadIdleTimeout = 2 * time.Minute
+
+var errUploadBodyTimeout = errors.New("upload body timed out")
+
+func prepareStreamingUpload(w http.ResponseWriter, r *http.Request, maxBytes int64) bool {
+	if r.ContentLength > maxBytes {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error": fmt.Sprintf("upload exceeds %d byte limit", maxBytes),
+		})
+		return false
+	}
+
+	// Replace the server's whole-request deadlines with a per-read idle deadline
+	// for this size-bounded body. Active uploads can run as long as needed, but
+	// a client that stalls while the server is reading still releases its
+	// connection and multipart resources.
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Time{})
+	_ = controller.SetWriteDeadline(time.Time{})
+	r.Body = &streamingUploadBody{
+		ReadCloser: http.MaxBytesReader(w, r.Body, maxBytes),
+		controller: controller,
+	}
+	return true
+}
+
+type streamingUploadBody struct {
+	io.ReadCloser
+	controller *http.ResponseController
+}
+
+func (b *streamingUploadBody) Read(p []byte) (int, error) {
+	_ = b.controller.SetReadDeadline(time.Now().Add(uploadIdleTimeout))
+	n, err := b.ReadCloser.Read(p)
+	_ = b.controller.SetReadDeadline(time.Time{})
+	if err != nil {
+		var timeoutErr interface{ Timeout() bool }
+		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+			return n, fmt.Errorf("%w: %v", errUploadBodyTimeout, err)
+		}
+	}
+	return n, err
+}
+
+func writeUploadFailure(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		// The requester has gone away. UploadStream has already attempted to
+		// abort any multipart upload, and there is no client left to answer.
+		return
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "upload exceeds maximum allowed size"})
+		return
+	}
+	if errors.Is(err, errUploadBodyTimeout) {
+		writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "upload body timed out"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
 }
 
 func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request) {
@@ -1635,13 +1701,15 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 		return
 	}
 	const maxUploadSize = 1024 << 20
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	if !prepareStreamingUpload(w, r, maxUploadSize) {
+		return
+	}
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
+		writeUploadFailure(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
