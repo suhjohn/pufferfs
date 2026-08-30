@@ -181,6 +181,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
 	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
+	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/heartbeat", s.handleSyncHeartbeat)
 	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/upload", s.handleSyncArtifactUpload)
 	s.mux.HandleFunc("DELETE /roots/{id}/sync/{generation_id}", s.handleSyncAbort)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
@@ -1470,6 +1471,63 @@ func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) 
 	return result, nil
 }
 
+func (s *Server) startSyncJobLease(ctx context.Context, jobID string) (func(), error) {
+	if jobID == "" {
+		return func() {}, nil
+	}
+	if err := s.db.TouchSyncJob(ctx, jobID); err != nil {
+		return nil, err
+	}
+	heartbeatCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(syncJobHeartbeatInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				if err := s.db.TouchSyncJob(heartbeatCtx, jobID); err != nil && heartbeatCtx.Err() == nil {
+					log.Printf("warning: failed to refresh sync upload lease for job %s: %v", jobID, err)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}, nil
+}
+
+func (s *Server) startGenerationUploadLease(ctx context.Context, orgID, rootID, generationID string) (*SyncGeneration, func(), error) {
+	generation, err := s.db.GetSyncGeneration(ctx, orgID, rootID, generationID)
+	if err != nil {
+		return nil, nil, err
+	}
+	stop, err := s.startSyncJobLease(ctx, generation.SyncJobID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return generation, stop, nil
+}
+
+func (s *Server) finishGenerationUpload(ctx context.Context, generation *SyncGeneration) error {
+	if generation == nil || generation.SyncJobID == "" {
+		return nil
+	}
+	return s.db.TouchSyncJob(ctx, generation.SyncJobID)
+}
+
+func writeGenerationUploadLookupError(w http.ResponseWriter, err error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "refreshing sync generation: " + err.Error()})
+}
+
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
@@ -1512,15 +1570,23 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	generationID := strings.TrimSpace(r.URL.Query().Get("generation_id"))
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
+	var generation *SyncGeneration
 	if generationID != "" {
-		if _, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID); err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+		var stopLease func()
+		generation, stopLease, err = s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+		if err != nil {
+			writeGenerationUploadLookupError(w, err)
 			return
 		}
+		defer stopLease()
 		s3Key = syncSourceFileKey(generationID, filePath)
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, "application/octet-stream"); err != nil {
 		writeUploadFailure(w, r, err)
+		return
+	}
+	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		writeGenerationUploadLookupError(w, err)
 		return
 	}
 
@@ -1567,15 +1633,23 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	generationID := strings.TrimSpace(r.URL.Query().Get("generation_id"))
 	s3Key := fmt.Sprintf("bundles/%s/%s", rootID, bundleID)
+	var generation *SyncGeneration
 	if generationID != "" {
-		if _, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID); err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+		var stopLease func()
+		generation, stopLease, err = s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+		if err != nil {
+			writeGenerationUploadLookupError(w, err)
 			return
 		}
+		defer stopLease()
 		s3Key = syncSourceBundleKey(generationID, bundleID)
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
 		writeUploadFailure(w, r, err)
+		return
+	}
+	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		writeGenerationUploadLookupError(w, err)
 		return
 	}
 
@@ -1661,6 +1735,35 @@ func writeUploadFailure(w http.ResponseWriter, r *http.Request, err error) {
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
 }
 
+func (s *Server) handleSyncHeartbeat(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !auth.HasScope(id, "sync", "write") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
+		return
+	}
+	rootID := r.PathValue("id")
+	generationID := r.PathValue("generation_id")
+	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
+	if err != nil || !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+		return
+	}
+	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
+	if err != nil {
+		writeGenerationUploadLookupError(w, err)
+		return
+	}
+	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		writeGenerationUploadLookupError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
+}
+
 func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
@@ -1678,10 +1781,12 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	if _, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
+	generation, stopLease, err := s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+	if err != nil {
+		writeGenerationUploadLookupError(w, err)
 		return
 	}
+	defer stopLease()
 	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
 	name := safeObjectName(strings.TrimSpace(r.URL.Query().Get("name")))
 	if name == "" {
@@ -1710,6 +1815,10 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
 		writeUploadFailure(w, r, err)
+		return
+	}
+	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		writeGenerationUploadLookupError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
@@ -2263,12 +2372,25 @@ func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *m
 		return job
 	}
 	timeout := syncJobTimeout()
-	if time.Since(syncJobLastProgress(job)) <= timeout {
+	staleBefore := time.Now().Add(-timeout)
+	if !syncJobLastProgress(job).Before(staleBefore) {
 		return job
 	}
 
 	message := fmt.Sprintf("sync job expired after %s without progress", timeout)
-	return s.failSyncJob(ctx, job, message)
+	errors := []map[string]string{{"error": message}}
+	expired, err := s.db.ExpireSyncJob(ctx, job.ID, staleBefore, errors)
+	if err != nil {
+		log.Printf("warning: failed to expire sync job %s: %v", job.ID, err)
+		return job
+	}
+	if !expired {
+		if current, loadErr := s.db.GetSyncJob(ctx, job.OrgID, job.ID); loadErr == nil {
+			return current
+		}
+		return job
+	}
+	return s.finishFailedSyncJob(ctx, job, errors)
 }
 
 func (s *Server) failSyncJob(ctx context.Context, job *models.SyncJob, message string) *models.SyncJob {
@@ -2280,6 +2402,10 @@ func (s *Server) failSyncJob(ctx context.Context, job *models.SyncJob, message s
 		log.Printf("warning: failed to reconcile sync job %s: %v", job.ID, err)
 		return job
 	}
+	return s.finishFailedSyncJob(ctx, job, errors)
+}
+
+func (s *Server) finishFailedSyncJob(ctx context.Context, job *models.SyncJob, errors []map[string]string) *models.SyncJob {
 	if err := s.db.MarkSyncGenerationFailedForJob(ctx, job.ID); err != nil {
 		log.Printf("warning: failed to reconcile sync generation for job %s: %v", job.ID, err)
 	}
@@ -2318,16 +2444,21 @@ func (s *Server) ReconcileSyncJobs(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	reconciled := 0
 	for i := range jobs {
-		message := fmt.Sprintf("sync job expired after %s without progress", timeout)
 		if generation, generationErr := s.db.GetSyncGenerationForJob(ctx, jobs[i].OrgID, jobs[i].RootID, jobs[i].ID); generationErr == nil {
 			if status, statusErr := s.db.GetSyncGenerationStatus(ctx, generation.ID); statusErr == nil && status == "failed" {
-				message = "sync generation failed before the job reached a terminal state"
+				if failed := s.failSyncJob(ctx, &jobs[i], "sync generation failed before the job reached a terminal state"); failed != nil && failed.Status == "failed" {
+					reconciled++
+				}
+				continue
 			}
 		}
-		s.failSyncJob(ctx, &jobs[i], message)
+		if expired := s.failExpiredSyncJob(ctx, &jobs[i]); expired != nil && expired.Status == "failed" {
+			reconciled++
+		}
 	}
-	return len(jobs), nil
+	return reconciled, nil
 }
 
 // RunSyncJobWatchdog periodically reconciles stalled jobs. It is intended to
@@ -2368,6 +2499,17 @@ func syncJobWatchdogInterval() time.Duration {
 	interval, err := time.ParseDuration(raw)
 	if err != nil || interval < time.Second {
 		return defaultInterval
+	}
+	return interval
+}
+
+func syncJobHeartbeatInterval() time.Duration {
+	interval := 2 * time.Minute
+	if timeoutInterval := syncJobTimeout() / 3; timeoutInterval < interval {
+		interval = timeoutInterval
+	}
+	if interval < 100*time.Millisecond {
+		return 100 * time.Millisecond
 	}
 	return interval
 }

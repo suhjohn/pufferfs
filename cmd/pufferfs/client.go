@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,18 @@ type apiError struct {
 	Body       []byte
 }
 
+var apiHTTPTransport = func() http.RoundTripper {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return http.DefaultTransport
+	}
+	clone := base.Clone()
+	if clone.MaxIdleConnsPerHost < maxUploadConcurrency {
+		clone.MaxIdleConnsPerHost = maxUploadConcurrency
+	}
+	return clone
+}()
+
 func (e *apiError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, string(e.Body))
 }
@@ -33,12 +46,16 @@ func newAPIClient(cfg *appconfig.Config) *apiClient {
 	return &apiClient{
 		baseURL:    cfg.Server.URL,
 		apiKey:     cfg.Server.APIKey,
-		httpClient: &http.Client{Timeout: 3600 * time.Second},
+		httpClient: &http.Client{Transport: apiHTTPTransport, Timeout: 3600 * time.Second},
 	}
 }
 
 func (c *apiClient) post(path string, body any) ([]byte, error) {
 	return c.request("POST", path, body)
+}
+
+func (c *apiClient) postContext(ctx context.Context, path string, body any) ([]byte, error) {
+	return c.requestWithContext(ctx, "POST", path, body)
 }
 
 func (c *apiClient) put(path string, body any) ([]byte, error) {
@@ -54,6 +71,10 @@ func (c *apiClient) delete(path string) ([]byte, error) {
 }
 
 func (c *apiClient) request(method, path string, body any) ([]byte, error) {
+	return c.requestWithContext(context.Background(), method, path, body)
+}
+
+func (c *apiClient) requestWithContext(ctx context.Context, method, path string, body any) ([]byte, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -64,7 +85,7 @@ func (c *apiClient) request(method, path string, body any) ([]byte, error) {
 	}
 
 	url := c.baseURL + path
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, err
 	}

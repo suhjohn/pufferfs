@@ -116,6 +116,13 @@ func TestWriteUploadFailureReturnsRequestTimeoutForIdleBody(t *testing.T) {
 	}
 }
 
+func TestSyncJobHeartbeatIntervalStaysAheadOfShortTimeout(t *testing.T) {
+	t.Setenv("PUFFERFS_SYNC_JOB_TIMEOUT", "3s")
+	if got, want := syncJobHeartbeatInterval(), time.Second; got != want {
+		t.Fatalf("heartbeat interval = %s, want %s", got, want)
+	}
+}
+
 type timeoutReadCloser struct{}
 
 func (timeoutReadCloser) Read([]byte) (int, error) { return 0, timeoutError{} }

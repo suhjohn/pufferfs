@@ -78,11 +78,12 @@ config-file value is kept).
 
 ### CLI sync tuning
 
-These control how the CLI packs uploads and handles moves. Byte values are
-plain integers (bytes).
+These control how the CLI packs uploads, limits upload concurrency, and handles
+moves. Byte values are plain integers (bytes).
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
+| `PUFFERFS_UPLOAD_CONCURRENCY` | Max concurrent CLI upload requests. Invalid values use the default; values above 16 are capped at 16. | 4 |
 | `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` | Files at or below this size are packed into bundles; larger files upload standalone. | 8 MiB (`8<<20`) |
 | `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object. | 256 MiB (`256<<20`) |
 | `PUFFERFS_MOVE_REUSE_MAX_BYTES` | Max file size for which moved-file index reuse is attempted; larger moves are handled conservatively. | 64 MiB (`64<<20`) |

@@ -131,7 +131,7 @@ func (d *SyncDispatcher) markMessageFailed(ctx context.Context, msg queue.JobMes
 
 func (d *SyncDispatcher) startHeartbeat(ctx context.Context, msg queue.ReceivedMessage) func() {
 	done := make(chan struct{})
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(syncJobHeartbeatInterval())
 	go func() {
 		defer ticker.Stop()
 		for {

@@ -2532,12 +2532,39 @@ func (db *DB) TouchSyncJob(ctx context.Context, jobID string) error {
 	if jobID == "" {
 		return nil
 	}
-	_, err := db.pool.Exec(ctx,
+	tag, err := db.pool.Exec(ctx,
 		`UPDATE sync_jobs SET updated_at = NOW()
 		 WHERE id = $1 AND status NOT IN ('completed', 'failed')`,
 		jobID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// ExpireSyncJob marks a job failed only if its lease is still stale. The
+// updated_at predicate prevents a watchdog read from racing with a concurrent
+// upload or worker heartbeat and failing a job that has renewed since.
+func (db *DB) ExpireSyncJob(ctx context.Context, jobID string, staleBefore time.Time, errors []map[string]string) (bool, error) {
+	if errors == nil {
+		errors = []map[string]string{}
+	}
+	tag, err := db.pool.Exec(ctx,
+		`UPDATE sync_jobs
+		 SET status = 'failed', finished_at = NOW(), updated_at = NOW(), errors = $2
+		 WHERE id = $1
+		   AND status NOT IN ('completed', 'failed')
+		   AND updated_at < $3`,
+		jobID, errors, staleBefore,
+	)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // RecordSyncJobShard stores idempotent progress for a completed shard and

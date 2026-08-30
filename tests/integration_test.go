@@ -1166,6 +1166,73 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		storageEnv:        e2eStorageEnv(),
 	}
 
+	t.Run("generation uploads and heartbeat renew the pending job lease", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-upload-lease-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		psqlOutput(t, `UPDATE sync_jobs SET updated_at = NOW() - INTERVAL '31 minutes' WHERE id = `+sqlQuote(syncInit.SyncJobID))
+		heartbeatPath := fmt.Sprintf("%s/roots/%s/sync/%s/heartbeat",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.PathEscape(syncInit.GenerationID),
+		)
+		status, body = rawRequest(t, http.MethodPost, heartbeatPath, env.apiKey, nil, "application/json", nil)
+		if status != http.StatusOK {
+			t.Fatalf("sync heartbeat: HTTP %d: %s", status, string(body))
+		}
+		lease := strings.TrimSpace(psqlOutput(t, `SELECT status || '|' || (updated_at > NOW() - INTERVAL '5 seconds')::text FROM sync_jobs WHERE id = `+sqlQuote(syncInit.SyncJobID)))
+		if lease != "pending|true" {
+			t.Fatalf("lease after heartbeat = %q, want pending|true", lease)
+		}
+
+		psqlOutput(t, `UPDATE sync_jobs SET updated_at = NOW() - INTERVAL '31 minutes' WHERE id = `+sqlQuote(syncInit.SyncJobID))
+		uploadPath := fmt.Sprintf("%s/roots/%s/upload?generation_id=%s&path=%s",
+			env.serverURL,
+			url.PathEscape(root.ID),
+			url.QueryEscape(syncInit.GenerationID),
+			url.QueryEscape("docs/alive.md"),
+		)
+		status, body = rawRequest(t, http.MethodPost, uploadPath, env.apiKey, []byte("active upload\n"), "application/octet-stream", nil)
+		if status != http.StatusOK {
+			t.Fatalf("generation upload: HTTP %d: %s", status, string(body))
+		}
+		lease = strings.TrimSpace(psqlOutput(t, `SELECT status || '|' || (updated_at > NOW() - INTERVAL '5 seconds')::text FROM sync_jobs WHERE id = `+sqlQuote(syncInit.SyncJobID)))
+		if lease != "pending|true" {
+			t.Fatalf("lease after upload = %q, want pending|true", lease)
+		}
+
+		status, body = jsonRequest(t, http.MethodDelete, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/"+url.PathEscape(syncInit.GenerationID), env.apiKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("abort sync: HTTP %d: %s", status, string(body))
+		}
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
+	})
+
 	t.Run("abort before finalize cleans generation-scoped source uploads", func(t *testing.T) {
 		env := newE2EEnv(t, services, "")
 		cleanupDone := false

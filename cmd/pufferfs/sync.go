@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
@@ -1575,6 +1576,8 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 			_ = abortSyncSession(client, rootID, syncInit.GenerationID)
 		}
 	}()
+	heartbeat := startSyncSessionHeartbeat(client, rootID, syncInit.GenerationID, log)
+	defer heartbeat.Stop()
 	baseGenerationID = syncInit.BaseGenerationID
 	baseGenerationSeq = syncInit.BaseGenerationSeq
 
@@ -1583,11 +1586,6 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 	if err != nil {
 		return nil, err
 	}
-	changeRefs, err := uploadChangeShards(client, rootID, syncInit.GenerationID, changes)
-	if err != nil {
-		return nil, fmt.Errorf("uploading change shards: %w", err)
-	}
-
 	// Build content proof from Merkle tree
 	proof := currentTree.BuildContentProof()
 	contentProof := &models.ContentProofData{
@@ -1595,13 +1593,9 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		DirHashes:  proof.DirHashes,
 		RootHash:   proof.RootHash,
 	}
-	contentProofRef, err := uploadContentProof(client, rootID, syncInit.GenerationID, contentProof)
+	metadataRefs, err := uploadSyncMetadata(client, rootID, syncInit.GenerationID, changes, contentProof, currentState)
 	if err != nil {
-		return nil, fmt.Errorf("uploading content proof: %w", err)
-	}
-	stateRef, err := uploadRootState(client, rootID, syncInit.GenerationID, currentState)
-	if err != nil {
-		return nil, fmt.Errorf("uploading root state: %w", err)
+		return nil, err
 	}
 
 	// Send sync request with SimHash for index reuse + content proof
@@ -1611,15 +1605,16 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		GenerationID:      syncInit.GenerationID,
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
-		ChangeRefs:        changeRefs,
+		ChangeRefs:        metadataRefs.ChangeRefs,
 		ChangeCount:       changeCount,
-		StateRef:          stateRef,
+		StateRef:          metadataRefs.StateRef,
 		SimHash:           currentTree.SimHashHex(),
-		ContentProofRef:   contentProofRef,
+		ContentProofRef:   metadataRefs.ContentProofRef,
 		ManifestRef:       manifestRef,
 	}
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
+	heartbeat.Stop()
 	if err != nil {
 		if conflict, ok := syncConflictFromError(err); ok {
 			return nil, conflict
@@ -1997,97 +1992,213 @@ type bundleManifestEntry struct {
 	Length      int64  `json:"length,omitempty"`
 }
 
+const (
+	defaultUploadConcurrency = 4
+	maxUploadConcurrency     = 16
+)
+
+type boundedUploadGroup struct {
+	slots chan struct{}
+	wg    sync.WaitGroup
+
+	mu         sync.Mutex
+	firstOrder int
+	firstErr   error
+}
+
+func newBoundedUploadGroup(limit int) *boundedUploadGroup {
+	if limit < 1 {
+		limit = 1
+	}
+	return &boundedUploadGroup{slots: make(chan struct{}, limit)}
+}
+
+func (g *boundedUploadGroup) Go(order int, upload func() error) bool {
+	if !g.acquire() {
+		return false
+	}
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		defer func() { <-g.slots }()
+		g.record(order, upload())
+	}()
+	return true
+}
+
+func (g *boundedUploadGroup) Do(order int, upload func() error) bool {
+	if !g.acquire() {
+		return false
+	}
+	err := upload()
+	g.record(order, err)
+	<-g.slots
+	return err == nil
+}
+
+func (g *boundedUploadGroup) Fail(order int, err error) {
+	g.record(order, err)
+}
+
+func (g *boundedUploadGroup) Wait() error {
+	g.wg.Wait()
+	return g.Err()
+}
+
+func (g *boundedUploadGroup) Err() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.firstErr
+}
+
+func (g *boundedUploadGroup) acquire() bool {
+	if g.Err() != nil {
+		return false
+	}
+	g.slots <- struct{}{}
+	if g.Err() != nil {
+		<-g.slots
+		return false
+	}
+	return true
+}
+
+func (g *boundedUploadGroup) record(order int, err error) {
+	if err == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.firstErr == nil || order < g.firstOrder {
+		g.firstOrder = order
+		g.firstErr = err
+	}
+}
+
+type sourceUploadResult struct {
+	ready  bool
+	bundle bool
+	key    string
+	entry  bundleManifestEntry
+}
+
 func uploadChangedFiles(client *apiClient, rootID, generationID, dir string, changes []models.FileChange) (string, error) {
 	smallLimit := uploadBundleSmallFileLimit()
 	maxBundleBytes := uploadBundleMaxBytes()
-	var manifest []bundleManifestEntry
+	uploads := newBoundedUploadGroup(uploadConcurrency())
+	results := make([]sourceUploadResult, len(changes))
 	var bundle bytes.Buffer
+	var bundleChanges []int
 	bundleID := fmt.Sprintf("%d", time.Now().UnixNano())
 	bundleIndex := 0
-	var bundleKey string
 
-	flushBundle := func() error {
+	flushBundle := func() bool {
 		if bundle.Len() == 0 {
+			return true
+		}
+		var key string
+		bundleName := fmt.Sprintf("%s-%06d", bundleID, bundleIndex)
+		order := bundleChanges[0]
+		if !uploads.Do(order, func() error {
+			var err error
+			key, err = uploadBundle(client, rootID, generationID, bundleName, bundle.Bytes(), "application/octet-stream")
+			if err != nil {
+				return fmt.Errorf("uploading source bundle %s: %w", bundleName, err)
+			}
 			return nil
+		}) {
+			return false
 		}
-		key, err := uploadBundle(client, rootID, generationID, fmt.Sprintf("%s-%06d", bundleID, bundleIndex), bundle.Bytes(), "application/octet-stream")
-		if err != nil {
-			return err
-		}
-		for i := range changes {
-			if changes[i].SourceKey == "__pending_bundle__" {
-				changes[i].SourceKey = key
-			}
-		}
-		for i := range manifest {
-			if manifest[i].BundleKey == "__pending_bundle__" {
-				manifest[i].BundleKey = key
-			}
+		for _, changeIndex := range bundleChanges {
+			results[changeIndex].key = key
 		}
 		bundle.Reset()
+		bundleChanges = bundleChanges[:0]
 		bundleIndex++
-		bundleKey = ""
-		return nil
+		return true
 	}
 
 	for i := range changes {
-		change := &changes[i]
+		change := changes[i]
 		if change.Status != models.StatusAdded && change.Status != models.StatusModified {
 			continue
 		}
 		localPath := filepath.Join(dir, filepath.FromSlash(change.Path))
-		info, err := os.Stat(localPath)
-		if err != nil {
-			return "", fmt.Errorf("stat %s: %w", change.Path, err)
-		}
-		if info.Size() == 0 || info.Size() > smallLimit {
-			key, err := uploadFile(client, rootID, generationID, change.Path, localPath)
-			if err != nil {
-				return "", fmt.Errorf("uploading %s: %w", change.Path, err)
+		if change.Size == 0 || change.Size > smallLimit {
+			results[i] = sourceUploadResult{
+				ready: true,
+				entry: bundleManifestEntry{
+					Path:        change.Path,
+					ContentHash: change.ContentHash,
+					Size:        change.Size,
+					Length:      change.Size,
+				}}
+			changeIndex := i
+			relPath := change.Path
+			expectedSize := change.Size
+			if !uploads.Go(i, func() error {
+				key, err := uploadFile(client, rootID, generationID, relPath, localPath, expectedSize)
+				if err != nil {
+					return fmt.Errorf("uploading %s: %w", relPath, err)
+				}
+				results[changeIndex].key = key
+				return nil
+			}) {
+				break
 			}
-			change.SourceKey = key
-			change.SourceOffset = 0
-			change.SourceLength = info.Size()
-			manifest = append(manifest, bundleManifestEntry{
-				Path:        change.Path,
-				ContentHash: change.ContentHash,
-				Size:        info.Size(),
-				ObjectKey:   key,
-				Length:      info.Size(),
-			})
 			continue
 		}
 
-		data, err := os.ReadFile(localPath)
+		data, err := readStableSyncFile(localPath, change.Size)
 		if err != nil {
-			return "", fmt.Errorf("reading %s: %w", change.Path, err)
+			uploads.Fail(i, fmt.Errorf("reading %s: %w", change.Path, err))
+			break
 		}
 		if bundle.Len() > 0 && int64(bundle.Len()+len(data)) > maxBundleBytes {
-			if err := flushBundle(); err != nil {
-				return "", err
+			if !flushBundle() {
+				break
 			}
-		}
-		if bundleKey == "" {
-			bundleKey = "__pending_bundle__"
 		}
 		offset := int64(bundle.Len())
 		if _, err := bundle.Write(data); err != nil {
-			return "", err
+			uploads.Fail(i, err)
+			break
 		}
-		change.SourceKey = bundleKey
-		change.SourceOffset = offset
-		change.SourceLength = int64(len(data))
-		manifest = append(manifest, bundleManifestEntry{
-			Path:        change.Path,
-			ContentHash: change.ContentHash,
-			Size:        int64(len(data)),
-			BundleKey:   bundleKey,
-			Offset:      offset,
-			Length:      int64(len(data)),
-		})
+		results[i] = sourceUploadResult{
+			ready:  true,
+			bundle: true,
+			entry: bundleManifestEntry{
+				Path:        change.Path,
+				ContentHash: change.ContentHash,
+				Size:        int64(len(data)),
+				Offset:      offset,
+				Length:      int64(len(data)),
+			},
+		}
+		bundleChanges = append(bundleChanges, i)
 	}
-	if err := flushBundle(); err != nil {
+	if uploads.Err() == nil && !flushBundle() {
+		// The group owns the upload error and returns it below after all workers drain.
+	}
+	if err := uploads.Wait(); err != nil {
 		return "", err
+	}
+
+	manifest := make([]bundleManifestEntry, 0, len(changes))
+	for i := range changes {
+		result := results[i]
+		if !result.ready {
+			continue
+		}
+		changes[i].SourceKey = result.key
+		changes[i].SourceOffset = result.entry.Offset
+		changes[i].SourceLength = result.entry.Length
+		if result.bundle {
+			result.entry.BundleKey = result.key
+		} else {
+			result.entry.ObjectKey = result.key
+		}
+		manifest = append(manifest, result.entry)
 	}
 	if len(manifest) == 0 {
 		return "", nil
@@ -2101,6 +2212,33 @@ func uploadChangedFiles(client *apiClient, rootID, generationID, dir string, cha
 		return "", fmt.Errorf("uploading source manifest: %w", err)
 	}
 	return key, nil
+}
+
+func readStableSyncFile(path string, expectedSize int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if before.Size() != expectedSize {
+		return nil, fmt.Errorf("file changed while syncing: expected %d bytes, found %d", expectedSize, before.Size())
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != expectedSize || after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return nil, fmt.Errorf("file changed while syncing")
+	}
+	return data, nil
 }
 
 func initSyncSession(client *apiClient, rootID, baseGenerationID string, baseGenerationSeq int64, totalFiles int) (*models.SyncInitResponse, error) {
@@ -2147,29 +2285,71 @@ func abortSyncSession(client *apiClient, rootID, generationID string) error {
 	return err
 }
 
-func uploadChangeShards(client *apiClient, rootID, generationID string, changes []models.FileChange) ([]string, error) {
-	if len(changes) == 0 {
-		return nil, nil
-	}
+type syncMetadataRefs struct {
+	ChangeRefs      []string
+	ContentProofRef string
+	StateRef        string
+}
+
+func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes []models.FileChange, proof *models.ContentProofData, state map[string]models.FileState) (syncMetadataRefs, error) {
 	shardSize := uploadChangeShardMaxFiles()
-	refs := make([]string, 0, (len(changes)+shardSize-1)/shardSize)
-	for start := 0; start < len(changes); start += shardSize {
+	shardCount := (len(changes) + shardSize - 1) / shardSize
+	refs := syncMetadataRefs{ChangeRefs: make([]string, shardCount)}
+	uploads := newBoundedUploadGroup(uploadConcurrency())
+	heavyMetadata := make(chan struct{}, 1)
+
+	for shardIndex, start := 0, 0; start < len(changes); shardIndex, start = shardIndex+1, start+shardSize {
 		end := start + shardSize
 		if end > len(changes) {
 			end = len(changes)
 		}
-		var buf bytes.Buffer
-		enc := json.NewEncoder(&buf)
-		for _, change := range changes[start:end] {
-			if err := enc.Encode(change); err != nil {
-				return nil, err
+		ordinal := shardIndex
+		shard := changes[start:end]
+		if !uploads.Go(ordinal, func() error {
+			var buf bytes.Buffer
+			enc := json.NewEncoder(&buf)
+			for _, change := range shard {
+				if err := enc.Encode(change); err != nil {
+					return fmt.Errorf("encoding change shard %d: %w", ordinal, err)
+				}
 			}
+			key, err := uploadSyncArtifact(client, rootID, generationID, "manifest", fmt.Sprintf("%06d.jsonl", ordinal), buf.Bytes(), "application/x-ndjson")
+			if err != nil {
+				return fmt.Errorf("uploading change shard %d: %w", ordinal, err)
+			}
+			refs.ChangeRefs[ordinal] = key
+			return nil
+		}) {
+			break
 		}
-		key, err := uploadSyncArtifact(client, rootID, generationID, "manifest", fmt.Sprintf("%06d.jsonl", len(refs)), buf.Bytes(), "application/x-ndjson")
-		if err != nil {
-			return nil, err
-		}
-		refs = append(refs, key)
+	}
+
+	if uploads.Err() == nil {
+		uploads.Go(shardCount, func() error {
+			heavyMetadata <- struct{}{}
+			defer func() { <-heavyMetadata }()
+			key, err := uploadContentProof(client, rootID, generationID, proof)
+			if err != nil {
+				return fmt.Errorf("uploading content proof: %w", err)
+			}
+			refs.ContentProofRef = key
+			return nil
+		})
+	}
+	if uploads.Err() == nil {
+		uploads.Go(shardCount+1, func() error {
+			heavyMetadata <- struct{}{}
+			defer func() { <-heavyMetadata }()
+			key, err := uploadRootState(client, rootID, generationID, state)
+			if err != nil {
+				return fmt.Errorf("uploading root state: %w", err)
+			}
+			refs.StateRef = key
+			return nil
+		})
+	}
+	if err := uploads.Wait(); err != nil {
+		return syncMetadataRefs{}, err
 	}
 	return refs, nil
 }
@@ -2185,16 +2365,30 @@ func uploadContentProof(client *apiClient, rootID, generationID string, proof *m
 	return uploadSyncArtifact(client, rootID, generationID, "proof", "content-proof.json", data, "application/json")
 }
 
-func uploadFile(client *apiClient, rootID, generationID, relPath, localPath string) (string, error) {
+func uploadFile(client *apiClient, rootID, generationID, relPath, localPath string, expectedSize int64) (string, error) {
 	file, err := os.Open(localPath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if before.Size() != expectedSize {
+		return "", fmt.Errorf("file changed while syncing: expected %d bytes, found %d", expectedSize, before.Size())
+	}
 	path := fmt.Sprintf("/roots/%s/upload?generation_id=%s&path=%s", rootID, url.QueryEscape(generationID), url.QueryEscape(relPath))
 	respBody, err := client.postStream(path, file, "application/octet-stream")
 	if err != nil {
 		return "", err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
+		return "", fmt.Errorf("file changed while syncing")
 	}
 	var resp struct {
 		Key string `json:"key"`
@@ -2255,6 +2449,21 @@ func uploadBundleMaxBytes() int64 {
 	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value < 1 {
 		return defaultBytes
+	}
+	return value
+}
+
+func uploadConcurrency() int {
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CONCURRENCY"))
+	if raw == "" {
+		return defaultUploadConcurrency
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return defaultUploadConcurrency
+	}
+	if value > maxUploadConcurrency {
+		return maxUploadConcurrency
 	}
 	return value
 }

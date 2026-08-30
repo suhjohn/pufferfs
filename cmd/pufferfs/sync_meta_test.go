@@ -8,12 +8,86 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/pufferfs/pufferfs/internal/ignore"
 	"github.com/pufferfs/pufferfs/internal/merkle"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
+
+func TestSyncSessionHeartbeatRepeatsUntilStopped(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/roots/root-1/sync/gen-1/heartbeat" {
+			t.Errorf("unexpected heartbeat request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	heartbeat := startSyncSessionHeartbeatWithInterval(
+		&apiClient{baseURL: server.URL, httpClient: server.Client()},
+		"root-1",
+		"gen-1",
+		5*time.Millisecond,
+		io.Discard,
+	)
+	deadline := time.Now().Add(time.Second)
+	for requests.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := requests.Load(); got < 2 {
+		heartbeat.Stop()
+		t.Fatalf("heartbeat requests = %d, want at least 2", got)
+	}
+
+	heartbeat.Stop()
+	heartbeat.Stop() // Stop is intentionally idempotent for explicit + deferred use.
+	stoppedAt := requests.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := requests.Load(); got != stoppedAt {
+		t.Fatalf("heartbeat continued after Stop: before=%d after=%d", stoppedAt, got)
+	}
+}
+
+func TestSyncSessionHeartbeatStopCancelsInFlightRequest(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	heartbeat := startSyncSessionHeartbeatWithInterval(
+		&apiClient{baseURL: server.URL, httpClient: server.Client()},
+		"root-1",
+		"gen-1",
+		time.Millisecond,
+		io.Discard,
+	)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		heartbeat.Stop()
+		t.Fatal("heartbeat request did not start")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		heartbeat.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not cancel the in-flight heartbeat request")
+	}
+}
 
 func TestRootMetaPersistsGenerationBase(t *testing.T) {
 	home := t.TempDir()

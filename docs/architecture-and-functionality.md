@@ -210,6 +210,10 @@ server:
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
 - Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` and empty files are
   uploaded as generation-scoped standalone objects.
+- Standalone source uploads and independent sync metadata uploads use a bounded
+  worker pool controlled by `PUFFERFS_UPLOAD_CONCURRENCY` (default 4, max 16).
+  Bundle construction stays serial to keep client memory bounded, but bundle
+  requests share the same source-upload limit and can overlap standalone files.
 - Replayable upload requests are retried up to three times for transport
   failures, `408`, `429`, and `5xx` responses. Every retry replays the same
   bytes to the same generation-scoped object key.
