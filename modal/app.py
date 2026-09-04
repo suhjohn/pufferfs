@@ -9,6 +9,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import tempfile
 import time
 from dataclasses import asdict
 
@@ -17,6 +18,10 @@ import modal
 from models import Chunk, ChunkWithEmbedding
 
 app = modal.App(os.getenv("PUFFERFS_MODAL_APP_NAME", "pufferfs"))
+EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
+EMBEDDING_MODEL_REVISION = "e9b6763023c676ca8431644204f50c2b100d9aab"
+EMBEDDING_CODE_REVISION = "7710840340a098cfb869c4f65e87cf2b1b70caca"
+EMBEDDING_DIM = 768
 PDF_RENDERER_INSTALL_URL = os.getenv(
     "PUFFERFS_PDF_RENDERER_INSTALL_URL",
     "https://raw.githubusercontent.com/suhjohn/frpdf-renderer/main/install.sh",
@@ -56,6 +61,18 @@ chunking_image = (
     .add_local_file("chunkers.py", "/root/chunkers.py", copy=True)
 )
 
+
+def _cache_embedding_model() -> None:
+    from sentence_transformers import SentenceTransformer
+
+    SentenceTransformer(
+        EMBEDDING_MODEL,
+        revision=EMBEDDING_MODEL_REVISION,
+        trust_remote_code=True,
+        model_kwargs={"code_revision": EMBEDDING_CODE_REVISION},
+    )
+
+
 embedding_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
@@ -66,7 +83,8 @@ embedding_image = (
         "fastapi[standard]",
     )
     .pip_install("turbopuffer>=2.9.0,<3")
-    .add_local_file("models.py", "/root/models.py")
+    .add_local_file("models.py", "/root/models.py", copy=True)
+    .run_function(_cache_embedding_model)
 )
 
 # ---------------------------------------------------------------------------
@@ -510,17 +528,36 @@ def _s3_client():
 
 
 def _iter_jsonl(s3, key: str):
+    from boto3.s3.transfer import TransferConfig
+
     bucket = os.environ["AWS_BUCKET_NAME"]
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"]
-    lines = gzip.GzipFile(fileobj=body) if key.endswith(".gz") else body.iter_lines()
-    try:
+    started = time.perf_counter()
+    with tempfile.SpooledTemporaryFile(max_size=16 << 20) as payload:
+        s3.download_fileobj(
+            bucket,
+            key,
+            payload,
+            Config=TransferConfig(
+                multipart_threshold=8 << 20,
+                multipart_chunksize=8 << 20,
+                max_concurrency=4,
+                num_download_attempts=5,
+            ),
+        )
+        payload_bytes = payload.tell()
+        download_elapsed = time.perf_counter() - started
+        payload.seek(0)
+        print(
+            f"timing stage=index_shard_artifact_download key={key} "
+            f"bytes={payload_bytes} elapsed={download_elapsed:.3f}s",
+            flush=True,
+        )
+        lines = gzip.GzipFile(fileobj=payload) if key.endswith(".gz") else payload
         for line in lines:
             if line.strip():
                 yield json.loads(line)
-    finally:
         if key.endswith(".gz"):
             lines.close()
-        body.close()
 
 
 TP_SCHEMA = {
@@ -613,11 +650,43 @@ def _embedding_chunk(row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# chunks_to_embeddings: embed a batch of chunks
+# Shared embedding model loader
 # ---------------------------------------------------------------------------
 
-EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
-EMBEDDING_DIM = 768
+
+def _load_embedding_model():
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(
+        EMBEDDING_MODEL,
+        revision=EMBEDDING_MODEL_REVISION,
+        trust_remote_code=True,
+        device=device,
+        model_kwargs={"code_revision": EMBEDDING_CODE_REVISION},
+    )
+    if device == "cuda":
+        model.half()
+    return model, device
+
+
+def _encode_texts(model, device: str, texts: list[str], prefix: str, batch_size: int) -> list[list[float]]:
+    if not texts:
+        return []
+    embeddings = model.encode(
+        [f"{prefix}{text}" for text in texts],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        batch_size=batch_size,
+        device=device,
+    )
+    return [embedding.tolist() for embedding in embeddings]
+
+
+# ---------------------------------------------------------------------------
+# Bulk chunk embedding and index writes
+# ---------------------------------------------------------------------------
 
 
 @app.cls(
@@ -627,8 +696,8 @@ EMBEDDING_DIM = 768
     cpu=4,
     timeout=3600,
     memory=8192,
-    min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "1")),
-    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "8")),
+    min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "0")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "16")),
     scaledown_window=900,
 )
 class Embedder:
@@ -636,20 +705,12 @@ class Embedder:
 
     @modal.enter()
     def load_model(self):
-        import torch
-        from sentence_transformers import SentenceTransformer
-
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, self.device = _load_embedding_model()
         self.encode_batch_size = _env_int("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", 64, 1, 512)
         self.shard_embed_batch_size = _env_int("PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS", 64, 1, 64)
         self.tp_write_batch_rows = _env_int("PUFFERFS_TP_WRITE_BATCH_ROWS", 512, 1, 512)
         self.tp_write_batch_bytes = _env_int("PUFFERFS_TP_WRITE_BATCH_BYTES", 8 << 20, 1 << 20, 8 << 20)
         self.tp = None
-        self.model = SentenceTransformer(
-            EMBEDDING_MODEL,
-            trust_remote_code=True,
-            device=self.device,
-        )
 
     def _turbopuffer(self):
         if self.tp is not None:
@@ -679,48 +740,27 @@ class Embedder:
         if not chunk_dicts:
             return []
 
-        texts = [f"search_document: {c['content']}" for c in chunk_dicts]
-        embeddings = self.model.encode(
-            texts,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=self.encode_batch_size,
-            device=self.device,
+        vectors = _encode_texts(
+            self.model,
+            self.device,
+            [chunk["content"] for chunk in chunk_dicts],
+            "search_document: ",
+            self.encode_batch_size,
         )
 
         results: list[dict] = []
-        for chunk_dict, emb in zip(chunk_dicts, embeddings):
+        for chunk_dict, vector in zip(chunk_dicts, vectors):
             chunk = Chunk(**chunk_dict)
-            cwe = ChunkWithEmbedding(chunk=chunk, embedding=emb.tolist())
+            cwe = ChunkWithEmbedding(chunk=chunk, embedding=vector)
             results.append(asdict(cwe))
 
         return results
-
-    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a list of raw text strings. Used for query embedding."""
-        if not texts:
-            return []
-        prefixed = [f"search_query: {t}" for t in texts]
-        embeddings = self.model.encode(
-            prefixed,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-            batch_size=self.encode_batch_size,
-            device=self.device,
-        )
-        return [emb.tolist() for emb in embeddings]
 
     @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-chunks-endpoint")
     def embed_chunks_endpoint(self, item: dict) -> dict:
         """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
         results = self._embed_chunks(item["chunks"])
         return {"results": results}
-
-    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-query-endpoint")
-    def embed_query_endpoint(self, item: dict) -> dict:
-        """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
-        embeddings = self._embed_texts(item["texts"])
-        return {"embeddings": embeddings}
 
     @modal.fastapi_endpoint(method="POST", label="pufferfs-index-shard-endpoint")
     def index_shard_endpoint(self, item: dict) -> dict:
@@ -751,22 +791,28 @@ class Embedder:
         close_paths: dict[str, set[str]] = {}
         chunks_added = 0
         chunks_removed = 0
+        embedding_seconds = 0.0
+        tp_write_seconds = 0.0
         request_row_budget = self.tp_write_batch_bytes - (64 << 10)
         started = time.perf_counter()
 
         def flush_writes() -> None:
-            nonlocal write_bytes, chunks_added
+            nonlocal write_bytes, chunks_added, tp_write_seconds
             if not write_buffer:
                 return
             rows_by_namespace: dict[str, list[dict]] = {}
             for namespace, row in write_buffer:
                 rows_by_namespace.setdefault(namespace, []).append(row)
             for namespace, rows in rows_by_namespace.items():
-                tp.namespace(namespace).write(
-                    upsert_rows=rows,
-                    schema=TP_SCHEMA,
-                    distance_metric="cosine_distance",
-                )
+                write_started = time.perf_counter()
+                try:
+                    tp.namespace(namespace).write(
+                        upsert_rows=rows,
+                        schema=TP_SCHEMA,
+                        distance_metric="cosine_distance",
+                    )
+                finally:
+                    tp_write_seconds += time.perf_counter() - write_started
                 chunks_added += len(rows)
             write_buffer.clear()
             write_bytes = 0
@@ -789,6 +835,7 @@ class Embedder:
                 flush_writes()
 
         def flush_pending() -> None:
+            nonlocal embedding_seconds
             if not pending:
                 return
             unique: dict[str, dict] = {}
@@ -801,7 +848,11 @@ class Embedder:
                 )
                 unique.setdefault(key, chunk)
             unique_keys = list(unique)
-            embedded = self._embed_chunks([unique[key] for key in unique_keys])
+            embed_started = time.perf_counter()
+            try:
+                embedded = self._embed_chunks([unique[key] for key in unique_keys])
+            finally:
+                embedding_seconds += time.perf_counter() - embed_started
             if len(embedded) != len(unique_keys):
                 raise RuntimeError(f"embedded {len(embedded)} chunks for {len(unique_keys)} unique pending rows")
             vectors = {key: result.get("embedding") for key, result in zip(unique_keys, embedded)}
@@ -819,7 +870,7 @@ class Embedder:
             pending.clear()
 
         def flush_closes() -> None:
-            nonlocal chunks_removed
+            nonlocal chunks_removed, tp_write_seconds
             if not close_paths:
                 return
             patch = {
@@ -840,6 +891,7 @@ class Embedder:
                 if base_sequence > 0:
                     filters.append(_active_generation_filter(base_sequence))
                 for attempt in range(100):
+                    write_started = time.perf_counter()
                     try:
                         response = tp.namespace(namespace).write(
                             patch_by_filter={"filters": _and_filter(filters), "patch": patch},
@@ -847,6 +899,8 @@ class Embedder:
                         )
                     except NotFoundError:
                         break
+                    finally:
+                        tp_write_seconds += time.perf_counter() - write_started
                     chunks_removed += int(response.rows_patched or response.rows_affected or 0)
                     if not response.rows_remaining:
                         break
@@ -880,6 +934,7 @@ class Embedder:
         print(
             f"timing stage=index_shard job_id={job.get('job_id', '')} "
             f"chunks_added={chunks_added} chunks_removed={chunks_removed} "
+            f"embedding={embedding_seconds:.3f}s tp_writes={tp_write_seconds:.3f}s "
             f"elapsed={time.perf_counter() - started:.3f}s",
             flush=True,
         )
@@ -888,6 +943,42 @@ class Embedder:
             "chunks_added": chunks_added,
             "chunks_removed": chunks_removed,
         }
+
+
+# ---------------------------------------------------------------------------
+# Latency-isolated query embedding
+# ---------------------------------------------------------------------------
+
+
+@app.cls(
+    image=embedding_image,
+    secrets=[modal_secret, public_endpoint_secret],
+    gpu=os.getenv("PUFFERFS_MODAL_QUERY_EMBED_GPU", "L4"),
+    cpu=2,
+    timeout=300,
+    memory=4096,
+    min_containers=int(os.getenv("PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS", "1")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS", "2")),
+    scaledown_window=900,
+)
+class QueryEmbedder:
+    """Dedicated Nomic pool so bulk indexing cannot starve interactive queries."""
+
+    @modal.enter()
+    def load_model(self):
+        self.model, self.device = _load_embedding_model()
+
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-query-endpoint")
+    def embed_query_endpoint(self, item: dict) -> dict:
+        """HTTP endpoint: POST {texts: [...]} -> {embeddings: [...]}"""
+        embeddings = _encode_texts(
+            self.model,
+            self.device,
+            item["texts"],
+            "search_query: ",
+            64,
+        )
+        return {"embeddings": embeddings}
 
 
 # ---------------------------------------------------------------------------

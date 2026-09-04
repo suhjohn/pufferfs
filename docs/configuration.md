@@ -176,6 +176,12 @@ Source capture tuning uses plain integer byte values:
 | `MODAL_SECRET_KEY` | Shared secret sent by index workers to authorize the state-changing Modal endpoint. | required with `MODAL_INDEX_SHARD_ENDPOINT` |
 | `PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE` | Rows per GPU model encode call (max 512). | 64 |
 | `PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS` | Maximum pending shard rows per embedding call. | 64 (max 64) |
+| `PUFFERFS_MODAL_EMBED_GPU` | GPU used by the bulk embedding/index pool. | `L4` |
+| `PUFFERFS_MODAL_EMBED_MIN_CONTAINERS` | Warm bulk embedding/index containers. Model weights are baked into the image, so the default does not keep an idle bulk GPU. | 0 |
+| `PUFFERFS_MODAL_EMBED_MAX_CONTAINERS` | Maximum concurrent bulk embedding/index containers. | 16 |
+| `PUFFERFS_MODAL_QUERY_EMBED_GPU` | GPU used by the latency-isolated query embedding pool. | `L4` |
+| `PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS` | Warm query embedding containers kept separate from bulk indexing. | 1 |
+| `PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS` | Maximum concurrent query embedding containers. | 2 |
 | `MODAL_OFFICE_TO_PDF_ENDPOINT` | Optional public Office → PDF conversion endpoint for direct callers. Not used by the API server. | — |
 | `MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT` | Optional public PDF → page JPEG endpoint for direct callers. Not used by the API server. | — |
 | `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
@@ -190,6 +196,13 @@ Source capture tuning uses plain integer byte values:
 | `PUFFERFS_MODAL_SECRET_NAME` | Single Modal secret name used by all Modal functions. It contains storage, Turbopuffer, and model-provider credentials. | `pufferfs` |
 | `PUFFERFS_VLLM_MODELS` | Comma-separated provider-qualified vision model specs for image/page OCR. Entries use `provider/model` and may include weights as `provider/model:weight`; choose weights from usable capacity, for example `min(RPM, TPM / estimated_tokens_per_page)`. `gemini/...` uses the Gemini SDK; other providers use OpenAI-compatible chat completions when `<PROVIDER>_API_KEY` and a base URL are available. Fireworks defaults to `https://api.fireworks.ai/inference/v1`. If Gemini OCR fails, including recitation blocks, OCR falls back to `openai/gpt-5.4-nano`. | `fireworks/accounts/fireworks/models/qwen3p7-plus:5,openai/gpt-5.4-nano:40,openai/gpt-5.4-mini:15,gemini/gemini-3.1-flash-lite:10,gemini/gemini-2.5-flash-lite:30` |
 | `PUFFERFS_EMBEDDING_MODEL_VERSION` | Embedding cache version; must be bumped when the Modal embedding model changes. | — |
+
+Nomic runs in FP16 on CUDA. The pinned model and remote-code revisions are
+baked into the Modal image, so new containers do not download mutable model
+files at startup. Bulk index workers download each compressed chunk artifact
+completely, with bounded retries and disk spill above 16 MiB, before beginning
+GPU work. Interactive query embeddings use a separate pool and therefore do
+not wait behind long-running index shards.
 
 The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 

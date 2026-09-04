@@ -328,9 +328,10 @@ The pipeline shape is:
 3. Index stage:
    - Rows are routed by stable hash of `file_path` to an active root namespace
      shard.
-   - In production, Modal streams the compressed chunk artifact, embeds missing
-     vectors in batches of at most 64, and writes Turbopuffer batches bounded by
-     512 rows and 8 MiB. Vectors are never persisted as a second S3 artifact.
+   - In production, Modal first downloads the compressed chunk artifact with
+     bounded retries, then embeds missing vectors in FP16 batches of at most 64
+     and writes Turbopuffer batches bounded by 512 rows and 8 MiB. Vectors are
+     never persisted as a second S3 artifact.
    - The in-process fallback performs the same chunk-to-index transformation in
      Go. Vector-disabled roots use this path without calling Modal.
    - Close paths are grouped by namespace and patched together with
@@ -420,10 +421,12 @@ Chunking strategies:
 - Images: upload image artifact and use Gemini vision/captioning when available,
   otherwise store a placeholder description.
 
-Embeddings use `nomic-ai/nomic-embed-text-v1.5` through SentenceTransformers,
-with `search_document:` prefixes for document chunks and `search_query:`
-prefixes for query text. The Go server's embedding cache version is expected to
-match the Modal model and can be overridden with
+Embeddings use a pinned `nomic-ai/nomic-embed-text-v1.5` revision through
+SentenceTransformers in FP16 on CUDA, with `search_document:` prefixes for
+document chunks and `search_query:` prefixes for query text. Bulk shard work
+and latency-sensitive query embedding run in separate Modal container pools.
+The Go server's embedding cache version is expected to match the Modal model
+and can be overridden with
 `PUFFERFS_EMBEDDING_MODEL_VERSION`. The server preserves line metadata on index
 rows, but strips `line_start` and `line_end` from the Modal embed payload so
 older deployed embed containers that only know the base chunk schema remain
@@ -556,8 +559,8 @@ PufferFS currently supports:
 - The embedding cache version must be bumped when the Modal embedding model
   changes.
 - Standalone Modal embedding calls receive only fields needed by the embedding
-  model. The index-shard endpoint streams complete rows because it writes them
-  directly to Turbopuffer.
+  model. The index-shard endpoint downloads complete-row artifacts before GPU
+  work because it writes those rows directly to Turbopuffer.
 - OAuth login uses signed random state bound to a short-lived httpOnly state
   cookie for CSRF protection.
 - ACLs are modeled as entries but the implemented read/write checks primarily

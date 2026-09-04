@@ -236,9 +236,10 @@ Chunk contents are embedded with a `search_document:` prefix. Query text is
 embedded separately with a `search_query:` prefix. Embeddings are normalized and
 stored as vectors for Turbopuffer hybrid/vector search.
 
-For queued vector syncs, Modal streams each compressed chunk artifact, embeds
-at most 64 pending rows at a time, and writes rows directly to Turbopuffer in
-batches bounded by 512 rows and 8 MiB. Partial buffers flush at end of shard;
+For queued vector syncs, Modal downloads each compressed chunk artifact with
+bounded retries, embeds at most 64 pending rows at a time in FP16, and writes
+rows directly to Turbopuffer in batches bounded by 512 rows and 8 MiB. Partial
+buffers flush at end of shard;
 there is no intermediate vector/index-row object in storage. The in-process
 fallback retains the embedding cache keyed by model version and content hash.
 
