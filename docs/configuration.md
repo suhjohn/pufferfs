@@ -89,7 +89,7 @@ moves. Byte values are plain integers (bytes).
 | `PUFFERFS_MULTIPART_MIN_BYTES` | Standalone files at or above this size use direct, retryable multipart object-storage uploads instead of traversing the API server. | 64 MiB (`64<<20`) |
 | `PUFFERFS_UPLOAD_MANIFEST_MAX_FILES` | Maximum file changes in one transport manifest, capped at 5000. The server independently forms bounded work shards. | 5000 |
 | `PUFFERFS_MOVE_REUSE_MAX_BYTES` | Max file size for which moved-file index reuse is attempted; larger moves are handled conservatively. | 64 MiB (`64<<20`) |
-| `PUFFERFS_SYNC_POLL_TIMEOUT` | How long the CLI polls an async sync job before giving up. Go duration. | 35m |
+| `PUFFERFS_SYNC_POLL_TIMEOUT` | Default maximum wait for explicit `sync wait` and `sync status --watch` commands. Foreground `sync` follows server status until completion, failure, or interruption. Go duration. | 35m |
 
 > Server enforced upload caps are separate: 10 GiB per source object and 1 GiB
 > per bundle (see [api-reference.md](./api-reference.md#limits)).

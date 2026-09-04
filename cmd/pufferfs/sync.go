@@ -1771,11 +1771,7 @@ func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScop
 
 func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*models.SyncJob, error) {
 	fmt.Fprintf(log, "Sync job %s started; polling until committed...\n", jobID)
-	deadline := time.Now().Add(syncPollTimeout())
 	for {
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for sync job %s", jobID)
-		}
 		body, err := client.get(fmt.Sprintf("/roots/%s/sync/status?job_id=%s", rootID, url.QueryEscape(jobID)))
 		if err != nil {
 			return nil, fmt.Errorf("polling sync job: %w", err)

@@ -25,7 +25,7 @@ config:
   pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
 
   # CLI release manifest advertised at GET /cli/version.
-  pufferfs:cliLatestVersion: "0.6.5"
+  pufferfs:cliLatestVersion: "0.6.6"
   pufferfs:cliMinVersion: "0.2.0"
   pufferfs:cliDownloadBaseUrl: "https://pufferfs.com/releases"
 

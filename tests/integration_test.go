@@ -531,6 +531,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 	})
 
 	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
+		t.Setenv("PUFFERFS_SYNC_POLL_TIMEOUT", "1s")
 		t.Setenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES", "65536")
 		t.Setenv("PUFFERFS_MULTIPART_MIN_BYTES", "1048576")
 		t.Setenv("PUFFERFS_MULTIPART_PART_BYTES", "5242880")

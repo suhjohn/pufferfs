@@ -71,7 +71,7 @@ pulumi config set pufferfs:modalIndexShardEndpoint https://...index-shard-endpoi
 Advertise CLI release compatibility from `GET /cli/version`:
 
 ```sh
-pulumi config set pufferfs:cliLatestVersion 0.6.5
+pulumi config set pufferfs:cliLatestVersion 0.6.6
 pulumi config set pufferfs:cliMinVersion 0.2.0
 pulumi config set pufferfs:cliDownloadBaseUrl https://pufferfs.com/releases
 ```
