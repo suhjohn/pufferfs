@@ -11,28 +11,8 @@ import (
 
 func normalizeSyncRequest(req *models.SyncRequest) error {
 	for i := range req.Changes {
-		path, err := cleanFilePath(req.Changes[i].Path)
-		if err != nil {
-			return fmt.Errorf("invalid change path %q: %w", req.Changes[i].Path, err)
-		}
-		req.Changes[i].Path = path
-
-		if req.Changes[i].OldPath != "" {
-			oldPath, err := cleanFilePath(req.Changes[i].OldPath)
-			if err != nil {
-				return fmt.Errorf("invalid old path %q: %w", req.Changes[i].OldPath, err)
-			}
-			req.Changes[i].OldPath = oldPath
-		}
-
-		if req.Changes[i].Status == models.StatusMoved || req.Changes[i].Status == models.StatusRenamed {
-			if req.Changes[i].OldPath == "" {
-				return fmt.Errorf("old_path is required for %s change %q", req.Changes[i].Status, req.Changes[i].Path)
-			}
-		}
-
-		if err := validateSourceRef(req.RootID, req.GenerationID, &req.Changes[i]); err != nil {
-			return fmt.Errorf("invalid source for %q: %w", req.Changes[i].Path, err)
+		if err := normalizeSyncChange(req.RootID, req.GenerationID, &req.Changes[i]); err != nil {
+			return err
 		}
 	}
 
@@ -94,11 +74,38 @@ func normalizeSyncRequest(req *models.SyncRequest) error {
 	if err := validateSyncStateRef(req.RootID, req.GenerationID, req.StateRef); err != nil {
 		return err
 	}
-	req.ManifestRef = strings.TrimSpace(strings.ReplaceAll(req.ManifestRef, "\\", "/"))
-	if err := validateManifestRef(req.RootID, req.GenerationID, req.ManifestRef); err != nil {
-		return err
-	}
 
+	return nil
+}
+
+func normalizeSyncChange(rootID, generationID string, change *models.FileChange) error {
+	switch change.Status {
+	case models.StatusUnchanged, models.StatusAdded, models.StatusRemoved, models.StatusModified, models.StatusMoved, models.StatusRenamed:
+	default:
+		return fmt.Errorf("invalid change status %q", change.Status)
+	}
+	if change.Size < 0 {
+		return fmt.Errorf("change size must be non-negative")
+	}
+	rawPath := change.Path
+	path, err := cleanFilePath(rawPath)
+	if err != nil {
+		return fmt.Errorf("invalid change path %q: %w", rawPath, err)
+	}
+	change.Path = path
+	if change.OldPath != "" {
+		rawOldPath := change.OldPath
+		change.OldPath, err = cleanFilePath(rawOldPath)
+		if err != nil {
+			return fmt.Errorf("invalid old path %q: %w", rawOldPath, err)
+		}
+	}
+	if (change.Status == models.StatusMoved || change.Status == models.StatusRenamed) && change.OldPath == "" {
+		return fmt.Errorf("old_path is required for %s change %q", change.Status, change.Path)
+	}
+	if err := validateSourceRef(rootID, generationID, change); err != nil {
+		return fmt.Errorf("invalid source for %q: %w", change.Path, err)
+	}
 	return nil
 }
 
@@ -189,17 +196,6 @@ func validateBundleObjectRef(rootID, ref, field string) error {
 		return fmt.Errorf("%s bundle key is invalid", field)
 	}
 	return nil
-}
-
-func validateManifestRef(rootID, generationID, ref string) error {
-	ref = strings.TrimSpace(strings.ReplaceAll(ref, "\\", "/"))
-	if ref == "" {
-		return nil
-	}
-	if strings.HasPrefix(ref, syncSourceBundlePrefix(generationID)) {
-		return validateSyncSourceBundleRef(generationID, ref, "manifest_ref")
-	}
-	return validateBundleObjectRef(rootID, ref, "manifest_ref")
 }
 
 func validateSourceRef(rootID, generationID string, change *models.FileChange) error {

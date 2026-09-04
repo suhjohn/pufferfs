@@ -85,10 +85,8 @@ moves. Byte values are plain integers (bytes).
 | --- | --- | --- |
 | `PUFFERFS_UPLOAD_CONCURRENCY` | Max concurrent CLI upload requests. Invalid values use the default; values above 16 are capped at 16. | 4 |
 | `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` | Files at or below this size are packed into bundles; larger files upload standalone. | 8 MiB (`8<<20`) |
-| `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object. Bundles upload concurrently within the shared upload limit. | 32 MiB (`32<<20`) |
-| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES` | Maximum file changes in one uploaded change manifest. | 128 |
-| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_BYTES` | Maximum source bytes represented by one change manifest; an oversize file is isolated. | 32 MiB (`32<<20`) |
-| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_CHUNKS` | Maximum estimated downstream chunks represented by one change manifest; an oversize file is isolated. | 8192 |
+| `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object, capped at 15 MiB. Bundles upload concurrently within the shared upload limit. | 15 MiB (`15<<20`) |
+| `PUFFERFS_UPLOAD_MANIFEST_MAX_FILES` | Maximum file changes in one transport manifest, capped at 5000. The server independently forms bounded work shards. | 5000 |
 | `PUFFERFS_MOVE_REUSE_MAX_BYTES` | Max file size for which moved-file index reuse is attempted; larger moves are handled conservatively. | 64 MiB (`64<<20`) |
 | `PUFFERFS_SYNC_POLL_TIMEOUT` | How long the CLI polls an async sync job before giving up. Go duration. | 35m |
 
@@ -156,7 +154,7 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `TURBOPUFFER_API_KEY` | Turbopuffer API key. | required for search |
 | `TURBOPUFFER_API_URL` | Turbopuffer base URL. | provider default |
 | `PUFFERFS_TP_NAMESPACE_SHARDS` | Physical namespaces per root, set at root creation. | 1 (max 256) |
-| `PUFFERFS_TP_WRITE_BATCH_ROWS` | Rows per Turbopuffer upsert/patch batch. | 512 (max 5000) |
+| `PUFFERFS_TP_WRITE_BATCH_ROWS` | Rows per Turbopuffer upsert request. | 512 (max 5000) |
 
 ### Modal compute
 
@@ -165,14 +163,13 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `MODAL_CHUNK_ENDPOINT` | File → chunks endpoint. | — |
 | `MODAL_EMBED_ENDPOINT` | Chunks → embeddings endpoint. | — |
 | `MODAL_QUERY_EMBED_ENDPOINT` | Query text → embedding endpoint. | — |
-| `MODAL_CHUNK_SHARD_ENDPOINT` | Sync shard → chunk artifact (queued pipeline). | — |
 | `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). | — |
-| `MODAL_INDEX_SHARD_ENDPOINT` | Index-row artifact → Turbopuffer writes (queued pipeline). | — |
+| `PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE` | Rows per GPU model encode call (max 512). | 64 |
 | `MODAL_OFFICE_TO_PDF_ENDPOINT` | Optional public Office → PDF conversion endpoint for direct callers. Not used by the API server. | — |
 | `MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT` | Optional public PDF → page JPEG endpoint for direct callers. Not used by the API server. | — |
 | `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
 | `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY` | JPEG quality for rendered page images. Lower values reduce upload size; valid values are clamped between 30 and 95. | 75 |
-| `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY` | Concurrent S3 page-image uploads per document chunking container. This overlaps with OCR fan-out and is separate from Modal OCR container concurrency. | 512 |
+| `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY` | Concurrent S3 page-image uploads per document chunking container (max 128). This overlaps with OCR fan-out and is separate from Modal OCR container concurrency. | 32 |
 | `PUFFERFS_PDF_RENDERER_INSTALL_URL` | Installer script URL for the `frpdf` binary installed into the Modal chunking image. | `https://raw.githubusercontent.com/suhjohn/frpdf-renderer/main/install.sh` |
 | `PUFFERFS_PDF_RENDERER_VERSION` | `frpdf-renderer` release version passed to the installer. Set to `latest` to install the latest release. | `v0.1.1` |
 | `PUFFERFS_PDF_RENDERER_PATH` | Runtime path to the installed PDF renderer binary. | `/usr/local/bin/frpdf` |
@@ -190,8 +187,7 @@ The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 | `AWS_ACCESS_KEY_ID` | Modal reads/writes S3-compatible storage. |
 | `AWS_SECRET_ACCESS_KEY` | Modal reads/writes S3-compatible storage. |
 | `AWS_ENDPOINT_URL` | Required for non-AWS S3-compatible storage; omit for AWS S3. |
-| `AWS_BUCKET_NAME` | Modal reads/writes source files, chunk artifacts, and page images. |
-| `TURBOPUFFER_API_KEY` | Modal index shard writes Turbopuffer rows. |
+| `AWS_BUCKET_NAME` | Modal reads source/chunk artifacts and writes index-row/page-image artifacts. |
 | `MODAL_SECRET_KEY` | Required to authorize direct calls to the public `office_to_pdf` and `pdf_to_page_images` Modal endpoints. |
 | `GEMINI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `gemini/...`, or media OCR is enabled. |
 | `OPENAI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `openai/...`. |
@@ -245,26 +241,14 @@ compatibility aliases, but new deployments should use the transactional names.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `PUFFERFS_SYNC_WORKERS` | In-process sync worker concurrency. | 64 (max 64) |
 | `PUFFERFS_SYNC_JOB_TIMEOUT` | Max time without persisted job progress before an async sync job is marked failed. Go duration. | 30m |
-| `PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL` | How often the cleanup worker reconciles stalled or inconsistent jobs. Go duration. | 1m |
-| `PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS` | Max concurrent in-flight shards in the queued pipeline. | 32 |
-| `PUFFERFS_SYNC_ARTIFACT_PART_RECORDS` | Maximum records per chunk/index artifact part. | 512 (max 10000) |
-| `PUFFERFS_SYNC_ARTIFACT_PART_BYTES` | Maximum encoded bytes per chunk/index artifact part. | 8 MiB (max 64 MiB) |
-| `PUFFERFS_SYNC_EMBED_BATCH_ROWS` | Maximum rows retained by one sync embedding work batch. | 128 (max 512) |
-| `PUFFERFS_SYNC_LOCAL_STREAM_THRESHOLD_BYTES` | Local text sources above this size are range-read and chunked incrementally. | 8 MiB |
-| `PUFFERFS_EMBED_BATCH_SIZE` | Chunks per Modal embed batch. | 16 |
-| `PUFFERFS_EMBED_BATCH_CONCURRENCY` | Concurrent embed batches. | 4 |
-| `PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE` | Embedding-cache lookup batch size. | 500 |
-| `PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY` | Concurrent embedding-cache lookups. | 4 |
-| `PUFFERFS_CLEANUP_BATCH_SIZE` | Object keys per cleanup batch. | 1000 |
-| `PUFFERFS_CLEANUP_MESSAGE_MAX_BYTES` | Maximum estimated encoded cleanup queue-message size. | 200 KiB (max 240 KiB) |
+| `PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL` | How often the commit worker reconciles stalled or inconsistent jobs. Go duration. | 1m |
 | `PUFFERFS_CLEANUP_SYNC_ARTIFACTS` | Whether terminal syncs delete transient source/sync artifacts. Set `0`, `false`, `no`, or `off` to disable. | enabled |
 
 ### Queue (Amazon SQS FIFO or NATS JetStream)
 
-The server uses the in-process object-storage path unless a durable backend is
-selected. Workers require either SQS or NATS. Production uses one SQS FIFO queue
+The server runs shards directly in-process unless a durable backend is selected.
+Workers require either SQS or NATS. Production uses one SQS FIFO queue
 per stage so failures and capacity are isolated.
 
 | Variable | Meaning | Default |
@@ -274,7 +258,6 @@ per stage so failures and capacity are isolated.
 | `PUFFERFS_SQS_EMBED_QUEUE_URL` | SQS FIFO URL for embed jobs. Required for SQS. | unset |
 | `PUFFERFS_SQS_INDEX_QUEUE_URL` | SQS FIFO URL for index jobs. Required for SQS. | unset |
 | `PUFFERFS_SQS_COMMIT_QUEUE_URL` | SQS FIFO URL for commit jobs. Required for SQS. | unset |
-| `PUFFERFS_SQS_CLEANUP_QUEUE_URL` | SQS FIFO URL for cleanup jobs. Required for SQS. | unset |
 | `NATS_URL` | JetStream URL. Selects NATS when the backend is unset. | unset (in-process) |
 | `PUFFERFS_QUEUE_DEDUPE_WINDOW` | JetStream message dedupe window. Go duration. | 24h |
 | `PUFFERFS_QUEUE_REPLICAS` | JetStream stream replicas. | 0 |
@@ -284,7 +267,8 @@ per stage so failures and capacity are isolated.
 | Variable | Meaning |
 | --- | --- |
 | `PUFFERFS_PROCESS` | `/pufferfs-runtime` execs the worker instead of the server when set to `worker`. |
-| `PUFFERFS_WORKER_STAGE` | Selects the worker stage: `chunk`, `embed`, `index`, `commit`, or `cleanup`. Setting it also implies worker mode. |
+| `PUFFERFS_WORKER_STAGE` | Selects the worker stage: `chunk`, `embed`, `index`, or `commit`. Setting it also implies worker mode. |
+| `PUFFERFS_WORKER_CONCURRENCY` | Maximum concurrent jobs in one worker process; default 4, max 64. |
 
 ### Billing (Stripe)
 

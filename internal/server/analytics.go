@@ -98,12 +98,8 @@ func syncAnalyticsProps(root *models.RootMetadata, req *models.SyncRequest, job 
 	if req != nil {
 		props["change_count"] = len(req.Changes)
 		props["change_ref_count"] = len(req.ChangeRefs)
-		props["has_manifest_ref"] = req.ManifestRef != ""
 		props["has_state_ref"] = req.StateRef != ""
 		props["has_base_generation"] = req.BaseGenerationID != "" || req.BaseGenerationSeq > 0
-		if req.ChangeCount > 0 {
-			props["reported_change_count"] = req.ChangeCount
-		}
 		if req.ProtocolVersion > 0 {
 			props["sync_protocol_version"] = req.ProtocolVersion
 		}

@@ -34,9 +34,7 @@ for key in \
   MODAL_CHUNK_ENDPOINT \
   MODAL_EMBED_ENDPOINT \
   MODAL_QUERY_EMBED_ENDPOINT \
-  MODAL_CHUNK_SHARD_ENDPOINT \
-  MODAL_EMBED_SHARD_ENDPOINT \
-  MODAL_INDEX_SHARD_ENDPOINT
+  MODAL_EMBED_SHARD_ENDPOINT
 do
   require_env "$key"
 done
@@ -71,9 +69,7 @@ pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
 pulumi config set pufferfs:modalChunkEndpoint "$MODAL_CHUNK_ENDPOINT"
 pulumi config set pufferfs:modalEmbedEndpoint "$MODAL_EMBED_ENDPOINT"
 pulumi config set pufferfs:modalQueryEmbedEndpoint "$MODAL_QUERY_EMBED_ENDPOINT"
-pulumi config set pufferfs:modalChunkShardEndpoint "$MODAL_CHUNK_SHARD_ENDPOINT"
 pulumi config set pufferfs:modalEmbedShardEndpoint "$MODAL_EMBED_SHARD_ENDPOINT"
-pulumi config set pufferfs:modalIndexShardEndpoint "$MODAL_INDEX_SHARD_ENDPOINT"
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
 

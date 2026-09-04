@@ -5,7 +5,7 @@ This stack deploys PufferFS to AWS:
 - ECR repository and locally built app image.
 - VPC with public ALB subnets, private ECS subnets, and NAT egress.
 - ECS/Fargate API service behind an Application Load Balancer.
-- ECS/Fargate worker services for `chunk`, `embed`, `index`, `commit`, and `cleanup`.
+- ECS/Fargate worker services for `chunk`, `embed`, `index`, and `commit`.
 - Isolated SQS FIFO queues and dead-letter queues for each worker stage.
 - CloudWatch alarms for queue age and dead-letter messages; set
   `pufferfs:alarmTopicArn` to route alarms to an SNS topic.
@@ -62,9 +62,7 @@ Set Modal endpoints:
 pulumi config set pufferfs:modalChunkEndpoint https://...chunk-file-endpoint.modal.run
 pulumi config set pufferfs:modalEmbedEndpoint https://...embed-chunks-endpoint.modal.run
 pulumi config set pufferfs:modalQueryEmbedEndpoint https://...embed-query-endpoint.modal.run
-pulumi config set pufferfs:modalChunkShardEndpoint https://...chunk-shard-endpoint.modal.run
 pulumi config set pufferfs:modalEmbedShardEndpoint https://...embed-shard-endpoint.modal.run
-pulumi config set pufferfs:modalIndexShardEndpoint https://...index-shard-endpoint.modal.run
 ```
 
 Advertise CLI release compatibility from `GET /cli/version`:

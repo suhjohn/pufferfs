@@ -18,7 +18,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -34,10 +33,8 @@ import (
 type objectStore interface {
 	Upload(ctx context.Context, key string, data []byte, contentType string) error
 	UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error
-	UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error)
 	Download(ctx context.Context, key string) ([]byte, error)
-	DownloadWithETag(ctx context.Context, key string) ([]byte, string, error)
-	DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	Open(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error)
 	DeleteMany(ctx context.Context, keys []string) error
 	DeletePrefix(ctx context.Context, prefix string) (int, error)
 }
@@ -1474,48 +1471,6 @@ func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) 
 	return result, nil
 }
 
-func (s *Server) startSyncJobLease(ctx context.Context, jobID string) (func(), error) {
-	if jobID == "" {
-		return func() {}, nil
-	}
-	if err := s.db.TouchSyncJob(ctx, jobID); err != nil {
-		return nil, err
-	}
-	heartbeatCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(syncJobHeartbeatInterval())
-		defer ticker.Stop()
-		for {
-			select {
-			case <-heartbeatCtx.Done():
-				return
-			case <-ticker.C:
-				if err := s.db.TouchSyncJob(heartbeatCtx, jobID); err != nil && heartbeatCtx.Err() == nil {
-					log.Printf("warning: failed to refresh sync upload lease for job %s: %v", jobID, err)
-				}
-			}
-		}
-	}()
-	return func() {
-		cancel()
-		<-done
-	}, nil
-}
-
-func (s *Server) startGenerationUploadLease(ctx context.Context, orgID, rootID, generationID string) (*SyncGeneration, func(), error) {
-	generation, err := s.db.GetSyncGeneration(ctx, orgID, rootID, generationID)
-	if err != nil {
-		return nil, nil, err
-	}
-	stop, err := s.startSyncJobLease(ctx, generation.SyncJobID)
-	if err != nil {
-		return nil, nil, err
-	}
-	return generation, stop, nil
-}
-
 func (s *Server) finishGenerationUpload(ctx context.Context, generation *SyncGeneration) error {
 	if generation == nil || generation.SyncJobID == "" {
 		return nil
@@ -1575,13 +1530,11 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
 	var generation *SyncGeneration
 	if generationID != "" {
-		var stopLease func()
-		generation, stopLease, err = s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
 		if err != nil {
 			writeGenerationUploadLookupError(w, err)
 			return
 		}
-		defer stopLease()
 		// Each request gets an immutable object key. A client may retry after the
 		// server stored the body but its response was lost; sharing a key between
 		// attempts would let a late request overwrite the bytes described by a
@@ -1676,13 +1629,11 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 	s3Key := fmt.Sprintf("bundles/%s/%s", rootID, bundleID)
 	var generation *SyncGeneration
 	if generationID != "" {
-		var stopLease func()
-		generation, stopLease, err = s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
 		if err != nil {
 			writeGenerationUploadLookupError(w, err)
 			return
 		}
-		defer stopLease()
 		s3Key = syncSourceBundleKey(generationID, bundleID)
 	}
 	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
@@ -1822,12 +1773,11 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	generation, stopLease, err := s.startGenerationUploadLease(r.Context(), id.OrgID, rootID, generationID)
+	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
 	if err != nil {
 		writeGenerationUploadLookupError(w, err)
 		return
 	}
-	defer stopLease()
 	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
 	name := safeObjectName(strings.TrimSpace(r.URL.Query().Get("name")))
 	if name == "" {
@@ -1891,8 +1841,8 @@ func (s *Server) handleSyncAbort(w http.ResponseWriter, r *http.Request) {
 	if generation.SyncJobID != "" {
 		_ = s.db.CompleteSyncJob(r.Context(), generation.SyncJobID, "failed", []map[string]string{{"error": "sync aborted"}})
 	}
-	if err := s.cleanupTerminalSyncObjects(r.Context(), rootID, generation.ID, nil); err != nil {
-		log.Printf("warning: failed aborted sync object cleanup for root %s generation %s: %v", rootID, generation.ID, err)
+	if err := s.cleanupFailedGeneration(r.Context(), id.OrgID, rootID, generation.ID, s.syncRequestForCleanup(r.Context(), generation.ID)); err != nil {
+		log.Printf("warning: failed aborted generation cleanup for root %s generation %s: %v", rootID, generation.ID, err)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
 }
@@ -1967,7 +1917,7 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync job: " + err.Error()})
 		return
 	}
-	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, "", req.BaseGenerationID, req.BaseGenerationSeq)
+	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, req.BaseGenerationID, req.BaseGenerationSeq)
 	if err != nil {
 		_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		if errors.Is(err, errStaleSyncBase) {
@@ -2049,28 +1999,15 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "changes or change_refs is required"})
 		return
 	}
-	if err := s.validateSyncIgnorePolicy(r.Context(), id, &req); err != nil {
+	if err := s.validateSyncChanges(r.Context(), id, rootID, &req); err != nil {
 		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := s.checkSyncWriteACL(r.Context(), id, rootID, &req); err != nil {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
 	}
 	if err := validateSyncBase(req.BaseGenerationID, req.BaseGenerationSeq, root.VisibleGenerationID, root.VisibleGenerationSeq); err != nil {
 		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
 		writeSyncConflict(w, err, &req, root.VisibleGenerationID, root.VisibleGenerationSeq)
 		return
-	}
-
-	// Store SimHash for future index reuse
-	if req.SimHash != "" {
-		if err := s.db.UpdateRootSimHash(r.Context(), id.OrgID, rootID, req.SimHash); err != nil {
-			log.Printf("warning: failed to update simhash: %v", err)
-		}
-
 	}
 
 	// Count actionable files
@@ -2080,10 +2017,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			actionableFiles++
 		}
 	}
-	if actionableFiles == 0 && req.ChangeCount > 0 {
-		actionableFiles = req.ChangeCount
-	}
-
 	var job *models.SyncJob
 	var generation *SyncGeneration
 	if req.GenerationID != "" {
@@ -2098,26 +2031,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "loading sync job: " + err.Error()})
 				return
 			}
-			if err := s.db.UpdateSyncJobTotalFiles(r.Context(), job.ID, actionableFiles); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updating sync job total: " + err.Error()})
-				return
-			}
-			job.TotalFiles = actionableFiles
 		}
 	} else {
 		job, err = s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)
 		if err != nil {
-			log.Printf("warning: failed to create sync job: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync job: " + err.Error()})
+			return
 		}
-		syncJobID := ""
-		if job != nil {
-			syncJobID = job.ID
-		}
-		generation, err = s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, syncJobID, req.ManifestRef, req.BaseGenerationID, req.BaseGenerationSeq)
+		generation, err = s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, req.BaseGenerationID, req.BaseGenerationSeq)
 		if err != nil {
-			if job != nil {
-				_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
-			}
+			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 			if errors.Is(err, errStaleSyncBase) {
 				if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
 					writeSyncConflict(w, err, &req, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
@@ -2138,20 +2061,13 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		if job != nil {
 			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
 		}
-		if cleanupErr := s.cleanupTerminalSyncObjects(r.Context(), rootID, generation.ID, &req); cleanupErr != nil {
-			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+		if cleanupErr := s.cleanupFailedGeneration(r.Context(), id.OrgID, rootID, generation.ID, &req); cleanupErr != nil {
+			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
 		}
 		s.captureSyncFailed(r.Context(), id.OrgID, id.UserID, root, &req, job, "prepare_state")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing sync state: " + err.Error()})
 		return
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		if err := s.cleanupFailedGenerationRowsForRoot(ctx, id.OrgID, rootID); err != nil {
-			log.Printf("warning: failed generation row cleanup for root %s: %v", rootID, err)
-		}
-	}()
 	if r.URL.Query().Get("async") == "true" {
 		go func(req models.SyncRequest, generation *SyncGeneration, job *models.SyncJob) {
 			ctx, cancel := context.WithTimeout(context.Background(), syncJobTimeout())
@@ -2160,7 +2076,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				log.Printf("async sync error for root %s: %v", rootID, err)
 			}
 		}(req, generation, job)
-		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: syncJobIdentifier(job), GenerationID: generation.ID, GenerationSeq: generation.Seq})
+		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: generation.SyncJobID, GenerationID: generation.ID, GenerationSeq: generation.Seq})
 		return
 	}
 
@@ -2184,55 +2100,58 @@ func (s *Server) cleanupRejectedSyncRequest(ctx context.Context, orgID, rootID s
 	if generation.SyncJobID != "" {
 		_ = s.db.CompleteSyncJob(ctx, generation.SyncJobID, "failed", []map[string]string{{"error": reason}})
 	}
-	if cleanupErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, nil); cleanupErr != nil {
-		log.Printf("warning: failed rejected sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
+	if cleanupErr := s.cleanupFailedGeneration(ctx, orgID, rootID, generation.ID, s.syncRequestForCleanup(ctx, generation.ID)); cleanupErr != nil {
+		log.Printf("warning: failed rejected generation cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
 	}
 }
 
-func (s *Server) validateSyncIgnorePolicy(ctx context.Context, id *auth.Identity, req *models.SyncRequest) error {
-	if id == nil || req == nil {
-		return nil
-	}
+func (s *Server) validateSyncChanges(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
 	policy, err := s.db.GetEffectiveIgnorePolicy(ctx, id.OrgID, id.UserID)
 	if err != nil {
 		return fmt.Errorf("loading ignore policy: %w", err)
 	}
-	if strings.TrimSpace(policy.OrgPatterns) == "" && strings.TrimSpace(policy.UserPatterns) == "" {
+	var matcher *ignore.Matcher
+	if strings.TrimSpace(policy.OrgPatterns) != "" || strings.TrimSpace(policy.UserPatterns) != "" {
+		matcher = ignore.NewPolicyMatcher(ignore.PolicyPatternSet{OrgPatterns: policy.OrgPatterns, UserPatterns: policy.UserPatterns})
+	}
+	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
+	if err != nil {
+		return fmt.Errorf("loading write ACLs: %w", err)
+	}
+	if matcher == nil && len(acls) == 0 {
 		return nil
 	}
-	matcher := ignore.NewPolicyMatcher(ignore.PolicyPatternSet{
-		OrgPatterns:  policy.OrgPatterns,
-		UserPatterns: policy.UserPatterns,
-	})
-	changes, err := s.syncRequestChangesForACL(ctx, req)
-	if err != nil {
-		return err
-	}
-	for _, change := range changes {
-		for _, path := range syncChangePolicyPaths(change) {
-			if matcher.ShouldIgnore(path, false) {
-				return fmt.Errorf("path %q is ignored by org/user policy", path)
+	check := func(change models.FileChange, ref string) error {
+		if ref != "" {
+			if err := normalizeSyncChange(req.RootID, req.GenerationID, &change); err != nil {
+				return fmt.Errorf("%s: %w", ref, err)
 			}
+		}
+		if matcher != nil && change.Status != models.StatusRemoved && matcher.ShouldIgnore(change.Path, false) {
+			return fmt.Errorf("path %q is ignored by org/user policy", change.Path)
+		}
+		if len(acls) == 0 {
+			return nil
+		}
+		if (change.Status == models.StatusMoved || change.Status == models.StatusRenamed) && !checkPermission(acls, change.OldPath, "write") {
+			return fmt.Errorf("no write permission for %s", change.OldPath)
+		}
+		if !checkPermission(acls, change.Path, "write") {
+			return fmt.Errorf("no write permission for %s", change.Path)
+		}
+		return nil
+	}
+	for _, change := range req.Changes {
+		if err := check(change, ""); err != nil {
+			return err
+		}
+	}
+	for _, ref := range req.ChangeRefs {
+		if err := eachJSONL(ctx, s.s3, ref, func(change models.FileChange) error { return check(change, ref) }); err != nil {
+			return err
 		}
 	}
 	return nil
-}
-
-func syncChangePolicyPaths(change models.FileChange) []string {
-	switch change.Status {
-	case models.StatusRemoved:
-		return nil
-	case models.StatusMoved, models.StatusRenamed:
-		if strings.TrimSpace(change.Path) == "" {
-			return nil
-		}
-		return []string{change.Path}
-	}
-	paths := make([]string, 0, 2)
-	if strings.TrimSpace(change.Path) != "" {
-		paths = append(paths, change.Path)
-	}
-	return paths
 }
 
 func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest, currentGenerationID string, currentGenerationSeq int64) {
@@ -2253,71 +2172,39 @@ func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest
 
 func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
 	root, _ := s.db.GetRoot(ctx, orgID, rootID)
+	fail := func(stage string, cause error) (*models.SyncResponse, error) {
+		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
+		if job != nil {
+			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": cause.Error()}})
+		}
+		if err := s.cleanupFailedGeneration(ctx, orgID, rootID, generation.ID, req); err != nil {
+			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", rootID, generation.ID, err)
+		}
+		s.captureSyncFailed(ctx, orgID, userID, root, req, job, stage)
+		return nil, cause
+	}
+
 	resp, err := s.runSyncPipeline(ctx, orgID, userID, generation, req, job)
 	if err != nil {
 		log.Printf("sync error for root %s: %v", rootID, err)
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-		}
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		if cleanupObjErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req); cleanupObjErr != nil {
-			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupObjErr)
-		}
-		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "pipeline")
-		return nil, err
+		return fail("pipeline", err)
 	}
 	if s.queue != nil {
 		return resp, nil
 	}
 
-	if err := s.storeSyncContentProof(ctx, orgID, userID, rootID, req); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-		}
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		if cleanupObjErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req); cleanupObjErr != nil {
-			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupObjErr)
-		}
-		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "content_proof")
-		return nil, fmt.Errorf("storing content proof: %w", err)
+	if err := s.cleanupFailedGenerations(ctx, orgID, rootID); err != nil {
+		return fail("cleanup", fmt.Errorf("cleaning failed generations: %w", err))
 	}
-	if err := s.cleanupFailedGenerationRowsForRoot(ctx, orgID, rootID); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-		}
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		if cleanupObjErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req); cleanupObjErr != nil {
-			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupObjErr)
-		}
-		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "cleanup")
-		return nil, fmt.Errorf("cleaning failed generations before commit: %w", err)
+	if err := s.storeSyncContentProof(ctx, orgID, userID, rootID, req); err != nil {
+		return fail("content_proof", fmt.Errorf("storing content proof: %w", err))
 	}
 
 	if job != nil {
 		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "committing")
 	}
 	if err := s.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if cleanupErr := s.cleanupFailedGenerationRows(ctx, orgID, rootID, generation.ID); cleanupErr != nil {
-			log.Printf("warning: failed generation row cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-		}
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		if cleanupObjErr := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req); cleanupObjErr != nil {
-			log.Printf("warning: failed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupObjErr)
-		}
-		s.captureSyncFailed(ctx, orgID, userID, root, req, job, "commit")
-		return nil, fmt.Errorf("committing generation: %w", err)
+		return fail("commit", fmt.Errorf("committing generation: %w", err))
 	}
 	if job != nil {
 		if err := s.db.CompleteSyncJob(ctx, job.ID, "completed", nil); err != nil {
@@ -2326,17 +2213,21 @@ func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, g
 		resp.SyncJobID = job.ID
 	}
 	s.captureSyncCompleted(ctx, orgID, userID, root, req, job, resp)
-	if err := s.cleanupCommittedSyncObjects(ctx, rootID, generation, req); err != nil {
+	if err := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req, false); err != nil {
 		log.Printf("warning: failed committed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, err)
 	}
 	return resp, nil
 }
 
 func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	if s.queue != nil {
-		return s.enqueueSync(ctx, orgID, userID, generation, req, job)
+	jobID := ""
+	if job != nil {
+		jobID = job.ID
 	}
-	return s.processSync(ctx, orgID, generation, req, job)
+	if s.queue != nil {
+		return s.enqueueSync(ctx, orgID, userID, generation, req, jobID)
+	}
+	return s.processSync(ctx, orgID, generation, req, jobID)
 }
 
 func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootID string, req *models.SyncRequest) error {
@@ -2363,13 +2254,6 @@ func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootI
 		return nil
 	}
 	return s.db.UpsertContentProof(ctx, orgID, userID, rootID, proof.RootHash, proofBytes)
-}
-
-func (s *Server) cleanupCommittedSyncObjects(ctx context.Context, rootID string, generation *SyncGeneration, req *models.SyncRequest) error {
-	if generation == nil {
-		return nil
-	}
-	return s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req)
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,13 +2324,15 @@ func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *m
 }
 
 func (s *Server) failSyncJob(ctx context.Context, job *models.SyncJob, message string) *models.SyncJob {
-	if job == nil || job.Status == "completed" || job.Status == "failed" {
+	if job == nil || job.Status == "completed" {
 		return job
 	}
 	errors := []map[string]string{{"error": message}}
-	if err := s.db.CompleteSyncJob(ctx, job.ID, "failed", errors); err != nil {
-		log.Printf("warning: failed to reconcile sync job %s: %v", job.ID, err)
-		return job
+	if job.Status != "failed" {
+		if err := s.db.CompleteSyncJob(ctx, job.ID, "failed", errors); err != nil {
+			log.Printf("warning: failed to reconcile sync job %s: %v", job.ID, err)
+			return job
+		}
 	}
 	return s.finishFailedSyncJob(ctx, job, errors)
 }
@@ -2457,8 +2343,8 @@ func (s *Server) finishFailedSyncJob(ctx context.Context, job *models.SyncJob, e
 	}
 	if generation, err := s.db.GetSyncGenerationForJob(ctx, job.OrgID, job.RootID, job.ID); err == nil {
 		req := s.syncRequestForCleanup(ctx, generation.ID)
-		if cleanupErr := s.cleanupTerminalSyncObjects(ctx, job.RootID, generation.ID, req); cleanupErr != nil {
-			log.Printf("warning: failed expired sync object cleanup for root %s generation %s: %v", job.RootID, generation.ID, cleanupErr)
+		if cleanupErr := s.cleanupFailedGeneration(ctx, job.OrgID, job.RootID, generation.ID, req); cleanupErr != nil {
+			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", job.RootID, generation.ID, cleanupErr)
 		}
 	} else {
 		log.Printf("warning: failed to load expired sync generation for job %s: %v", job.ID, err)
@@ -2493,11 +2379,20 @@ func (s *Server) ReconcileSyncJobs(ctx context.Context) (int, error) {
 	reconciled := 0
 	for i := range jobs {
 		if generation, generationErr := s.db.GetSyncGenerationForJob(ctx, jobs[i].OrgID, jobs[i].RootID, jobs[i].ID); generationErr == nil {
-			if status, statusErr := s.db.GetSyncGenerationStatus(ctx, generation.ID); statusErr == nil && status == "failed" {
-				if failed := s.failSyncJob(ctx, &jobs[i], "sync generation failed before the job reached a terminal state"); failed != nil && failed.Status == "failed" {
+			if status, statusErr := s.db.GetSyncGenerationStatus(ctx, generation.ID); statusErr == nil {
+				switch status {
+				case "visible":
+					if err := s.db.CompleteSyncJob(ctx, jobs[i].ID, "completed", nil); err != nil {
+						return reconciled, err
+					}
 					reconciled++
+					continue
+				case "failed", "cleaning":
+					if failed := s.failSyncJob(ctx, &jobs[i], "sync generation failed before the job reached a terminal state"); failed != nil && failed.Status == "failed" {
+						reconciled++
+					}
+					continue
 				}
-				continue
 			}
 		}
 		if expired := s.failExpiredSyncJob(ctx, &jobs[i]); expired != nil && expired.Status == "failed" {
@@ -2508,7 +2403,7 @@ func (s *Server) ReconcileSyncJobs(ctx context.Context) (int, error) {
 }
 
 // RunSyncJobWatchdog periodically reconciles stalled jobs. It is intended to
-// run in the singleton cleanup worker.
+// run in the singleton commit worker.
 func (s *Server) RunSyncJobWatchdog(ctx context.Context) {
 	interval := syncJobWatchdogInterval()
 	reconcile := func() {
@@ -3181,85 +3076,6 @@ func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, f
 	return checkPermission(acls, filePath, "write")
 }
 
-func (s *Server) checkSyncWriteACL(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
-	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil || len(acls) == 0 {
-		_, ok, rootErr := s.rootForPermission(ctx, id, rootID, models.RootPermissionSync)
-		if rootErr == nil && ok {
-			return nil
-		}
-		return fmt.Errorf("write permission required")
-	}
-
-	canWrite := func(filePath string) bool {
-		return checkPermission(acls, filePath, "write")
-	}
-
-	changes, err := s.syncRequestChangesForACL(ctx, req)
-	if err != nil {
-		return err
-	}
-	for _, change := range changes {
-		switch change.Status {
-		case models.StatusAdded, models.StatusModified, models.StatusRemoved:
-			if !canWrite(change.Path) {
-				return fmt.Errorf("no write permission for %s", change.Path)
-			}
-		case models.StatusMoved, models.StatusRenamed:
-			if !canWrite(change.OldPath) {
-				return fmt.Errorf("no write permission for %s", change.OldPath)
-			}
-			if !canWrite(change.Path) {
-				return fmt.Errorf("no write permission for %s", change.Path)
-			}
-		}
-	}
-	return nil
-}
-
-func (s *Server) syncRequestChangesForACL(ctx context.Context, req *models.SyncRequest) ([]models.FileChange, error) {
-	if req == nil {
-		return nil, nil
-	}
-	changes := append([]models.FileChange(nil), req.Changes...)
-	if len(req.ChangeRefs) == 0 {
-		return changes, nil
-	}
-	for _, ref := range req.ChangeRefs {
-		data, err := s.s3.Download(ctx, ref)
-		if err != nil {
-			return nil, fmt.Errorf("downloading change ref %s: %w", ref, err)
-		}
-		dec := json.NewDecoder(bytes.NewReader(data))
-		for {
-			var change models.FileChange
-			if err := dec.Decode(&change); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return nil, fmt.Errorf("parsing change ref %s: %w", ref, err)
-			}
-			path, err := cleanFilePath(change.Path)
-			if err != nil {
-				return nil, fmt.Errorf("invalid change path %q in %s: %w", change.Path, ref, err)
-			}
-			change.Path = path
-			if change.OldPath != "" {
-				oldPath, err := cleanFilePath(change.OldPath)
-				if err != nil {
-					return nil, fmt.Errorf("invalid old path %q in %s: %w", change.OldPath, ref, err)
-				}
-				change.OldPath = oldPath
-			}
-			if err := validateSourceRef(req.RootID, req.GenerationID, &change); err != nil {
-				return nil, fmt.Errorf("invalid source for %q in %s: %w", change.Path, ref, err)
-			}
-			changes = append(changes, change)
-		}
-	}
-	return changes, nil
-}
-
 // checkReadACL checks if a user has read permission for a path in a root.
 func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
@@ -3339,14 +3155,14 @@ func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID
 
 type pendingEmbedding struct {
 	chunk       map[string]any
-	row         map[string]any
+	rows        []map[string]any
 	contentHash string
 }
 
 type syncSourceCache struct {
-	s3      objectStore
-	mu      sync.Mutex
-	objects map[string][]byte
+	s3   objectStore
+	key  string
+	data []byte
 }
 
 func stateObjectKey(rootID, generationID string) string {
@@ -3441,58 +3257,34 @@ func decodeRootState(ref string, data []byte) (map[string]models.FileState, erro
 	return state, nil
 }
 
-func newSyncSourceCache(s3 objectStore) *syncSourceCache {
-	return &syncSourceCache{s3: s3, objects: make(map[string][]byte)}
-}
-
 func (c *syncSourceCache) read(ctx context.Context, key string, offset, length int64) ([]byte, error) {
 	if key == "" {
 		return nil, fmt.Errorf("empty source key")
 	}
-	if length > 0 {
-		return c.s3.DownloadRange(ctx, key, offset, length)
-	}
-	if !strings.HasPrefix(key, "bundles/") {
-		return c.s3.Download(ctx, key)
-	}
-	c.mu.Lock()
-	data, ok := c.objects[key]
-	if !ok {
-		var err error
-		data, err = c.s3.Download(ctx, key)
+	if !isSourceBundleKey(key) {
+		body, err := c.s3.Open(ctx, key, offset, length)
 		if err != nil {
-			c.mu.Unlock()
 			return nil, err
 		}
-		c.objects[key] = data
+		defer body.Close()
+		return io.ReadAll(body)
 	}
-	c.mu.Unlock()
-	if length <= 0 {
+	if key != c.key {
+		data, err := c.s3.Download(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		c.key, c.data = key, data
+	}
+	data := c.data
+	if length == 0 {
 		return data, nil
 	}
 	end := offset + length
 	if offset < 0 || end < offset || end > int64(len(data)) {
 		return nil, fmt.Errorf("invalid range offset=%d length=%d object_bytes=%d", offset, length, len(data))
 	}
-	out := make([]byte, length)
-	copy(out, data[offset:end])
-	return out, nil
-}
-
-func syncWorkerCount() int {
-	const defaultWorkers = 64
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_WORKERS"))
-	if raw == "" {
-		return defaultWorkers
-	}
-	workers, err := strconv.Atoi(raw)
-	if err != nil || workers < 1 {
-		return defaultWorkers
-	}
-	if workers > 64 {
-		return 64
-	}
-	return workers
+	return data[offset:end], nil
 }
 
 func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pending []pendingEmbedding) error {
@@ -3501,10 +3293,11 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 		chunks[i] = item.chunk
 	}
 	embedStart := time.Now()
-	embedResults, err := s.embedChunksInBatches(chunks)
+	resp, err := s.modal.EmbedChunks(chunks)
 	if err != nil {
 		return fmt.Errorf("embedding sync chunks: %w", err)
 	}
+	embedResults := resp.Results
 	if len(embedResults) != len(pending) {
 		return fmt.Errorf("embedding sync chunks: got %d results for %d chunks", len(embedResults), len(pending))
 	}
@@ -3516,7 +3309,9 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 		if !ok {
 			return fmt.Errorf("embedding result %d missing embedding vector", i)
 		}
-		pending[i].row["vector"] = embedding
+		for _, row := range pending[i].rows {
+			row["vector"] = embedding
+		}
 		hash := pending[i].contentHash
 		if hash == "" {
 			chunk, _ := result["chunk"].(map[string]any)
@@ -3542,52 +3337,13 @@ func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pen
 	return nil
 }
 
-func (s *Server) upsertRowsInBatches(ns string, rows []map[string]any, distanceMetric string) error {
-	batchSize := tpWriteBatchSize()
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		writeStart := time.Now()
-		if err := s.tp.UpsertRows(ns, rows[start:end], distanceMetric); err != nil {
-			return err
-		}
-		log.Printf("timing stage=tp_upsert_batch batch=%d/%d rows=%d elapsed=%s", start/batchSize+1, (len(rows)+batchSize-1)/batchSize, end-start, time.Since(writeStart))
-	}
-	return nil
-}
-
-func (s *Server) patchRowsInBatches(ns string, rows []map[string]any) error {
-	batchSize := tpWriteBatchSize()
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		writeStart := time.Now()
-		if err := s.tp.PatchRows(ns, rows[start:end]); err != nil {
-			return err
-		}
-		log.Printf("timing stage=tp_patch_batch batch=%d/%d rows=%d elapsed=%s", start/batchSize+1, (len(rows)+batchSize-1)/batchSize, end-start, time.Since(writeStart))
-	}
-	return nil
-}
-
 func tpWriteBatchSize() int {
 	const defaultRows = 512
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_TP_WRITE_BATCH_ROWS"))
-	if raw == "" {
+	rows, _ := strconv.Atoi(os.Getenv("PUFFERFS_TP_WRITE_BATCH_ROWS"))
+	if rows < 1 {
 		return defaultRows
 	}
-	rows, err := strconv.Atoi(raw)
-	if err != nil || rows < 1 {
-		return defaultRows
-	}
-	if rows > 5000 {
-		return 5000
-	}
-	return rows
+	return min(rows, 5000)
 }
 
 func filteredQueryLimit(topK int) int {
@@ -3629,86 +3385,6 @@ func modalChunkPayload(row map[string]any) map[string]any {
 		chunk["image_path"] = imagePath
 	}
 	return chunk
-}
-
-func (s *Server) embedChunksInBatches(chunks []map[string]any) ([]map[string]any, error) {
-	batchSize := embedBatchSize()
-	batchCount := (len(chunks) + batchSize - 1) / batchSize
-	concurrency := embedBatchConcurrency()
-	if concurrency > batchCount {
-		concurrency = batchCount
-	}
-	totalStart := time.Now()
-	batchResults := make([][]map[string]any, batchCount)
-	errs := make([]error, batchCount)
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-
-	for start := 0; start < len(chunks); start += batchSize {
-		end := start + batchSize
-		if end > len(chunks) {
-			end = len(chunks)
-		}
-		batchIndex := start / batchSize
-		wg.Add(1)
-		go func(batchIndex, start, end int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			batchStart := time.Now()
-			resp, err := s.modal.EmbedChunks(chunks[start:end])
-			if err != nil {
-				errs[batchIndex] = err
-				return
-			}
-			log.Printf("timing stage=modal_embed_batch batch=%d/%d chunks=%d elapsed=%s", batchIndex+1, batchCount, end-start, time.Since(batchStart))
-			batchResults[batchIndex] = resp.Results
-		}(batchIndex, start, end)
-	}
-	wg.Wait()
-
-	results := make([]map[string]any, 0, len(chunks))
-	for batchIndex, err := range errs {
-		if err != nil {
-			return nil, fmt.Errorf("embedding batch %d/%d: %w", batchIndex+1, batchCount, err)
-		}
-		results = append(results, batchResults[batchIndex]...)
-	}
-	log.Printf("timing stage=modal_embed_batches_total chunks=%d batches=%d batch_size=%d concurrency=%d elapsed=%s", len(chunks), batchCount, batchSize, concurrency, time.Since(totalStart))
-	return results, nil
-}
-
-func embedBatchSize() int {
-	const defaultSize = 16
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBED_BATCH_SIZE"))
-	if raw == "" {
-		return defaultSize
-	}
-	size, err := strconv.Atoi(raw)
-	if err != nil || size < 1 {
-		return defaultSize
-	}
-	if size > 128 {
-		return 128
-	}
-	return size
-}
-
-func embedBatchConcurrency() int {
-	const defaultConcurrency = 4
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBED_BATCH_CONCURRENCY"))
-	if raw == "" {
-		return defaultConcurrency
-	}
-	concurrency, err := strconv.Atoi(raw)
-	if err != nil || concurrency < 1 {
-		return defaultConcurrency
-	}
-	if concurrency > 16 {
-		return 16
-	}
-	return concurrency
 }
 
 // ---------------------------------------------------------------------------

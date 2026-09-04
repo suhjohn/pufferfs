@@ -4,41 +4,28 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
+	"io"
 	"unicode/utf8"
 
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 const (
-	defaultLocalChunkStreamThreshold = 8 << 20
-	localChunkReadBlock              = 4 << 20
+	localChunkStreamThreshold = 8 << 20
+	localChunkReadBuffer      = 64 << 10
 )
-
-func localChunkStreamThreshold() int64 {
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_LOCAL_STREAM_THRESHOLD_BYTES"))
-	if raw == "" {
-		return defaultLocalChunkStreamThreshold
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 64<<10 {
-		return defaultLocalChunkStreamThreshold
-	}
-	return value
-}
 
 func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, change models.FileChange, emit func(map[string]any) error) error {
 	length := change.SourceLength
 	if length <= 0 {
 		length = change.Size
 	}
-	if length <= localChunkStreamThreshold() {
-		return nil
-	}
 	fileType := detectLocalFileType(change.Path)
-	pending := make([]byte, 0, localChunkReadBlock+textChunkChars)
+	target, overlap := textChunkChars, textOverlapChars
+	if isCodeFile(change.Path) {
+		target, overlap = codeChunkChars, codeOverlapChars
+	}
+	pending := make([]byte, 0, localChunkReadBuffer+target)
 	lineStart := 1
 	chunkIndex := 0
 	emitPiece := func(piece []byte) error {
@@ -58,10 +45,10 @@ func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, cha
 		return emit(chunk)
 	}
 	drain := func(final bool) error {
-		for len(pending) > textChunkChars || (final && len(pending) > 0) {
+		for len(pending) > target || (final && len(pending) > 0) {
 			end := len(pending)
-			if end > textChunkChars {
-				end = bestTextBoundary(string(pending[:textChunkChars]), 0, textChunkChars, textChunkChars/2)
+			if end > target {
+				end = bestTextBoundary(string(pending[:target]), 0, target, target/2)
 			}
 			if err := emitPiece(pending[:end]); err != nil {
 				return err
@@ -70,7 +57,7 @@ func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, cha
 				pending = pending[:0]
 				break
 			}
-			advance := end - textOverlapChars
+			advance := end - overlap
 			if advance <= 0 {
 				advance = end
 			}
@@ -78,27 +65,28 @@ func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, cha
 				advance++
 			}
 			lineStart += bytes.Count(pending[:advance], []byte{'\n'})
-			pending = append([]byte(nil), pending[advance:]...)
+			copy(pending, pending[advance:])
+			pending = pending[:len(pending)-advance]
 		}
 		return nil
 	}
-	for read := int64(0); read < length; {
-		block := int64(localChunkReadBlock)
-		if remaining := length - read; remaining < block {
-			block = remaining
-		}
-		data, err := p.server.s3.DownloadRange(ctx, key, change.SourceOffset+read, block)
-		if err != nil {
-			return fmt.Errorf("downloading %s range offset=%d length=%d: %w", key, change.SourceOffset+read, block, err)
-		}
-		if int64(len(data)) != block {
-			return fmt.Errorf("downloading %s range offset=%d: got %d bytes, want %d", key, change.SourceOffset+read, len(data), block)
-		}
-		pending = append(pending, data...)
+	body, err := p.server.s3.Open(ctx, key, change.SourceOffset, length)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", key, err)
+	}
+	defer body.Close()
+	buf := make([]byte, localChunkReadBuffer)
+	for {
+		n, readErr := body.Read(buf)
+		pending = append(pending, buf[:n]...)
 		if err := drain(false); err != nil {
 			return err
 		}
-		read += block
+		if readErr == io.EOF {
+			return drain(true)
+		}
+		if readErr != nil {
+			return fmt.Errorf("reading %s: %w", key, readErr)
+		}
 	}
-	return drain(true)
 }

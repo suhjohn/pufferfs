@@ -8,17 +8,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
 const (
-	StageChunk   = "chunk"
-	StageEmbed   = "embed"
-	StageIndex   = "index"
-	StageCommit  = "commit"
-	StageCleanup = "cleanup"
+	StageChunk  = "chunk"
+	StageEmbed  = "embed"
+	StageIndex  = "index"
+	StageCommit = "commit"
 )
 
 type JobMessage struct {
@@ -33,14 +33,11 @@ type JobMessage struct {
 	BaseGenerationSeq int64            `json:"base_generation_seq"`
 	Stage             string           `json:"stage"`
 	PayloadRef        string           `json:"payload_ref,omitempty"`
-	CleanupKeys       []string         `json:"cleanup_keys,omitempty"`
 	IndexNamespaces   []IndexNamespace `json:"index_namespaces,omitempty"`
 	ShardIndex        int              `json:"shard_index"`
 	TotalShards       int              `json:"total_shards"`
 	FilesInShard      int              `json:"files_in_shard,omitempty"`
 	DisableVector     bool             `json:"disable_vector,omitempty"`
-	Priority          int              `json:"priority,omitempty"`
-	EnqueuedAt        time.Time        `json:"enqueued_at"`
 }
 
 type IndexNamespace struct {
@@ -69,6 +66,8 @@ type NATSQueue struct {
 	nc             *nats.Conn
 	js             nats.JetStreamContext
 	consumerPrefix string
+	subMu          sync.Mutex
+	subs           map[string]*nats.Subscription
 }
 
 type NATSOption func(*natsQueueConfig)
@@ -96,7 +95,7 @@ func NewNATSQueue(url string, opts ...NATSOption) (*NATSQueue, error) {
 		nc.Close()
 		return nil, err
 	}
-	q := &NATSQueue{nc: nc, js: js, consumerPrefix: cfg.consumerPrefix}
+	q := &NATSQueue{nc: nc, js: js, consumerPrefix: cfg.consumerPrefix, subs: make(map[string]*nats.Subscription)}
 	if err := q.ensureTopology(cfg.consumerPrefix, cfg.replicas); err != nil {
 		nc.Close()
 		return nil, err
@@ -119,7 +118,7 @@ func WithReplicas(replicas int) NATSOption {
 }
 
 func (q *NATSQueue) ensureTopology(consumerPrefix string, replicas int) error {
-	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit, StageCleanup} {
+	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit} {
 		stream := streamName(stage)
 		subject := subjectForStage(stage)
 		streamConfig := nats.StreamConfig{
@@ -248,9 +247,6 @@ func normalizeQueueReplicas(n int) int {
 
 func (q *NATSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage) error {
 	for _, msg := range msgs {
-		if msg.EnqueuedAt.IsZero() {
-			msg.EnqueuedAt = time.Now().UTC()
-		}
 		msg.Stage = stage
 		data, err := json.Marshal(msg)
 		if err != nil {
@@ -274,10 +270,20 @@ func (q *NATSQueue) Pull(ctx context.Context, stage string, batchSize int, timeo
 	}
 	stream := streamName(stage)
 	consumer := consumerName(q.consumerPrefix, stage)
-	sub, err := q.js.PullSubscribe(subjectForStage(stage), consumer, nats.Bind(stream, consumer))
-	if err != nil {
-		return nil, err
+	q.subMu.Lock()
+	sub := q.subs[stage]
+	if sub == nil {
+		var err error
+		sub, err = q.js.PullSubscribe(subjectForStage(stage), consumer, nats.Bind(stream, consumer))
+		if err == nil {
+			q.subs[stage] = sub
+		}
+		if err != nil {
+			q.subMu.Unlock()
+			return nil, err
+		}
 	}
+	q.subMu.Unlock()
 	fetchCtx := ctx
 	cancel := func() {}
 	if timeout > 0 {

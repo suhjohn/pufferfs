@@ -348,7 +348,7 @@ Response `200`:
 
 ### `POST /roots/{id}/upload?path=<relpath>[&generation_id=<id>]`
 
-Upload a single source file's bytes (large/empty files). Requires `sync`/`write`
+Upload a single source file's bytes (normally a large file). Requires `sync`/`write`
 and write-ACL on the path. Body is the raw file. **Max 512 MiB.** With
 `generation_id`, stored as temporary transport at
 `syncs/<generationID>/sources/files/.capture-<captureID>/<path>`, using a unique
@@ -496,11 +496,11 @@ POST /roots/{id}/sync/{generation_id}/upload?kind=proof&name=content-proof.json
 POST /roots/{id}/sync/{generation_id}/upload?kind=state&name=state.json.gz
 ```
 
-Body is the raw artifact bytes (gzipped JSONL for manifests, gzipped JSON for
-state/proof). **Max 1024 MiB.** Returns `200` with the stored object key:
+Body is JSONL for manifests, JSON for proofs, and gzipped JSON for state.
+**Max 1024 MiB.** Returns `200` with the stored object key:
 
 ```json
-{ "ref": "syncs/<generation_id>/manifests/000000.jsonl" }
+{ "key": "syncs/<generation_id>/manifests/000000.jsonl" }
 ```
 
 ### `DELETE /roots/{id}/sync/{generation_id}`
@@ -550,10 +550,8 @@ every changed path. Request body is a `SyncRequest`:
   "base_generation_seq": 7,
   "change_refs": ["syncs/<generation>/manifests/000000.jsonl", "..."],
   "changes": [],
-  "state_ref": "syncs/<generation>/state/state.json.gz",
-  "simhash": "...",
-  "content_proof": { "root_hash": "...", "file_hashes": {}, "dir_hashes": {} },
-  "manifest_ref": "..."
+  "state_ref": "states/<root>/<generation>.json.gz",
+  "content_proof": { "root_hash": "...", "file_hashes": {}, "dir_hashes": {} }
 }
 ```
 
@@ -578,7 +576,7 @@ Rules:
 
 - `protocol_version` must equal the server's `SyncProtocolVersion` (`1`), else
   `400` with `{"error","protocol_version","required_version"}`.
-- Exactly one of `state` (inline map) or `state_ref` (object key) is required.
+- At least one of `state` (inline map) or `state_ref` (object key) is required.
   Inline state is gzipped and persisted by the server as a state ref.
 - `source_key` values for uploaded content should reference
   `syncs/<generation_id>/sources/files/.capture-<capture_id>/<path>` or
@@ -591,8 +589,7 @@ Rules:
 - `base_generation_id`/`seq` must match the root's current visible generation,
   otherwise a [sync conflict](#sync-conflicts) is returned.
 - `changes[].status` is one of `ADDED`, `MODIFIED`, `REMOVED`, `MOVED`,
-  `RENAMED`, `UNCHANGED` (also defined: `COPIED`, `MOVED_AND_MODIFIED`). For
-  moves/renames, `old_path` is required.
+  `RENAMED`, or `UNCHANGED`. For moves/renames, `old_path` is required.
 
 **Sync modes:**
 
@@ -808,7 +805,7 @@ Deletes return `409` while sync jobs are active and report
 ```json
 {
   "path": "string", "absolute_path": "string?",
-  "status": "ADDED|MODIFIED|REMOVED|MOVED|RENAMED|UNCHANGED|COPIED|MOVED_AND_MODIFIED",
+  "status": "ADDED|MODIFIED|REMOVED|MOVED|RENAMED|UNCHANGED",
   "old_path": "string?", "content_hash": "string", "size": 0,
   "source_key": "string?", "source_offset": 0, "source_length": 0
 }

@@ -87,9 +87,6 @@ func (q *SQSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage
 		if msg.JobID == "" {
 			return errors.New("queue job_id is required")
 		}
-		if msg.EnqueuedAt.IsZero() {
-			msg.EnqueuedAt = time.Now().UTC()
-		}
 		msg.Stage = stage
 		body, marshalErr := json.Marshal(msg)
 		if marshalErr != nil {
@@ -246,12 +243,9 @@ func sqsMessageGroupID(stage string, msg JobMessage) string {
 	if stage == StageCommit {
 		return sqsStableID(msg.OrgID, msg.RootID, stage)
 	}
-	if stage == StageCleanup {
-		return sqsStableID(msg.OrgID, msg.RootID, msg.GenerationID, stage, msg.JobID)
-	}
 	return sqsStableID(msg.OrgID, msg.RootID, msg.GenerationID, stage, strconv.Itoa(msg.ShardIndex))
 }
 
 func allStages() []string {
-	return []string{StageChunk, StageEmbed, StageIndex, StageCommit, StageCleanup}
+	return []string{StageChunk, StageEmbed, StageIndex, StageCommit}
 }

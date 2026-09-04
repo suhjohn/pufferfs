@@ -2,11 +2,7 @@
 package diff
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"io"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -14,75 +10,9 @@ import (
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
-// Scan walks a directory and builds the current filesystem state.
-func Scan(rootDir string, matcher *ignore.Matcher) (map[string]models.FileState, error) {
-	state := make(map[string]models.FileState)
-	rootDir = filepath.Clean(rootDir)
-
-	err := filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		relPath, err := filepath.Rel(rootDir, path)
-		if err != nil {
-			return err
-		}
-		if relPath == "." {
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
-
-		if matcher.ShouldIgnore(relPath, d.IsDir()) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", relPath, err)
-		}
-
-		hash, err := hashFile(path)
-		if err != nil {
-			return fmt.Errorf("hash %s: %w", relPath, err)
-		}
-
-		state[relPath] = models.FileState{
-			Size:        info.Size(),
-			ContentHash: hash,
-			Mtime:       info.ModTime().UnixNano(),
-		}
-		return nil
-	})
-
-	return state, err
-}
-
 // Compute produces a DiffResult between previous and current filesystem states.
 func Compute(prev, curr map[string]models.FileState) models.DiffResult {
 	result := models.DiffResult{}
-
-	// Index current files by hash for move detection
-	currByHash := make(map[string][]string)
-	for path, st := range curr {
-		currByHash[st.ContentHash] = append(currByHash[st.ContentHash], path)
-	}
-
-	// Index previous files by hash
-	prevByHash := make(map[string][]string)
-	for path, st := range prev {
-		prevByHash[st.ContentHash] = append(prevByHash[st.ContentHash], path)
-	}
-
-	// Track which paths are accounted for
-	matched := make(map[string]bool)
 
 	// Pass 1: find unchanged and modified files (same path exists in both)
 	for path, currSt := range curr {
@@ -104,82 +34,67 @@ func Compute(prev, curr map[string]models.FileState) models.DiffResult {
 				})
 				result.Stats.Modified++
 			}
-			matched[path] = true
 		}
 	}
 
-	// Pass 2: find added and moved files
 	removedPaths := make(map[string]models.FileState)
+	removedByHash := make(map[string][]string)
 	for path, st := range prev {
 		if _, ok := curr[path]; !ok {
 			removedPaths[path] = st
+			removedByHash[st.ContentHash] = append(removedByHash[st.ContentHash], path)
 		}
 	}
 
 	addedPaths := make(map[string]models.FileState)
 	for path, st := range curr {
-		if !matched[path] {
-			if _, ok := prev[path]; !ok {
-				addedPaths[path] = st
-			}
+		if _, ok := prev[path]; !ok {
+			addedPaths[path] = st
 		}
 	}
-
-	// Try to match removed→added by content hash (move/rename detection)
-	usedRemoved := make(map[string]bool)
-	usedAdded := make(map[string]bool)
 
 	for addedPath, addedSt := range addedPaths {
-		for removedPath, removedSt := range removedPaths {
-			if usedRemoved[removedPath] || usedAdded[addedPath] {
-				continue
-			}
-			if addedSt.ContentHash == removedSt.ContentHash {
-				status := classifyMove(removedPath, addedPath)
-				result.Changes = append(result.Changes, models.FileChange{
-					Path:        addedPath,
-					Status:      status,
-					OldPath:     removedPath,
-					ContentHash: addedSt.ContentHash,
-					Size:        addedSt.Size,
-				})
-				switch status {
-				case models.StatusMoved, models.StatusMovedAndModified:
-					result.Stats.Moved++
-				case models.StatusRenamed:
-					result.Stats.Renamed++
-				}
-				usedRemoved[removedPath] = true
-				usedAdded[addedPath] = true
-				break
-			}
+		paths := removedByHash[addedSt.ContentHash]
+		if len(paths) == 0 {
+			continue
+		}
+		removedPath := paths[len(paths)-1]
+		removedByHash[addedSt.ContentHash] = paths[:len(paths)-1]
+		delete(removedPaths, removedPath)
+		delete(addedPaths, addedPath)
+		status := classifyMove(removedPath, addedPath)
+		result.Changes = append(result.Changes, models.FileChange{
+			Path:        addedPath,
+			Status:      status,
+			OldPath:     removedPath,
+			ContentHash: addedSt.ContentHash,
+			Size:        addedSt.Size,
+		})
+		if status == models.StatusMoved {
+			result.Stats.Moved++
+		} else {
+			result.Stats.Renamed++
 		}
 	}
 
-	// Remaining removed files
 	for path, st := range removedPaths {
-		if !usedRemoved[path] {
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        path,
-				Status:      models.StatusRemoved,
-				ContentHash: st.ContentHash,
-				Size:        st.Size,
-			})
-			result.Stats.Removed++
-		}
+		result.Changes = append(result.Changes, models.FileChange{
+			Path:        path,
+			Status:      models.StatusRemoved,
+			ContentHash: st.ContentHash,
+			Size:        st.Size,
+		})
+		result.Stats.Removed++
 	}
 
-	// Remaining added files
 	for path, st := range addedPaths {
-		if !usedAdded[path] {
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        path,
-				Status:      models.StatusAdded,
-				ContentHash: st.ContentHash,
-				Size:        st.Size,
-			})
-			result.Stats.Added++
-		}
+		result.Changes = append(result.Changes, models.FileChange{
+			Path:        path,
+			Status:      models.StatusAdded,
+			ContentHash: st.ContentHash,
+			Size:        st.Size,
+		})
+		result.Stats.Added++
 	}
 
 	return result
@@ -196,21 +111,6 @@ func classifyMove(oldPath, newPath string) models.FileChangeStatus {
 		return models.StatusRenamed
 	}
 	return models.StatusMoved
-}
-
-// hashFile computes the SHA-256 hex digest of a file.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // DetectSecrets returns paths that match secret filename patterns.

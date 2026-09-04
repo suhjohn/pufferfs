@@ -108,38 +108,35 @@ func BuildTreeWithStateCache(rootDir string, matcher *ignore.Matcher, stateCache
 
 	// Parallel file hashing
 	workers := runtime.NumCPU()
-	if workers > 16 {
-		workers = 16
-	}
-	if workers < 1 {
-		workers = 1
-	}
+	workers = min(max(workers, 1), 16, len(files))
 
 	type hashResult struct {
-		index int
-		hash  string
-		err   error
+		hash string
+		err  error
 	}
 
 	results := make([]hashResult, len(files))
+	jobs := make(chan int)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, workers)
-
-	for i, f := range files {
+	for range workers {
 		wg.Add(1)
-		go func(idx int, entry fileEntry) {
+		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			if cached, ok := stateCache[entry.relPath]; ok && cached.Size == entry.size && cached.Mtime == entry.mtime && cached.ContentHash != "" {
-				results[idx] = hashResult{index: idx, hash: cached.ContentHash}
-				return
+			for idx := range jobs {
+				entry := files[idx]
+				if cached, ok := stateCache[entry.relPath]; ok && cached.Size == entry.size && cached.Mtime == entry.mtime && cached.ContentHash != "" {
+					results[idx] = hashResult{hash: cached.ContentHash}
+					continue
+				}
+				hash, err := hashFile(entry.absPath)
+				results[idx] = hashResult{hash: hash, err: err}
 			}
-			hash, err := hashFile(entry.absPath)
-			results[idx] = hashResult{index: idx, hash: hash, err: err}
-		}(i, f)
+		}()
 	}
+	for i := range files {
+		jobs <- i
+	}
+	close(jobs)
 	wg.Wait()
 
 	// Insert file nodes into tree
@@ -412,87 +409,6 @@ func extractState(node *Node, prefix string, state map[string]models.FileState) 
 			childPath = prefix + "/" + name
 		}
 		extractState(child, childPath, state)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SimHash — locality-sensitive hash for finding similar trees
-// ---------------------------------------------------------------------------
-
-// SimHash computes a 256-bit SimHash from the file content hashes in the tree.
-// Similar trees produce similar SimHashes (small Hamming distance).
-// This is used to find existing indexes to reuse within an org.
-func (t *Tree) SimHash() [32]byte {
-	// Collect all file hashes
-	var hashes []string
-	collectFileHashes(t.Root, &hashes)
-
-	// SimHash: for each bit position, count +1 for set bits, -1 for unset bits
-	var counts [256]int
-	for _, hashStr := range hashes {
-		// Parse the hex hash (skip "sha256:" prefix)
-		hexStr := strings.TrimPrefix(hashStr, "sha256:")
-		hashBytes, err := hex.DecodeString(hexStr)
-		if err != nil {
-			continue
-		}
-		for i, b := range hashBytes {
-			for bit := 0; bit < 8; bit++ {
-				if i*8+bit >= 256 {
-					break
-				}
-				if b&(1<<uint(7-bit)) != 0 {
-					counts[i*8+bit]++
-				} else {
-					counts[i*8+bit]--
-				}
-			}
-		}
-	}
-
-	// Threshold: majority vote
-	var result [32]byte
-	for i := 0; i < 256; i++ {
-		if counts[i] > 0 {
-			result[i/8] |= 1 << uint(7-i%8)
-		}
-	}
-	return result
-}
-
-// SimHashHex returns the SimHash as a hex string.
-func (t *Tree) SimHashHex() string {
-	h := t.SimHash()
-	return hex.EncodeToString(h[:])
-}
-
-// HammingDistance computes the Hamming distance between two SimHashes.
-func HammingDistance(a, b [32]byte) int {
-	dist := 0
-	for i := 0; i < 32; i++ {
-		xor := a[i] ^ b[i]
-		for xor != 0 {
-			dist += int(xor & 1)
-			xor >>= 1
-		}
-	}
-	return dist
-}
-
-// SimHashSimilarity returns a similarity score [0, 1] between two SimHashes.
-// 1.0 = identical, 0.0 = completely different.
-func SimHashSimilarity(a, b [32]byte) float64 {
-	d := HammingDistance(a, b)
-	return 1.0 - float64(d)/256.0
-}
-
-func collectFileHashes(node *Node, hashes *[]string) {
-	if !node.IsDir {
-		*hashes = append(*hashes, node.Hash)
-		return
-	}
-	for _, child := range node.Children {
-		collectFileHashes(child, hashes)
 	}
 }
 

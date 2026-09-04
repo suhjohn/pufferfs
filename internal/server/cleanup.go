@@ -1,22 +1,21 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
-	"log"
 	"os"
-	"strconv"
 	"strings"
 
-	"github.com/google/uuid"
-	"github.com/pufferfs/pufferfs/internal/queue"
+	"github.com/jackc/pgx/v5"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
-const syncStageCleanup = queue.StageCleanup
+func isObjectNotFound(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "not found") || strings.Contains(msg, "status code: 404")
+}
 
 func cleanupSyncArtifactsEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS"))) {
@@ -25,87 +24,6 @@ func cleanupSyncArtifactsEnabled() bool {
 	default:
 		return true
 	}
-}
-
-func cleanupDeleteBatchSize() int {
-	const defaultBatchSize = 1000
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_CLEANUP_BATCH_SIZE"))
-	if raw == "" {
-		return defaultBatchSize
-	}
-	size, err := strconv.Atoi(raw)
-	if err != nil || size < 1 {
-		return defaultBatchSize
-	}
-	if size > 1000 {
-		return 1000
-	}
-	return size
-}
-
-func cleanupMessageMaxBytes() int {
-	const defaultBytes = 200 << 10
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_CLEANUP_MESSAGE_MAX_BYTES"))
-	if raw == "" {
-		return defaultBytes
-	}
-	size, err := strconv.Atoi(raw)
-	if err != nil || size < 1024 {
-		return defaultBytes
-	}
-	if size > 240<<10 {
-		return 240 << 10
-	}
-	return size
-}
-
-func enqueueCleanupBatches(ctx context.Context, q queue.Queue, base queue.JobMessage, keys []string) error {
-	if !cleanupSyncArtifactsEnabled() {
-		return nil
-	}
-	keys = cleanupDeletableKeys(keys)
-	if len(keys) == 0 {
-		return nil
-	}
-	batchSize := cleanupDeleteBatchSize()
-	maxBytes := cleanupMessageMaxBytes()
-	msgs := make([]queue.JobMessage, 0, (len(keys)+batchSize-1)/batchSize)
-	for start := 0; start < len(keys); {
-		msg := queue.JobMessage{
-			JobID:             fmt.Sprintf("cleanup-%s-%s", base.GenerationID, uuid.NewString()),
-			SyncJobID:         base.SyncJobID,
-			UserID:            base.UserID,
-			OrgID:             base.OrgID,
-			RootID:            base.RootID,
-			GenerationID:      base.GenerationID,
-			GenerationSeq:     base.GenerationSeq,
-			BaseGenerationID:  base.BaseGenerationID,
-			BaseGenerationSeq: base.BaseGenerationSeq,
-			Stage:             syncStageCleanup,
-			ShardIndex:        base.ShardIndex,
-			TotalShards:       base.TotalShards,
-			Priority:          base.Priority,
-		}
-		baseJSON, _ := json.Marshal(msg)
-		bytesUsed := len(baseJSON) + len(`,"cleanup_keys":[]`)
-		end := start
-		for end < len(keys) && end-start < batchSize {
-			encodedKey, _ := json.Marshal(keys[end])
-			separator := 0
-			if end > start {
-				separator = 1
-			}
-			if end > start && bytesUsed+len(encodedKey)+separator > maxBytes {
-				break
-			}
-			bytesUsed += len(encodedKey) + separator
-			end++
-		}
-		msg.CleanupKeys = append([]string(nil), keys[start:end]...)
-		msgs = append(msgs, msg)
-		start = end
-	}
-	return q.Enqueue(ctx, syncStageCleanup, msgs...)
 }
 
 func cleanupDeletableKeys(keys []string) []string {
@@ -128,133 +46,59 @@ func cleanupDeletableKey(key string) bool {
 		strings.HasPrefix(key, "bundles/")
 }
 
-func cleanupShardKeys(msg queue.JobMessage) []string {
-	keys := append([]string(nil), msg.CleanupKeys...)
-	if msg.PayloadRef != "" {
-		keys = append(keys, msg.PayloadRef)
-	}
-	keys = keepGenerationManifestRefs(keys, msg.GenerationID)
-	return cleanupDeletableKeys(keys)
-}
-
-func keepGenerationManifestRefs(keys []string, generationID string) []string {
-	if generationID == "" {
-		return keys
-	}
-	prefix := fmt.Sprintf("syncs/%s/manifests/", generationID)
-	out := keys[:0]
-	for _, key := range keys {
-		if strings.HasPrefix(key, prefix) {
-			continue
-		}
-		out = append(out, key)
-	}
-	return out
-}
-
-func cleanupGenerationKeys(req *models.SyncRequest, msg queue.JobMessage) []string {
-	keys := []string{syncRequestKey(msg.GenerationID)}
-	for i := 0; i < msg.TotalShards; i++ {
-		keys = append(keys, syncShardDoneKey(msg.GenerationID, i))
-	}
-	if req != nil {
-		if req.ManifestRef != "" {
-			keys = append(keys, req.ManifestRef)
-		}
-		if req.ContentProofRef != "" {
-			keys = append(keys, req.ContentProofRef)
-		}
-		keys = append(keys, req.ChangeRefs...)
-		for _, change := range req.Changes {
-			if change.Status != models.StatusAdded && change.Status != models.StatusModified {
-				continue
-			}
-			if change.SourceKey != "" {
-				keys = append(keys, change.SourceKey)
-				continue
-			}
-			keys = append(keys, fmt.Sprintf("files/%s/%s", msg.RootID, change.Path))
-		}
-	}
-	return cleanupDeletableKeys(keys)
-}
-
-func cleanupGenerationKeysWithChangeRefSources(ctx context.Context, s3 objectStore, req *models.SyncRequest, msg queue.JobMessage) ([]string, error) {
-	keys := cleanupGenerationKeys(req, msg)
-	if req == nil || s3 == nil || len(req.ChangeRefs) == 0 {
-		return keys, nil
-	}
-	for _, ref := range req.ChangeRefs {
-		if ref == "" {
-			continue
-		}
-		sourceKeys, err := cleanupSourceKeysFromChangeRef(ctx, s3, msg.RootID, ref)
-		if err != nil {
-			if isObjectNotFound(err) {
-				continue
-			}
-			return nil, err
-		}
-		keys = append(keys, sourceKeys...)
-	}
-	return cleanupDeletableKeys(keys), nil
-}
-
-func cleanupSourceKeysFromChangeRef(ctx context.Context, s3 objectStore, rootID, ref string) ([]string, error) {
-	data, err := s3.Download(ctx, ref)
-	if err != nil {
-		return nil, fmt.Errorf("downloading cleanup change ref %s: %w", ref, err)
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	var keys []string
-	for {
-		var change models.FileChange
-		if err := dec.Decode(&change); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("parsing cleanup change ref %s: %w", ref, err)
-		}
-		if change.Status != models.StatusAdded && change.Status != models.StatusModified {
-			continue
-		}
-		if change.SourceKey != "" {
-			keys = append(keys, change.SourceKey)
-			continue
-		}
-		if change.Path != "" {
-			keys = append(keys, fmt.Sprintf("files/%s/%s", rootID, change.Path))
-		}
-	}
-	return cleanupDeletableKeys(keys), nil
-}
-
-func (s *Server) cleanupTerminalSyncObjects(ctx context.Context, rootID, generationID string, req *models.SyncRequest) error {
+func (s *Server) cleanupTerminalSyncObjects(ctx context.Context, rootID, generationID string, req *models.SyncRequest, deleteState bool) error {
 	if s == nil || s.s3 == nil || generationID == "" || !cleanupSyncArtifactsEnabled() {
 		return nil
 	}
-	msg := queue.JobMessage{RootID: rootID, GenerationID: generationID}
-	keys, err := cleanupGenerationKeysWithChangeRefSources(ctx, s.s3, req, msg)
-	if err != nil {
-		return err
-	}
-
 	prefix := syncGenerationPrefix(generationID)
-	legacyKeys := make([]string, 0, len(keys))
-	for _, key := range keys {
-		if strings.HasPrefix(key, prefix) {
-			continue
+	var legacyKeys []string
+	addLegacy := func(key string) {
+		if !strings.HasPrefix(key, prefix) {
+			legacyKeys = append(legacyKeys, key)
 		}
-		legacyKeys = append(legacyKeys, key)
+	}
+	addSource := func(change models.FileChange) {
+		if change.Status != models.StatusAdded && change.Status != models.StatusModified {
+			return
+		}
+		key := change.SourceKey
+		if key == "" && change.Path != "" {
+			key = fmt.Sprintf("files/%s/%s", rootID, change.Path)
+		}
+		addLegacy(key)
+	}
+	if req != nil {
+		addLegacy(req.ContentProofRef)
+		for _, ref := range req.ChangeRefs {
+			addLegacy(ref)
+		}
+		for _, change := range req.Changes {
+			addSource(change)
+		}
+		for _, ref := range req.ChangeRefs {
+			if ref == "" {
+				continue
+			}
+			if err := eachJSONL(ctx, s.s3, ref, func(change models.FileChange) error {
+				addSource(change)
+				return nil
+			}); err != nil && !isObjectNotFound(err) {
+				return fmt.Errorf("reading cleanup change ref %s: %w", ref, err)
+			}
+		}
 	}
 
-	if _, err := s.s3.DeletePrefix(ctx, prefix); err != nil {
-		return fmt.Errorf("deleting sync generation prefix %s: %w", prefix, err)
+	legacyKeys = cleanupDeletableKeys(legacyKeys)
+	if deleteState {
+		legacyKeys = append(legacyKeys, stateObjectKey(rootID, generationID))
 	}
 	if len(legacyKeys) > 0 {
-		if err := s.s3.DeleteMany(ctx, cleanupDeletableKeys(legacyKeys)); err != nil {
+		if err := s.s3.DeleteMany(ctx, legacyKeys); err != nil {
 			return fmt.Errorf("deleting legacy sync source objects: %w", err)
 		}
+	}
+	if _, err := s.s3.DeletePrefix(ctx, prefix); err != nil {
+		return fmt.Errorf("deleting sync generation prefix %s: %w", prefix, err)
 	}
 	return nil
 }
@@ -274,80 +118,91 @@ func (s *Server) syncRequestForCleanup(ctx context.Context, generationID string)
 	return &req
 }
 
-func (d *SyncDispatcher) processCleanup(ctx context.Context, msg queue.JobMessage) error {
-	keys := cleanupDeletableKeys(msg.CleanupKeys)
-	if len(keys) == 0 {
+func (s *Server) cleanupFailedGeneration(ctx context.Context, orgID, rootID, generationID string, req *models.SyncRequest) (err error) {
+	if s == nil || s.db == nil || orgID == "" || rootID == "" || generationID == "" {
 		return nil
 	}
-	batchSize := cleanupDeleteBatchSize()
-	for start := 0; start < len(keys); start += batchSize {
-		end := start + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-		if err := d.server.s3.DeleteMany(ctx, keys[start:end]); err != nil {
-			return fmt.Errorf("deleting cleanup batch: %w", err)
-		}
-		log.Printf("cleanup deleted %d sync artifact objects generation_id=%s", end-start, msg.GenerationID)
-	}
-	return nil
-}
-
-func (s *Server) cleanupFailedGenerationRows(ctx context.Context, orgID, rootID, generationID string) error {
-	if s == nil || s.tp == nil || s.db == nil || orgID == "" || rootID == "" || generationID == "" {
-		return nil
-	}
-	namespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
+	status, err := s.db.GetSyncGenerationStatus(ctx, generationID)
 	if err != nil {
-		return fmt.Errorf("listing root index namespaces for failed generation cleanup: %w", err)
-	}
-	activeNamespaces := activeRootIndexNamespaces(namespaces)
-	closeFilter := []any{"valid_to_generation", "Eq", generationID}
-	reopenPatch := map[string]any{
-		"valid_to_generation":     "",
-		"valid_to_generation_seq": 0,
-	}
-	for _, ns := range activeNamespaces {
-		for pass := 0; pass < 100; pass++ {
-			rowsRemaining, _, err := s.tp.PatchByFilter(ns.Namespace, closeFilter, reopenPatch, true)
-			if err != nil {
-				return fmt.Errorf("reopening rows closed by failed generation %s in %s: %w", generationID, ns.Namespace, err)
-			}
-			if !rowsRemaining {
-				break
-			}
-			if pass == 99 {
-				return fmt.Errorf("reopening rows closed by failed generation %s in %s: rows remain after repeated patch passes", generationID, ns.Namespace)
-			}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
-
-		orphanFilter := []any{"generation_id", "Eq", generationID}
-		for pass := 0; pass < 100; pass++ {
-			rowsRemaining, err := s.tp.DeleteByFilter(ns.Namespace, orphanFilter, true)
-			if err != nil {
-				return fmt.Errorf("deleting failed generation rows %s in %s: %w", generationID, ns.Namespace, err)
-			}
-			if !rowsRemaining {
-				break
-			}
-			if pass == 99 {
-				return fmt.Errorf("deleting failed generation rows %s in %s: rows remain after repeated delete passes", generationID, ns.Namespace)
-			}
-		}
+		return fmt.Errorf("checking failed generation %s: %w", generationID, err)
 	}
-	return nil
-}
-
-func (s *Server) cleanupFailedGenerationRowsForRoot(ctx context.Context, orgID, rootID string) error {
-	if s == nil || s.db == nil || s.tp == nil {
+	if status != "failed" && status != "cleaning" {
 		return nil
 	}
-	generations, err := s.db.ListFailedSyncGenerations(ctx, orgID, rootID, 100)
+	if err := s.db.MarkSyncGenerationCleaning(ctx, generationID); err != nil {
+		return fmt.Errorf("claiming failed generation %s cleanup: %w", generationID, err)
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if markErr := s.db.MarkSyncGenerationCleanupPending(ctx, generationID); markErr != nil {
+			err = errors.Join(err, fmt.Errorf("preserving failed generation %s for cleanup retry: %w", generationID, markErr))
+		}
+	}()
+	if req == nil {
+		req = s.syncRequestForCleanup(ctx, generationID)
+	}
+	rowErr := func() error {
+		namespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
+		if err != nil {
+			return fmt.Errorf("listing root index namespaces for failed generation cleanup: %w", err)
+		}
+		activeNamespaces := activeRootIndexNamespaces(namespaces)
+		if len(activeNamespaces) > 0 && s.tp == nil {
+			return fmt.Errorf("cleaning failed generation %s: index client is unavailable", generationID)
+		}
+		closeFilter := []any{"valid_to_generation", "Eq", generationID}
+		reopenPatch := map[string]any{
+			"valid_to_generation":     "",
+			"valid_to_generation_seq": 0,
+		}
+		for _, ns := range activeNamespaces {
+			for pass := 0; pass < 100; pass++ {
+				rowsRemaining, _, err := s.tp.PatchByFilter(ns.Namespace, closeFilter, reopenPatch, true)
+				if err != nil {
+					return fmt.Errorf("reopening rows closed by failed generation %s in %s: %w", generationID, ns.Namespace, err)
+				}
+				if !rowsRemaining {
+					break
+				}
+				if pass == 99 {
+					return fmt.Errorf("reopening rows closed by failed generation %s in %s: rows remain after repeated patch passes", generationID, ns.Namespace)
+				}
+			}
+
+			orphanFilter := []any{"generation_id", "Eq", generationID}
+			for pass := 0; pass < 100; pass++ {
+				rowsRemaining, err := s.tp.DeleteByFilter(ns.Namespace, orphanFilter, true)
+				if err != nil {
+					return fmt.Errorf("deleting failed generation rows %s in %s: %w", generationID, ns.Namespace, err)
+				}
+				if !rowsRemaining {
+					break
+				}
+				if pass == 99 {
+					return fmt.Errorf("deleting failed generation rows %s in %s: rows remain after repeated delete passes", generationID, ns.Namespace)
+				}
+			}
+		}
+		return nil
+	}()
+	if err := errors.Join(rowErr, s.cleanupTerminalSyncObjects(ctx, rootID, generationID, req, true)); err != nil {
+		return err
+	}
+	return s.db.MarkSyncGenerationCleaned(ctx, generationID)
+}
+
+func (s *Server) cleanupFailedGenerations(ctx context.Context, orgID, rootID string) error {
+	ids, err := s.db.ListFailedSyncGenerationIDs(ctx, orgID, rootID)
 	if err != nil {
 		return err
 	}
-	for _, generation := range generations {
-		if err := s.cleanupFailedGenerationRows(ctx, generation.OrgID, generation.RootID, generation.ID); err != nil {
+	for _, id := range ids {
+		if err := s.cleanupFailedGeneration(ctx, orgID, rootID, id, s.syncRequestForCleanup(ctx, id)); err != nil {
 			return err
 		}
 	}

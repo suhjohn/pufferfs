@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/pufferfs/pufferfs/internal/queue"
 )
 
 // defaultEmbeddingModelVersion identifies the embedding model whose vectors are
@@ -23,9 +25,7 @@ type ModalClient struct {
 	chunkURL      string
 	embedURL      string
 	queryEmbedURL string
-	chunkShardURL string
 	embedShardURL string
-	indexShardURL string
 	modelVersion  string
 	httpClient    *http.Client
 }
@@ -36,9 +36,7 @@ func NewModalClient() *ModalClient {
 		chunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		embedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		queryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
-		chunkShardURL: os.Getenv("MODAL_CHUNK_SHARD_ENDPOINT"),
 		embedShardURL: os.Getenv("MODAL_EMBED_SHARD_ENDPOINT"),
-		indexShardURL: os.Getenv("MODAL_INDEX_SHARD_ENDPOINT"),
 		modelVersion:  embeddingModelVersion(),
 		httpClient:    &http.Client{Timeout: 900 * time.Second},
 	}
@@ -74,7 +72,6 @@ type ChunkFileRequest struct {
 // ChunkFileResponse is returned from Modal.
 type ChunkFileResponse struct {
 	Chunks []map[string]any `json:"chunks"`
-	Count  int              `json:"count"`
 }
 
 // EmbedChunksRequest is sent to the Modal embed endpoint.
@@ -85,7 +82,6 @@ type EmbedChunksRequest struct {
 // EmbedChunksResponse is returned from Modal.
 type EmbedChunksResponse struct {
 	Results []map[string]any `json:"results"`
-	Count   int              `json:"count"`
 }
 
 // EmbedQueryRequest is sent to the Modal query embed endpoint.
@@ -99,12 +95,11 @@ type EmbedQueryResponse struct {
 }
 
 type ModalShardRequest struct {
-	Job map[string]any `json:"job"`
+	Job queue.JobMessage `json:"job"`
 }
 
 type ModalShardResponse struct {
 	ResultRef string `json:"result_ref,omitempty"`
-	Count     int    `json:"count,omitempty"`
 }
 
 // ChunkFile calls the Modal chunking function.
@@ -139,38 +134,14 @@ func (m *ModalClient) EmbedQuery(text string) ([]float64, error) {
 	return resp.Embeddings[0], nil
 }
 
-func (m *ModalClient) HasChunkShardEndpoint() bool {
-	return strings.TrimSpace(m.chunkShardURL) != ""
-}
-
 func (m *ModalClient) HasEmbedShardEndpoint() bool {
 	return strings.TrimSpace(m.embedShardURL) != ""
 }
 
-func (m *ModalClient) HasIndexShardEndpoint() bool {
-	return strings.TrimSpace(m.indexShardURL) != ""
-}
-
-func (m *ModalClient) ChunkShard(job map[string]any) (*ModalShardResponse, error) {
-	var resp ModalShardResponse
-	if err := m.post(m.chunkShardURL, ModalShardRequest{Job: job}, &resp); err != nil {
-		return nil, fmt.Errorf("modal chunk shard: %w", err)
-	}
-	return &resp, nil
-}
-
-func (m *ModalClient) EmbedShard(job map[string]any) (*ModalShardResponse, error) {
+func (m *ModalClient) EmbedShard(job queue.JobMessage) (*ModalShardResponse, error) {
 	var resp ModalShardResponse
 	if err := m.post(m.embedShardURL, ModalShardRequest{Job: job}, &resp); err != nil {
 		return nil, fmt.Errorf("modal embed shard: %w", err)
-	}
-	return &resp, nil
-}
-
-func (m *ModalClient) IndexShard(job map[string]any) (*ModalShardResponse, error) {
-	var resp ModalShardResponse
-	if err := m.post(m.indexShardURL, ModalShardRequest{Job: job}, &resp); err != nil {
-		return nil, fmt.Errorf("modal index shard: %w", err)
 	}
 	return &resp, nil
 }

@@ -20,9 +20,7 @@ config:
   pufferfs:modalChunkEndpoint: "https://...chunk-file-endpoint.modal.run"
   pufferfs:modalEmbedEndpoint: "https://...embed-chunks-endpoint.modal.run"
   pufferfs:modalQueryEmbedEndpoint: "https://...embed-query-endpoint.modal.run"
-  pufferfs:modalChunkShardEndpoint: "https://...chunk-shard-endpoint.modal.run"
   pufferfs:modalEmbedShardEndpoint: "https://...embed-shard-endpoint.modal.run"
-  pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
 
   # CLI release manifest advertised at GET /cli/version.
   pufferfs:cliLatestVersion: "0.3.0"
@@ -69,5 +67,4 @@ config:
   pufferfs:worker-embedDesiredCount: 1
   pufferfs:worker-indexDesiredCount: 1
   pufferfs:worker-commitDesiredCount: 1
-  pufferfs:worker-cleanupDesiredCount: 1
   pufferfs:tpNamespaceShards: 4

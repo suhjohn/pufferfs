@@ -50,9 +50,8 @@ type capturedSource struct {
 }
 
 type captureBatch struct {
-	ManifestRef string
-	Files       map[string]capturedSource
-	Deferred    map[string]error
+	Files    map[string]capturedSource
+	Deferred map[string]error
 }
 
 type captureSyncInput struct {
@@ -217,11 +216,8 @@ func runCapturedSyncOnce(input captureSyncInput) (*syncCommandResult, error) {
 		BaseGenerationID:  syncInit.BaseGenerationID,
 		BaseGenerationSeq: syncInit.BaseGenerationSeq,
 		ChangeRefs:        metadataRefs.ChangeRefs,
-		ChangeCount:       changeCount,
 		StateRef:          metadataRefs.StateRef,
-		SimHash:           currentTree.SimHashHex(),
 		ContentProofRef:   metadataRefs.ContentProofRef,
-		ManifestRef:       batch.ManifestRef,
 	}
 
 	respBody, err := input.Client.post(fmt.Sprintf("/roots/%s/sync?async=true", input.RootID), syncReq)
@@ -431,11 +427,10 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 			return true
 		}
 		bundleName := fmt.Sprintf("%s-%06d", bundleID, bundleIndex)
-		order := bundleCandidates[0]
-		bundleData := append([]byte(nil), bundle.Bytes()...)
-		candidateIndexes := append([]int(nil), bundleCandidates...)
+		bundleData := bundle.Bytes()
+		candidateIndexes := bundleCandidates
 		bundleBytes := int64(len(bundleData))
-		if !uploads.Go(order, func() error {
+		if !uploads.Go(func() error {
 			key, err := uploadBundle(client, rootID, generationID, bundleName, bundleData, "application/octet-stream")
 			if err != nil {
 				return fmt.Errorf("uploading source bundle %s: %w", bundleName, err)
@@ -448,8 +443,8 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 		}) {
 			return false
 		}
-		bundle.Reset()
-		bundleCandidates = bundleCandidates[:0]
+		bundle = bytes.Buffer{}
+		bundleCandidates = nil
 		bundleIndex++
 		return true
 	}
@@ -458,7 +453,7 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 		localPath := filepath.Join(dir, filepath.FromSlash(candidate.Path))
 		startStandalone := func() bool {
 			candidateIndex := i
-			if !uploads.Go(i, func() error {
+			if !uploads.Go(func() error {
 				capture, err := captureStandaloneFile(client, rootID, generationID, candidate.Path, localPath)
 				if err != nil {
 					var changed *sourceChangedError
@@ -477,7 +472,7 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 			}
 			return true
 		}
-		if candidate.Size == 0 || candidate.Size > smallLimit {
+		if candidate.Size > min(smallLimit, maxBundleBytes) {
 			if !startStandalone() {
 				break
 			}
@@ -498,10 +493,15 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 				reportProgress(1, 0)
 				continue
 			}
-			uploads.Fail(i, fmt.Errorf("capturing %s: %w", candidate.Path, err))
+			uploads.Fail(fmt.Errorf("capturing %s: %w", candidate.Path, err))
 			break
 		}
-		if bundle.Len() > 0 && int64(bundle.Len()+len(data)) > maxBundleBytes {
+		if len(data) == 0 {
+			results[i] = captureFileResult{ready: true, capture: capture}
+			reportProgress(1, 0)
+			continue
+		}
+		if bundle.Len() > 0 && (len(bundleCandidates) == 128 || int64(bundle.Len()+len(data)) > maxBundleBytes) {
 			if !flushBundle() {
 				break
 			}
@@ -509,14 +509,14 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 		capture.SourceOffset = int64(bundle.Len())
 		capture.SourceLength = int64(len(data))
 		if _, err := bundle.Write(data); err != nil {
-			uploads.Fail(i, err)
+			uploads.Fail(err)
 			break
 		}
-		results[i] = captureFileResult{ready: true, bundle: true, capture: capture}
+		results[i] = captureFileResult{ready: true, capture: capture}
 		bundleCandidates = append(bundleCandidates, i)
 	}
-	if uploads.Err() == nil && !flushBundle() {
-		// The bounded group owns the error returned below.
+	if uploads.Err() == nil {
+		flushBundle()
 	}
 	if err := uploads.Wait(); err != nil {
 		return captureBatch{}, err
@@ -526,7 +526,6 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 		Files:    make(map[string]capturedSource),
 		Deferred: make(map[string]error),
 	}
-	manifest := make([]bundleManifestEntry, 0, len(candidates))
 	for i, result := range results {
 		if result.deferred != nil {
 			batch.Deferred[candidates[i].Path] = result.deferred
@@ -537,37 +536,12 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 		}
 		capture := result.capture
 		batch.Files[capture.Path] = capture
-		entry := bundleManifestEntry{
-			Path:        capture.Path,
-			ContentHash: capture.ContentHash,
-			Size:        capture.Size,
-			Offset:      capture.SourceOffset,
-			Length:      capture.SourceLength,
-		}
-		if result.bundle {
-			entry.BundleKey = capture.SourceKey
-		} else {
-			entry.ObjectKey = capture.SourceKey
-		}
-		manifest = append(manifest, entry)
-	}
-	if len(manifest) == 0 {
-		return batch, nil
-	}
-	manifestBytes, err := json.Marshal(manifest)
-	if err != nil {
-		return captureBatch{}, err
-	}
-	batch.ManifestRef, err = uploadBundle(client, rootID, generationID, bundleID+"-manifest", manifestBytes, "application/json")
-	if err != nil {
-		return captureBatch{}, fmt.Errorf("uploading source manifest: %w", err)
 	}
 	return batch, nil
 }
 
 type captureFileResult struct {
 	ready    bool
-	bundle   bool
 	capture  capturedSource
 	deferred error
 }
@@ -748,8 +722,9 @@ func capturedDiff(baseState, currentState map[string]models.FileState, selectPat
 
 func limitCapturedMoveReuse(result models.DiffResult, baseState, currentState map[string]models.FileState) models.DiffResult {
 	limited := models.DiffResult{Stats: result.Stats}
+	maxMoveBytes := moveReuseMaxBytes()
 	for _, change := range result.Changes {
-		if (change.Status != models.StatusMoved && change.Status != models.StatusRenamed) || change.Size <= moveReuseMaxBytes() {
+		if (change.Status != models.StatusMoved && change.Status != models.StatusRenamed) || change.Size <= maxMoveBytes {
 			limited.Changes = append(limited.Changes, change)
 			continue
 		}
@@ -787,6 +762,15 @@ func changesWithCapturedSources(root string, result models.DiffResult, captures 
 		changes[i].SourceOffset = capture.SourceOffset
 		changes[i].SourceLength = capture.SourceLength
 	}
+	sort.Slice(changes, func(i, j int) bool {
+		if changes[i].SourceKey != changes[j].SourceKey {
+			return changes[i].SourceKey < changes[j].SourceKey
+		}
+		if changes[i].SourceOffset != changes[j].SourceOffset {
+			return changes[i].SourceOffset < changes[j].SourceOffset
+		}
+		return changes[i].Path < changes[j].Path
+	})
 	return changes, nil
 }
 

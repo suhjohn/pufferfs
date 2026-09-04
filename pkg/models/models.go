@@ -191,14 +191,12 @@ type FileState struct {
 type FileChangeStatus string
 
 const (
-	StatusUnchanged        FileChangeStatus = "UNCHANGED"
-	StatusAdded            FileChangeStatus = "ADDED"
-	StatusRemoved          FileChangeStatus = "REMOVED"
-	StatusModified         FileChangeStatus = "MODIFIED"
-	StatusMoved            FileChangeStatus = "MOVED"
-	StatusRenamed          FileChangeStatus = "RENAMED"
-	StatusCopied           FileChangeStatus = "COPIED"
-	StatusMovedAndModified FileChangeStatus = "MOVED_AND_MODIFIED"
+	StatusUnchanged FileChangeStatus = "UNCHANGED"
+	StatusAdded     FileChangeStatus = "ADDED"
+	StatusRemoved   FileChangeStatus = "REMOVED"
+	StatusModified  FileChangeStatus = "MODIFIED"
+	StatusMoved     FileChangeStatus = "MOVED"
+	StatusRenamed   FileChangeStatus = "RENAMED"
 )
 
 // FileChange describes a single file's change between two states.
@@ -222,7 +220,6 @@ type DiffStats struct {
 	Modified  int `json:"modified"`
 	Moved     int `json:"moved"`
 	Renamed   int `json:"renamed"`
-	Copied    int `json:"copied"`
 }
 
 // DiffResult is the output of a directory diff.
@@ -289,13 +286,10 @@ type SyncRequest struct {
 	BaseGenerationSeq int64                `json:"base_generation_seq,omitempty"`
 	Changes           []FileChange         `json:"changes"`
 	ChangeRefs        []string             `json:"change_refs,omitempty"`
-	ChangeCount       int                  `json:"change_count,omitempty"`
 	State             map[string]FileState `json:"state,omitempty"`
 	StateRef          string               `json:"state_ref,omitempty"`
-	SimHash           string               `json:"simhash,omitempty"`
 	ContentProof      *ContentProofData    `json:"content_proof,omitempty"`
 	ContentProofRef   string               `json:"content_proof_ref,omitempty"`
-	ManifestRef       string               `json:"manifest_ref,omitempty"`
 	DisableVector     bool                 `json:"disable_vector,omitempty"`
 }
 

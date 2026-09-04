@@ -349,9 +349,9 @@ const logGroup = new aws.cloudwatch.LogGroup(name("logs"), {
 });
 
 // Each pipeline stage gets an independent FIFO queue so a wedged indexing
-// workload cannot consume chunk/embed/lesson capacity. Ordering is scoped to
-// one root by the application-provided MessageGroupId.
-const syncStages = ["chunk", "embed", "index", "commit", "cleanup"] as const;
+// workload cannot consume chunk/embed/lesson capacity. Data shards use
+// independent groups for concurrency; commits use one group per root.
+const syncStages = ["chunk", "embed", "index", "commit"] as const;
 const syncQueues = syncStages.map((stage) => {
   const dlq = new aws.sqs.Queue(name(`${stage}-dlq`), {
     name: `${name(`sync-${stage}-dlq`)}.fifo`,
@@ -361,7 +361,7 @@ const syncQueues = syncStages.map((stage) => {
   });
   // Commit-not-ready is normal while large roots finish their final shards;
   // retain those retries through the 30-minute watchdog window.
-  const maxReceiveCount = stage === "commit" ? 400 : stage === "cleanup" ? 35 : 5;
+  const maxReceiveCount = stage === "commit" ? 400 : 5;
   const queue = new aws.sqs.Queue(name(`${stage}-queue`), {
     name: `${name(`sync-${stage}`)}.fifo`,
     fifoQueue: true,
@@ -695,9 +695,7 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "MODAL_CHUNK_ENDPOINT", value: requireNonBlank("modalChunkEndpoint") },
   { name: "MODAL_EMBED_ENDPOINT", value: requireNonBlank("modalEmbedEndpoint") },
   { name: "MODAL_QUERY_EMBED_ENDPOINT", value: requireNonBlank("modalQueryEmbedEndpoint") },
-  { name: "MODAL_CHUNK_SHARD_ENDPOINT", value: requireNonBlank("modalChunkShardEndpoint") },
   { name: "MODAL_EMBED_SHARD_ENDPOINT", value: requireNonBlank("modalEmbedShardEndpoint") },
-  { name: "MODAL_INDEX_SHARD_ENDPOINT", value: requireNonBlank("modalIndexShardEndpoint") },
   { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
@@ -944,7 +942,6 @@ const workerDefaults: Record<string, number> = {
   embed: 8,
   index: 16,
   commit: 2,
-  cleanup: 4,
 };
 
 const workerServices = Object.entries(workerDefaults).map(([stage, defaultConcurrency]) => {

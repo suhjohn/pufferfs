@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -29,8 +30,8 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	defer q.Close()
 
 	store := newMemoryObjectStore()
-	modal := newFakeShardModal(t)
-	srv := NewWithStore(nil, store, modal, nil)
+	modal, tp := newFakeSyncServices(t)
+	srv := NewWithStore(nil, store, modal, tp)
 
 	initial := queue.JobMessage{
 		JobID:             "chunk-job",
@@ -42,14 +43,23 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 		BaseGenerationSeq: 1,
 		Stage:             queue.StageChunk,
 		PayloadRef:        "syncs/gen-1/inputs/shard-000000.jsonl",
-		ShardIndex:        0,
-		TotalShards:       1,
+		IndexNamespaces: []queue.IndexNamespace{{
+			Namespace:  "org-org-1-root-root-1",
+			ShardCount: 1,
+		}},
+		ShardIndex:    0,
+		TotalShards:   1,
+		FilesInShard:  1,
+		DisableVector: true,
 	}
 	if err := q.Enqueue(ctx, queue.StageChunk, initial); err != nil {
 		t.Fatalf("enqueue chunk: %v", err)
 	}
-	if err := store.Upload(ctx, initial.PayloadRef, []byte("{\"path\":\"a.txt\",\"status\":\"added\"}\n"), "application/x-ndjson"); err != nil {
+	if err := store.Upload(ctx, initial.PayloadRef, []byte("{\"path\":\"a.txt\",\"status\":\"ADDED\",\"content_hash\":\"hash-a\",\"size\":12,\"source_key\":\"files/root-1/a.txt\",\"source_length\":12}\n"), "application/x-ndjson"); err != nil {
 		t.Fatalf("upload input artifact: %v", err)
+	}
+	if err := store.Upload(ctx, "files/root-1/a.txt", []byte("hello world\n"), "text/plain"); err != nil {
+		t.Fatalf("upload source: %v", err)
 	}
 
 	chunkDispatcher := NewSyncDispatcher(srv, q, queue.StageChunk, 1)
@@ -61,31 +71,12 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 		t.Fatalf("ack chunk: %v", err)
 	}
 
-	embedMsg := pullOne(t, ctx, q, queue.StageEmbed)
-	if embedMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl" {
-		t.Fatalf("embed payload ref = %q", embedMsg.Job.PayloadRef)
-	}
-	if embedMsg.Job.FilesInShard != 1 {
-		t.Fatalf("embed files_in_shard = %d, want 1", embedMsg.Job.FilesInShard)
-	}
-	if err := store.Upload(ctx, embedMsg.Job.PayloadRef, []byte("chunks\n"), "application/x-ndjson"); err != nil {
-		t.Fatalf("upload chunk artifact: %v", err)
-	}
-	embedDispatcher := NewSyncDispatcher(srv, q, queue.StageEmbed, 1)
-	if err := embedDispatcher.Process(ctx, embedMsg.Job); err != nil {
-		t.Fatalf("process embed: %v", err)
-	}
-	_ = q.Ack(embedMsg)
-
 	indexMsg := pullOne(t, ctx, q, queue.StageIndex)
-	if indexMsg.Job.PayloadRef != "syncs/gen-1/index_rows/chunk-job-embed.jsonl" {
+	if indexMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl" {
 		t.Fatalf("index payload ref = %q", indexMsg.Job.PayloadRef)
 	}
 	if indexMsg.Job.FilesInShard != 1 {
 		t.Fatalf("index files_in_shard = %d, want 1", indexMsg.Job.FilesInShard)
-	}
-	if err := store.Upload(ctx, indexMsg.Job.PayloadRef, []byte("{\"op\":\"upsert\",\"row\":{\"file_path\":\"a.txt\"}}\n"), "application/x-ndjson"); err != nil {
-		t.Fatalf("upload index artifact: %v", err)
 	}
 	indexDispatcher := NewSyncDispatcher(srv, q, queue.StageIndex, 1)
 	if err := indexDispatcher.Process(ctx, indexMsg.Job); err != nil {
@@ -93,21 +84,9 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	}
 	_ = q.Ack(indexMsg)
 
-	if _, err := store.Download(ctx, syncShardDoneKey("gen-1", 0)); err != nil {
-		t.Fatalf("done marker not written: %v", err)
-	}
-	cleanupMsg := pullOne(t, ctx, q, queue.StageCleanup)
-	if got := cleanupMsg.Job.CleanupKeys; len(got) != 3 {
-		t.Fatalf("cleanup keys = %#v, want input/chunk/index artifacts", got)
-	}
-	cleanupDispatcher := NewSyncDispatcher(srv, q, queue.StageCleanup, 1)
-	if err := cleanupDispatcher.Process(ctx, cleanupMsg.Job); err != nil {
-		t.Fatalf("process cleanup: %v", err)
-	}
-	_ = q.Ack(cleanupMsg)
-	for _, key := range []string{initial.PayloadRef, embedMsg.Job.PayloadRef, indexMsg.Job.PayloadRef} {
-		if store.Has(key) {
-			t.Fatalf("cleanup left artifact %s", key)
+	for _, key := range []string{initial.PayloadRef, indexMsg.Job.PayloadRef} {
+		if !store.Has(key) {
+			t.Fatalf("artifact %s was deleted before terminal cleanup", key)
 		}
 	}
 	commitMsg := pullOne(t, ctx, q, queue.StageCommit)
@@ -116,36 +95,40 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	}
 }
 
-func TestCleanupDispatcherPreservesIndexedImageArtifacts(t *testing.T) {
+func TestTerminalCleanupPreservesCommittedArtifactsAndDeletesFailedState(t *testing.T) {
 	t.Setenv("PUFFERFS_CLEANUP_SYNC_ARTIFACTS", "true")
 	ctx := context.Background()
 	store := newMemoryObjectStore()
 	imageKey := "chunks/root-1/document.pdf.0.jpg"
+	stateKey := "states/root-1/gen-1.json.gz"
 	syncKey := "syncs/gen-1/chunks/job.jsonl"
-	if err := store.Upload(ctx, imageKey, []byte("image"), "image/jpeg"); err != nil {
-		t.Fatalf("upload image: %v", err)
-	}
-	if err := store.Upload(ctx, syncKey, []byte("artifact"), "application/x-ndjson"); err != nil {
-		t.Fatalf("upload artifact: %v", err)
+	for key, data := range map[string]string{imageKey: "image", stateKey: "state", syncKey: "artifact"} {
+		if err := store.Upload(ctx, key, []byte(data), "application/octet-stream"); err != nil {
+			t.Fatalf("upload %s: %v", key, err)
+		}
 	}
 	srv := NewWithStore(nil, store, &ModalClient{}, nil)
-	dispatcher := NewSyncDispatcher(srv, nil, queue.StageCleanup, 1)
-	err := dispatcher.Process(ctx, queue.JobMessage{
-		JobID:        "cleanup",
-		OrgID:        "org-1",
-		RootID:       "root-1",
-		GenerationID: "gen-1",
-		Stage:        queue.StageCleanup,
-		CleanupKeys:  []string{imageKey, syncKey},
-	})
-	if err != nil {
-		t.Fatalf("process cleanup: %v", err)
+	if err := srv.cleanupTerminalSyncObjects(ctx, "root-1", "gen-1", nil, false); err != nil {
+		t.Fatalf("terminal cleanup: %v", err)
 	}
 	if !store.Has(imageKey) {
 		t.Fatalf("cleanup deleted indexed image artifact %s", imageKey)
 	}
+	if !store.Has(stateKey) {
+		t.Fatalf("cleanup deleted committed state %s", stateKey)
+	}
 	if store.Has(syncKey) {
 		t.Fatalf("cleanup left sync artifact %s", syncKey)
+	}
+	failedStateKey := "states/root-1/gen-2.json.gz"
+	if err := store.Upload(ctx, failedStateKey, []byte("state"), "application/gzip"); err != nil {
+		t.Fatalf("upload failed state: %v", err)
+	}
+	if err := srv.cleanupTerminalSyncObjects(ctx, "root-1", "gen-2", nil, true); err != nil {
+		t.Fatalf("failed terminal cleanup: %v", err)
+	}
+	if store.Has(failedStateKey) {
+		t.Fatalf("cleanup left failed state %s", failedStateKey)
 	}
 }
 
@@ -161,45 +144,15 @@ func pullOne(t *testing.T, ctx context.Context, q queue.Queue, stage string) que
 	return msgs[0]
 }
 
-func newFakeShardModal(t *testing.T) *ModalClient {
+func newFakeSyncServices(t *testing.T) (*ModalClient, *TPClient) {
 	t.Helper()
 	mux := http.NewServeMux()
-	var serverURL string
-	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
-		job := decodeModalJob(t, r)
-		writeJSONResponse(t, w, map[string]any{"result_ref": fmt.Sprintf("syncs/%s/chunks/%s.jsonl", job["generation_id"], job["job_id"]), "count": 1})
-	})
-	mux.HandleFunc("/embed", func(w http.ResponseWriter, r *http.Request) {
-		job := decodeModalJob(t, r)
-		writeJSONResponse(t, w, map[string]any{"result_ref": fmt.Sprintf("syncs/%s/index_rows/%s.jsonl", job["generation_id"], job["job_id"]), "count": 1})
-	})
-	mux.HandleFunc("/index", func(w http.ResponseWriter, r *http.Request) {
-		_ = decodeModalJob(t, r)
-		writeJSONResponse(t, w, map[string]any{"count": 1})
+	mux.HandleFunc("/v2/namespaces/", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSONResponse(t, w, map[string]any{})
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	serverURL = srv.URL
-	return &ModalClient{
-		chunkShardURL: serverURL + "/chunk",
-		embedShardURL: serverURL + "/embed",
-		indexShardURL: serverURL + "/index",
-		httpClient:    srv.Client(),
-	}
-}
-
-func decodeModalJob(t *testing.T, r *http.Request) map[string]any {
-	t.Helper()
-	var payload struct {
-		Job map[string]any `json:"job"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		t.Fatalf("decoding modal request: %v", err)
-	}
-	if payload.Job["job_id"] == "" || payload.Job["stage"] == "" {
-		t.Fatalf("modal request missing job fields: %#v", payload.Job)
-	}
-	return payload.Job
+	return &ModalClient{}, NewTPClientWithURL("test", srv.URL)
 }
 
 func writeJSONResponse(t *testing.T, w http.ResponseWriter, value any) {
@@ -257,13 +210,6 @@ func (s *memoryObjectStore) UploadStream(_ context.Context, key string, body io.
 	return s.Upload(context.Background(), key, data, "")
 }
 
-func (s *memoryObjectStore) UploadCAS(ctx context.Context, key string, data []byte, contentType, _, _ string) (string, error) {
-	if err := s.Upload(ctx, key, data, contentType); err != nil {
-		return "", err
-	}
-	return "etag", nil
-}
-
 func (s *memoryObjectStore) Download(_ context.Context, key string) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -274,27 +220,19 @@ func (s *memoryObjectStore) Download(_ context.Context, key string) ([]byte, err
 	return append([]byte(nil), data...), nil
 }
 
-func (s *memoryObjectStore) DownloadWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	data, err := s.Download(ctx, key)
-	if err != nil {
-		return nil, "", err
-	}
-	return data, "etag", nil
-}
-
-func (s *memoryObjectStore) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+func (s *memoryObjectStore) Open(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
 	data, err := s.Download(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	if length <= 0 {
-		return data, nil
+	if length > 0 {
+		end := offset + length
+		if offset < 0 || end > int64(len(data)) {
+			return nil, fmt.Errorf("range %d-%d outside object %s length %d", offset, end, key, len(data))
+		}
+		data = data[offset:end]
 	}
-	end := offset + length
-	if offset < 0 || end > int64(len(data)) {
-		return nil, fmt.Errorf("range %d-%d outside object %s length %d", offset, end, key, len(data))
-	}
-	return append([]byte(nil), data[offset:end]...), nil
+	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
 func (s *memoryObjectStore) DeleteMany(_ context.Context, keys []string) error {

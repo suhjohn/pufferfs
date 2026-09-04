@@ -184,8 +184,8 @@ What to expect:
 - This is generic regular-file handling and does not require copying the root to
   a local snapshot directory. It does not claim an instantaneous filesystem-wide
   snapshot when writers remain active.
-- Small files are packed into bundle objects; large and empty files are
-  uploaded individually.
+- Small non-empty files are packed into bundle objects, large files are
+  uploaded individually, and empty files need no source upload.
 - With `--root <path>` and no subset flags, the CLI syncs that folder as the
   full root. If `--name` is omitted, the root name defaults to the directory
   basename.

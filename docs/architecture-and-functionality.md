@@ -13,13 +13,12 @@ hybrid text/vector retrieval. The system is split into:
   supervision, and direct-install upgrades.
 - A Go API server that owns authentication, tenancy, root metadata, sync
   orchestration, query proxying, billing, and administrative provisioning.
-- Optional Go worker processes that consume queued sync stages from NATS
-  JetStream.
-- Python Modal functions that chunk files, embed chunks and queries, and can
-  execute full shard-level chunk/embed/index work.
+- Optional Go worker processes that consume queued sync stages from SQS or
+  NATS JetStream.
+- Python Modal functions that convert rich files and embed chunks and queries.
 - Turbopuffer namespaces for BM25/vector/hybrid search.
 - S3-compatible object storage for temporary source transport objects, durable
-  root state, sync artifacts, page images, and queue artifacts.
+  root state, sync artifacts, and page images.
 - PostgreSQL for control-plane state plus small durable caches: orgs, users,
   API keys, roots, ACLs, sync jobs/generations, root state refs, embedding
   cache, content proofs, and subscriptions.
@@ -30,7 +29,7 @@ hybrid text/vector retrieval. The system is split into:
 
 - `cmd/pufferfs`: CLI entrypoint and commands.
 - `cmd/server`: HTTP API server wiring.
-- `cmd/worker`: NATS-backed sync stage worker.
+- `cmd/worker`: SQS/NATS-backed sync stage worker.
 - `cmd/runtime`: container runtime switch that execs server or worker.
 - `internal/server`: API handlers, DB access, sync pipeline, dispatchers,
   Turbopuffer client, Modal client, billing, cleanup, query helpers, local
@@ -40,7 +39,7 @@ hybrid text/vector retrieval. The system is split into:
 - `internal/config`: TOML/environment configuration loading.
 - `internal/diff`, `internal/merkle`, `internal/ignore`: filesystem scanning,
   hashing, diffing, content proofs, and ignore handling.
-- `internal/queue`: NATS JetStream queue abstraction.
+- `internal/queue`: SQS FIFO and NATS JetStream queue backends.
 - `internal/storage`: S3-compatible object storage client.
 - `pkg/models`: shared Go request/response/domain models.
 - `modal`: Modal app, file chunkers, and Python models.
@@ -94,7 +93,7 @@ environment variables such as `PUFFERFS_SERVER_URL`, `PUFFERFS_API_KEY`,
 ### API Server
 
 `cmd/server` loads config, opens Postgres with migrations, creates S3/Modal/
-Turbopuffer clients, optionally attaches a NATS queue, configures optional
+Turbopuffer clients, optionally attaches a durable queue, configures optional
 Stripe billing, and exposes HTTP routes. Normal routes accept either JWT
 session credentials or tenant API keys. `/admin/*` routes use a separate
 platform admin key when configured.
@@ -121,12 +120,11 @@ Important API surfaces:
 
 ### Workers
 
-`cmd/worker` runs one stage at a time: `chunk`, `embed`, `index`, `commit`, or
-`cleanup`. It connects to the same database/storage/Modal/Turbopuffer
-dependencies as the server plus NATS JetStream. Workers pull batches, process
+`cmd/worker` runs one stage at a time: `chunk`, `embed`, `index`, or `commit`.
+It connects to the same database/storage/Modal/Turbopuffer dependencies as the
+server plus the selected queue backend. Workers pull batches, process
 jobs concurrently, heartbeat long jobs, retry with backoff, mark failed
-generations/jobs after max attempts, and skip work for generations already
-failed.
+generations/jobs after max attempts, and skip work for terminal generations.
 
 ### Container Runtime
 
@@ -140,7 +138,7 @@ The control plane is PostgreSQL:
 
 - `organizations`, `users`, `org_members`, `api_keys`.
 - `roots`: logical sync/access unit with org, scope, owner, source path,
-  simhash, visible generation, and visible generation sequence.
+  visible generation, and visible generation sequence.
 - `root_index_namespaces`: physical Turbopuffer namespace shards per root.
 - `root_states`: root file-state JSON or an object-storage `state_ref`.
 - `sync_jobs`: user-visible sync lifecycle/progress.
@@ -160,29 +158,27 @@ ACLs, API keys, org members, and sync jobs.
 Object storage carries the high-volume data plane:
 
 - `syncs/<generationID>/sources/files/.capture-<captureID>/<path>`:
-  generation-scoped standalone source captures for large or empty files. Each
+  generation-scoped standalone source captures for large files. Each
   request gets a unique capture ID so a retried request cannot overwrite bytes
   accepted from another attempt. Legacy generation-scoped keys without a
   capture ID are still accepted when finalizing older clients.
 - `syncs/<generationID>/sources/bundles/<bundleID>`: generation-scoped packed
-  small-file source transport bundles and source manifests.
+  small-file source transport bundles.
 - `files/<rootID>/<path>` and `bundles/<rootID>/<bundleID>`: legacy
   root-scoped source transport accepted for older clients.
-- `states/<rootID>/<generationID>.json.gz`: compressed root state snapshots
-  written by the server when a sync request carries inline state instead of a
-  state ref.
+- `states/<rootID>/<generationID>.json.gz`: durable compressed root state
+  snapshots uploaded by current clients or written from inline state.
 - `syncs/<generationID>/manifests/*.jsonl`: manifest shards uploaded by the
   client during the manifest-session flow.
 - `syncs/<generationID>/proofs/content-proof.json`: generation-scoped content
   proof artifact.
-- `syncs/<generationID>/state/state.json.gz`: generation-scoped compressed state.
+- `syncs/<generationID>/state/state.json.gz`: legacy generation-scoped state,
+  copied to the durable state key before processing.
 - `syncs/<generationID>/request.json`: queued sync request payload.
 - `syncs/<generationID>/inputs/*.jsonl`: file-change shards (derived from
   manifests or inline changes).
 - `syncs/<generationID>/chunks/*.jsonl`: chunk-stage artifacts.
 - `syncs/<generationID>/index_rows/*.jsonl`: embed-stage/index-row artifacts.
-- `syncs/<generationID>/queues/*.queue.json`: in-process object-queue state.
-- `syncs/<generationID>/done/*.done`: queued shard completion markers.
 - `chunks/<rootID>/...`: rendered document page images and indexed image
   artifacts.
 
@@ -198,7 +194,7 @@ built-in ignores, `.gitignore`, `.tpfsignore`, and `~/.tpfs/.tpfsignore`.
 Metadata can prove that a file still matches the committed local cache, but is
 never treated as the identity of uncached content. Files that need capture are
 read or streamed once; the SHA-256, size, source ranges, final flat state,
-Merkle tree, SimHash, and content proof are then derived from the bytes that
+Merkle tree, and content proof are then derived from the bytes that
 were actually accepted for that generation.
 
 This is a captured-version sync, not an instantaneous filesystem snapshot. A
@@ -214,9 +210,8 @@ previously committed version remains visible. Replacing the path does not
 invalidate bytes already available through the open descriptor, but does mark
 the path dirty. This applies to all regular files, independent of file type.
 
-The model defines statuses for added, removed, modified, moved, renamed,
-copied, moved-and-modified, and unchanged files. The current CLI diff paths
-actively produce added, removed, modified, moved, renamed, and unchanged.
+The model and CLI use added, removed, modified, moved, renamed, and unchanged
+file statuses.
 Move/rename detection matches removed and added files by content hash; large
 moved files can be treated more conservatively via
 `PUFFERFS_MOVE_REUSE_MAX_BYTES`.
@@ -228,13 +223,15 @@ unchanged:
 
 - Small non-empty files are concatenated into generation-scoped bundle objects up to
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
-- Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` and empty files are
-  uploaded as generation-scoped standalone objects.
+- Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` are uploaded as
+  generation-scoped standalone objects. Empty files need no source upload.
 - Standalone source uploads, completed source bundles, and independent sync metadata uploads use a bounded
   worker pool controlled by `PUFFERFS_UPLOAD_CONCURRENCY` (default 4, max 16).
-  Bundle construction stays serial and each bundle is capped at 32 MiB to keep
-  client memory bounded; completed bundle requests can overlap one another and
-  standalone files.
+  Bundle construction stays serial. Each bundle is capped at 128 files and
+  15 MiB, source references are grouped by bundle, and the server preserves
+  bundle boundaries when forming work shards. A worker therefore downloads a
+  packed source object once. Completed bundle requests can overlap one another
+  and standalone files.
 - Replayable upload requests are retried up to three times for transport
   failures, `408`, `429`, and `5xx` responses. Buffered bundle retries replay
   the same bytes. Standalone retries reopen the HTTP request over the same
@@ -243,8 +240,8 @@ unchanged:
   authoritative.
 - Each file change carries `source_key`, `source_offset`, and `source_length`
   so server/Modal can read exact bytes.
-- The complete root state is gzip-compressed and uploaded through the bundle
-  endpoint as a `state_ref`.
+- The complete root state is gzip-compressed and streamed to its durable
+  generation state object as a `state_ref`.
 - Paths observed changing during capture are persisted in the local root cache
   and forcibly recaptured on the next sync. Follow mode schedules these
   reconciliation passes at least 30 seconds apart, even if a writer never
@@ -264,7 +261,7 @@ For large trees, the CLI uses the manifest-session flow:
 1. Call `POST /roots/{id}/sync/init` to create a sync generation and obtain a
    `generation_id` and `manifest_prefix`.
 2. Capture and upload candidate source bytes. Build the final state, Merkle
-   tree, SimHash, and content proof from the successful captures.
+   tree, and content proof from the successful captures.
 3. Upload file-change manifest shards (JSONL) under the generation's artifact
    namespace via `POST /roots/{id}/sync/{generation_id}/upload`.
 4. Upload the content proof and compressed state via the same artifact endpoint.
@@ -297,9 +294,9 @@ snapshot does not change until the generation commits.
 
 There are two execution modes:
 
-- Without NATS, the server runs the object-storage queue pipeline in-process.
-- With NATS configured, the server writes request/shard artifacts and enqueues
-  chunk jobs; dedicated workers advance chunk, embed, index, commit, and cleanup
+- Without a queue backend, the server runs the same bounded shards directly in-process.
+- With SQS or NATS configured, the server writes request/shard artifacts and enqueues
+  chunk jobs; dedicated workers advance chunk, embed, index, and commit
   stages.
 
 Queued data shards use independent FIFO message groups so workers can process
@@ -308,13 +305,13 @@ both its 10-message limit and its 1 MiB aggregate batch limit.
 
 The pipeline shape is:
 
-1. Prepare input shards from non-unchanged file changes, bounded independently
-   by file count, source bytes, and estimated downstream chunk work.
+1. Prepare input shards from non-unchanged file changes, bounded by 128 files,
+   estimated downstream chunk work, and packed-source bundle boundaries.
 2. Chunk stage:
    - Added/modified code, text, and markdown can be chunked locally in Go.
    - PDFs, Office docs, and images go to Modal.
-   - Large text sources are range-read and emitted incrementally; chunk artifacts
-     are partitioned into bounded JSONL parts behind a small manifest.
+   - Large text sources and chunk artifacts stream directly through storage
+     without whole-file materialization.
    - Modified/removed/moved paths emit close operations for active prior rows.
    - Moves/renames query active old rows and copy row metadata/vector into new
      generation rows when safe.
@@ -323,22 +320,25 @@ The pipeline shape is:
    - Existing rows with vectors are reused.
    - Missing vectors are resolved through the Postgres embedding cache or Modal
      embedding endpoint.
-   - Embedding works in bounded row batches and new rows are written as bounded
-     index-row artifact parts.
+   - Embedding works in bounded row batches while index rows stream to storage.
+   - Vector-disabled roots bypass this stage and route chunk artifacts directly
+     to indexing.
 4. Index stage:
    - Rows are routed by stable hash of `file_path` to an active root namespace
      shard.
    - Rows are upserted to Turbopuffer in batches.
-   - Close operations patch active rows with `valid_to_generation` and
-     `valid_to_generation_seq`.
+   - Close paths are grouped by namespace and patched together with
+     `valid_to_generation` and `valid_to_generation_seq`.
 5. Commit:
+   - Finish any pending cleanup for earlier failed generations so their row
+     closures cannot affect the new visibility window.
    - Store content proof when present.
    - Ensure root state is available by object ref.
-   - Clean rows from failed generations for the root.
    - Mark the new generation visible and complete the sync job.
-6. Cleanup:
+6. Terminal cleanup:
    - Delete `syncs/<generationID>/` and any legacy root-scoped source transport
      refs known from the finalized request.
+   - Batch object deletes at the S3 1,000-key request limit.
    - Preserve durable root state and OCR/page images referenced by indexed
      chunks.
 
@@ -395,9 +395,11 @@ The Modal app defines:
 - `chunk_file_endpoint`: file to chunks.
 - `embed_chunks_endpoint`: chunks to embeddings.
 - `embed_query_endpoint`: query text to embedding.
-- `chunk_shard_endpoint`: sync shard pointer to chunk artifact.
 - `embed_shard_endpoint`: chunk artifact to index-row artifact.
-- `index_shard_endpoint`: index-row artifact to Turbopuffer writes/patches.
+
+The Go workers stream text chunking and Turbopuffer indexing directly. Modal is
+kept at the file-conversion and embedding boundaries where it provides the
+specialized CPU/GPU runtime.
 
 Chunking strategies:
 
@@ -514,8 +516,8 @@ PufferFS currently supports:
 - Small-file bundle uploads and standalone large-file uploads.
 - Gzip root state storage by object reference.
 - Async sync job tracking and status polling.
-- Optional NATS-backed queue workers for chunk/embed/index/commit/cleanup.
-- In-process object-storage queue fallback.
+- Optional SQS/NATS-backed queue workers for chunk/embed/index/commit.
+- Direct in-process execution when no durable queue is configured.
 - Local Go chunking for text/code/markdown-like files.
 - Subset sync with `sync --root <path> --include <glob> [--exclude <glob>]`.
 - Modal chunking for PDFs, Office docs, presentations, images, structured
@@ -536,10 +538,10 @@ PufferFS currently supports:
 
 - The web console is not a replacement for the CLI; it currently does not expose
   sync or query workflows.
-- `handleSyncInit` is retained only for old clients and does not perform
-  namespace cloning.
-- The in-process object queue is implemented via S3 queue-state JSON with CAS
-  semantics; production queued sync is expected to use NATS JetStream.
+- `handleSyncInit` creates the generation-scoped upload session used by the
+  current CLI; it does not perform namespace cloning.
+- With no external queue configured, the request executes the same bounded
+  chunk/embed/index stages directly. Production uses SQS or NATS JetStream.
 - Query correctness relies on generation visibility filters. Any new query path
   must apply the same visible-generation window.
 - The embedding cache version must be bumped when the Modal embedding model

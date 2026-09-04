@@ -22,7 +22,7 @@ Use the AWS Pulumi stack in [infra/pulumi](/Users/johnsuh/pufferfs/infra/pulumi)
 
 - Run from `/Users/johnsuh/pufferfs`.
 - Expect AWS credentials to already work via `AWS_PROFILE` or environment variables.
-- Expect these keys in `.env`: `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `MODAL_CHUNK_ENDPOINT`, `MODAL_EMBED_ENDPOINT`, `MODAL_QUERY_EMBED_ENDPOINT`, `MODAL_CHUNK_SHARD_ENDPOINT`, `MODAL_EMBED_SHARD_ENDPOINT`, `MODAL_INDEX_SHARD_ENDPOINT`.
+- Expect these keys in `.env`: `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `MODAL_CHUNK_ENDPOINT`, `MODAL_EMBED_ENDPOINT`, `MODAL_QUERY_EMBED_ENDPOINT`, `MODAL_EMBED_SHARD_ENDPOINT`.
 - For the web frontend + Google login, also expect: `WEB_DOMAIN`, `API_DOMAIN`, `FRONTEND_URL`, `COOKIE_DOMAIN`, `OAUTH_REDIRECT_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `VITE_API_URL`. Optional billing adds `ENABLE_BILLING`/`VITE_ENABLE_BILLING` and the `STRIPE_*` keys. See the runbook for the full mapping to `pulumi config`.
 - Expect `PULUMI_CONFIG_PASSPHRASE` in `.env` when using the local Pulumi secrets backend.
 

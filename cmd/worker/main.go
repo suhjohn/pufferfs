@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageChunk), "sync stage to run: chunk, embed, index, commit, cleanup")
+	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageChunk), "sync stage to run: chunk, embed, index, commit")
 	concurrency := flag.Int("concurrency", getenvInt("PUFFERFS_WORKER_CONCURRENCY", 4), "maximum jobs processed concurrently")
 	flag.Parse()
 
@@ -49,7 +49,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if *stage == queue.StageCleanup {
+	if *stage == queue.StageCommit {
 		go srv.RunSyncJobWatchdog(ctx)
 	}
 	log.Printf("pufferfs worker running stage=%s concurrency=%d queue=%s", *stage, *concurrency, backend)

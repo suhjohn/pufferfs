@@ -6,12 +6,9 @@ import os
 import base64
 import binascii
 import hmac
-import hashlib
 import json
+import threading
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from dataclasses import asdict
 
 import modal
@@ -275,7 +272,7 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def _page_image_upload_concurrency() -> int:
-    return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY", 512, 1, 2048)
+    return _env_int("PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY", 32, 1, 128)
 
 
 def _s3_max_pool_connections() -> int:
@@ -450,7 +447,10 @@ def file_to_chunks(
         s3 = _s3_client()
         bucket = os.environ["AWS_BUCKET_NAME"]
         resp = s3.get_object(Bucket=bucket, Key=s3_key)
-        file_bytes = resp["Body"].read()
+        try:
+            file_bytes = resp["Body"].read()
+        finally:
+            resp["Body"].close()
 
     # Only use S3 from Modal when NOT using inline content (i.e., Modal can reach S3)
     def _ensure_s3():
@@ -490,7 +490,7 @@ def file_to_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Queue stage functions: NATS job pointer -> S3 artifact -> next S3 artifact
+# Queue embed stage: job pointer -> S3 artifact -> next S3 artifact
 # ---------------------------------------------------------------------------
 
 
@@ -507,497 +507,49 @@ def _s3_client():
     )
 
 
-def _artifact_refs(s3, key: str) -> list[str]:
-    bucket = os.environ["AWS_BUCKET_NAME"]
-    if not key.endswith(".manifest.json"):
-        return [key]
-    stream = s3.get_object(Bucket=bucket, Key=key)["Body"]
-    try:
-        manifest = json.loads(stream.read())
-    finally:
-        stream.close()
-    if int(manifest.get("version") or 0) != 1:
-        raise RuntimeError(f"unsupported artifact manifest version in {key}")
-    return list(manifest.get("refs") or [])
-
-
 def _iter_jsonl(s3, key: str):
     bucket = os.environ["AWS_BUCKET_NAME"]
-    for ref in _artifact_refs(s3, key):
-        body = s3.get_object(Bucket=bucket, Key=ref)["Body"]
-        try:
-            for line in body.iter_lines():
-                if line.strip():
-                    yield json.loads(line)
-        finally:
-            body.close()
-
-
-def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    body = s3.get_object(Bucket=bucket, Key=key)["Body"]
     try:
-        value = int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-    return max(minimum, min(maximum, value))
-
-
-class _ArtifactWriter:
-    def __init__(self, s3, generation_id: str, dirname: str, name: str):
-        self.s3 = s3
-        self.bucket = os.environ["AWS_BUCKET_NAME"]
-        self.prefix = f"syncs/{generation_id}/{dirname}/{name}"
-        self.max_rows = _bounded_env_int("PUFFERFS_SYNC_ARTIFACT_PART_RECORDS", 512, 1, 10000)
-        self.max_bytes = _bounded_env_int("PUFFERFS_SYNC_ARTIFACT_PART_BYTES", 8 << 20, 65536, 64 << 20)
-        self.data = bytearray()
-        self.part_rows = 0
-        self.records = 0
-        self.total_bytes = 0
-        self.refs: list[str] = []
-
-    def append(self, row: dict) -> None:
-        line = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
-        if self.part_rows and (self.part_rows >= self.max_rows or len(self.data) + len(line) > self.max_bytes):
-            self._flush()
-        self.data.extend(line)
-        self.part_rows += 1
-        self.records += 1
-        self.total_bytes += len(line)
-
-    def _flush(self) -> None:
-        if not self.part_rows:
-            return
-        key = f"{self.prefix}.part-{len(self.refs):06d}.jsonl"
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=bytes(self.data), ContentType="application/x-ndjson")
-        self.refs.append(key)
-        self.data.clear()
-        self.part_rows = 0
-
-    def close(self) -> str:
-        self._flush()
-        if len(self.refs) == 1:
-            return self.refs[0]
-        key = f"{self.prefix}.manifest.json"
-        manifest = {"version": 1, "refs": self.refs, "records": self.records, "bytes": self.total_bytes}
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=json.dumps(manifest).encode(), ContentType="application/json")
-        return key
+        for line in body.iter_lines():
+            if line.strip():
+                yield json.loads(line)
+    finally:
+        body.close()
 
 
 def _write_jsonl(s3, generation_id: str, dirname: str, name: str, rows) -> str:
-    writer = _ArtifactWriter(s3, generation_id, dirname, name)
-    for row in rows:
-        writer.append(row)
-    return writer.close()
+    key = f"syncs/{generation_id}/{dirname}/{name}.jsonl"
+    read_fd, write_fd = os.pipe()
+    errors = []
 
+    def upload():
+        try:
+            with os.fdopen(read_fd, "rb", buffering=0) as source:
+                s3.upload_fileobj(
+                    source,
+                    os.environ["AWS_BUCKET_NAME"],
+                    key,
+                    ExtraArgs={"ContentType": "application/x-ndjson"},
+                )
+        except Exception as exc:
+            errors.append(exc)
 
-def _source_bytes(s3, change: dict) -> bytes:
-    bucket = os.environ["AWS_BUCKET_NAME"]
-    key = change.get("source_key") or f"files/{change['root_id']}/{change['path']}"
-    kwargs = {"Bucket": bucket, "Key": key}
-    length = int(change.get("source_length") or 0)
-    if length > 0:
-        offset = int(change.get("source_offset") or 0)
-        kwargs["Range"] = f"bytes={offset}-{offset + length - 1}"
-    body = s3.get_object(**kwargs)["Body"]
+    thread = threading.Thread(target=upload, daemon=True)
+    thread.start()
     try:
-        return body.read()
+        with os.fdopen(write_fd, "wb", buffering=0) as output:
+            for row in rows:
+                output.write((json.dumps(row, separators=(",", ":")) + "\n").encode())
     finally:
-        body.close()
-
-
-def _source_body(s3, change: dict):
-    bucket = os.environ["AWS_BUCKET_NAME"]
-    key = change.get("source_key") or f"files/{change['root_id']}/{change['path']}"
-    kwargs = {"Bucket": bucket, "Key": key}
-    length = int(change.get("source_length") or 0)
-    if length > 0:
-        offset = int(change.get("source_offset") or 0)
-        kwargs["Range"] = f"bytes={offset}-{offset + length - 1}"
-    return s3.get_object(**kwargs)["Body"]
-
-
-def _iter_source_lines(s3, change: dict):
-    body = _source_body(s3, change)
-    try:
-        yield from body.iter_lines(chunk_size=65536, keepends=True)
-    finally:
-        body.close()
-
-
-def _is_heading_line(line: str) -> bool:
-    hashes = len(line) - len(line.lstrip("#"))
-    return 1 <= hashes <= 6 and len(line) > hashes and line[hashes].isspace()
-
-
-def _iter_text_chunks(s3, change: dict, root_id: str, file_type: str):
-    """Bounded-memory counterpart to chunk_code/chunk_markdown for shard jobs."""
-    from models import Chunk
-
-    file_path = change["path"]
-    absolute_path = change.get("absolute_path", "")
-    chunk_index = 0
-
-    def make(content: str, line_start: int | None = None, line_end: int | None = None) -> dict:
-        nonlocal chunk_index
-        chunk = Chunk(
-            id=Chunk.make_id(root_id, file_path, chunk_index),
-            root_id=root_id,
-            file_path=file_path,
-            chunk_index=chunk_index,
-            content=content,
-            content_hash=Chunk.hash_content(content),
-            file_type=file_type,
-            absolute_path=absolute_path,
-            line_start=line_start,
-            line_end=line_end,
-        )
-        chunk_index += 1
-        return asdict(chunk)
-
-    if file_type in {
-        "python", "javascript", "typescript", "go", "rust", "java", "c", "cpp",
-        "csharp", "ruby", "php", "swift", "kotlin", "scala", "shell", "bash",
-        "lua", "perl", "r", "sql", "html", "css", "scss", "yaml", "toml",
-        "json", "xml", "proto", "graphql", "hcl", "terraform", "dockerfile", "makefile",
-    }:
-        lines: list[str] = []
-        first_line = 1
-        for raw_line in _iter_source_lines(s3, change):
-            lines.append(raw_line.decode("utf-8", errors="replace"))
-            if len(lines) == 300:
-                content = "".join(lines)
-                if content.strip():
-                    yield make(content, first_line, first_line + len(lines) - 1)
-                lines = lines[-50:]
-                first_line += 250
-        if len(lines) > 50 or (lines and chunk_index == 0):
-            content = "".join(lines)
-            if content.strip():
-                yield make(content, first_line, first_line + len(lines) - 1)
-        return
-
-    max_chars = 2000
-    overlap = 200
-    section = ""
-    section_line = 1
-    current_line = 1
-
-    def drain(final: bool):
-        nonlocal section, section_line
-        while len(section) > max_chars or (final and section):
-            end = min(max_chars, len(section))
-            piece = section[:end]
-            if piece.strip():
-                line_end = section_line + piece.count("\n")
-                if piece.endswith("\n"):
-                    line_end -= 1
-                yield make(piece, section_line, max(section_line, line_end))
-            if end == len(section):
-                section = ""
-                break
-            advance = end - overlap
-            section_line += section[:advance].count("\n")
-            section = section[advance:]
-
-    for raw_line in _iter_source_lines(s3, change):
-        line = raw_line.decode("utf-8", errors="replace")
-        if _is_heading_line(line) and section:
-            yield from drain(True)
-            section_line = current_line
-        section += line
-        yield from drain(False)
-        current_line += line.count("\n") or 1
-    yield from drain(True)
+        thread.join()
+    if errors:
+        raise errors[0]
+    return key
 
 
 def _safe_object_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in name)
-
-
-def _generation_chunk_id(root_id: str, generation_id: str, file_path: str, chunk_index: int) -> str:
-    path_hash = hashlib.sha256(f"{root_id}:{generation_id}:{file_path}".encode()).hexdigest()[:16]
-    return f"{path_hash}:{chunk_index}"
-
-
-def _legacy_namespace(org_id: str, root_id: str) -> str:
-    return f"org-{org_id}-root-{root_id}"
-
-
-def _job_index_namespaces(job: dict) -> list[dict]:
-    namespaces = job.get("index_namespaces") or []
-    if not namespaces:
-        return [
-            {
-                "namespace": _legacy_namespace(job["org_id"], job["root_id"]),
-                "shard_index": 0,
-                "shard_count": 1,
-            }
-        ]
-    return sorted(namespaces, key=lambda ns: int(ns.get("shard_index") or 0))
-
-
-def _path_shard_index(file_path: str, shard_count: int) -> int:
-    if shard_count <= 1:
-        return 0
-    digest = hashlib.sha256(file_path.encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big") % shard_count
-
-
-def _namespace_for_path(job: dict, file_path: str) -> str:
-    namespaces = _job_index_namespaces(job)
-    shard_count = int(namespaces[0].get("shard_count") or len(namespaces))
-    by_shard = {}
-    for ns in namespaces:
-        if int(ns.get("shard_count") or shard_count) != shard_count:
-            raise RuntimeError("root index namespace shard count mismatch")
-        shard_index = int(ns.get("shard_index") or 0)
-        by_shard[shard_index] = ns["namespace"]
-    if len(by_shard) != shard_count:
-        raise RuntimeError(f"root has {len(by_shard)} index namespaces, expected {shard_count}")
-    shard_index = _path_shard_index(file_path, shard_count)
-    namespace = by_shard.get(shard_index)
-    if not namespace:
-        raise RuntimeError(f"root missing index namespace shard {shard_index}")
-    return namespace
-
-
-def _tp_base_url() -> str:
-    return os.environ.get("TURBOPUFFER_API_URL", "https://api.turbopuffer.com").rstrip("/")
-
-
-def _tp_request(method: str, path: str, body: dict) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    last_error: Exception | None = None
-    for attempt in range(3):
-        req = urllib.request.Request(_tp_base_url() + path, data=data, method=method)
-        req.add_header("Authorization", f"Bearer {os.environ['TURBOPUFFER_API_KEY']}")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                payload = resp.read()
-            if not payload:
-                return {}
-            return json.loads(payload.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body_text = exc.read().decode("utf-8")
-            last_error = RuntimeError(f"turbopuffer HTTP {exc.code}: {body_text}")
-            if exc.code != 429 and exc.code < 500:
-                raise last_error from exc
-        except urllib.error.URLError as exc:
-            last_error = exc
-        time.sleep(attempt + 1)
-    raise RuntimeError(f"turbopuffer request failed: {last_error}") from last_error
-
-
-def _is_tp_not_found(exc: Exception) -> bool:
-    return "turbopuffer HTTP 404:" in str(exc)
-
-
-def _active_generation_filter(seq: int) -> list:
-    return [
-        "And",
-        [
-            ["valid_from_generation_seq", "Lte", seq],
-            ["Or", [["valid_to_generation_seq", "Eq", 0], ["valid_to_generation_seq", "Gt", seq]]],
-        ],
-    ]
-
-
-def _query_active_rows(job: dict, file_path: str, attrs: list[str]) -> list[dict]:
-    limit = 10000
-    filters = [["file_path", "Eq", file_path]]
-    base_seq = int(job.get("base_generation_seq") or 0)
-    if base_seq > 0:
-        filters.append(_active_generation_filter(base_seq))
-    body = {
-        "rank_by": ["file_path", "asc"],
-        "limit": limit,
-        "filters": ["And", filters],
-        "include_attributes": attrs,
-    }
-    ns = urllib.parse.quote(_namespace_for_path(job, file_path), safe="")
-    try:
-        rows = _tp_request("POST", f"/v2/namespaces/{ns}/query", body).get("rows", [])
-    except RuntimeError as exc:
-        if _is_tp_not_found(exc):
-            return []
-        raise
-    if len(rows) >= limit:
-        raise RuntimeError(f"{file_path} has at least {limit} active chunks; refusing partial metadata copy")
-    return rows
-
-
-def _close_rows_for_path(job: dict, file_path: str) -> int:
-    filters = [["file_path", "Eq", file_path]]
-    base_seq = int(job.get("base_generation_seq") or 0)
-    if base_seq > 0:
-        filters.append(_active_generation_filter(base_seq))
-    patch = {
-        "valid_to_generation": job["generation_id"],
-        "valid_to_generation_seq": job["generation_seq"],
-    }
-    ns = urllib.parse.quote(_namespace_for_path(job, file_path), safe="")
-    closed = 0
-    for _ in range(100):
-        try:
-            result = _tp_request(
-                "POST",
-                f"/v2/namespaces/{ns}",
-                {
-                    "patch_by_filter": {"filters": ["And", filters], "patch": patch},
-                    "patch_by_filter_allow_partial": True,
-                },
-            )
-        except RuntimeError as exc:
-            if _is_tp_not_found(exc):
-                return closed
-            raise
-        closed += int(result.get("rows_affected") or result.get("rows_patched") or result.get("count") or 0)
-        if not result.get("rows_remaining"):
-            return closed
-    raise RuntimeError(f"closing rows for {file_path}: rows remain after repeated patch passes")
-
-
-def _row_from_chunk(job: dict, file_hash: str, chunk: dict) -> dict:
-    chunk_index = int(chunk.get("chunk_index") or 0)
-    file_path = chunk.get("file_path", "")
-    row = {
-        "id": _generation_chunk_id(job["root_id"], job["generation_id"], file_path, chunk_index),
-        "content": chunk.get("content", ""),
-        "file_path": file_path,
-        "chunk_index": chunk_index,
-        "content_hash": chunk.get("content_hash", ""),
-        "file_hash": file_hash,
-        "file_type": chunk.get("file_type", ""),
-        "root_id": job["root_id"],
-        "generation_id": job["generation_id"],
-        "valid_from_generation": job["generation_id"],
-        "valid_from_generation_seq": job["generation_seq"],
-        "valid_to_generation": "",
-        "valid_to_generation_seq": 0,
-    }
-    if chunk.get("absolute_path"):
-        row["absolute_path"] = chunk["absolute_path"]
-    if chunk.get("page_number") is not None:
-        row["page_number"] = chunk["page_number"]
-    if chunk.get("image_path") is not None:
-        row["image_path"] = chunk["image_path"]
-    if chunk.get("line_start") is not None:
-        row["line_start"] = chunk["line_start"]
-    if chunk.get("line_end") is not None:
-        row["line_end"] = chunk["line_end"]
-    return row
-
-
-def _row_from_existing(job: dict, file_path: str, absolute_path: str, file_hash: str, row: dict, fallback_index: int) -> dict:
-    chunk_index = int(row.get("chunk_index") or fallback_index)
-    out = {
-        "id": _generation_chunk_id(job["root_id"], job["generation_id"], file_path, chunk_index),
-        "content": row.get("content", ""),
-        "file_path": file_path,
-        "chunk_index": chunk_index,
-        "content_hash": row.get("content_hash", ""),
-        "file_hash": file_hash,
-        "file_type": row.get("file_type", ""),
-        "root_id": job["root_id"],
-        "generation_id": job["generation_id"],
-        "valid_from_generation": job["generation_id"],
-        "valid_from_generation_seq": job["generation_seq"],
-        "valid_to_generation": "",
-        "valid_to_generation_seq": 0,
-    }
-    if absolute_path:
-        out["absolute_path"] = absolute_path
-    if row.get("page_number") is not None:
-        out["page_number"] = row["page_number"]
-    if row.get("image_path") is not None:
-        out["image_path"] = row["image_path"]
-    if row.get("line_start") is not None:
-        out["line_start"] = row["line_start"]
-    if row.get("line_end") is not None:
-        out["line_end"] = row["line_end"]
-    if row.get("vector") is not None:
-        out["vector"] = row["vector"]
-    return out
-
-
-def _modal_can_read_source_directly(s3_key: str, change: dict) -> bool:
-    return (
-        bool(s3_key)
-        and not _source_key_is_bundle(s3_key)
-        and int(change.get("source_offset") or 0) == 0
-    )
-
-
-def _source_key_is_bundle(s3_key: str) -> bool:
-    return s3_key.startswith("bundles/") or "/sources/bundles/" in s3_key
-
-
-@app.function(
-    image=chunking_image,
-    secrets=[modal_secret],
-    timeout=3600,
-    memory=2048,
-)
-@modal.fastapi_endpoint(method="POST", label="pufferfs-chunk-shard-endpoint")
-def chunk_shard_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {job:{...}} -> {result_ref,count}."""
-    from chunkers import detect_file_type
-
-    job = item["job"]
-    s3 = _s3_client()
-    writer = _ArtifactWriter(s3, job["generation_id"], "chunks", _safe_object_name(job["job_id"]))
-    count = 0
-
-    def emit(artifact: dict) -> None:
-        nonlocal count
-        writer.append(artifact)
-        count += 1
-
-    for change in _iter_jsonl(s3, job["payload_ref"]):
-        change["root_id"] = job["root_id"]
-        status = change.get("status")
-        if status in ("ADDED", "MODIFIED"):
-            if status == "MODIFIED":
-                emit({"op": "close", "change": change})
-            s3_key = change.get("source_key") or f"files/{job['root_id']}/{change['path']}"
-            file_type = detect_file_type(change["path"])
-            if file_type not in ("pdf", "docx", "pptx", "image", "eml", "msg", "vcf", "ics", "audio", "video"):
-                chunks = _iter_text_chunks(s3, change, job["root_id"], file_type)
-            else:
-                chunks = file_to_chunks.remote(
-                    s3_key=s3_key,
-                    file_path=change["path"],
-                    absolute_path=change.get("absolute_path", ""),
-                    file_type=file_type,
-                    root_id=job["root_id"],
-                    content_b64=None
-                    if _modal_can_read_source_directly(s3_key, change)
-                    else base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
-                )
-            for chunk in chunks:
-                emit({"op": "chunk", "change": change, "chunk": chunk})
-        elif status == "REMOVED":
-            emit({"op": "close", "change": change})
-        elif status in ("MOVED", "RENAMED"):
-            old_path = change.get("old_path", "")
-            emit({"op": "close", "change": {"path": old_path, "status": "REMOVED"}})
-            rows = _query_active_rows(
-                job,
-                old_path,
-                ["content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "vector"],
-            )
-            for idx, existing in enumerate(rows):
-                emit(
-                    {
-                        "op": "row",
-                        "change": change,
-                        "row": _row_from_existing(job, change["path"], change.get("absolute_path", ""), change.get("content_hash", ""), existing, idx),
-                    }
-                )
-    if not count:
-        emit({"op": "noop"})
-    result_ref = writer.close()
-    return {"result_ref": result_ref, "count": count}
 
 
 # ---------------------------------------------------------------------------
@@ -1028,7 +580,7 @@ class Embedder:
         from sentence_transformers import SentenceTransformer
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.encode_batch_size = int(os.getenv("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", "64"))
+        self.encode_batch_size = _env_int("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", 64, 1, 512)
         self.model = SentenceTransformer(
             EMBEDDING_MODEL,
             trust_remote_code=True,
@@ -1075,7 +627,7 @@ class Embedder:
     def embed_chunks_endpoint(self, item: dict) -> dict:
         """HTTP endpoint: POST {chunks: [...]} -> {results: [...]}"""
         results = self._embed_chunks(item["chunks"])
-        return {"results": results, "count": len(results)}
+        return {"results": results}
 
     @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-query-endpoint")
     def embed_query_endpoint(self, item: dict) -> dict:
@@ -1085,165 +637,67 @@ class Embedder:
 
     @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-shard-endpoint")
     def embed_shard_endpoint(self, item: dict) -> dict:
-        """HTTP endpoint: POST {job:{...}} -> {result_ref,count}."""
+        """HTTP endpoint: POST {job:{...}} -> {result_ref}."""
         job = item["job"]
         disable_vector = bool(job.get("disable_vector"))
         s3 = _s3_client()
-        writer = _ArtifactWriter(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]))
         pending: list[tuple[dict, dict]] = []
-        batch_size = _bounded_env_int("PUFFERFS_SYNC_EMBED_BATCH_ROWS", 128, 1, 512)
-        count = 0
 
-        def emit(row: dict) -> None:
-            nonlocal count
-            writer.append(row)
-            count += 1
-
-        def flush_pending() -> None:
+        def flush_pending():
             if not pending:
                 return
-            embedded = self._embed_chunks([chunk for chunk, _ in pending])
-            if len(embedded) != len(pending):
-                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(pending)} pending rows")
-            for (_, row), result in zip(pending, embedded):
-                embedding = result.get("embedding")
+            unique: dict[str, dict] = {}
+            for chunk, _ in pending:
+                unique.setdefault(chunk.get("content_hash") or chunk["content"], chunk)
+            embedded = self._embed_chunks(list(unique.values()))
+            if len(embedded) != len(unique):
+                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(unique)} unique pending rows")
+            vectors = {key: result.get("embedding") for key, result in zip(unique, embedded)}
+            for chunk, row in pending:
+                embedding = vectors[chunk.get("content_hash") or chunk["content"]]
                 if embedding is None:
                     raise RuntimeError("embedding result missing embedding vector")
                 row["vector"] = embedding
-                emit({"op": "upsert", "row": row})
+                yield {"op": "upsert", "row": row}
             pending.clear()
 
-        for artifact in _iter_jsonl(s3, job["payload_ref"]):
-            op = artifact.get("op")
-            if op == "close":
-                path = artifact.get("change", {}).get("path", "")
-                if path:
-                    flush_pending()
-                    emit({"op": "close", "close_path": path})
-            elif op == "row" and artifact.get("row"):
-                row = artifact["row"]
-                if disable_vector:
-                    row.pop("vector", None)
-                    emit({"op": "upsert", "row": row})
-                    continue
-                if row.get("vector") is not None:
-                    emit({"op": "upsert", "row": row})
-                else:
-                    pending.append(
-                        (
-                            {
-                                "id": row.get("id"),
-                                "content": row.get("content", ""),
-                                "file_path": row.get("file_path", ""),
-                                "chunk_index": row.get("chunk_index", 0),
-                                "content_hash": row.get("content_hash", ""),
-                                "file_type": row.get("file_type", ""),
-                                "root_id": row.get("root_id"),
-                                "absolute_path": row.get("absolute_path", ""),
-                                "page_number": row.get("page_number"),
-                                "image_path": row.get("image_path"),
-                                "line_start": row.get("line_start"),
-                                "line_end": row.get("line_end"),
-                            },
-                            row,
+        def rows():
+            for artifact in _iter_jsonl(s3, job["payload_ref"]):
+                op = artifact.get("op")
+                if op == "close" and artifact.get("close_path"):
+                    yield artifact
+                elif op == "upsert" and artifact.get("row"):
+                    row = artifact["row"]
+                    if disable_vector:
+                        row.pop("vector", None)
+                    if disable_vector or row.get("vector") is not None:
+                        yield artifact
+                    else:
+                        pending.append(
+                            (
+                                {
+                                    "id": row.get("id"),
+                                    "content": row.get("content", ""),
+                                    "file_path": row.get("file_path", ""),
+                                    "chunk_index": row.get("chunk_index", 0),
+                                    "content_hash": row.get("content_hash", ""),
+                                    "file_type": row.get("file_type", ""),
+                                    "root_id": row.get("root_id"),
+                                    "absolute_path": row.get("absolute_path", ""),
+                                    "page_number": row.get("page_number"),
+                                    "image_path": row.get("image_path"),
+                                    "line_start": row.get("line_start"),
+                                    "line_end": row.get("line_end"),
+                                },
+                                row,
+                            )
                         )
-                    )
-                    if len(pending) >= batch_size:
-                        flush_pending()
-            elif op == "chunk" and artifact.get("chunk"):
-                row = _row_from_chunk(job, artifact.get("change", {}).get("content_hash", ""), artifact["chunk"])
-                if disable_vector:
-                    row.pop("vector", None)
-                    emit({"op": "upsert", "row": row})
-                else:
-                    pending.append((artifact["chunk"], row))
-                    if len(pending) >= batch_size:
-                        flush_pending()
-        flush_pending()
-        result_ref = writer.close()
-        return {"result_ref": result_ref, "count": count}
+                if len(pending) == 128:
+                    yield from flush_pending()
+            yield from flush_pending()
 
-
-def _tp_upsert_rows(namespace: str, rows: list[dict], *, disable_vector: bool = False) -> None:
-    if not rows:
-        return
-    body = {
-        "upsert_rows": rows,
-        "schema": {
-            "content": {"type": "string", "full_text_search": True},
-            "file_path": {"type": "string"},
-            "absolute_path": {"type": "string"},
-            "chunk_index": {"type": "uint"},
-            "content_hash": {"type": "string"},
-            "file_hash": {"type": "string"},
-            "file_type": {"type": "string"},
-            "page_number": {"type": "uint"},
-            "image_path": {"type": "string"},
-            "line_start": {"type": "uint"},
-            "line_end": {"type": "uint"},
-            "root_id": {"type": "string"},
-            "generation_id": {"type": "string"},
-            "valid_from_generation": {"type": "string"},
-            "valid_from_generation_seq": {"type": "uint"},
-            "valid_to_generation": {"type": "string"},
-            "valid_to_generation_seq": {"type": "uint"},
-        },
-    }
-    if not disable_vector:
-        body["distance_metric"] = "cosine_distance"
-    ns = urllib.parse.quote(namespace, safe="")
-    _tp_request("POST", f"/v2/namespaces/{ns}", body)
-
-
-def _tp_patch_rows(namespace: str, rows: list[dict]) -> None:
-    if not rows:
-        return
-    ns = urllib.parse.quote(namespace, safe="")
-    _tp_request("POST", f"/v2/namespaces/{ns}", {"patch_rows": rows})
-
-
-@app.function(
-    image=chunking_image,
-    secrets=[modal_secret],
-    timeout=900,
-    memory=2048,
-)
-@modal.fastapi_endpoint(method="POST", label="pufferfs-index-shard-endpoint")
-def index_shard_endpoint(item: dict) -> dict:
-    """HTTP endpoint: POST {job:{...}} -> {count}."""
-    job = item["job"]
-    disable_vector = bool(job.get("disable_vector"))
-    s3 = _s3_client()
-    batch_size = _bounded_env_int("PUFFERFS_TP_WRITE_BATCH_ROWS", 512, 1, 5000)
-    buffers: dict[str, list[dict]] = {}
-    upserted = 0
-    closed = 0
-
-    def flush(namespace: str) -> None:
-        nonlocal upserted
-        rows = buffers.get(namespace) or []
-        if not rows:
-            return
-        _tp_upsert_rows(namespace, rows, disable_vector=disable_vector)
-        upserted += len(rows)
-        rows.clear()
-
-    def flush_all() -> None:
-        for namespace in list(buffers):
-            flush(namespace)
-
-    for record in _iter_jsonl(s3, job["payload_ref"]):
-        if record.get("op") == "upsert" and record.get("row"):
-            row = record["row"]
-            namespace = _namespace_for_path(job, row.get("file_path", ""))
-            buffers.setdefault(namespace, []).append(row)
-            if len(buffers[namespace]) >= batch_size:
-                flush(namespace)
-        elif record.get("op") == "close" and record.get("close_path"):
-            flush_all()
-            closed += _close_rows_for_path(job, record["close_path"])
-    flush_all()
-    return {"count": upserted + closed}
+        result_ref = _write_jsonl(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]), rows())
+        return {"result_ref": result_ref}
 
 
 # ---------------------------------------------------------------------------
@@ -1268,4 +722,4 @@ def chunk_file_endpoint(item: dict) -> dict:
         root_id=item["root_id"],
         content_b64=item.get("content_b64"),
     )
-    return {"chunks": chunks, "count": len(chunks)}
+    return {"chunks": chunks}

@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -245,7 +243,6 @@ func (db *DB) migrateFallback() error {
 			vector_disabled BOOLEAN NOT NULL DEFAULT FALSE,
 			scope       TEXT NOT NULL DEFAULT 'org',
 			owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-			simhash     TEXT NOT NULL DEFAULT '',
 			visible_generation_id TEXT NOT NULL DEFAULT '',
 			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -382,7 +379,6 @@ func (db *DB) migrateFallback() error {
 			seq                BIGSERIAL,
 			base_generation_seq BIGINT NOT NULL DEFAULT 0,
 			status             TEXT NOT NULL DEFAULT 'building',
-			manifest_ref       TEXT NOT NULL DEFAULT '',
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			visible_at         TIMESTAMPTZ
 		);
@@ -1985,7 +1981,7 @@ func (db *DB) GetVisibleGenerationSeq(ctx context.Context, rootID string) (int64
 	return db.GetGenerationSeq(ctx, visibleID)
 }
 
-func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, manifestRef, clientBaseGenerationID string, clientBaseGenerationSeq int64) (*SyncGeneration, error) {
+func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, clientBaseGenerationID string, clientBaseGenerationSeq int64) (*SyncGeneration, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -2002,9 +1998,11 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 
 	staleCutoff := time.Now().Add(-syncJobTimeout())
 	if _, err := tx.Exec(ctx,
-		`UPDATE sync_generations
+		`UPDATE sync_generations g
 		 SET status = 'failed'
-		 WHERE root_id = $1 AND status = 'building' AND created_at < $2`,
+		 WHERE g.root_id = $1 AND g.status = 'building'
+		   AND COALESCE((SELECT j.status IN ('completed', 'failed') OR j.updated_at < $2
+		                   FROM sync_jobs j WHERE j.id = g.sync_job_id), g.created_at < $2)`,
 		rootID, staleCutoff,
 	); err != nil {
 		return nil, err
@@ -2040,10 +2038,10 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 	generationID := uuid.New().String()
 	var seq int64
 	err = tx.QueryRow(ctx,
-		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, base_generation_seq, status, manifest_ref)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'building', $7)
+		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, base_generation_seq, status)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'building')
 		 RETURNING seq`,
-		generationID, orgID, rootID, syncJobID, baseGenerationID, baseSeq, manifestRef,
+		generationID, orgID, rootID, syncJobID, baseGenerationID, baseSeq,
 	).Scan(&seq)
 	if err != nil {
 		return nil, err
@@ -2192,6 +2190,62 @@ func (db *DB) MarkSyncGenerationFailedForJob(ctx context.Context, jobID string) 
 	return err
 }
 
+func (db *DB) MarkSyncGenerationCleanupPending(ctx context.Context, generationID string) error {
+	if generationID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_generations SET status = 'failed'
+		 WHERE id = $1 AND status IN ('failed', 'cleaning', 'superseded')`,
+		generationID,
+	)
+	return err
+}
+
+func (db *DB) MarkSyncGenerationCleaning(ctx context.Context, generationID string) error {
+	if generationID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_generations SET status = 'cleaning' WHERE id = $1 AND status = 'failed'`,
+		generationID,
+	)
+	return err
+}
+
+func (db *DB) MarkSyncGenerationCleaned(ctx context.Context, generationID string) error {
+	if generationID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_generations SET status = 'superseded' WHERE id = $1 AND status = 'cleaning'`,
+		generationID,
+	)
+	return err
+}
+
+func (db *DB) ListFailedSyncGenerationIDs(ctx context.Context, orgID, rootID string) ([]string, error) {
+	rows, err := db.pool.Query(ctx,
+		`SELECT id FROM sync_generations
+		 WHERE org_id = $1 AND root_id = $2 AND status IN ('failed', 'cleaning')
+		 ORDER BY created_at`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 func (db *DB) GetSyncGenerationStatus(ctx context.Context, generationID string) (string, error) {
 	var status string
 	err := db.pool.QueryRow(ctx,
@@ -2199,34 +2253,6 @@ func (db *DB) GetSyncGenerationStatus(ctx context.Context, generationID string) 
 		generationID,
 	).Scan(&status)
 	return status, err
-}
-
-func (db *DB) ListFailedSyncGenerations(ctx context.Context, orgID, rootID string, limit int) ([]SyncGeneration, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, root_id, base_generation_id, seq, base_generation_seq
-		 FROM sync_generations
-		 WHERE org_id = $1 AND root_id = $2 AND status = 'failed'
-		 ORDER BY created_at ASC
-		 LIMIT $3`,
-		orgID, rootID, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var generations []SyncGeneration
-	for rows.Next() {
-		var generation SyncGeneration
-		if err := rows.Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq); err != nil {
-			return nil, err
-		}
-		generations = append(generations, generation)
-	}
-	return generations, rows.Err()
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,74 +2263,11 @@ func (db *DB) ListFailedSyncGenerations(ctx context.Context, orgID, rootID strin
 // scoped to a specific embedding model version so vectors are never reused
 // across model versions.
 func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID, modelVersion string, hashes []string) (map[string][]float64, error) {
-	result := make(map[string][]float64)
-	if len(hashes) == 0 {
-		return result, nil
-	}
 	hashes = uniqueStrings(hashes)
+	result := make(map[string][]float64)
 	if len(hashes) == 0 {
 		return result, nil
 	}
-	batchSize := embeddingCacheQueryBatchSize()
-	if len(hashes) <= batchSize {
-		return db.getCachedEmbeddingsBatch(ctx, orgID, modelVersion, hashes)
-	}
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var (
-		mu       sync.Mutex
-		wg       sync.WaitGroup
-		firstErr error
-	)
-	batches := make(chan []string)
-	workers := embeddingCacheQueryConcurrency()
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for batch := range batches {
-				cached, err := db.getCachedEmbeddingsBatch(ctx, orgID, modelVersion, batch)
-				mu.Lock()
-				if err != nil && firstErr == nil {
-					firstErr = err
-					cancel()
-				}
-				for hash, embedding := range cached {
-					result[hash] = embedding
-				}
-				mu.Unlock()
-				if err != nil {
-					return
-				}
-			}
-		}()
-	}
-
-sendBatches:
-	for start := 0; start < len(hashes); start += batchSize {
-		end := start + batchSize
-		if end > len(hashes) {
-			end = len(hashes)
-		}
-		select {
-		case batches <- hashes[start:end]:
-		case <-ctx.Done():
-			break sendBatches
-		}
-	}
-	close(batches)
-	wg.Wait()
-
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return result, nil
-}
-
-func (db *DB) getCachedEmbeddingsBatch(ctx context.Context, orgID, modelVersion string, hashes []string) (map[string][]float64, error) {
-	result := make(map[string][]float64)
 	rows, err := db.pool.Query(ctx,
 		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND model_version = $2 AND content_hash = ANY($3)`,
 		orgID, modelVersion, hashes,
@@ -2342,62 +2305,11 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func embeddingCacheQueryBatchSize() int {
-	const defaultBatchSize = 500
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE"))
-	if raw == "" {
-		return defaultBatchSize
-	}
-	size, err := strconv.Atoi(raw)
-	if err != nil || size < 1 {
-		return defaultBatchSize
-	}
-	if size > 5000 {
-		return 5000
-	}
-	return size
-}
-
-func embeddingCacheQueryConcurrency() int {
-	const defaultConcurrency = 4
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY"))
-	if raw == "" {
-		return defaultConcurrency
-	}
-	concurrency, err := strconv.Atoi(raw)
-	if err != nil || concurrency < 1 {
-		return defaultConcurrency
-	}
-	if concurrency > 16 {
-		return 16
-	}
-	return concurrency
-}
-
-// SaveCachedEmbeddings stores embeddings in the cache via a batched multi-value
-// INSERT, keyed by (org_id, model_version, content_hash).
+// SaveCachedEmbeddings stores one pipeline batch in the embedding cache.
 func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID, modelVersion string, entries map[string][]float64) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	const batchSize = 500
-	batch := make(map[string][]float64, batchSize)
-	for hash, embedding := range entries {
-		batch[hash] = embedding
-		if len(batch) == batchSize {
-			if err := db.saveCachedEmbeddingBatch(ctx, orgID, modelVersion, batch); err != nil {
-				return err
-			}
-			batch = make(map[string][]float64, batchSize)
-		}
-	}
-	if len(batch) > 0 {
-		return db.saveCachedEmbeddingBatch(ctx, orgID, modelVersion, batch)
-	}
-	return nil
-}
-
-func (db *DB) saveCachedEmbeddingBatch(ctx context.Context, orgID, modelVersion string, entries map[string][]float64) error {
 	var sb strings.Builder
 	sb.WriteString(`INSERT INTO embedding_cache (org_id, model_version, content_hash, embedding, created_at) VALUES `)
 	args := make([]any, 0, len(entries)*2+2)
@@ -2540,14 +2452,8 @@ func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) err
 		`UPDATE sync_jobs SET status = $1, updated_at = NOW()
 		 WHERE id = $2
 		   AND status NOT IN ('completed', 'failed')
-		   AND CASE status
-		       WHEN 'pending' THEN 0 WHEN 'queued' THEN 1 WHEN 'chunking' THEN 2
-		       WHEN 'embedding' THEN 3 WHEN 'indexing' THEN 4 WHEN 'upserting' THEN 4
-		       WHEN 'committing' THEN 5 ELSE 0 END
-		       <= CASE $1
-		       WHEN 'pending' THEN 0 WHEN 'queued' THEN 1 WHEN 'chunking' THEN 2
-		       WHEN 'embedding' THEN 3 WHEN 'indexing' THEN 4 WHEN 'upserting' THEN 4
-		       WHEN 'committing' THEN 5 ELSE 0 END`,
+		   AND array_position(ARRAY['pending','queued','chunking','embedding','indexing','upserting','committing'], status)
+		       < array_position(ARRAY['pending','queued','chunking','embedding','indexing','upserting','committing'], $1)`,
 		status, jobID,
 	)
 	return err
@@ -2608,46 +2514,33 @@ func (db *DB) ExpireSyncJob(ctx context.Context, jobID string, staleBefore time.
 	return tag.RowsAffected() == 1, nil
 }
 
-// RecordSyncJobShard stores idempotent progress for a completed shard and
-// refreshes the job-level processed count from completed index shards.
-func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shardIndex, filesProcessed int) error {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx,
+// RecordSyncJobShard stores idempotent progress and returns the completed shard
+// count and current generation status in the same progress round trip.
+func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shardIndex, filesProcessed int) (int, string, error) {
+	if _, err := db.pool.Exec(ctx,
 		`INSERT INTO sync_job_shards (job_id, stage, shard_index, status, files_processed, finished_at)
 		 VALUES ($1, $2, $3, 'completed', $4, NOW())
-		 ON CONFLICT (job_id, stage, shard_index) DO UPDATE SET
-			status = EXCLUDED.status,
-			files_processed = EXCLUDED.files_processed,
-			finished_at = EXCLUDED.finished_at`,
+		 ON CONFLICT (job_id, stage, shard_index) DO NOTHING`,
 		jobID, stage, shardIndex, filesProcessed,
 	); err != nil {
-		return err
+		return 0, "", err
 	}
-
-	if stage == syncStageIndex {
-		if _, err := tx.Exec(ctx,
-			`UPDATE sync_jobs
-			 SET processed = (
-				SELECT SUM(files_processed)
-				FROM sync_job_shards
+	var completed int
+	var generationStatus string
+	err := db.pool.QueryRow(ctx,
+		`UPDATE sync_jobs
+		 SET processed = CASE WHEN $2 = 'index' THEN COALESCE((
+				SELECT SUM(files_processed) FROM sync_job_shards
 				WHERE job_id = $1 AND stage = $2 AND status = 'completed'
-			 )
-			 WHERE id = $1`,
-			jobID, syncStageIndex,
-		); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(ctx, `UPDATE sync_jobs SET updated_at = NOW() WHERE id = $1`, jobID); err != nil {
-		return err
-	}
-
-	return tx.Commit(ctx)
+			), 0) ELSE processed END,
+			 updated_at = NOW()
+		 WHERE id = $1
+		 RETURNING
+		   (SELECT COUNT(*) FROM sync_job_shards WHERE job_id = $1 AND stage = $2 AND status = 'completed'),
+		   COALESCE((SELECT status FROM sync_generations WHERE sync_job_id = $1 ORDER BY seq DESC LIMIT 1), '')`,
+		jobID, stage,
+	).Scan(&completed, &generationStatus)
+	return completed, generationStatus, err
 }
 
 func (db *DB) CountCompletedSyncJobShards(ctx context.Context, jobID, stage string) (int, error) {
@@ -2742,8 +2635,8 @@ func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*mode
 	return job, nil
 }
 
-// ListSyncJobsForReconciliation returns active jobs whose persisted progress
-// heartbeat is stale, or whose generation has already failed.
+// ListSyncJobsForReconciliation returns stale active jobs and jobs whose failed
+// generation still needs cleanup.
 func (db *DB) ListSyncJobsForReconciliation(ctx context.Context, staleBefore time.Time, limit int) ([]models.SyncJob, error) {
 	if limit <= 0 {
 		limit = 100
@@ -2752,14 +2645,13 @@ func (db *DB) ListSyncJobsForReconciliation(ctx context.Context, staleBefore tim
 		`SELECT j.id, j.org_id, COALESCE(j.root_id, ''), j.user_id, j.status,
 		        j.total_files, j.processed, j.errors, j.started_at, j.updated_at, j.finished_at
 		 FROM sync_jobs j
-		 WHERE j.status NOT IN ('completed', 'failed')
-		   AND (
-		     j.updated_at < $1
+		 WHERE j.status <> 'completed'
+		   AND ((j.status <> 'failed' AND j.updated_at < $1)
 		     OR EXISTS (
 		       SELECT 1 FROM sync_generations g
-		       WHERE g.sync_job_id = j.id AND g.status = 'failed'
-		     )
-		   )
+			       WHERE g.sync_job_id = j.id
+			         AND (g.status IN ('failed', 'cleaning') OR (j.status = 'failed' AND g.status = 'visible'))
+		     ))
 		 ORDER BY j.updated_at ASC
 		 LIMIT $2`,
 		staleBefore, limit,
@@ -2787,19 +2679,6 @@ func (db *DB) ListSyncJobsForReconciliation(ctx context.Context, staleBefore tim
 // Ping checks the database connection.
 func (db *DB) Ping(ctx context.Context) error {
 	return db.pool.Ping(ctx)
-}
-
-// ---------------------------------------------------------------------------
-// SimHash / Index Reuse
-// ---------------------------------------------------------------------------
-
-// UpdateRootSimHash stores the SimHash for a root.
-func (db *DB) UpdateRootSimHash(ctx context.Context, orgID, rootID, simhash string) error {
-	_, err := db.pool.Exec(ctx,
-		`UPDATE roots SET simhash = $1 WHERE id = $2 AND org_id = $3`,
-		simhash, rootID, orgID,
-	)
-	return err
 }
 
 // ---------------------------------------------------------------------------

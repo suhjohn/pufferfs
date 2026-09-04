@@ -1,11 +1,14 @@
 # PufferFS Sync Architecture: How We Got Here
 
+> Historical design record. The object-storage queue broker described below
+> has since been replaced by SQS/NATS workers and a direct in-process fallback.
+
 ## Executive summary
 
 We started with a practical performance problem: PufferFS sync/indexing was too slow for real document workspaces and clearly would not scale to very large trees. The conversation evolved from “how do we speed this up?” into a full to-be architecture for high-throughput sync:
 
 - **Postgres is control plane only**: roots, jobs, generations, coarse progress.
-- **S3/R2 is the data plane**: source bundles, manifests, queue state, chunks, index artifacts.
+- **S3/R2 is the data plane**: source bundles, manifests, chunks, and index artifacts.
 - **Queue jobs are batch pointers**: no per-file Postgres rows, no per-file durable queue rows.
 - **Small files are packed into bundle objects**: no one S3 PUT per small file.
 - **Work runs as durable stages**: chunk → embed → index.
@@ -97,7 +100,7 @@ sync_generations
   base_generation_id
   seq
   base_generation_seq
-  status: building / visible / failed / superseded
+  status: building / visible / failed / cleaning / superseded
   manifest_ref
   visible_at
 ```
@@ -623,9 +626,9 @@ Key properties:
 - **Backward compatible**: inline `changes` without `generation_id` still works
   for small syncs or old clients.
 - **Scalability contract**: the final sync request size is bounded by shard
-  count, not file count. Shards close on file count, represented source bytes,
-  or estimated chunk work, so neither many tiny files nor a few huge files can
-  create an unbounded worker unit.
+  count, not file count. The server independently forms work shards capped by
+  file count and estimated chunk work while preserving packed-source bundle
+  boundaries, so transport batching cannot create an unbounded worker unit.
 
 This is the recommended path for any sync exceeding a few thousand files. The
 CLI uses this flow by default.

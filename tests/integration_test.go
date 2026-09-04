@@ -33,6 +33,7 @@ import (
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	natsserver "github.com/nats-io/nats-server/v2/server"
 
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -530,10 +531,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 	})
 
 	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
-		t.Setenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES", "2")
 		t.Setenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES", "65536")
-		t.Setenv("PUFFERFS_SYNC_ARTIFACT_PART_RECORDS", "2")
-		t.Setenv("PUFFERFS_SYNC_LOCAL_STREAM_THRESHOLD_BYTES", "65536")
 		nats := startE2ENATS(t)
 		env := newQueuedE2EEnv(t, services, nats.ClientURL())
 		homeDir := t.TempDir()
@@ -544,11 +542,15 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		projectDir := filepath.Join(homeDir, "text-workspace")
 		writeFile(t, projectDir, "docs/readme.md", "# Local Chunking\n\nThis file is chunked entirely in Go without calling Modal.\n")
 		writeFile(t, projectDir, "docs/notes.txt", "Plain text file chunked locally by the Go worker.\n")
+		writeFile(t, projectDir, "docs/empty.txt", "")
 		writeFile(t, projectDir, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n")
-		writeFile(t, projectDir, "sessions/events.jsonl", strings.Repeat("{\"event\":\"bounded stream integration token\"}\n", 4000))
+		writeFile(t, projectDir, "sessions/events.jsonl", strings.Repeat("{\"event\":\"bounded stream integration token\"}\n", 200000))
+		for i := range 130 {
+			writeFile(t, projectDir, fmt.Sprintf("generated/%03d.txt", i), strings.Repeat("bounded batch file ", 64))
+		}
 
 		syncStart := time.Now()
-		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName, "--no-vector")
 		t.Logf("text-only queued CLI sync command elapsed=%s", time.Since(syncStart))
 		if err != nil {
 			t.Fatalf("text-only queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
@@ -558,6 +560,13 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
 		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		chunkShards, err := strconv.Atoi(strings.TrimSpace(psqlOutput(t,
+			`SELECT COUNT(*) FROM sync_job_shards WHERE stage = 'chunk' AND job_id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`)))
+		if err != nil || chunkShards < 2 {
+			t.Fatalf("chunk work shards = %d (parse error %v), want at least 2", chunkShards, err)
+		}
+		assertDBCountZero(t, "embed shards for vector-disabled sync",
+			`SELECT COUNT(*) FROM sync_job_shards WHERE stage = 'embed' AND job_id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`)
 		namespaces := rootIndexNamespaces(t, rootID)
 		assertRootIndexNamespaceCount(t, namespaces, 2)
 		cleanupDone := false
@@ -572,15 +581,54 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
 		assertHasTPRows(t, services, namespaces, "docs/readme.md")
 		assertHasTPRows(t, services, namespaces, "sessions/events.jsonl")
-		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
-		assertCLIQuery(t, homeDir, env, "bounded stream integration token", env.rootName, "hybrid", "", "sessions/events.jsonl")
+		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "fts", "", "docs/readme.md")
+		assertCLIQuery(t, homeDir, env, "bounded stream integration token", env.rootName, "fts", "", "sessions/events.jsonl")
+
+		for i := range 130 {
+			content := strings.Repeat("batched close integration token ", 64)
+			if i == 0 {
+				content += "unique generated zero marker"
+			}
+			writeFile(t, projectDir, fmt.Sprintf("generated/%03d.txt", i), content)
+		}
+		stdout, stderr, err = runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName, "--no-vector")
+		if err != nil {
+			t.Fatalf("batched modify sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Merkle diff found 130 changed files")
+		requireOutputContains(t, stdout, "Sync complete")
+		generationID = visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
+		chunkShards, err = strconv.Atoi(strings.TrimSpace(psqlOutput(t,
+			`SELECT COUNT(*) FROM sync_job_shards WHERE stage = 'chunk' AND job_id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`)))
+		if err != nil || chunkShards < 2 {
+			t.Fatalf("modify chunk work shards = %d (parse error %v), want at least 2", chunkShards, err)
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		lateRef := fmt.Sprintf("syncs/%s/chunks/late-visible.jsonl", generationID)
+		putStorageObject(t, lateRef, "late duplicate artifact")
+		lateQueue, err := queue.NewNATSQueue(nats.ClientURL())
+		if err != nil {
+			t.Fatalf("connect late-message queue: %v", err)
+		}
+		defer lateQueue.Close()
+		err = lateQueue.Enqueue(context.Background(), queue.StageChunk, queue.JobMessage{
+			JobID:        fmt.Sprintf("late-visible-%d", time.Now().UnixNano()),
+			OrgID:        env.orgID,
+			RootID:       rootID,
+			GenerationID: generationID,
+		})
+		if err != nil {
+			t.Fatalf("enqueue late visible-generation message: %v", err)
+		}
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", generationID), 30*time.Second)
+		assertCLIQuery(t, homeDir, env, "unique generated zero marker", env.rootName, "fts", "", "generated/000.txt")
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 		cleanupDone = true
 	})
 
 	t.Run("blocking sync with manifest-session shards remains queryable", func(t *testing.T) {
-		t.Setenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES", "1")
+		t.Setenv("PUFFERFS_UPLOAD_MANIFEST_MAX_FILES", "1")
 		env := newE2EEnv(t, services, "")
 		homeDir := t.TempDir()
 		initPufferFS(t, env, homeDir)
@@ -955,8 +1003,8 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
 		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
-		if gotStatus != "failed" {
-			t.Fatalf("generation status = %q, want failed", gotStatus)
+		if gotStatus != "superseded" {
+			t.Fatalf("generation status = %q, want superseded", gotStatus)
 		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
@@ -1023,8 +1071,8 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
 		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
-		if gotStatus != "failed" {
-			t.Fatalf("generation status = %q, want failed", gotStatus)
+		if gotStatus != "superseded" {
+			t.Fatalf("generation status = %q, want superseded", gotStatus)
 		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
@@ -1326,8 +1374,8 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		}
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
 		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
-		if gotStatus != "failed" {
-			t.Fatalf("generation status = %q, want failed", gotStatus)
+		if gotStatus != "superseded" {
+			t.Fatalf("generation status = %q, want superseded", gotStatus)
 		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
@@ -1394,8 +1442,8 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		}
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
 		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
-		if gotStatus != "failed" {
-			t.Fatalf("generation status = %q, want failed", gotStatus)
+		if gotStatus != "superseded" {
+			t.Fatalf("generation status = %q, want superseded", gotStatus)
 		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
@@ -1499,8 +1547,8 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		}
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
 		gotStatus := strings.TrimSpace(psqlOutput(t, `SELECT status FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID)))
-		if gotStatus != "failed" {
-			t.Fatalf("generation status = %q, want failed", gotStatus)
+		if gotStatus != "superseded" {
+			t.Fatalf("generation status = %q, want superseded", gotStatus)
 		}
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
@@ -1512,9 +1560,7 @@ type realServices struct {
 	modalChunkURL      string
 	modalEmbedURL      string
 	modalQueryEmbedURL string
-	modalChunkShardURL string
 	modalEmbedShardURL string
-	modalIndexShardURL string
 	turbopufferAPIKey  string
 	turbopufferAPIURL  string
 	storageEnv         []string
@@ -1533,9 +1579,7 @@ func requireRealServices(t *testing.T) realServices {
 		storageEnv:         e2eStorageEnv(),
 	}
 	if useRealS3 {
-		cfg.modalChunkShardURL = os.Getenv("MODAL_CHUNK_SHARD_ENDPOINT")
 		cfg.modalEmbedShardURL = os.Getenv("MODAL_EMBED_SHARD_ENDPOINT")
-		cfg.modalIndexShardURL = os.Getenv("MODAL_INDEX_SHARD_ENDPOINT")
 	}
 
 	var missing []string
@@ -1801,6 +1845,21 @@ func listStorageKeysWithPrefix(t *testing.T, prefix string, maxKeys int32) []str
 	return keys
 }
 
+func putStorageObject(t *testing.T, key, body string) {
+	t.Helper()
+	bucket := e2eMinioBucket
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		bucket = os.Getenv("AWS_BUCKET_NAME")
+	}
+	if _, err := newMinioClient(t).PutObject(context.Background(), &s3sdk.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(body),
+	}); err != nil {
+		t.Fatalf("put storage object %s: %v", key, err)
+	}
+}
+
 func assertStoragePrefixEmpty(t *testing.T, prefix string) {
 	t.Helper()
 
@@ -2017,9 +2076,7 @@ func startStageWorkers(t *testing.T, services realServices, natsURL string, stag
 			"MODAL_CHUNK_ENDPOINT=" + services.modalChunkURL,
 			"MODAL_EMBED_ENDPOINT=" + services.modalEmbedURL,
 			"MODAL_QUERY_EMBED_ENDPOINT=" + services.modalQueryEmbedURL,
-			"MODAL_CHUNK_SHARD_ENDPOINT=" + services.modalChunkShardURL,
 			"MODAL_EMBED_SHARD_ENDPOINT=" + services.modalEmbedShardURL,
-			"MODAL_INDEX_SHARD_ENDPOINT=" + services.modalIndexShardURL,
 			"TURBOPUFFER_API_KEY=" + services.turbopufferAPIKey,
 			"TURBOPUFFER_API_URL=" + services.turbopufferAPIURL,
 			"PUFFERFS_TP_NAMESPACE_SHARDS=" + e2eTPNamespaceShards,

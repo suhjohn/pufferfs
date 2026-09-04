@@ -693,7 +693,7 @@ func printSelectionWaitProgress(w io.Writer, result *syncSelectionWaitResult) {
 		fmt.Fprintf(w, "missing: %s\n", strings.Join(limitStrings(result.Missing, 5), ", "))
 	}
 	if len(result.Stale) > 0 {
-		paths := make([]string, 0, minInt(len(result.Stale), 5))
+		paths := make([]string, 0, min(len(result.Stale), 5))
 		for i, stale := range result.Stale {
 			if i >= 5 {
 				break
@@ -711,13 +711,6 @@ func limitStrings(values []string, limit int) []string {
 	out := append([]string{}, values[:limit]...)
 	out = append(out, fmt.Sprintf("...+%d more", len(values)-limit))
 	return out
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func syncJobTerminal(status string) bool {
@@ -747,26 +740,16 @@ func printSyncJob(w io.Writer, job *models.SyncJob) {
 }
 
 func syncJobCurrentProgress(job *models.SyncJob) int {
-	if job == nil {
-		return 0
-	}
-	switch job.Status {
-	case "chunking":
+	if job.Status == "chunking" {
 		return job.Chunked
-	case "embedding":
-		return job.Embedded
-	case "indexing", "upserting", "committing", "completed":
-		if job.Indexed > job.Processed {
-			return job.Indexed
-		}
 	}
-	return job.Processed
+	if job.Status == "embedding" {
+		return job.Embedded
+	}
+	return max(job.Processed, job.Indexed)
 }
 
 func printSyncProgress(w io.Writer, job *models.SyncJob) {
-	if job == nil {
-		return
-	}
 	fmt.Fprintf(w, "Sync status: %s (%d/%d files; chunked=%d embedded=%d indexed=%d)\n",
 		job.Status, syncJobCurrentProgress(job), job.TotalFiles, job.Chunked, job.Embedded, job.Indexed)
 }
@@ -962,7 +945,7 @@ func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVecto
 	fmt.Fprintf(log, "Merkle diff found %d changed files (skipped unchanged subtrees)\n", len(treeChanges))
 
 	// Convert Merkle changes to DiffResult for compatibility
-	result := merkleChangesToDiffResult(treeChanges, prevTree, currentTree)
+	result := merkleChangesToDiffResult(treeChanges)
 
 	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
 }
@@ -1677,7 +1660,6 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		return nil, err
 	}
 
-	// Send sync request with SimHash for index reuse + content proof
 	syncReq := models.SyncRequest{
 		ProtocolVersion:   models.SyncProtocolVersion,
 		RootID:            rootID,
@@ -1685,11 +1667,8 @@ func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope strin
 		BaseGenerationID:  baseGenerationID,
 		BaseGenerationSeq: baseGenerationSeq,
 		ChangeRefs:        metadataRefs.ChangeRefs,
-		ChangeCount:       changeCount,
 		StateRef:          metadataRefs.StateRef,
-		SimHash:           currentTree.SimHashHex(),
 		ContentProofRef:   metadataRefs.ContentProofRef,
-		ManifestRef:       "",
 	}
 
 	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
@@ -1893,7 +1872,7 @@ func backgroundSyncResult(name, dir string, changes int, resp models.SyncRespons
 
 // merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.
 // Includes move detection by matching removed→added files with the same content hash.
-func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.Tree) models.DiffResult {
+func merkleChangesToDiffResult(changes []merkle.DiffChange) models.DiffResult {
 	result := models.DiffResult{}
 
 	// Separate added and removed for move detection
@@ -1915,29 +1894,30 @@ func merkleChangesToDiffResult(changes []merkle.DiffChange, prev, curr *merkle.T
 		}
 	}
 
-	// Move detection: match removed→added by content hash
-	usedRemoved := make(map[int]bool)
-	usedAdded := make(map[int]bool)
-
+	removedByHash := make(map[string][]int, len(removed))
+	for i, change := range removed {
+		removedByHash[change.ContentHash] = append(removedByHash[change.ContentHash], i)
+	}
+	usedRemoved := make([]bool, len(removed))
+	usedAdded := make([]bool, len(added))
+	maxMoveBytes := moveReuseMaxBytes()
 	for ai, a := range added {
-		for ri, r := range removed {
-			if usedRemoved[ri] || usedAdded[ai] {
-				continue
-			}
-			if a.ContentHash == r.ContentHash && a.Size <= moveReuseMaxBytes() {
-				result.Changes = append(result.Changes, models.FileChange{
-					Path:        a.Path,
-					Status:      models.StatusMoved,
-					OldPath:     r.Path,
-					ContentHash: a.ContentHash,
-					Size:        a.Size,
-				})
-				result.Stats.Moved++
-				usedRemoved[ri] = true
-				usedAdded[ai] = true
-				break
-			}
+		matches := removedByHash[a.ContentHash]
+		if len(matches) == 0 || a.Size > maxMoveBytes {
+			continue
 		}
+		ri := matches[len(matches)-1]
+		removedByHash[a.ContentHash] = matches[:len(matches)-1]
+		usedRemoved[ri] = true
+		usedAdded[ai] = true
+		result.Changes = append(result.Changes, models.FileChange{
+			Path:        a.Path,
+			Status:      models.StatusMoved,
+			OldPath:     removed[ri].Path,
+			ContentHash: a.ContentHash,
+			Size:        a.Size,
+		})
+		result.Stats.Moved++
 	}
 
 	for ri, r := range removed {
@@ -2061,16 +2041,6 @@ func findLocalRootMeta(name, sourcePath string) (*rootMeta, error) {
 	return nil, fmt.Errorf("local root metadata not found")
 }
 
-type bundleManifestEntry struct {
-	Path        string `json:"path"`
-	ContentHash string `json:"content_hash"`
-	Size        int64  `json:"size"`
-	BundleKey   string `json:"bundle_key,omitempty"`
-	ObjectKey   string `json:"object_key,omitempty"`
-	Offset      int64  `json:"offset,omitempty"`
-	Length      int64  `json:"length,omitempty"`
-}
-
 const (
 	defaultUploadConcurrency = 4
 	maxUploadConcurrency     = 16
@@ -2080,9 +2050,8 @@ type boundedUploadGroup struct {
 	slots chan struct{}
 	wg    sync.WaitGroup
 
-	mu         sync.Mutex
-	firstOrder int
-	firstErr   error
+	mu       sync.Mutex
+	firstErr error
 }
 
 func newBoundedUploadGroup(limit int) *boundedUploadGroup {
@@ -2092,31 +2061,26 @@ func newBoundedUploadGroup(limit int) *boundedUploadGroup {
 	return &boundedUploadGroup{slots: make(chan struct{}, limit)}
 }
 
-func (g *boundedUploadGroup) Go(order int, upload func() error) bool {
-	if !g.acquire() {
+func (g *boundedUploadGroup) Go(upload func() error) bool {
+	if g.Err() != nil {
+		return false
+	}
+	g.slots <- struct{}{}
+	if g.Err() != nil {
+		<-g.slots
 		return false
 	}
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
 		defer func() { <-g.slots }()
-		g.record(order, upload())
+		g.record(upload())
 	}()
 	return true
 }
 
-func (g *boundedUploadGroup) Do(order int, upload func() error) bool {
-	if !g.acquire() {
-		return false
-	}
-	err := upload()
-	g.record(order, err)
-	<-g.slots
-	return err == nil
-}
-
-func (g *boundedUploadGroup) Fail(order int, err error) {
-	g.record(order, err)
+func (g *boundedUploadGroup) Fail(err error) {
+	g.record(err)
 }
 
 func (g *boundedUploadGroup) Wait() error {
@@ -2130,26 +2094,13 @@ func (g *boundedUploadGroup) Err() error {
 	return g.firstErr
 }
 
-func (g *boundedUploadGroup) acquire() bool {
-	if g.Err() != nil {
-		return false
-	}
-	g.slots <- struct{}{}
-	if g.Err() != nil {
-		<-g.slots
-		return false
-	}
-	return true
-}
-
-func (g *boundedUploadGroup) record(order int, err error) {
+func (g *boundedUploadGroup) record(err error) {
 	if err == nil {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.firstErr == nil || order < g.firstOrder {
-		g.firstOrder = order
+	if g.firstErr == nil {
 		g.firstErr = err
 	}
 }
@@ -2209,23 +2160,18 @@ type syncMetadataRefs struct {
 }
 
 func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes []models.FileChange, proof *models.ContentProofData, state map[string]models.FileState) (syncMetadataRefs, error) {
-	changeShards := shardUploadChanges(changes, uploadChangeShardLimits{
-		MaxFiles:           uploadChangeShardMaxFiles(),
-		MaxSourceBytes:     uploadChangeShardMaxBytes(),
-		MaxEstimatedChunks: uploadChangeShardMaxChunks(),
-	})
-	shardCount := len(changeShards)
+	manifestSize := uploadManifestMaxFiles()
+	shardCount := (len(changes) + manifestSize - 1) / manifestSize
 	refs := syncMetadataRefs{ChangeRefs: make([]string, shardCount)}
 	uploads := newBoundedUploadGroup(uploadConcurrency())
-	heavyMetadata := make(chan struct{}, 1)
-
-	for shardIndex, shard := range changeShards {
+	for shardIndex, start := 0, 0; start < len(changes); shardIndex, start = shardIndex+1, start+manifestSize {
+		end := min(start+manifestSize, len(changes))
 		ordinal := shardIndex
-		shardItems := shard
-		if !uploads.Go(ordinal, func() error {
+		shard := changes[start:end]
+		if !uploads.Go(func() error {
 			var buf bytes.Buffer
 			enc := json.NewEncoder(&buf)
-			for _, change := range shardItems {
+			for _, change := range shard {
 				if err := enc.Encode(change); err != nil {
 					return fmt.Errorf("encoding change shard %d: %w", ordinal, err)
 				}
@@ -2242,9 +2188,7 @@ func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes 
 	}
 
 	if uploads.Err() == nil {
-		uploads.Go(shardCount, func() error {
-			heavyMetadata <- struct{}{}
-			defer func() { <-heavyMetadata }()
+		uploads.Go(func() error {
 			key, err := uploadContentProof(client, rootID, generationID, proof)
 			if err != nil {
 				return fmt.Errorf("uploading content proof: %w", err)
@@ -2254,9 +2198,7 @@ func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes 
 		})
 	}
 	if uploads.Err() == nil {
-		uploads.Go(shardCount+1, func() error {
-			heavyMetadata <- struct{}{}
-			defer func() { <-heavyMetadata }()
+		uploads.Go(func() error {
 			key, err := uploadRootState(client, rootID, generationID, state)
 			if err != nil {
 				return fmt.Errorf("uploading root state: %w", err)
@@ -2323,135 +2265,37 @@ func uploadRootState(client *apiClient, rootID, generationID string, state map[s
 
 func uploadBundleSmallFileLimit() int64 {
 	const defaultBytes = 8 << 20
-	raw := os.Getenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES")
-	if raw == "" {
-		return defaultBytes
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 1 {
+	value, _ := strconv.ParseInt(os.Getenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES"), 10, 64)
+	if value < 1 {
 		return defaultBytes
 	}
 	return value
 }
 
 func uploadBundleMaxBytes() int64 {
-	const defaultBytes = 32 << 20
-	raw := os.Getenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES")
-	if raw == "" {
+	const defaultBytes = 15 << 20
+	value, _ := strconv.ParseInt(os.Getenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES"), 10, 64)
+	if value < 1 {
 		return defaultBytes
 	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 1 {
-		return defaultBytes
-	}
-	return value
+	return min(value, int64(defaultBytes))
 }
 
 func uploadConcurrency() int {
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CONCURRENCY"))
-	if raw == "" {
+	value, _ := strconv.Atoi(os.Getenv("PUFFERFS_UPLOAD_CONCURRENCY"))
+	if value < 1 {
 		return defaultUploadConcurrency
 	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 {
-		return defaultUploadConcurrency
-	}
-	if value > maxUploadConcurrency {
-		return maxUploadConcurrency
-	}
-	return value
+	return min(value, maxUploadConcurrency)
 }
 
-func uploadChangeShardMaxFiles() int {
-	const defaultFiles = 128
-	raw := os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES")
-	if raw == "" {
+func uploadManifestMaxFiles() int {
+	const defaultFiles = 5000
+	value, _ := strconv.Atoi(os.Getenv("PUFFERFS_UPLOAD_MANIFEST_MAX_FILES"))
+	if value < 1 {
 		return defaultFiles
 	}
-	value, err := strconv.Atoi(raw)
-	if err != nil || value < 1 {
-		return defaultFiles
-	}
-	return value
-}
-
-func uploadChangeShardMaxBytes() int64 {
-	const defaultBytes = 32 << 20
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_BYTES"))
-	if raw == "" {
-		return defaultBytes
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 1 {
-		return defaultBytes
-	}
-	return value
-}
-
-func uploadChangeShardMaxChunks() int64 {
-	const defaultChunks = 8192
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_CHUNKS"))
-	if raw == "" {
-		return defaultChunks
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value < 1 {
-		return defaultChunks
-	}
-	return value
-}
-
-type uploadChangeShardLimits struct {
-	MaxFiles           int
-	MaxSourceBytes     int64
-	MaxEstimatedChunks int64
-}
-
-func shardUploadChanges(changes []models.FileChange, limits uploadChangeShardLimits) [][]models.FileChange {
-	var shards [][]models.FileChange
-	var current []models.FileChange
-	var sourceBytes, estimatedChunks int64
-	for _, change := range changes {
-		size := change.SourceLength
-		if size <= 0 {
-			size = change.Size
-		}
-		if size < 0 {
-			size = 0
-		}
-		work := estimatedChangeChunks(change, size)
-		full := len(current) > 0 && (len(current) >= limits.MaxFiles ||
-			sourceBytes+size > limits.MaxSourceBytes ||
-			estimatedChunks+work > limits.MaxEstimatedChunks)
-		if full {
-			shards = append(shards, current)
-			current = nil
-			sourceBytes = 0
-			estimatedChunks = 0
-		}
-		current = append(current, change)
-		sourceBytes += size
-		estimatedChunks += work
-	}
-	if len(current) > 0 {
-		shards = append(shards, current)
-	}
-	return shards
-}
-
-func estimatedChangeChunks(change models.FileChange, size int64) int64 {
-	switch change.Status {
-	case models.StatusAdded, models.StatusModified:
-		// Text chunks advance by roughly 2 KiB after overlap. Rich documents can
-		// expand more, but the byte limit remains a second independent guard.
-		const effectiveChunkBytes = 2000
-		if size <= 0 {
-			return 1
-		}
-		return (size + effectiveChunkBytes - 1) / effectiveChunkBytes
-	default:
-		return 1
-	}
+	return min(value, defaultFiles)
 }
 
 func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileState, error) {

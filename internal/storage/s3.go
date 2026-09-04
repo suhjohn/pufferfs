@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -128,84 +129,9 @@ func (c *Client) UploadStream(ctx context.Context, key string, body io.Reader, c
 	return err
 }
 
-// UploadCAS puts an object only if the supplied ETag precondition matches.
-func (c *Client) UploadCAS(ctx context.Context, key string, data []byte, contentType, ifMatch, ifNoneMatch string) (string, error) {
-	input := &s3.PutObjectInput{
-		Bucket:      &c.bucket,
-		Key:         &key,
-		Body:        bytes.NewReader(data),
-		ContentType: &contentType,
-	}
-	if ifMatch != "" {
-		input.IfMatch = &ifMatch
-	}
-	if ifNoneMatch != "" {
-		input.IfNoneMatch = &ifNoneMatch
-	}
-	resp, err := c.s3.PutObject(ctx, input)
-	if err != nil {
-		return "", err
-	}
-	if resp.ETag == nil {
-		return "", nil
-	}
-	return *resp.ETag, nil
-}
-
-// UploadFile uploads a local file to S3.
-func (c *Client) UploadFile(ctx context.Context, key string, filePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = c.s3.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: &c.bucket,
-		Key:    &key,
-		Body:   f,
-	})
-	return err
-}
-
 // Download gets an object from S3.
 func (c *Client) Download(ctx context.Context, key string) ([]byte, error) {
-	data, _, err := c.DownloadWithETag(ctx, key)
-	return data, err
-}
-
-// DownloadWithETag gets an object and returns its ETag for conditional writes.
-func (c *Client) DownloadWithETag(ctx context.Context, key string) ([]byte, string, error) {
-	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &c.bucket,
-		Key:    &key,
-	})
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-	etag := ""
-	if resp.ETag != nil {
-		etag = *resp.ETag
-	}
-	return data, etag, nil
-}
-
-// DownloadRange gets a byte range from an object in S3.
-func (c *Client) DownloadRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	if length <= 0 {
-		return c.Download(ctx, key)
-	}
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &c.bucket,
-		Key:    &key,
-		Range:  &rangeHeader,
-	})
+	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: &c.bucket, Key: &key})
 	if err != nil {
 		return nil, err
 	}
@@ -213,30 +139,47 @@ func (c *Client) DownloadRange(ctx context.Context, key string, offset, length i
 	return io.ReadAll(resp.Body)
 }
 
-// Delete removes an object from S3.
-func (c *Client) Delete(ctx context.Context, key string) error {
-	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &c.bucket,
-		Key:    &key,
-	})
-	return err
+// Open streams an object, optionally limited to a byte range.
+func (c *Client) Open(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
+	if offset < 0 || length < 0 {
+		return nil, fmt.Errorf("invalid object range offset=%d length=%d", offset, length)
+	}
+	input := &s3.GetObjectInput{Bucket: &c.bucket, Key: &key}
+	if length > 0 {
+		if offset > math.MaxInt64-length+1 {
+			return nil, fmt.Errorf("invalid object range offset=%d length=%d", offset, length)
+		}
+		rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+		input.Range = &rangeHeader
+	}
+	resp, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
 // DeleteMany removes objects from S3 in one batch.
 func (c *Client) DeleteMany(ctx context.Context, keys []string) error {
-	if len(keys) == 0 {
-		return nil
+	for start := 0; start < len(keys); start += 1000 {
+		end := min(start+1000, len(keys))
+		objects := make([]types.ObjectIdentifier, 0, end-start)
+		for _, key := range keys[start:end] {
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+		output, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &c.bucket,
+			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return err
+		}
+		if len(output.Errors) > 0 {
+			failure := output.Errors[0]
+			return fmt.Errorf("deleting %d objects: %s (%s): %s", len(output.Errors), aws.ToString(failure.Key), aws.ToString(failure.Code), aws.ToString(failure.Message))
+		}
 	}
-	objects := make([]types.ObjectIdentifier, 0, len(keys))
-	for _, key := range keys {
-		key := key
-		objects = append(objects, types.ObjectIdentifier{Key: &key})
-	}
-	_, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-		Bucket: &c.bucket,
-		Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-	})
-	return err
+	return nil
 }
 
 func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
@@ -260,33 +203,10 @@ func (c *Client) DeletePrefix(ctx context.Context, prefix string) (int, error) {
 			}
 			keys = append(keys, *obj.Key)
 		}
-		for start := 0; start < len(keys); start += 1000 {
-			end := start + 1000
-			if end > len(keys) {
-				end = len(keys)
-			}
-			if err := c.DeleteMany(ctx, keys[start:end]); err != nil {
-				return deleted, err
-			}
-			deleted += end - start
+		if err := c.DeleteMany(ctx, keys); err != nil {
+			return deleted, err
 		}
+		deleted += len(keys)
 	}
 	return deleted, nil
-}
-
-// Rename copies an object to a new key and deletes the old one.
-func (c *Client) Rename(ctx context.Context, oldKey, newKey string) error {
-	copySource := fmt.Sprintf("%s/%s", c.bucket, oldKey)
-	_, err := c.s3.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     &c.bucket,
-		CopySource: &copySource,
-		Key:        &newKey,
-	})
-	if err != nil {
-		return fmt.Errorf("copy %s -> %s: %w", oldKey, newKey, err)
-	}
-	if err := c.Delete(ctx, oldKey); err != nil {
-		return fmt.Errorf("rename delete %s after copy to %s: %w", oldKey, newKey, err)
-	}
-	return nil
 }

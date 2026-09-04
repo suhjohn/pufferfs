@@ -23,17 +23,6 @@ func localChunkable(filePath string) bool {
 	return true
 }
 
-// chunkLocally splits text content into chunks matching the Python chunker output format.
-// Returns []map[string]any matching Modal's Chunk dataclass (asdict).
-func chunkLocally(content []byte, rootID, filePath string) []map[string]any {
-	var chunks []map[string]any
-	_ = chunkLocallyEach(content, rootID, filePath, func(chunk map[string]any) error {
-		chunks = append(chunks, chunk)
-		return nil
-	})
-	return chunks
-}
-
 func chunkLocallyEach(content []byte, rootID, filePath string, visit func(map[string]any) error) error {
 	text := string(content)
 	if strings.TrimSpace(text) == "" {
@@ -52,16 +41,6 @@ const (
 	codeChunkChars   = 3000
 	codeOverlapChars = 1000
 )
-
-// chunkCode uses a sliding window with line-boundary overlap.
-func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
-	var chunks []map[string]any
-	_ = walkCodeChunks(text, rootID, filePath, fileType, func(chunk map[string]any) error {
-		chunks = append(chunks, chunk)
-		return nil
-	})
-	return chunks
-}
 
 func walkCodeChunks(text, rootID, filePath, fileType string, visit func(map[string]any) error) error {
 	lines := strings.SplitAfter(text, "\n")
@@ -108,16 +87,6 @@ func walkCodeChunks(text, rootID, filePath, fileType string, visit func(map[stri
 	return nil
 }
 
-// chunkMarkdown splits by headings, then uses a boundary-aware sliding window with overlap.
-func chunkMarkdown(text, rootID, filePath, fileType string) []map[string]any {
-	var chunks []map[string]any
-	_ = walkMarkdownChunks(text, rootID, filePath, fileType, func(chunk map[string]any) error {
-		chunks = append(chunks, chunk)
-		return nil
-	})
-	return chunks
-}
-
 func walkMarkdownChunks(text, rootID, filePath, fileType string, visit func(map[string]any) error) error {
 	sections := splitByHeadingsWithOffsets(text)
 	idx := 0
@@ -159,16 +128,6 @@ type textSection struct {
 type textPiece struct {
 	text  string
 	start int
-	end   int
-}
-
-func splitByHeadings(text string) []string {
-	sections := splitByHeadingsWithOffsets(text)
-	out := make([]string, 0, len(sections))
-	for _, section := range sections {
-		out = append(out, section.text)
-	}
-	return out
 }
 
 func splitByHeadingsWithOffsets(text string) []textSection {
@@ -193,18 +152,9 @@ func splitByHeadingsWithOffsets(text string) []textSection {
 	return sections
 }
 
-func splitTextWithOverlap(text string, targetChars, overlapChars int) []string {
-	pieces := splitTextWithOverlapOffsets(text, 0, targetChars, overlapChars)
-	out := make([]string, 0, len(pieces))
-	for _, piece := range pieces {
-		out = append(out, piece.text)
-	}
-	return out
-}
-
 func splitTextWithOverlapOffsets(text string, baseOffset, targetChars, overlapChars int) []textPiece {
 	if len(text) <= targetChars {
-		return []textPiece{{text: text, start: baseOffset, end: baseOffset + len(text)}}
+		return []textPiece{{text: text, start: baseOffset}}
 	}
 
 	var pieces []textPiece
@@ -216,7 +166,7 @@ func splitTextWithOverlapOffsets(text string, baseOffset, targetChars, overlapCh
 		} else {
 			end = bestTextBoundary(text, start, end, targetChars/2)
 		}
-		pieces = append(pieces, textPiece{text: text[start:end], start: baseOffset + start, end: baseOffset + end})
+		pieces = append(pieces, textPiece{text: text[start:end], start: baseOffset + start})
 		if end >= len(text) {
 			break
 		}
@@ -230,27 +180,6 @@ func splitTextWithOverlapOffsets(text string, baseOffset, targetChars, overlapCh
 		start = nextStart
 	}
 	return pieces
-}
-
-func lineSpanForByteRange(text string, start, end int) (int, int) {
-	if start < 0 {
-		start = 0
-	}
-	if end > len(text) {
-		end = len(text)
-	}
-	lineStart := 1 + strings.Count(text[:start], "\n")
-	lineEnd := lineStart
-	if end > start {
-		lineEnd = lineStart + strings.Count(text[start:end], "\n")
-		if strings.HasSuffix(text[start:end], "\n") {
-			lineEnd--
-		}
-	}
-	if lineEnd < lineStart {
-		lineEnd = lineStart
-	}
-	return lineStart, lineEnd
 }
 
 func bestTextBoundary(text string, start, hardEnd, minSize int) int {
