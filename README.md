@@ -1,5 +1,7 @@
 # PufferFS
 
+!! This product is experimental. Report any bugs you see 
+
 PufferFS is a filesystem sync and search service for agent workflows. Sync a
 local folder into a hosted hybrid index, then query it from the CLI, web
 console, scripts, or agents.
