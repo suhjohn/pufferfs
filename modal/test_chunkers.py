@@ -189,6 +189,7 @@ class ChunkersTest(unittest.TestCase):
                 os.environ["PUFFERFS_PDF_RENDERER_JOBS"] = old_jobs
 
     def test_render_pdf_pages_jpeg_falls_back_to_mupdf_cli(self):
+        import base64
         import os
         import subprocess
 
@@ -197,6 +198,9 @@ class ChunkersTest(unittest.TestCase):
         old_dpi = os.environ.get("PUFFERFS_MODAL_PAGE_IMAGE_DPI")
         old_run = chunkers.subprocess.run
         calls = []
+        png_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
 
         def fake_run(cmd, check, capture_output, text):
             calls.append((cmd, check, capture_output, text))
@@ -205,10 +209,10 @@ class ChunkersTest(unittest.TestCase):
             output_pattern = cmd[cmd.index("-o") + 1]
             output_dir = os.path.dirname(output_pattern)
             os.makedirs(output_dir, exist_ok=True)
-            with open(os.path.join(output_dir, "page_10.jpg"), "wb") as f:
-                f.write(b"\xff\xd8page10\xff\xd9")
-            with open(os.path.join(output_dir, "page_2.jpg"), "wb") as f:
-                f.write(b"\xff\xd8page2\xff\xd9")
+            with open(os.path.join(output_dir, "page_10.png"), "wb") as f:
+                f.write(png_bytes)
+            with open(os.path.join(output_dir, "page_2.png"), "wb") as f:
+                f.write(png_bytes)
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         os.environ["PUFFERFS_MODAL_PAGE_IMAGE_DPI"] = "144"
@@ -216,10 +220,11 @@ class ChunkersTest(unittest.TestCase):
         try:
             pages = render_pdf_pages_jpeg(b"%PDF")
             self.assertEqual([page_num for page_num, _ in pages], [1, 9])
+            self.assertEqual([img[:2] for _, img in pages], [b"\xff\xd8", b"\xff\xd8"])
             self.assertEqual(calls[1][0][:2], ["mutool", "draw"])
             self.assertIn("-i", calls[1][0])
             self.assertEqual(calls[1][0][calls[1][0].index("-r") + 1], "144")
-            self.assertEqual(calls[1][0][calls[1][0].index("-F") + 1], "jpeg")
+            self.assertEqual(calls[1][0][calls[1][0].index("-F") + 1], "png")
         finally:
             chunkers.subprocess.run = old_run
             if old_dpi is None:

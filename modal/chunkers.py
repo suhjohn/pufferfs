@@ -7,6 +7,7 @@ import email
 from email import policy
 import glob
 from html.parser import HTMLParser
+import io
 import os
 import quopri
 import random
@@ -167,6 +168,23 @@ def _collect_rendered_jpeg_pages(output_dir: str) -> list[tuple[int, bytes]]:
     return pages
 
 
+def _collect_rendered_png_pages_as_jpeg(output_dir: str) -> list[tuple[int, bytes]]:
+    from PIL import Image
+
+    pages: list[tuple[int, bytes]] = []
+    for png_path in glob.glob(os.path.join(output_dir, "page_*.png")):
+        match = re.search(r"page_(\d+)\.png$", os.path.basename(png_path))
+        page_num = int(match.group(1)) - 1 if match else len(pages)
+        with Image.open(png_path) as image:
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=_page_image_jpeg_quality(), optimize=True)
+            pages.append((page_num, output.getvalue()))
+    pages.sort(key=lambda page: page[0])
+    return pages
+
+
 def _run_frpdf_renderer(input_path: str, output_dir: str) -> list[tuple[int, bytes]]:
     cmd = [
         _pdf_renderer_path(),
@@ -199,13 +217,13 @@ def _run_mupdf_renderer(input_path: str, output_dir: str) -> list[tuple[int, byt
         "-r",
         str(_page_image_dpi()),
         "-F",
-        "jpeg",
+        "png",
         "-o",
-        os.path.join(output_dir, "page_%d.jpg"),
+        os.path.join(output_dir, "page_%d.png"),
         input_path,
     ]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return _collect_rendered_jpeg_pages(output_dir)
+    return _collect_rendered_png_pages_as_jpeg(output_dir)
 
 
 def render_pdf_pages_jpeg(pdf_bytes: bytes) -> list[tuple[int, bytes]]:
