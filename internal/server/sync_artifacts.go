@@ -1,24 +1,36 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 )
 
-// streamJSONL uploads one JSONL object while write produces it. The storage
-// uploader owns multipart buffering, so neither side materializes the object.
+// streamJSONL uploads one compressed JSONL object while write produces it. The
+// storage uploader owns multipart buffering, so neither side materializes the
+// object.
 func (p *syncPipeline) streamJSONL(ctx context.Context, dir, name string, write func(*json.Encoder) error) (string, error) {
-	key := fmt.Sprintf("syncs/%s/%s/%s.jsonl", p.generation.ID, dir, safeObjectName(name))
+	key := fmt.Sprintf("syncs/%s/%s/%s.jsonl.gz", p.generation.ID, dir, safeObjectName(name))
 	reader, writer := io.Pipe()
 	uploaded := make(chan error, 1)
 	go func() {
-		err := p.server.s3.UploadStream(ctx, key, reader, "application/x-ndjson")
+		err := p.server.s3.UploadStream(ctx, key, reader, "application/gzip")
 		_ = reader.CloseWithError(err)
 		uploaded <- err
 	}()
-	writeErr := write(json.NewEncoder(writer))
+	gz, err := gzip.NewWriterLevel(writer, gzip.BestSpeed)
+	if err != nil {
+		_ = writer.CloseWithError(err)
+		<-uploaded
+		return "", fmt.Errorf("creating gzip writer: %w", err)
+	}
+	writeErr := write(json.NewEncoder(gz))
+	if closeErr := gz.Close(); writeErr == nil {
+		writeErr = closeErr
+	}
 	_ = writer.CloseWithError(writeErr)
 	uploadErr := <-uploaded
 	if writeErr != nil {
@@ -36,7 +48,16 @@ func eachJSONL[T any](ctx context.Context, store objectStore, key string, visit 
 		return fmt.Errorf("opening %s: %w", key, err)
 	}
 	defer reader.Close()
-	dec := json.NewDecoder(reader)
+	var input io.Reader = reader
+	if strings.HasSuffix(key, ".gz") {
+		gz, err := gzip.NewReader(reader)
+		if err != nil {
+			return fmt.Errorf("opening compressed %s: %w", key, err)
+		}
+		defer gz.Close()
+		input = gz
+	}
+	dec := json.NewDecoder(input)
 	for {
 		var value T
 		if err := dec.Decode(&value); err != nil {

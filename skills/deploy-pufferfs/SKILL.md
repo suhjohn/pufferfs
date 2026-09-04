@@ -22,7 +22,7 @@ Use the AWS Pulumi stack in [infra/pulumi](/Users/johnsuh/pufferfs/infra/pulumi)
 
 - Run from `/Users/johnsuh/pufferfs`.
 - Expect AWS credentials to already work via `AWS_PROFILE` or environment variables.
-- Expect these keys in `.env`: `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `MODAL_CHUNK_ENDPOINT`, `MODAL_EMBED_ENDPOINT`, `MODAL_QUERY_EMBED_ENDPOINT`, `MODAL_EMBED_SHARD_ENDPOINT`.
+- Expect these keys in `.env`: `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `MODAL_SECRET_KEY`, `MODAL_CHUNK_ENDPOINT`, `MODAL_EMBED_ENDPOINT`, `MODAL_QUERY_EMBED_ENDPOINT`, `MODAL_INDEX_SHARD_ENDPOINT`.
 - For the web frontend + Google login, also expect: `WEB_DOMAIN`, `API_DOMAIN`, `FRONTEND_URL`, `COOKIE_DOMAIN`, `OAUTH_REDIRECT_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `VITE_API_URL`. Optional billing adds `ENABLE_BILLING`/`VITE_ENABLE_BILLING` and the `STRIPE_*` keys. See the runbook for the full mapping to `pulumi config`.
 - Expect `PULUMI_CONFIG_PASSPHRASE` in `.env` when using the local Pulumi secrets backend.
 
@@ -43,7 +43,7 @@ Pulumi's current npm packages require Node 20+.
 - Use the existing `prod` stack if it already exists. Initialize it only when missing.
 - Configure Pulumi from `.env`; do not hand-edit `Pulumi.<stack>.yaml` unless the user asks.
 - Prefer `pulumi stack output ...` for reporting deploy results.
-- Secrets (`DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `GOOGLE_CLIENT_SECRET`, `STRIPE_*`, `PUFFERFS_ADMIN_KEY_HASH`) must be set with `pulumi config set --secret`. `.env` and `Pulumi.*.yaml` are git-ignored — never commit them or print secret values; report key names and presence only.
+- Secrets (`DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, `MODAL_SECRET_KEY`, `GOOGLE_CLIENT_SECRET`, `STRIPE_*`, `PUFFERFS_ADMIN_KEY_HASH`) must be set with `pulumi config set --secret`. `.env` and `Pulumi.*.yaml` are git-ignored — never commit them or print secret values; report key names and presence only.
 - Backend image deploys should use an immutable git SHA image tag (`pufferfs:imageTag`) so ECS rolls through a task-definition change instead of relying on a mutable `prod` tag.
 - The frontend is a separate static deploy: build `web/` (Node 20+), `aws s3 sync web/dist/client/` to the `webBucketName` bucket, then invalidate `webDistributionId`. The browser API base is baked in at build time via `VITE_API_URL`.
 - Custom domains use Cloudflare DNS in a two-phase flow: first `pulumi up` creates the ACM certs, then add the exported validation + host CNAMEs in Cloudflare (DNS-only), wait for ACM `Issued`, then set `apiHttpsReady=true`/`webHttpsReady=true` and `pulumi up` again.

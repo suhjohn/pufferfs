@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import base64
 import binascii
+import gzip
+import hashlib
 import hmac
 import json
-import threading
 import time
 from dataclasses import asdict
 
@@ -62,6 +63,7 @@ embedding_image = (
         "sentence-transformers>=3.0.0",
         "torch>=2.0.0",
         "einops>=0.7.0",
+        "turbopuffer>=2.9.0,<3",
         "fastapi[standard]",
     )
     .add_local_file("models.py", "/root/models.py")
@@ -490,7 +492,7 @@ def file_to_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Queue embed stage: job pointer -> S3 artifact -> next S3 artifact
+# Queue index stage: job pointer -> S3 chunk stream -> Turbopuffer
 # ---------------------------------------------------------------------------
 
 
@@ -510,46 +512,104 @@ def _s3_client():
 def _iter_jsonl(s3, key: str):
     bucket = os.environ["AWS_BUCKET_NAME"]
     body = s3.get_object(Bucket=bucket, Key=key)["Body"]
+    lines = gzip.GzipFile(fileobj=body) if key.endswith(".gz") else body.iter_lines()
     try:
-        for line in body.iter_lines():
+        for line in lines:
             if line.strip():
                 yield json.loads(line)
     finally:
+        if key.endswith(".gz"):
+            lines.close()
         body.close()
 
 
-def _write_jsonl(s3, generation_id: str, dirname: str, name: str, rows) -> str:
-    key = f"syncs/{generation_id}/{dirname}/{name}.jsonl"
-    read_fd, write_fd = os.pipe()
-    errors = []
-
-    def upload():
-        try:
-            with os.fdopen(read_fd, "rb", buffering=0) as source:
-                s3.upload_fileobj(
-                    source,
-                    os.environ["AWS_BUCKET_NAME"],
-                    key,
-                    ExtraArgs={"ContentType": "application/x-ndjson"},
-                )
-        except Exception as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=upload, daemon=True)
-    thread.start()
-    try:
-        with os.fdopen(write_fd, "wb", buffering=0) as output:
-            for row in rows:
-                output.write((json.dumps(row, separators=(",", ":")) + "\n").encode())
-    finally:
-        thread.join()
-    if errors:
-        raise errors[0]
-    return key
+TP_SCHEMA = {
+    "content": {"type": "string", "full_text_search": True},
+    "file_path": {"type": "string"},
+    "chunk_index": {"type": "uint"},
+    "content_hash": {"type": "string"},
+    "file_hash": {"type": "string"},
+    "file_type": {"type": "string"},
+    "page_number": {"type": "uint"},
+    "image_path": {"type": "string"},
+    "line_start": {"type": "uint"},
+    "line_end": {"type": "uint"},
+    "root_id": {"type": "string"},
+    "generation_id": {"type": "string"},
+    "valid_from_generation": {"type": "string"},
+    "valid_from_generation_seq": {"type": "uint"},
+    "valid_to_generation": {"type": "string"},
+    "valid_to_generation_seq": {"type": "uint"},
+}
 
 
-def _safe_object_name(name: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in name)
+def _index_namespace_map(job: dict) -> tuple[dict[int, str], int]:
+    entries = job.get("index_namespaces") or []
+    if not entries:
+        raise ValueError("index_namespaces is required")
+    shard_counts = {int(entry.get("shard_count") or 0) for entry in entries}
+    if len(shard_counts) != 1:
+        raise ValueError("index namespace shard counts do not match")
+    shard_count = shard_counts.pop()
+    if shard_count < 1 or shard_count > 256 or len(entries) != shard_count:
+        raise ValueError("index namespace set is incomplete")
+    by_shard: dict[int, str] = {}
+    for entry in entries:
+        shard_index = int(entry.get("shard_index", -1))
+        namespace = str(entry.get("namespace") or "")
+        if shard_index < 0 or shard_index >= shard_count or not namespace or shard_index in by_shard:
+            raise ValueError("index namespace entry is invalid")
+        by_shard[shard_index] = namespace
+    return by_shard, shard_count
+
+
+def _namespace_for_path(by_shard: dict[int, str], shard_count: int, file_path: str) -> str:
+    if not file_path:
+        raise ValueError("file_path is required for namespace routing")
+    digest = hashlib.sha256(file_path.encode()).digest()
+    shard_index = int.from_bytes(digest[:8], "big") % shard_count
+    return by_shard[shard_index]
+
+
+def _and_filter(filters: list) -> list | None:
+    if not filters:
+        return None
+    if len(filters) == 1:
+        return filters[0]
+    return ["And", filters]
+
+
+def _active_generation_filter(sequence: int) -> list:
+    return [
+        "And",
+        [
+            ["valid_from_generation_seq", "Lte", sequence],
+            [
+                "Or",
+                [
+                    ["valid_to_generation_seq", "Eq", 0],
+                    ["valid_to_generation_seq", "Gt", sequence],
+                ],
+            ],
+        ],
+    ]
+
+
+def _embedding_chunk(row: dict) -> dict:
+    return {
+        "id": row.get("id"),
+        "content": row.get("content", ""),
+        "file_path": row.get("file_path", ""),
+        "chunk_index": row.get("chunk_index", 0),
+        "content_hash": row.get("content_hash", ""),
+        "file_type": row.get("file_type", ""),
+        "root_id": row.get("root_id"),
+        "absolute_path": row.get("absolute_path", ""),
+        "page_number": row.get("page_number"),
+        "image_path": row.get("image_path"),
+        "line_start": row.get("line_start"),
+        "line_end": row.get("line_end"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -562,10 +622,10 @@ EMBEDDING_DIM = 768
 
 @app.cls(
     image=embedding_image,
-    secrets=[modal_secret],
+    secrets=[modal_secret, public_endpoint_secret],
     gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
     cpu=4,
-    timeout=600,
+    timeout=3600,
     memory=8192,
     min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "1")),
     max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "8")),
@@ -581,11 +641,38 @@ class Embedder:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.encode_batch_size = _env_int("PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE", 64, 1, 512)
+        self.shard_embed_batch_size = _env_int("PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS", 64, 1, 64)
+        self.tp_write_batch_rows = _env_int("PUFFERFS_TP_WRITE_BATCH_ROWS", 512, 1, 512)
+        self.tp_write_batch_bytes = _env_int("PUFFERFS_TP_WRITE_BATCH_BYTES", 8 << 20, 1 << 20, 8 << 20)
+        self.tp = None
         self.model = SentenceTransformer(
             EMBEDDING_MODEL,
             trust_remote_code=True,
             device=self.device,
         )
+
+    def _turbopuffer(self):
+        if self.tp is not None:
+            return self.tp
+        from turbopuffer import Turbopuffer
+
+        api_key = os.environ.get("TURBOPUFFER_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("TURBOPUFFER_API_KEY is not configured")
+        options = {
+            "api_key": api_key,
+            "region": os.environ.get("TURBOPUFFER_REGION", "gcp-us-central1"),
+            "timeout": 120,
+            "max_retries": 4,
+            "compression": True,
+        }
+        base_url = os.environ.get("TURBOPUFFER_API_URL")
+        if base_url:
+            options["base_url"] = base_url
+            if "{region}" not in base_url:
+                options.pop("region")
+        self.tp = Turbopuffer(**options)
+        return self.tp
 
     def _embed_chunks(self, chunk_dicts: list[dict]) -> list[dict]:
         """Embed a batch of Chunk dicts, return ChunkWithEmbedding dicts."""
@@ -635,69 +722,172 @@ class Embedder:
         embeddings = self._embed_texts(item["texts"])
         return {"embeddings": embeddings}
 
-    @modal.fastapi_endpoint(method="POST", label="pufferfs-embed-shard-endpoint")
-    def embed_shard_endpoint(self, item: dict) -> dict:
-        """HTTP endpoint: POST {job:{...}} -> {result_ref}."""
-        job = item["job"]
-        disable_vector = bool(job.get("disable_vector"))
-        s3 = _s3_client()
-        pending: list[tuple[dict, dict]] = []
+    @modal.fastapi_endpoint(method="POST", label="pufferfs-index-shard-endpoint")
+    def index_shard_endpoint(self, item: dict) -> dict:
+        """Embed one chunk artifact and write bounded batches to Turbopuffer."""
+        _require_modal_secret(item)
+        job = item.get("job") or {}
+        generation_id = str(job.get("generation_id") or "")
+        generation_sequence = int(job.get("generation_seq") or 0)
+        base_sequence = int(job.get("base_generation_seq") or 0)
+        payload_ref = str(job.get("payload_ref") or "")
+        if not generation_id or not payload_ref.startswith(f"syncs/{generation_id}/chunks/"):
+            raise ValueError("payload_ref must reference this generation's chunk artifact")
+        if not payload_ref.endswith((".jsonl", ".jsonl.gz")):
+            raise ValueError("payload_ref must be a JSONL chunk artifact")
+        if bool(job.get("disable_vector")):
+            raise ValueError("vector-disabled shards must use the Go index path")
+        if generation_sequence < 1 or base_sequence < 0 or base_sequence >= generation_sequence:
+            raise ValueError("generation sequence metadata is invalid")
 
-        def flush_pending():
+        by_shard, shard_count = _index_namespace_map(job)
+        from turbopuffer import NotFoundError
+
+        s3 = _s3_client()
+        tp = self._turbopuffer()
+        pending: list[dict] = []
+        write_buffer: list[tuple[str, dict]] = []
+        write_bytes = 0
+        close_paths: dict[str, set[str]] = {}
+        chunks_added = 0
+        chunks_removed = 0
+        request_row_budget = self.tp_write_batch_bytes - (64 << 10)
+        started = time.perf_counter()
+
+        def flush_writes() -> None:
+            nonlocal write_bytes, chunks_added
+            if not write_buffer:
+                return
+            rows_by_namespace: dict[str, list[dict]] = {}
+            for namespace, row in write_buffer:
+                rows_by_namespace.setdefault(namespace, []).append(row)
+            for namespace, rows in rows_by_namespace.items():
+                tp.namespace(namespace).write(
+                    upsert_rows=rows,
+                    schema=TP_SCHEMA,
+                    distance_metric="cosine_distance",
+                )
+                chunks_added += len(rows)
+            write_buffer.clear()
+            write_bytes = 0
+
+        def append_write(row: dict) -> None:
+            nonlocal write_bytes
+            file_path = str(row.get("file_path") or "")
+            namespace = _namespace_for_path(by_shard, shard_count, file_path)
+            row_bytes = len(json.dumps(row, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()) + 1
+            if row_bytes > request_row_budget:
+                raise ValueError(f"index row for {file_path} is too large for one write request")
+            if write_buffer and (
+                len(write_buffer) >= self.tp_write_batch_rows
+                or write_bytes + row_bytes > request_row_budget
+            ):
+                flush_writes()
+            write_buffer.append((namespace, row))
+            write_bytes += row_bytes
+            if len(write_buffer) >= self.tp_write_batch_rows or write_bytes >= request_row_budget:
+                flush_writes()
+
+        def flush_pending() -> None:
             if not pending:
                 return
             unique: dict[str, dict] = {}
-            for chunk, _ in pending:
-                unique.setdefault(chunk.get("content_hash") or chunk["content"], chunk)
-            embedded = self._embed_chunks(list(unique.values()))
-            if len(embedded) != len(unique):
-                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(unique)} unique pending rows")
-            vectors = {key: result.get("embedding") for key, result in zip(unique, embedded)}
-            for chunk, row in pending:
-                embedding = vectors[chunk.get("content_hash") or chunk["content"]]
+            for row in pending:
+                chunk = _embedding_chunk(row)
+                key = (
+                    f"hash:{chunk['content_hash']}"
+                    if chunk.get("content_hash")
+                    else f"content:{chunk['content']}"
+                )
+                unique.setdefault(key, chunk)
+            unique_keys = list(unique)
+            embedded = self._embed_chunks([unique[key] for key in unique_keys])
+            if len(embedded) != len(unique_keys):
+                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(unique_keys)} unique pending rows")
+            vectors = {key: result.get("embedding") for key, result in zip(unique_keys, embedded)}
+            for row in pending:
+                key = (
+                    f"hash:{row['content_hash']}"
+                    if row.get("content_hash")
+                    else f"content:{row.get('content', '')}"
+                )
+                embedding = vectors.get(key)
                 if embedding is None:
                     raise RuntimeError("embedding result missing embedding vector")
                 row["vector"] = embedding
-                yield {"op": "upsert", "row": row}
+                append_write(row)
             pending.clear()
 
-        def rows():
-            for artifact in _iter_jsonl(s3, job["payload_ref"]):
-                op = artifact.get("op")
-                if op == "close" and artifact.get("close_path"):
-                    yield artifact
-                elif op == "upsert" and artifact.get("row"):
-                    row = artifact["row"]
-                    if disable_vector:
-                        row.pop("vector", None)
-                    if disable_vector or row.get("vector") is not None:
-                        yield artifact
-                    else:
-                        pending.append(
-                            (
-                                {
-                                    "id": row.get("id"),
-                                    "content": row.get("content", ""),
-                                    "file_path": row.get("file_path", ""),
-                                    "chunk_index": row.get("chunk_index", 0),
-                                    "content_hash": row.get("content_hash", ""),
-                                    "file_type": row.get("file_type", ""),
-                                    "root_id": row.get("root_id"),
-                                    "absolute_path": row.get("absolute_path", ""),
-                                    "page_number": row.get("page_number"),
-                                    "image_path": row.get("image_path"),
-                                    "line_start": row.get("line_start"),
-                                    "line_end": row.get("line_end"),
-                                },
-                                row,
-                            )
+        def flush_closes() -> None:
+            nonlocal chunks_removed
+            if not close_paths:
+                return
+            patch = {
+                "valid_to_generation": generation_id,
+                "valid_to_generation_seq": generation_sequence,
+            }
+            for namespace, paths in close_paths.items():
+                filters = [
+                    ["file_path", "In", sorted(paths)],
+                    [
+                        "Or",
+                        [
+                            ["valid_to_generation_seq", "Eq", 0],
+                            ["valid_to_generation_seq", "Lte", patch["valid_to_generation_seq"]],
+                        ],
+                    ],
+                ]
+                if base_sequence > 0:
+                    filters.append(_active_generation_filter(base_sequence))
+                for attempt in range(100):
+                    try:
+                        response = tp.namespace(namespace).write(
+                            patch_by_filter={"filters": _and_filter(filters), "patch": patch},
+                            patch_by_filter_allow_partial=True,
                         )
-                if len(pending) == 128:
-                    yield from flush_pending()
-            yield from flush_pending()
+                    except NotFoundError:
+                        break
+                    chunks_removed += int(response.rows_patched or response.rows_affected or 0)
+                    if not response.rows_remaining:
+                        break
+                    if attempt == 99:
+                        raise RuntimeError(f"closing rows in {namespace}: rows remain after repeated patch passes")
+            close_paths.clear()
 
-        result_ref = _write_jsonl(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]), rows())
-        return {"result_ref": result_ref}
+        for artifact in _iter_jsonl(s3, payload_ref):
+            op = artifact.get("op")
+            if op == "close" and artifact.get("close_path"):
+                flush_pending()
+                flush_writes()
+                path = str(artifact["close_path"])
+                namespace = _namespace_for_path(by_shard, shard_count, path)
+                close_paths.setdefault(namespace, set()).add(path)
+                continue
+            if op != "upsert" or not artifact.get("row"):
+                continue
+            flush_closes()
+            row = artifact["row"]
+            if row.get("vector") is not None:
+                append_write(row)
+            else:
+                pending.append(row)
+                if len(pending) >= self.shard_embed_batch_size:
+                    flush_pending()
+
+        flush_pending()
+        flush_closes()
+        flush_writes()
+        print(
+            f"timing stage=index_shard job_id={job.get('job_id', '')} "
+            f"chunks_added={chunks_added} chunks_removed={chunks_removed} "
+            f"elapsed={time.perf_counter() - started:.3f}s",
+            flush=True,
+        )
+        return {
+            "status": "indexed",
+            "chunks_added": chunks_added,
+            "chunks_removed": chunks_removed,
+        }
 
 
 # ---------------------------------------------------------------------------

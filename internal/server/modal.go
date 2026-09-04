@@ -25,7 +25,8 @@ type ModalClient struct {
 	chunkURL      string
 	embedURL      string
 	queryEmbedURL string
-	embedShardURL string
+	indexShardURL string
+	secretKey     string
 	modelVersion  string
 	httpClient    *http.Client
 }
@@ -36,9 +37,10 @@ func NewModalClient() *ModalClient {
 		chunkURL:      os.Getenv("MODAL_CHUNK_ENDPOINT"),
 		embedURL:      os.Getenv("MODAL_EMBED_ENDPOINT"),
 		queryEmbedURL: os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
-		embedShardURL: os.Getenv("MODAL_EMBED_SHARD_ENDPOINT"),
+		indexShardURL: os.Getenv("MODAL_INDEX_SHARD_ENDPOINT"),
+		secretKey:     os.Getenv("MODAL_SECRET_KEY"),
 		modelVersion:  embeddingModelVersion(),
-		httpClient:    &http.Client{Timeout: 900 * time.Second},
+		httpClient:    &http.Client{Timeout: time.Hour},
 	}
 }
 
@@ -95,11 +97,12 @@ type EmbedQueryResponse struct {
 }
 
 type ModalShardRequest struct {
-	Job queue.JobMessage `json:"job"`
+	SecretKey string           `json:"secret_key"`
+	Job       queue.JobMessage `json:"job"`
 }
 
 type ModalShardResponse struct {
-	ResultRef string `json:"result_ref,omitempty"`
+	Status string `json:"status"`
 }
 
 // ChunkFile calls the Modal chunking function.
@@ -134,16 +137,22 @@ func (m *ModalClient) EmbedQuery(text string) ([]float64, error) {
 	return resp.Embeddings[0], nil
 }
 
-func (m *ModalClient) HasEmbedShardEndpoint() bool {
-	return strings.TrimSpace(m.embedShardURL) != ""
+func (m *ModalClient) HasIndexShardEndpoint() bool {
+	return strings.TrimSpace(m.indexShardURL) != ""
 }
 
-func (m *ModalClient) EmbedShard(job queue.JobMessage) (*ModalShardResponse, error) {
-	var resp ModalShardResponse
-	if err := m.post(m.embedShardURL, ModalShardRequest{Job: job}, &resp); err != nil {
-		return nil, fmt.Errorf("modal embed shard: %w", err)
+func (m *ModalClient) IndexShard(job queue.JobMessage) error {
+	if strings.TrimSpace(m.secretKey) == "" {
+		return fmt.Errorf("MODAL_SECRET_KEY is required for Modal shard indexing")
 	}
-	return &resp, nil
+	var resp ModalShardResponse
+	if err := m.post(m.indexShardURL, ModalShardRequest{SecretKey: m.secretKey, Job: job}, &resp); err != nil {
+		return fmt.Errorf("modal index shard: %w", err)
+	}
+	if resp.Status != "indexed" {
+		return fmt.Errorf("modal index shard returned status %q", resp.Status)
+	}
+	return nil
 }
 
 func (m *ModalClient) post(url string, body any, out any) error {

@@ -729,7 +729,7 @@ func printSyncJob(w io.Writer, job *models.SyncJob) {
 	fmt.Fprintf(w, "root_id: %s\n", job.RootID)
 	fmt.Fprintf(w, "status: %s\n", job.Status)
 	fmt.Fprintf(w, "progress: %d/%d files\n", syncJobCurrentProgress(job), job.TotalFiles)
-	fmt.Fprintf(w, "stages: chunked=%d embedded=%d indexed=%d\n", job.Chunked, job.Embedded, job.Indexed)
+	fmt.Fprintf(w, "stages: chunked=%d indexed=%d\n", job.Chunked, job.Indexed)
 	fmt.Fprintf(w, "started_at: %s\n", job.StartedAt.Format(time.RFC3339))
 	if job.FinishedAt != nil {
 		fmt.Fprintf(w, "finished_at: %s\n", job.FinishedAt.Format(time.RFC3339))
@@ -743,15 +743,12 @@ func syncJobCurrentProgress(job *models.SyncJob) int {
 	if job.Status == "chunking" {
 		return job.Chunked
 	}
-	if job.Status == "embedding" {
-		return job.Embedded
-	}
 	return max(job.Processed, job.Indexed)
 }
 
 func printSyncProgress(w io.Writer, job *models.SyncJob) {
-	fmt.Fprintf(w, "Sync status: %s (%d/%d files; chunked=%d embedded=%d indexed=%d)\n",
-		job.Status, syncJobCurrentProgress(job), job.TotalFiles, job.Chunked, job.Embedded, job.Indexed)
+	fmt.Fprintf(w, "Sync status: %s (%d/%d files; chunked=%d indexed=%d)\n",
+		job.Status, syncJobCurrentProgress(job), job.TotalFiles, job.Chunked, job.Indexed)
 }
 
 func printSyncJobs(w io.Writer, jobs []models.SyncJob) {

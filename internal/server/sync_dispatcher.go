@@ -243,41 +243,20 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if _, err := d.recordStageProgress(ctx, msg, syncStageChunk, filesInShard); err != nil {
 			return err
 		}
-		nextStage, suffix := syncStageEmbed, "-embed"
-		if msg.DisableVector {
-			nextStage, suffix = syncStageIndex, "-index"
-		}
-		next := p.jobMessage(nextStage, msg.JobID+suffix, resultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
-		return d.queue.Enqueue(ctx, nextStage, next)
-	case syncStageEmbed:
-		if msg.SyncJobID != "" && msg.ShardIndex == 0 {
-			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "embedding")
-		}
-		var resultRef string
-		var err error
-		if d.server.modal.HasEmbedShardEndpoint() {
-			resp, err := d.server.modal.EmbedShard(msg)
-			if err != nil {
-				return err
-			}
-			resultRef = resp.ResultRef
-		} else {
-			resultRef, err = p.processEmbedJob(ctx, msg)
-			if err != nil {
-				return err
-			}
-		}
-		if _, err := d.recordStageProgress(ctx, msg, syncStageEmbed, msg.FilesInShard); err != nil {
-			return err
-		}
-		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards, msg.FilesInShard)
+		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
 		return d.queue.Enqueue(ctx, syncStageIndex, next)
 	case syncStageIndex:
 		if msg.SyncJobID != "" && msg.ShardIndex == 0 {
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing")
 		}
-		if err := p.processIndexJob(ctx, msg); err != nil {
-			return err
+		if !msg.DisableVector && d.server.modal.HasIndexShardEndpoint() {
+			if err := d.server.modal.IndexShard(msg); err != nil {
+				return err
+			}
+		} else {
+			if err := p.processIndexJob(ctx, msg); err != nil {
+				return err
+			}
 		}
 		completed, err := d.recordStageProgress(ctx, msg, syncStageIndex, msg.FilesInShard)
 		if err != nil {

@@ -5,13 +5,15 @@ This stack deploys PufferFS to AWS:
 - ECR repository and locally built app image.
 - VPC with public ALB subnets, private ECS subnets, and NAT egress.
 - ECS/Fargate API service behind an Application Load Balancer.
-- ECS/Fargate worker services for `chunk`, `embed`, `index`, and `commit`.
+- ECS/Fargate worker services for `chunk`, `index`, and `commit`.
 - Isolated SQS FIFO queues and dead-letter queues for each worker stage.
 - CloudWatch alarms for queue age and dead-letter messages; set
   `pufferfs:alarmTopicArn` to route alarms to an SNS topic.
 - 3 private NATS JetStream nodes retained as a rollback backend.
 - S3 artifact bucket.
-- Secrets Manager entries for `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`, and optional `PUFFERFS_ADMIN_KEY_HASH`.
+- Secrets Manager entries for `DATABASE_URL`, `JWT_SECRET`,
+  `TURBOPUFFER_API_KEY`, `MODAL_SECRET_KEY`, and optional
+  `PUFFERFS_ADMIN_KEY_HASH`.
 - CloudWatch logs.
 
 Postgres is not created here. Provide `pufferfs:databaseUrl` for the database you want the services to use.
@@ -48,6 +50,7 @@ Set secrets:
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$(openssl rand -base64 32)"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
+pulumi config set --secret pufferfs:modalSecretKey "$MODAL_SECRET_KEY"
 ```
 
 Optional admin key:
@@ -62,13 +65,13 @@ Set Modal endpoints:
 pulumi config set pufferfs:modalChunkEndpoint https://...chunk-file-endpoint.modal.run
 pulumi config set pufferfs:modalEmbedEndpoint https://...embed-chunks-endpoint.modal.run
 pulumi config set pufferfs:modalQueryEmbedEndpoint https://...embed-query-endpoint.modal.run
-pulumi config set pufferfs:modalEmbedShardEndpoint https://...embed-shard-endpoint.modal.run
+pulumi config set pufferfs:modalIndexShardEndpoint https://...index-shard-endpoint.modal.run
 ```
 
 Advertise CLI release compatibility from `GET /cli/version`:
 
 ```sh
-pulumi config set pufferfs:cliLatestVersion 0.3.0
+pulumi config set pufferfs:cliLatestVersion 0.6.5
 pulumi config set pufferfs:cliMinVersion 0.2.0
 pulumi config set pufferfs:cliDownloadBaseUrl https://pufferfs.com/releases
 ```

@@ -14,16 +14,18 @@ config:
     secure: "pulumi-secret-jwt-secret"
   pufferfs:turbopufferApiKey:
     secure: "pulumi-secret-turbopuffer-api-key"
+  pufferfs:modalSecretKey:
+    secure: "pulumi-secret-modal-shared-key"
   pufferfs:adminKeyHash:
     secure: "optional-admin-key-sha256"
 
   pufferfs:modalChunkEndpoint: "https://...chunk-file-endpoint.modal.run"
   pufferfs:modalEmbedEndpoint: "https://...embed-chunks-endpoint.modal.run"
   pufferfs:modalQueryEmbedEndpoint: "https://...embed-query-endpoint.modal.run"
-  pufferfs:modalEmbedShardEndpoint: "https://...embed-shard-endpoint.modal.run"
+  pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
 
   # CLI release manifest advertised at GET /cli/version.
-  pufferfs:cliLatestVersion: "0.3.0"
+  pufferfs:cliLatestVersion: "0.6.5"
   pufferfs:cliMinVersion: "0.2.0"
   pufferfs:cliDownloadBaseUrl: "https://pufferfs.com/releases"
 
@@ -64,7 +66,6 @@ config:
 
   pufferfs:apiDesiredCount: 2
   pufferfs:worker-chunkDesiredCount: 1
-  pufferfs:worker-embedDesiredCount: 1
   pufferfs:worker-indexDesiredCount: 1
   pufferfs:worker-commitDesiredCount: 1
   pufferfs:tpNamespaceShards: 4

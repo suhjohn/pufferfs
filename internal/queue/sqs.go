@@ -247,5 +247,5 @@ func sqsMessageGroupID(stage string, msg JobMessage) string {
 }
 
 func allStages() []string {
-	return []string{StageChunk, StageEmbed, StageIndex, StageCommit}
+	return []string{StageChunk, StageIndex, StageCommit}
 }

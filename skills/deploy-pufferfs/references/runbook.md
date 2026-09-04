@@ -10,7 +10,8 @@
   URLs, public OAuth client id, feature flags).
 - Secrets here: `DATABASE_URL`, `JWT_SECRET`, `TURBOPUFFER_API_KEY`,
   `GOOGLE_CLIENT_SECRET`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
-  `PUFFERFS_ADMIN_KEY_HASH`. Everything else is plaintext config.
+  `MODAL_SECRET_KEY`, `PUFFERFS_ADMIN_KEY_HASH`. Everything else is plaintext
+  config.
 
 ## Required env
 
@@ -22,11 +23,12 @@ AWS_SECRET_ACCESS_KEY
 DATABASE_URL
 JWT_SECRET
 TURBOPUFFER_API_KEY
+MODAL_SECRET_KEY
 PULUMI_CONFIG_PASSPHRASE
 MODAL_CHUNK_ENDPOINT
 MODAL_EMBED_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
-MODAL_EMBED_SHARD_ENDPOINT
+MODAL_INDEX_SHARD_ENDPOINT
 ```
 
 Frontend + Google login (required for the web app to work):
@@ -92,10 +94,11 @@ pulumi config set pufferfs:imageTag "$(git -C /Users/johnsuh/pufferfs rev-parse 
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
+pulumi config set --secret pufferfs:modalSecretKey "$MODAL_SECRET_KEY"
 pulumi config set pufferfs:modalChunkEndpoint "$MODAL_CHUNK_ENDPOINT"
 pulumi config set pufferfs:modalEmbedEndpoint "$MODAL_EMBED_ENDPOINT"
 pulumi config set pufferfs:modalQueryEmbedEndpoint "$MODAL_QUERY_EMBED_ENDPOINT"
-pulumi config set pufferfs:modalEmbedShardEndpoint "$MODAL_EMBED_SHARD_ENDPOINT"
+pulumi config set pufferfs:modalIndexShardEndpoint "$MODAL_INDEX_SHARD_ENDPOINT"
 if [ -n "${PUFFERFS_ADMIN_KEY_HASH:-}" ]; then
   pulumi config set --secret pufferfs:adminKeyHash "$PUFFERFS_ADMIN_KEY_HASH"
 fi

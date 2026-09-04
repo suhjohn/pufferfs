@@ -35,6 +35,7 @@ PULUMI_CONFIG_PASSPHRASE   # when using an S3/local passphrase backend
 DATABASE_URL
 JWT_SECRET
 TURBOPUFFER_API_KEY
+MODAL_SECRET_KEY
 GOOGLE_CLIENT_SECRET
 ```
 
@@ -48,7 +49,7 @@ STRIPE_WEBHOOK_SECRET
 MODAL_CHUNK_ENDPOINT
 MODAL_EMBED_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
-MODAL_EMBED_SHARD_ENDPOINT
+MODAL_INDEX_SHARD_ENDPOINT
 MODAL_OFFICE_TO_PDF_ENDPOINT
 MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
 ```
@@ -109,7 +110,7 @@ Required Modal endpoint variables, unless stored as secrets:
 MODAL_CHUNK_ENDPOINT
 MODAL_EMBED_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
-MODAL_EMBED_SHARD_ENDPOINT
+MODAL_INDEX_SHARD_ENDPOINT
 ```
 
 The public Modal conversion endpoints are optional for direct callers and are
@@ -120,13 +121,15 @@ MODAL_OFFICE_TO_PDF_ENDPOINT
 MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
 ```
 
-Add `MODAL_SECRET_KEY` to the Modal secret named by `PUFFERFS_MODAL_SECRET_NAME`
-to authorize direct calls to those conversion endpoints.
+Add `MODAL_SECRET_KEY` and `TURBOPUFFER_API_KEY` to the Modal secret named by
+`PUFFERFS_MODAL_SECRET_NAME`. The shared key authorizes shard indexing and
+direct calls to the conversion endpoints; the Turbopuffer key lets index shards
+write their bounded batches directly.
 
 Optional CLI release variables:
 
 ```text
-PUFFERFS_CLI_LATEST_VERSION=0.3.0
+PUFFERFS_CLI_LATEST_VERSION=0.6.5
 PUFFERFS_CLI_MIN_VERSION=0.2.0
 PUFFERFS_CLI_DOWNLOAD_BASE_URL=https://pufferfs.com/releases
 ```

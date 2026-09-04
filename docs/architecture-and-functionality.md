@@ -120,7 +120,7 @@ Important API surfaces:
 
 ### Workers
 
-`cmd/worker` runs one stage at a time: `chunk`, `embed`, `index`, or `commit`.
+`cmd/worker` runs one stage at a time: `chunk`, `index`, or `commit`.
 It connects to the same database/storage/Modal/Turbopuffer dependencies as the
 server plus the selected queue backend. Workers pull batches, process
 jobs concurrently, heartbeat long jobs, retry with backoff, mark failed
@@ -177,8 +177,7 @@ Object storage carries the high-volume data plane:
 - `syncs/<generationID>/request.json`: queued sync request payload.
 - `syncs/<generationID>/inputs/*.jsonl`: file-change shards (derived from
   manifests or inline changes).
-- `syncs/<generationID>/chunks/*.jsonl`: chunk-stage artifacts.
-- `syncs/<generationID>/index_rows/*.jsonl`: embed-stage/index-row artifacts.
+- `syncs/<generationID>/chunks/*.jsonl.gz`: compressed chunk-stage artifacts.
 - `chunks/<rootID>/...`: rendered document page images and indexed image
   artifacts.
 
@@ -303,8 +302,8 @@ snapshot does not change until the generation commits.
 There are two execution modes:
 
 - Without a queue backend, the server runs the same bounded shards directly in-process.
-- With SQS or NATS configured, the server writes request/shard artifacts and enqueues
-  chunk jobs; dedicated workers advance chunk, embed, index, and commit
+- With SQS or NATS configured, the server writes request/shard artifacts and
+  enqueues chunk jobs; dedicated workers advance chunk, index, and commit
   stages.
 
 Queued data shards use independent FIFO message groups so workers can process
@@ -326,27 +325,23 @@ The pipeline shape is:
    - Modified/removed/moved paths emit close operations for active prior rows.
    - Moves/renames query active old rows and copy row metadata/vector into new
      generation rows when safe.
-3. Embed stage:
-   - Close operations pass through.
-   - Existing rows with vectors are reused.
-   - Missing vectors are resolved through the Postgres embedding cache or Modal
-     embedding endpoint.
-   - Embedding works in bounded row batches while index rows stream to storage.
-   - Vector-disabled roots bypass this stage and route chunk artifacts directly
-     to indexing.
-4. Index stage:
+3. Index stage:
    - Rows are routed by stable hash of `file_path` to an active root namespace
      shard.
-   - Rows are upserted to Turbopuffer in batches.
+   - In production, Modal streams the compressed chunk artifact, embeds missing
+     vectors in batches of at most 64, and writes Turbopuffer batches bounded by
+     512 rows and 8 MiB. Vectors are never persisted as a second S3 artifact.
+   - The in-process fallback performs the same chunk-to-index transformation in
+     Go. Vector-disabled roots use this path without calling Modal.
    - Close paths are grouped by namespace and patched together with
      `valid_to_generation` and `valid_to_generation_seq`.
-5. Commit:
+4. Commit:
    - Finish any pending cleanup for earlier failed generations so their row
      closures cannot affect the new visibility window.
    - Store content proof when present.
    - Ensure root state is available by object ref.
    - Mark the new generation visible and complete the sync job.
-6. Terminal cleanup:
+5. Terminal cleanup:
    - Delete `syncs/<generationID>/` and any legacy root-scoped source transport
      refs known from the finalized request.
    - Batch object deletes at the S3 1,000-key request limit.
@@ -406,11 +401,14 @@ The Modal app defines:
 - `chunk_file_endpoint`: file to chunks.
 - `embed_chunks_endpoint`: chunks to embeddings.
 - `embed_query_endpoint`: query text to embedding.
-- `embed_shard_endpoint`: chunk artifact to index-row artifact.
+- `index_shard_endpoint`: compressed chunk artifact to bounded embedding and
+  Turbopuffer writes.
 
-The Go workers stream text chunking and Turbopuffer indexing directly. Modal is
-kept at the file-conversion and embedding boundaries where it provides the
-specialized CPU/GPU runtime.
+Go workers stream text chunking directly. For queued vector syncs, Modal owns
+the bounded embed-and-index transformation; the Go index path remains for
+vector-disabled roots and in-process fallback. Modal is otherwise kept at the
+file-conversion and embedding boundaries where it provides the specialized
+CPU/GPU runtime.
 
 Chunking strategies:
 
@@ -527,7 +525,7 @@ PufferFS currently supports:
 - Small-file bundle uploads and direct multipart large-file uploads.
 - Gzip root state storage by object reference.
 - Async sync job tracking and status polling.
-- Optional SQS/NATS-backed queue workers for chunk/embed/index/commit.
+- Optional SQS/NATS-backed queue workers for chunk/index/commit.
 - Direct in-process execution when no durable queue is configured.
 - Local Go chunking for text/code/markdown-like files.
 - Subset sync with `sync --root <path> --include <glob> [--exclude <glob>]`.
@@ -552,14 +550,14 @@ PufferFS currently supports:
 - `handleSyncInit` creates the generation-scoped upload session used by the
   current CLI; it does not perform namespace cloning.
 - With no external queue configured, the request executes the same bounded
-  chunk/embed/index stages directly. Production uses SQS or NATS JetStream.
+  chunk/index stages directly. Production uses SQS or NATS JetStream.
 - Query correctness relies on generation visibility filters. Any new query path
   must apply the same visible-generation window.
 - The embedding cache version must be bumped when the Modal embedding model
   changes.
-- Modal chunk-embedding payloads intentionally contain only fields needed for
-  embedding; path/line/page metadata remains on index rows unless the Modal
-  endpoint needs it for extraction.
+- Standalone Modal embedding calls receive only fields needed by the embedding
+  model. The index-shard endpoint streams complete rows because it writes them
+  directly to Turbopuffer.
 - OAuth login uses signed random state bound to a short-lived httpOnly state
   cookie for CSRF protection.
 - ACLs are modeled as entries but the implemented read/write checks primarily

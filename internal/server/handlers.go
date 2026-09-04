@@ -3326,7 +3326,16 @@ func tpWriteBatchSize() int {
 	if rows < 1 {
 		return defaultRows
 	}
-	return min(rows, 5000)
+	return min(rows, defaultRows)
+}
+
+func tpWriteBatchMaxBytes() int {
+	const defaultBytes = 8 << 20
+	bytes, _ := strconv.Atoi(os.Getenv("PUFFERFS_TP_WRITE_BATCH_BYTES"))
+	if bytes < 1 {
+		return defaultBytes
+	}
+	return min(bytes, defaultBytes)
 }
 
 func filteredQueryLimit(topK int) int {

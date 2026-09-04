@@ -109,7 +109,7 @@ PufferFS depends on a few external systems:
 - S3-compatible object storage for temporary source transport, durable state
   snapshots, rendered file artifacts, and sync artifacts.
 - Turbopuffer for hybrid search namespaces.
-- Modal for chunking, embeddings, OCR/image processing, and shard workers.
+- Modal for chunking, embeddings, OCR/image processing, and direct vector-shard indexing.
 - Amazon SQS FIFO (production) or NATS JetStream (self-hosted) for the optional
   queued sync pipeline.
 - Email-code and Google OAuth for hosted web login.

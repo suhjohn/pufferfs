@@ -1,7 +1,7 @@
 modal>=0.73.0
 sentence-transformers>=3.0.0
 torch>=2.0.0
-turbopuffer>=1.0.0
+turbopuffer>=2.9.0,<3
 boto3>=1.34.0
 extract-msg>=0.50.0
 Pillow>=10.0.0

@@ -162,7 +162,8 @@ Source capture tuning uses plain integer byte values:
 | `TURBOPUFFER_API_KEY` | Turbopuffer API key. | required for search |
 | `TURBOPUFFER_API_URL` | Turbopuffer base URL. | provider default |
 | `PUFFERFS_TP_NAMESPACE_SHARDS` | Physical namespaces per root, set at root creation. | 1 (max 256) |
-| `PUFFERFS_TP_WRITE_BATCH_ROWS` | Rows per Turbopuffer upsert request. | 512 (max 5000) |
+| `PUFFERFS_TP_WRITE_BATCH_ROWS` | Rows per Turbopuffer upsert request. | 512 (max 512) |
+| `PUFFERFS_TP_WRITE_BATCH_BYTES` | Approximate maximum serialized Turbopuffer request size; row buffers reserve 64 KiB for the envelope/schema. | 8 MiB (max 8 MiB) |
 
 ### Modal compute
 
@@ -171,8 +172,10 @@ Source capture tuning uses plain integer byte values:
 | `MODAL_CHUNK_ENDPOINT` | File → chunks endpoint. | — |
 | `MODAL_EMBED_ENDPOINT` | Chunks → embeddings endpoint. | — |
 | `MODAL_QUERY_EMBED_ENDPOINT` | Query text → embedding endpoint. | — |
-| `MODAL_EMBED_SHARD_ENDPOINT` | Chunk artifact → index-row artifact (queued pipeline). | — |
+| `MODAL_INDEX_SHARD_ENDPOINT` | Compressed chunk artifact → embedded Turbopuffer rows (queued pipeline). | — |
+| `MODAL_SECRET_KEY` | Shared secret sent by index workers to authorize the state-changing Modal endpoint. | required with `MODAL_INDEX_SHARD_ENDPOINT` |
 | `PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE` | Rows per GPU model encode call (max 512). | 64 |
+| `PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS` | Maximum pending shard rows per embedding call. | 64 (max 64) |
 | `MODAL_OFFICE_TO_PDF_ENDPOINT` | Optional public Office → PDF conversion endpoint for direct callers. Not used by the API server. | — |
 | `MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT` | Optional public PDF → page JPEG endpoint for direct callers. Not used by the API server. | — |
 | `PUFFERFS_MODAL_PAGE_IMAGE_DPI` | DPI used when rendering PDF/Office pages to JPEG images for OCR and previews. Lower values reduce S3 upload size and vision-token payloads at some OCR-detail cost. | 160 |
@@ -195,8 +198,9 @@ The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 | `AWS_ACCESS_KEY_ID` | Modal reads/writes S3-compatible storage. |
 | `AWS_SECRET_ACCESS_KEY` | Modal reads/writes S3-compatible storage. |
 | `AWS_ENDPOINT_URL` | Required for non-AWS S3-compatible storage; omit for AWS S3. |
-| `AWS_BUCKET_NAME` | Modal reads source/chunk artifacts and writes index-row/page-image artifacts. |
-| `MODAL_SECRET_KEY` | Required to authorize direct calls to the public `office_to_pdf` and `pdf_to_page_images` Modal endpoints. |
+| `AWS_BUCKET_NAME` | Modal reads source/chunk artifacts and writes page-image artifacts. |
+| `TURBOPUFFER_API_KEY` | Modal index shards write embedded rows directly to Turbopuffer. |
+| `MODAL_SECRET_KEY` | Authorizes shard indexing and direct calls to public conversion endpoints. |
 | `GEMINI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `gemini/...`, or media OCR is enabled. |
 | `OPENAI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `openai/...`. |
 | `FIREWORKS_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `fireworks/...`. |
@@ -263,7 +267,6 @@ per stage so failures and capacity are isolated.
 | --- | --- | --- |
 | `PUFFERFS_QUEUE_BACKEND` | Durable queue backend: `sqs` or `nats`. | unset |
 | `PUFFERFS_SQS_CHUNK_QUEUE_URL` | SQS FIFO URL for chunk jobs. Required for SQS. | unset |
-| `PUFFERFS_SQS_EMBED_QUEUE_URL` | SQS FIFO URL for embed jobs. Required for SQS. | unset |
 | `PUFFERFS_SQS_INDEX_QUEUE_URL` | SQS FIFO URL for index jobs. Required for SQS. | unset |
 | `PUFFERFS_SQS_COMMIT_QUEUE_URL` | SQS FIFO URL for commit jobs. Required for SQS. | unset |
 | `NATS_URL` | JetStream URL. Selects NATS when the backend is unset. | unset (in-process) |
@@ -275,7 +278,7 @@ per stage so failures and capacity are isolated.
 | Variable | Meaning |
 | --- | --- |
 | `PUFFERFS_PROCESS` | `/pufferfs-runtime` execs the worker instead of the server when set to `worker`. |
-| `PUFFERFS_WORKER_STAGE` | Selects the worker stage: `chunk`, `embed`, `index`, or `commit`. Setting it also implies worker mode. |
+| `PUFFERFS_WORKER_STAGE` | Selects the worker stage: `chunk`, `index`, or `commit`. Setting it also implies worker mode. |
 | `PUFFERFS_WORKER_CONCURRENCY` | Maximum concurrent jobs in one worker process; default 4, max 64. |
 
 ### Billing (Stripe)

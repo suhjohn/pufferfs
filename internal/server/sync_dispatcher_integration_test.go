@@ -72,11 +72,18 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	}
 
 	indexMsg := pullOne(t, ctx, q, queue.StageIndex)
-	if indexMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl" {
+	if indexMsg.Job.PayloadRef != "syncs/gen-1/chunks/chunk-job.jsonl.gz" {
 		t.Fatalf("index payload ref = %q", indexMsg.Job.PayloadRef)
 	}
 	if indexMsg.Job.FilesInShard != 1 {
 		t.Fatalf("index files_in_shard = %d, want 1", indexMsg.Job.FilesInShard)
+	}
+	artifact, err := store.Download(ctx, indexMsg.Job.PayloadRef)
+	if err != nil {
+		t.Fatalf("download compressed chunk artifact: %v", err)
+	}
+	if len(artifact) < 2 || artifact[0] != 0x1f || artifact[1] != 0x8b {
+		t.Fatalf("chunk artifact is not gzip data: prefix=%x", artifact[:min(len(artifact), 2)])
 	}
 	indexDispatcher := NewSyncDispatcher(srv, q, queue.StageIndex, 1)
 	if err := indexDispatcher.Process(ctx, indexMsg.Job); err != nil {
@@ -91,6 +98,89 @@ func TestSyncDispatcherStageTransitionsWithLocalJetStream(t *testing.T) {
 	}
 	commitMsg := pullOne(t, ctx, q, queue.StageCommit)
 	if commitMsg.Job.Stage != queue.StageCommit || commitMsg.Job.TotalShards != 1 {
+		t.Fatalf("unexpected commit job: %#v", commitMsg.Job)
+	}
+}
+
+func TestSyncDispatcherVectorShardIndexesThroughModalWithoutIntermediateArtifact(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ns := runDispatcherTestNATS(t)
+	q, err := queue.NewNATSQueue(ns.ClientURL(), queue.WithConsumerPrefix("modal-index-test"))
+	if err != nil {
+		t.Fatalf("new queue: %v", err)
+	}
+	defer q.Close()
+
+	var received ModalShardRequest
+	modalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode Modal request: %v", err)
+		}
+		if received.SecretKey != "shared-secret" {
+			t.Fatalf("Modal request missing shared secret")
+		}
+		writeJSONResponse(t, w, ModalShardResponse{Status: "indexed"})
+	}))
+	defer modalServer.Close()
+
+	store := newMemoryObjectStore()
+	modal := &ModalClient{
+		indexShardURL: modalServer.URL,
+		secretKey:     "shared-secret",
+		httpClient:    modalServer.Client(),
+	}
+	srv := NewWithStore(nil, store, modal, nil)
+	initial := queue.JobMessage{
+		JobID:             "vector-chunk-job",
+		OrgID:             "org-1",
+		RootID:            "root-1",
+		GenerationID:      "gen-vector",
+		GenerationSeq:     2,
+		BaseGenerationID:  "gen-0",
+		BaseGenerationSeq: 1,
+		Stage:             queue.StageChunk,
+		PayloadRef:        "syncs/gen-vector/inputs/shard-000000.jsonl",
+		IndexNamespaces: []queue.IndexNamespace{{
+			Namespace:  "org-org-1-root-root-1",
+			ShardCount: 1,
+		}},
+		TotalShards:  1,
+		FilesInShard: 1,
+	}
+	if err := store.Upload(ctx, initial.PayloadRef, []byte("{\"path\":\"a.txt\",\"status\":\"ADDED\",\"content_hash\":\"hash-a\",\"size\":12,\"source_key\":\"files/root-1/a.txt\",\"source_length\":12}\n"), "application/x-ndjson"); err != nil {
+		t.Fatalf("upload input artifact: %v", err)
+	}
+	if err := store.Upload(ctx, "files/root-1/a.txt", []byte("hello world\n"), "text/plain"); err != nil {
+		t.Fatalf("upload source: %v", err)
+	}
+	if err := q.Enqueue(ctx, queue.StageChunk, initial); err != nil {
+		t.Fatalf("enqueue chunk: %v", err)
+	}
+
+	chunkDispatcher := NewSyncDispatcher(srv, q, queue.StageChunk, 1)
+	chunkMsg := pullOne(t, ctx, q, queue.StageChunk)
+	if err := chunkDispatcher.Process(ctx, chunkMsg.Job); err != nil {
+		t.Fatalf("process chunk: %v", err)
+	}
+	_ = q.Ack(chunkMsg)
+
+	indexMsg := pullOne(t, ctx, q, queue.StageIndex)
+	indexDispatcher := NewSyncDispatcher(srv, q, queue.StageIndex, 1)
+	if err := indexDispatcher.Process(ctx, indexMsg.Job); err != nil {
+		t.Fatalf("process Modal index: %v", err)
+	}
+	_ = q.Ack(indexMsg)
+
+	if received.Job.PayloadRef != indexMsg.Job.PayloadRef || !strings.HasSuffix(received.Job.PayloadRef, ".jsonl.gz") {
+		t.Fatalf("Modal payload ref = %q, want %q", received.Job.PayloadRef, indexMsg.Job.PayloadRef)
+	}
+	if store.HasPrefix("syncs/gen-vector/index_rows/") {
+		t.Fatal("indexing wrote an intermediate index_rows artifact")
+	}
+	commitMsg := pullOne(t, ctx, q, queue.StageCommit)
+	if commitMsg.Job.GenerationID != "gen-vector" {
 		t.Fatalf("unexpected commit job: %#v", commitMsg.Job)
 	}
 }
@@ -262,4 +352,15 @@ func (s *memoryObjectStore) Has(key string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.objects[key]
 	return ok
+}
+
+func (s *memoryObjectStore) HasPrefix(prefix string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }

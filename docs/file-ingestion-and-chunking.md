@@ -236,14 +236,11 @@ Chunk contents are embedded with a `search_document:` prefix. Query text is
 embedded separately with a `search_query:` prefix. Embeddings are normalized and
 stored as vectors for Turbopuffer hybrid/vector search.
 
-The embedding model version is part of the embedding cache key. Changing the
-model should also change `PUFFERFS_EMBEDDING_MODEL_VERSION` or the default model
-constant so old vectors are not reused.
-
-The Go server sends only the fields needed by the Modal chunk-embedding
-endpoint. Line metadata such as `line_start` and `line_end` is preserved on the
-index row, but omitted from the embed request for compatibility with deployed
-Modal containers that accept the older chunk schema.
+For queued vector syncs, Modal streams each compressed chunk artifact, embeds
+at most 64 pending rows at a time, and writes rows directly to Turbopuffer in
+batches bounded by 512 rows and 8 MiB. Partial buffers flush at end of shard;
+there is no intermediate vector/index-row object in storage. The in-process
+fallback retains the embedding cache keyed by model version and content hash.
 
 ## Search Index Rows
 

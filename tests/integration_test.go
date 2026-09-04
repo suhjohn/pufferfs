@@ -1660,7 +1660,8 @@ type realServices struct {
 	modalChunkURL      string
 	modalEmbedURL      string
 	modalQueryEmbedURL string
-	modalEmbedShardURL string
+	modalIndexShardURL string
+	modalSecretKey     string
 	turbopufferAPIKey  string
 	turbopufferAPIURL  string
 	storageEnv         []string
@@ -1679,7 +1680,8 @@ func requireRealServices(t *testing.T) realServices {
 		storageEnv:         e2eStorageEnv(),
 	}
 	if useRealS3 {
-		cfg.modalEmbedShardURL = os.Getenv("MODAL_EMBED_SHARD_ENDPOINT")
+		cfg.modalIndexShardURL = os.Getenv("MODAL_INDEX_SHARD_ENDPOINT")
+		cfg.modalSecretKey = os.Getenv("MODAL_SECRET_KEY")
 	}
 
 	var missing []string
@@ -1696,6 +1698,12 @@ func requireRealServices(t *testing.T) realServices {
 		missing = append(missing, "TURBOPUFFER_API_KEY")
 	}
 	if useRealS3 {
+		if cfg.modalIndexShardURL == "" {
+			missing = append(missing, "MODAL_INDEX_SHARD_ENDPOINT")
+		}
+		if cfg.modalSecretKey == "" {
+			missing = append(missing, "MODAL_SECRET_KEY")
+		}
 		for _, name := range []string{"AWS_ENDPOINT_URL", "AWS_BUCKET_NAME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
 			if os.Getenv(name) == "" {
 				missing = append(missing, name)
@@ -2193,7 +2201,7 @@ func startE2ENATS(t *testing.T) *natsserver.Server {
 }
 
 func queueStages() []string {
-	return []string{"chunk", "embed", "index", "commit"}
+	return []string{"chunk", "index", "commit"}
 }
 
 func startStageWorkers(t *testing.T, services realServices, natsURL string, stages ...string) []*exec.Cmd {
@@ -2208,7 +2216,8 @@ func startStageWorkers(t *testing.T, services realServices, natsURL string, stag
 			"MODAL_CHUNK_ENDPOINT=" + services.modalChunkURL,
 			"MODAL_EMBED_ENDPOINT=" + services.modalEmbedURL,
 			"MODAL_QUERY_EMBED_ENDPOINT=" + services.modalQueryEmbedURL,
-			"MODAL_EMBED_SHARD_ENDPOINT=" + services.modalEmbedShardURL,
+			"MODAL_INDEX_SHARD_ENDPOINT=" + services.modalIndexShardURL,
+			"MODAL_SECRET_KEY=" + services.modalSecretKey,
 			"TURBOPUFFER_API_KEY=" + services.turbopufferAPIKey,
 			"TURBOPUFFER_API_URL=" + services.turbopufferAPIURL,
 			"PUFFERFS_TP_NAMESPACE_SHARDS=" + e2eTPNamespaceShards,

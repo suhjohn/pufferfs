@@ -16,7 +16,6 @@ import (
 
 const (
 	StageChunk  = "chunk"
-	StageEmbed  = "embed"
 	StageIndex  = "index"
 	StageCommit = "commit"
 )
@@ -118,7 +117,7 @@ func WithReplicas(replicas int) NATSOption {
 }
 
 func (q *NATSQueue) ensureTopology(consumerPrefix string, replicas int) error {
-	for _, stage := range []string{StageChunk, StageEmbed, StageIndex, StageCommit} {
+	for _, stage := range []string{StageChunk, StageIndex, StageCommit} {
 		stream := streamName(stage)
 		subject := subjectForStage(stage)
 		streamConfig := nats.StreamConfig{

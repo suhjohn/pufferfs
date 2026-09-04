@@ -17,7 +17,6 @@ import (
 
 const (
 	syncStageChunk  = "chunk"
-	syncStageEmbed  = "embed"
 	syncStageIndex  = "index"
 	syncStageCommit = "commit"
 
@@ -151,27 +150,8 @@ func (p *syncPipeline) run(ctx context.Context) (*models.SyncResponse, error) {
 		}
 		jobs[i].PayloadRef = ref
 	}
-	if p.req == nil || !p.req.DisableVector {
-		if p.jobID != "" {
-			_ = p.server.db.UpdateSyncJobStatus(ctx, p.jobID, "embedding")
-		}
-		for i := range jobs {
-			jobs[i].JobID += "-embed"
-			jobs[i].Stage = syncStageEmbed
-			ref, err := p.processEmbedJob(ctx, jobs[i])
-			if err != nil {
-				return nil, err
-			}
-			if p.jobID != "" {
-				if _, _, err := p.server.db.RecordSyncJobShard(ctx, p.jobID, syncStageEmbed, jobs[i].ShardIndex, jobs[i].FilesInShard); err != nil {
-					return nil, err
-				}
-			}
-			jobs[i].PayloadRef = ref
-		}
-	}
 	if p.jobID != "" {
-		_ = p.server.db.UpdateSyncJobStatus(ctx, p.jobID, "upserting")
+		_ = p.server.db.UpdateSyncJobStatus(ctx, p.jobID, "indexing")
 	}
 	for i := range jobs {
 		jobs[i].JobID += "-index"
@@ -583,38 +563,6 @@ func isSourceBundleKey(key string) bool {
 	return strings.HasPrefix(key, "bundles/") || strings.Contains(key, "/sources/bundles/")
 }
 
-func (p *syncPipeline) processEmbedJob(ctx context.Context, job queue.JobMessage) (string, error) {
-	return p.streamJSONL(ctx, "index_rows", job.JobID, func(enc *json.Encoder) error {
-		batch := make([]syncArtifact, 0, 128)
-		flush := func() error {
-			if err := p.prepareIndexRows(ctx, batch); err != nil {
-				return err
-			}
-			for _, row := range batch {
-				if err := enc.Encode(row); err != nil {
-					return err
-				}
-			}
-			batch = batch[:0]
-			return nil
-		}
-		err := eachJSONL(ctx, p.server.s3, job.PayloadRef, func(item syncArtifact) error {
-			if item.Op != "upsert" && item.Op != "close" {
-				return nil
-			}
-			batch = append(batch, item)
-			if len(batch) == cap(batch) {
-				return flush()
-			}
-			return nil
-		})
-		if err == nil && len(batch) > 0 {
-			err = flush()
-		}
-		return err
-	})
-}
-
 func (p *syncPipeline) prepareIndexRows(ctx context.Context, rows []syncArtifact) error {
 	if p.req != nil && p.req.DisableVector {
 		for i := range rows {
@@ -673,19 +621,57 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job queue.JobMessage
 	if p.req != nil && p.req.DisableVector {
 		distanceMetric = ""
 	}
+	type routedRow struct {
+		namespace string
+		row       map[string]any
+	}
 	batchSize := tpWriteBatchSize()
-	buffers := make(map[string][]map[string]any)
+	batchMaxBytes := max(1, tpWriteBatchMaxBytes()-(64<<10))
+	writeBuffer := make([]routedRow, 0, batchSize)
+	writeBytes := 0
 	closePaths := make(map[string][]string)
-	flushNamespace := func(namespace string) error {
-		rows := buffers[namespace]
-		if len(rows) == 0 {
+	flushWrites := func() error {
+		if len(writeBuffer) == 0 {
 			return nil
 		}
-		if err := p.server.tp.UpsertRows(namespace, rows, distanceMetric); err != nil {
-			return err
+		byNamespace := make(map[string][]map[string]any)
+		var namespaceOrder []string
+		for _, item := range writeBuffer {
+			if _, ok := byNamespace[item.namespace]; !ok {
+				namespaceOrder = append(namespaceOrder, item.namespace)
+			}
+			byNamespace[item.namespace] = append(byNamespace[item.namespace], item.row)
 		}
-		p.resp.ChunksAdded += len(rows)
-		buffers[namespace] = buffers[namespace][:0]
+		for _, namespace := range namespaceOrder {
+			rows := byNamespace[namespace]
+			if err := p.server.tp.UpsertRows(namespace, rows, distanceMetric); err != nil {
+				return err
+			}
+			p.resp.ChunksAdded += len(rows)
+		}
+		writeBuffer = writeBuffer[:0]
+		writeBytes = 0
+		return nil
+	}
+	appendWrite := func(namespace string, row map[string]any) error {
+		encoded, err := json.Marshal(row)
+		if err != nil {
+			return fmt.Errorf("measuring index row: %w", err)
+		}
+		rowBytes := len(encoded) + 1
+		if rowBytes > batchMaxBytes {
+			return fmt.Errorf("index row for %s is %d bytes; maximum batch bytes is %d", strVal(row, "file_path"), rowBytes, batchMaxBytes)
+		}
+		if len(writeBuffer) > 0 && (len(writeBuffer) >= batchSize || writeBytes+rowBytes > batchMaxBytes) {
+			if err := flushWrites(); err != nil {
+				return err
+			}
+		}
+		writeBuffer = append(writeBuffer, routedRow{namespace: namespace, row: row})
+		writeBytes += rowBytes
+		if len(writeBuffer) >= batchSize || writeBytes >= batchMaxBytes {
+			return flushWrites()
+		}
 		return nil
 	}
 	flushCloses := func() error {
@@ -721,7 +707,7 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job queue.JobMessage
 		clear(closePaths)
 		return nil
 	}
-	err = eachJSONL(ctx, p.server.s3, job.PayloadRef, func(record syncArtifact) error {
+	applyPrepared := func(record syncArtifact) error {
 		switch record.Op {
 		case "upsert":
 			if len(closePaths) > 0 {
@@ -737,13 +723,13 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job queue.JobMessage
 			if err != nil {
 				return fmt.Errorf("routing index row for %s: %w", filePath, err)
 			}
-			buffers[ns.Namespace] = append(buffers[ns.Namespace], record.Row)
-			if len(buffers[ns.Namespace]) >= batchSize {
-				return flushNamespace(ns.Namespace)
-			}
+			return appendWrite(ns.Namespace, record.Row)
 		case "close":
 			if record.ClosePath == "" {
 				return nil
+			}
+			if err := flushWrites(); err != nil {
+				return err
 			}
 			ns, err := rootIndexNamespaceForPath(indexNamespaces, record.ClosePath)
 			if err != nil {
@@ -752,8 +738,37 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job queue.JobMessage
 			closePaths[ns.Namespace] = append(closePaths[ns.Namespace], record.ClosePath)
 		}
 		return nil
+	}
+	embedBatch := make([]syncArtifact, 0, 128)
+	flushEmbedBatch := func() error {
+		if len(embedBatch) == 0 {
+			return nil
+		}
+		if err := p.prepareIndexRows(ctx, embedBatch); err != nil {
+			return err
+		}
+		for _, record := range embedBatch {
+			if err := applyPrepared(record); err != nil {
+				return err
+			}
+		}
+		embedBatch = embedBatch[:0]
+		return nil
+	}
+	err = eachJSONL(ctx, p.server.s3, job.PayloadRef, func(record syncArtifact) error {
+		if record.Op != "upsert" && record.Op != "close" {
+			return nil
+		}
+		embedBatch = append(embedBatch, record)
+		if len(embedBatch) == cap(embedBatch) {
+			return flushEmbedBatch()
+		}
+		return nil
 	})
 	if err != nil {
+		return err
+	}
+	if err := flushEmbedBatch(); err != nil {
 		return err
 	}
 	if len(closePaths) > 0 {
@@ -761,10 +776,8 @@ func (p *syncPipeline) processIndexJob(ctx context.Context, job queue.JobMessage
 			return err
 		}
 	}
-	for namespace := range buffers {
-		if err := flushNamespace(namespace); err != nil {
-			return err
-		}
+	if err := flushWrites(); err != nil {
+		return err
 	}
 	p.resp.FilesProcessed += job.FilesInShard
 	return nil

@@ -17,7 +17,6 @@ const (
 
 var sqsQueueEnv = map[string]string{
 	StageChunk:  "PUFFERFS_SQS_CHUNK_QUEUE_URL",
-	StageEmbed:  "PUFFERFS_SQS_EMBED_QUEUE_URL",
 	StageIndex:  "PUFFERFS_SQS_INDEX_QUEUE_URL",
 	StageCommit: "PUFFERFS_SQS_COMMIT_QUEUE_URL",
 }

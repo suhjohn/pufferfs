@@ -362,9 +362,9 @@ const logGroup = new aws.cloudwatch.LogGroup(name("logs"), {
 });
 
 // Each pipeline stage gets an independent FIFO queue so a wedged indexing
-// workload cannot consume chunk/embed/lesson capacity. Data shards use
+// workload cannot consume chunking capacity. Data shards use
 // independent groups for concurrency; commits use one group per root.
-const syncStages = ["chunk", "embed", "index", "commit"] as const;
+const syncStages = ["chunk", "index", "commit"] as const;
 const syncQueues = syncStages.map((stage) => {
   const dlq = new aws.sqs.Queue(name(`${stage}-dlq`), {
     name: `${name(`sync-${stage}-dlq`)}.fifo`,
@@ -662,6 +662,7 @@ const secretValues: Record<string, pulumi.Input<string>> = {
   DATABASE_URL: cfg.requireSecret("databaseUrl"),
   JWT_SECRET: cfg.requireSecret("jwtSecret"),
   TURBOPUFFER_API_KEY: cfg.requireSecret("turbopufferApiKey"),
+  MODAL_SECRET_KEY: cfg.requireSecret("modalSecretKey"),
 };
 
 const adminKeyHash = cfg.getSecret("adminKeyHash");
@@ -708,7 +709,7 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "MODAL_CHUNK_ENDPOINT", value: requireNonBlank("modalChunkEndpoint") },
   { name: "MODAL_EMBED_ENDPOINT", value: requireNonBlank("modalEmbedEndpoint") },
   { name: "MODAL_QUERY_EMBED_ENDPOINT", value: requireNonBlank("modalQueryEmbedEndpoint") },
-  { name: "MODAL_EMBED_SHARD_ENDPOINT", value: requireNonBlank("modalEmbedShardEndpoint") },
+  { name: "MODAL_INDEX_SHARD_ENDPOINT", value: requireNonBlank("modalIndexShardEndpoint") },
   { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
@@ -952,7 +953,6 @@ const apiService = new aws.ecs.Service(name("api"), {
 
 const workerDefaults: Record<string, number> = {
   chunk: 16,
-  embed: 8,
   index: 16,
   commit: 2,
 };
