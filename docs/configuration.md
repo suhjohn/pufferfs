@@ -86,11 +86,12 @@ moves. Byte values are plain integers (bytes).
 | `PUFFERFS_UPLOAD_CONCURRENCY` | Max concurrent CLI upload requests. Invalid values use the default; values above 16 are capped at 16. | 4 |
 | `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` | Files at or below this size are packed into bundles; larger files upload standalone. | 8 MiB (`8<<20`) |
 | `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object, capped at 15 MiB. Bundles upload concurrently within the shared upload limit. | 15 MiB (`15<<20`) |
+| `PUFFERFS_MULTIPART_MIN_BYTES` | Standalone files at or above this size use direct, retryable multipart object-storage uploads instead of traversing the API server. | 64 MiB (`64<<20`) |
 | `PUFFERFS_UPLOAD_MANIFEST_MAX_FILES` | Maximum file changes in one transport manifest, capped at 5000. The server independently forms bounded work shards. | 5000 |
 | `PUFFERFS_MOVE_REUSE_MAX_BYTES` | Max file size for which moved-file index reuse is attempted; larger moves are handled conservatively. | 64 MiB (`64<<20`) |
 | `PUFFERFS_SYNC_POLL_TIMEOUT` | How long the CLI polls an async sync job before giving up. Go duration. | 35m |
 
-> Server enforced upload caps are separate: 512 MiB per single file, 1024 MiB
+> Server enforced upload caps are separate: 10 GiB per source object and 1 GiB
 > per bundle (see [api-reference.md](./api-reference.md#limits)).
 
 ### `sync --follow` flags
@@ -146,6 +147,13 @@ If neither admin key variable is set, all `/admin/*` routes return `403`.
 | `AWS_BUCKET_NAME` | Bucket for source files, bundles, states, sync artifacts, page images. |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Credentials. |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Region. |
+
+Source capture tuning uses plain integer byte values:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `PUFFERFS_MULTIPART_PART_BYTES` | Preferred direct-upload part size. Values below S3's 5 MiB minimum use the default; the server raises it when needed to stay within 10,000 parts. | 16 MiB (`16<<20`) |
+| `PUFFERFS_SOURCE_RANGE_BYTES` | Target bytes in each line-aware local text/code execution range. Every completed range is assigned its own worker shard. Values below 1 MiB use the default; values above the default are capped at the execution-shard budget. | 16,318,456 bytes (about 15.6 MiB) |
 
 ### Search (Turbopuffer)
 

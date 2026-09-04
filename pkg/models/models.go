@@ -187,6 +187,15 @@ type FileState struct {
 	Mtime       int64  `json:"mtime"`
 }
 
+// SourceRange is one independently chunkable region of a standalone source
+// object. Ranges are contiguous and cover the entire source. LineStart keeps
+// line metadata global even when workers read the regions independently.
+type SourceRange struct {
+	Offset    int64 `json:"offset"`
+	Length    int64 `json:"length"`
+	LineStart int64 `json:"line_start"`
+}
+
 // FileChangeStatus enumerates possible diff outcomes.
 type FileChangeStatus string
 
@@ -210,6 +219,7 @@ type FileChange struct {
 	SourceKey    string           `json:"source_key,omitempty"`
 	SourceOffset int64            `json:"source_offset,omitempty"`
 	SourceLength int64            `json:"source_length,omitempty"`
+	SourceRanges []SourceRange    `json:"source_ranges,omitempty"`
 }
 
 // DiffStats summarises counts per status.
@@ -308,6 +318,63 @@ type SyncInitResponse struct {
 	BaseGenerationID  string `json:"base_generation_id"`
 	BaseGenerationSeq int64  `json:"base_generation_seq"`
 	ManifestPrefix    string `json:"manifest_prefix"`
+}
+
+type MultipartSourceInitRequest struct {
+	GenerationID string `json:"generation_id"`
+	Path         string `json:"path"`
+	Size         int64  `json:"size"`
+}
+
+type MultipartSourceInitResponse struct {
+	Key        string `json:"key"`
+	UploadID   string `json:"upload_id"`
+	PartSize   int64  `json:"part_size"`
+	PartCount  int    `json:"part_count"`
+	RangeBytes int64  `json:"range_bytes,omitempty"`
+}
+
+type MultipartSourcePartRequest struct {
+	GenerationID string `json:"generation_id"`
+	Key          string `json:"key"`
+	UploadID     string `json:"upload_id"`
+	PartNumber   int    `json:"part_number"`
+	Size         int64  `json:"size"`
+}
+
+type MultipartSourcePartResponse struct {
+	URL     string              `json:"url"`
+	Headers map[string][]string `json:"headers,omitempty"`
+}
+
+type MultipartSourceCompletedPart struct {
+	PartNumber int    `json:"part_number"`
+	ETag       string `json:"etag"`
+}
+
+type MultipartSourceCompleteRequest struct {
+	GenerationID string                         `json:"generation_id"`
+	Path         string                         `json:"path"`
+	Key          string                         `json:"key"`
+	UploadID     string                         `json:"upload_id"`
+	Size         int64                          `json:"size"`
+	PartSize     int64                          `json:"part_size"`
+	ContentHash  string                         `json:"content_hash"`
+	SourceRanges []SourceRange                  `json:"source_ranges,omitempty"`
+	Parts        []MultipartSourceCompletedPart `json:"parts"`
+}
+
+type MultipartSourceAbortRequest struct {
+	GenerationID string `json:"generation_id"`
+	Key          string `json:"key"`
+	UploadID     string `json:"upload_id"`
+}
+
+type SourceUploadResponse struct {
+	Key          string        `json:"key"`
+	ContentHash  string        `json:"content_hash"`
+	Size         int64         `json:"size"`
+	SourceRanges []SourceRange `json:"source_ranges,omitempty"`
 }
 
 type SyncConflictResponse struct {

@@ -224,6 +224,19 @@ new aws.s3.BucketServerSideEncryptionConfigurationV2(name("artifacts-encryption"
   ],
 });
 
+new aws.s3.BucketLifecycleConfigurationV2(name("artifacts-lifecycle"), {
+  bucket: bucket.id,
+  rules: [
+    {
+      id: "abort-incomplete-multipart-uploads",
+      status: "Enabled",
+      abortIncompleteMultipartUpload: {
+        daysAfterInitiation: 1,
+      },
+    },
+  ],
+});
+
 // --- Frontend: TanStack Start prerendered to static, on S3 + CloudFront -----
 // The web build (web/dist) is a plain folder of static files. Upload happens
 // out of band (`aws s3 sync` in CI); see web/README.md. CloudFront serves it
@@ -436,7 +449,7 @@ new aws.iam.RolePolicy(name("ecs-task-policy"), {
       const statements: Record<string, unknown>[] = [
         {
           Effect: "Allow",
-          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListBucket"],
           Resource: [bucketArn, `${bucketArn}/*`],
         },
         {

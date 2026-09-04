@@ -24,9 +24,15 @@ import (
 // Client wraps an S3 client with the configured bucket.
 type Client struct {
 	s3       *s3.Client
+	presign  *s3.PresignClient
 	uploader streamUploader
 	aborter  multipartAborter
 	bucket   string
+}
+
+type CompletedPart struct {
+	PartNumber int32
+	ETag       string
 }
 
 type streamUploader interface {
@@ -76,7 +82,95 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 	})
 	uploader := newStreamUploader(client)
 
-	return &Client{s3: client, uploader: uploader, aborter: client, bucket: cfg.Bucket}, nil
+	return &Client{s3: client, presign: s3.NewPresignClient(client), uploader: uploader, aborter: client, bucket: cfg.Bucket}, nil
+}
+
+func (c *Client) CreateMultipartUpload(ctx context.Context, key, contentType string) (string, error) {
+	out, err := c.s3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket:      &c.bucket,
+		Key:         &key,
+		ContentType: &contentType,
+	})
+	if err != nil {
+		return "", err
+	}
+	if out.UploadId == nil || *out.UploadId == "" {
+		return "", errors.New("object storage returned an empty multipart upload id")
+	}
+	return *out.UploadId, nil
+}
+
+func (c *Client) PresignMultipartPart(ctx context.Context, key, uploadID string, partNumber int32, contentLength int64, expires time.Duration) (string, map[string][]string, error) {
+	if c.presign == nil {
+		return "", nil, errors.New("object storage presigner is unavailable")
+	}
+	out, err := c.presign.PresignUploadPart(ctx, &s3.UploadPartInput{
+		Bucket:        &c.bucket,
+		Key:           &key,
+		UploadId:      &uploadID,
+		PartNumber:    &partNumber,
+		ContentLength: &contentLength,
+	}, func(options *s3.PresignOptions) {
+		options.Expires = expires
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return out.URL, out.SignedHeader, nil
+}
+
+func (c *Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, size int64, parts []CompletedPart) error {
+	completed := make([]types.CompletedPart, len(parts))
+	for i, part := range parts {
+		completed[i] = types.CompletedPart{PartNumber: &part.PartNumber, ETag: &part.ETag}
+	}
+	_, err := c.s3.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:   &c.bucket,
+		Key:      &key,
+		UploadId: &uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{
+			Parts: completed,
+		},
+	})
+	if err != nil {
+		// Completion is idempotent from PufferFS's perspective. If S3 committed
+		// the object but its response was lost, a retry reports NoSuchUpload.
+		// This key is unique to the capture attempt, so matching size is enough
+		// to recognize that successful prior completion.
+		if matches, _, _ := c.objectHasSize(ctx, key, size); matches {
+			return nil
+		}
+		return err
+	}
+	matches, actual, err := c.objectHasSize(ctx, key, size)
+	if err != nil {
+		return err
+	}
+	if !matches {
+		_ = c.DeleteMany(ctx, []string{key})
+		return fmt.Errorf("completed multipart object size %d does not match expected size %d", actual, size)
+	}
+	return nil
+}
+
+func (c *Client) objectHasSize(ctx context.Context, key string, size int64) (bool, int64, error) {
+	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &c.bucket, Key: &key})
+	if err != nil {
+		return false, -1, err
+	}
+	if out.ContentLength == nil {
+		return false, -1, errors.New("object storage returned no content length")
+	}
+	return *out.ContentLength == size, *out.ContentLength, nil
+}
+
+func (c *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	_, err := c.s3.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket:   &c.bucket,
+		Key:      &key,
+		UploadId: &uploadID,
+	})
+	return err
 }
 
 func newStreamUploader(client manager.UploadAPIClient, options ...func(*manager.Uploader)) *manager.Uploader {

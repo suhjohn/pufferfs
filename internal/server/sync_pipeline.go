@@ -24,6 +24,7 @@ const (
 	defaultSyncShardMaxFiles  = 128
 	defaultSyncShardMaxChunks = 8192
 	activeRowsQueryLimit      = 10000
+	rangedSourceOffsetFence   = int64(-1)
 )
 
 type syncPipeline struct {
@@ -49,6 +50,66 @@ type syncArtifact struct {
 type syncInputShard struct {
 	Ref       string
 	FileCount int
+}
+
+// syncChunkWork is the execution record stored in input shards. Unranged
+// records remain wire-compatible with the old FileChange-only JSON shape.
+// Ranged records let independent workers read disjoint regions of one source.
+type syncChunkWork struct {
+	models.FileChange
+	RangeOffset    int64 `json:"work_range_offset,omitempty"`
+	RangeLength    int64 `json:"work_range_length,omitempty"`
+	RangeLineStart int64 `json:"work_range_line_start,omitempty"`
+	RangeIndex     int   `json:"work_range_index,omitempty"`
+	RangeCount     int   `json:"work_range_count,omitempty"`
+}
+
+func chunkWorkForChange(change models.FileChange) []syncChunkWork {
+	if len(change.SourceRanges) == 0 {
+		return []syncChunkWork{{FileChange: change}}
+	}
+	work := make([]syncChunkWork, len(change.SourceRanges))
+	ranges := change.SourceRanges
+	change.SourceRanges = nil
+	// Older workers do not understand the work_range fields. Make them fail
+	// the storage read instead of indexing the entire file once per range
+	// during a rolling deployment. Current workers use RangeOffset directly.
+	change.SourceOffset = rangedSourceOffsetFence
+	for i, sourceRange := range ranges {
+		work[i] = syncChunkWork{
+			FileChange:     change,
+			RangeOffset:    sourceRange.Offset,
+			RangeLength:    sourceRange.Length,
+			RangeLineStart: sourceRange.LineStart,
+			RangeIndex:     i,
+			RangeCount:     len(ranges),
+		}
+	}
+	return work
+}
+
+func (work syncChunkWork) fileCredit() int {
+	if work.RangeCount == 0 || work.RangeIndex == work.RangeCount-1 {
+		return 1
+	}
+	return 0
+}
+
+func (work syncChunkWork) closesPreviousRows() bool {
+	return work.RangeCount == 0 || work.RangeIndex == 0
+}
+
+func validateChunkWork(work syncChunkWork) error {
+	if work.RangeCount == 0 {
+		return nil
+	}
+	if work.RangeIndex < 0 || work.RangeIndex >= work.RangeCount || work.RangeOffset < 0 || work.RangeLength <= 0 || work.RangeLineStart < 1 {
+		return fmt.Errorf("invalid ranged chunk work for %s", work.Path)
+	}
+	if work.SourceOffset != rangedSourceOffsetFence || work.SourceKey == "" || !localChunkable(work.Path) {
+		return fmt.Errorf("unsupported ranged chunk work for %s", work.Path)
+	}
+	return nil
 }
 
 func (s *Server) processSync(ctx context.Context, orgID string, generation *SyncGeneration, req *models.SyncRequest, jobID string) (*models.SyncResponse, error) {
@@ -237,9 +298,11 @@ func syncRequestKey(generationID string) string {
 
 func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error) {
 	var shards []syncInputShard
-	var current []models.FileChange
+	var current []syncChunkWork
 	var currentChunks int64
+	var currentFiles int
 	var currentBundle string
+	var currentIsRange bool
 	var uploads errgroup.Group
 	uploads.SetLimit(4)
 	flush := func() error {
@@ -248,8 +311,8 @@ func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error
 		}
 		var buf bytes.Buffer
 		enc := json.NewEncoder(&buf)
-		for _, change := range current {
-			if err := enc.Encode(change); err != nil {
+		for _, work := range current {
+			if err := enc.Encode(work); err != nil {
 				return err
 			}
 		}
@@ -261,22 +324,29 @@ func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error
 			}
 			return nil
 		})
-		shards = append(shards, syncInputShard{Ref: ref, FileCount: len(current)})
+		shards = append(shards, syncInputShard{Ref: ref, FileCount: currentFiles})
 		current = nil
 		currentChunks = 0
+		currentFiles = 0
 		currentBundle = ""
+		currentIsRange = false
 		return nil
 	}
-	add := func(change models.FileChange) error {
-		if err := normalizeSyncChange(p.rootID, p.generation.ID, &change); err != nil {
-			return err
+	addWork := func(work syncChunkWork) error {
+		change := work.FileChange
+		// A source range is the unit of parallel execution, not merely another
+		// record that may be packed behind work from the same large file.
+		if len(current) > 0 && (currentIsRange || work.RangeCount > 0) {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
-		if change.Status == models.StatusUnchanged {
-			return nil
-		}
-		size := change.SourceLength
+		size := work.RangeLength
 		if size == 0 {
-			size = change.Size
+			size = change.SourceLength
+			if size == 0 {
+				size = change.Size
+			}
 		}
 		size = max(size, 0)
 		bundle := ""
@@ -288,18 +358,34 @@ func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error
 				return err
 			}
 		}
-		work := int64(1)
+		estimatedChunks := int64(1)
 		if (change.Status == models.StatusAdded || change.Status == models.StatusModified || change.Status == models.StatusMoved || change.Status == models.StatusRenamed) && size > 0 {
-			work = (size-1)/2000 + 1
+			estimatedChunks = (size-1)/2000 + 1
 		}
-		if len(current) > 0 && (len(current) >= defaultSyncShardMaxFiles || currentChunks+work > defaultSyncShardMaxChunks) {
+		if len(current) > 0 && (len(current) >= defaultSyncShardMaxFiles || currentChunks+estimatedChunks > defaultSyncShardMaxChunks) {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
-		current = append(current, change)
-		currentChunks += work
+		current = append(current, work)
+		currentChunks += estimatedChunks
+		currentFiles += work.fileCredit()
 		currentBundle = bundle
+		currentIsRange = work.RangeCount > 0
+		return nil
+	}
+	add := func(change models.FileChange) error {
+		if err := normalizeSyncChange(p.rootID, p.generation.ID, &change); err != nil {
+			return err
+		}
+		if change.Status == models.StatusUnchanged {
+			return nil
+		}
+		for _, work := range chunkWorkForChange(change) {
+			if err := addWork(work); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	var inputErr error
@@ -333,19 +419,25 @@ func (p *syncPipeline) inputShards(ctx context.Context) ([]syncInputShard, error
 
 func (p *syncPipeline) processChunkJob(ctx context.Context, job queue.JobMessage, sourceCache *syncSourceCache) (string, error) {
 	return p.streamJSONL(ctx, "chunks", job.JobID, func(enc *json.Encoder) error {
-		changes := make([]models.FileChange, 0, job.FilesInShard)
-		if err := eachJSONL(ctx, p.server.s3, job.PayloadRef, func(change models.FileChange) error {
-			changes = append(changes, change)
+		var workItems []syncChunkWork
+		if err := eachJSONL(ctx, p.server.s3, job.PayloadRef, func(work syncChunkWork) error {
+			if err := validateChunkWork(work); err != nil {
+				return err
+			}
+			workItems = append(workItems, work)
 			return nil
 		}); err != nil {
 			return err
 		}
 		var oldPaths []string
-		for _, change := range changes {
+		for _, work := range workItems {
+			change := work.FileChange
 			path := ""
 			switch change.Status {
 			case models.StatusModified, models.StatusRemoved:
-				path = change.Path
+				if work.closesPreviousRows() {
+					path = change.Path
+				}
 			case models.StatusMoved, models.StatusRenamed:
 				path = change.OldPath
 				oldPaths = append(oldPaths, path)
@@ -389,10 +481,11 @@ func (p *syncPipeline) processChunkJob(ctx context.Context, job queue.JobMessage
 				}
 			}
 		}
-		for _, change := range changes {
+		for _, work := range workItems {
+			change := work.FileChange
 			switch change.Status {
 			case models.StatusAdded, models.StatusModified:
-				if err := p.chunkFileEach(ctx, change, sourceCache, func(item syncArtifact) error { return enc.Encode(item) }); err != nil {
+				if err := p.chunkFileWorkEach(ctx, work, sourceCache, func(item syncArtifact) error { return enc.Encode(item) }); err != nil {
 					return err
 				}
 			case models.StatusMoved, models.StatusRenamed:
@@ -408,7 +501,8 @@ func (p *syncPipeline) processChunkJob(ctx context.Context, job queue.JobMessage
 	})
 }
 
-func (p *syncPipeline) chunkFileEach(ctx context.Context, change models.FileChange, sourceCache *syncSourceCache, emit func(syncArtifact) error) error {
+func (p *syncPipeline) chunkFileWorkEach(ctx context.Context, work syncChunkWork, sourceCache *syncSourceCache, emit func(syncArtifact) error) error {
+	change := work.FileChange
 	if change.Size == 0 && change.SourceLength == 0 && change.SourceKey == "" {
 		return nil
 	}
@@ -424,6 +518,23 @@ func (p *syncPipeline) chunkFileEach(ctx context.Context, change models.FileChan
 		return emit(syncArtifact{Op: "upsert", Row: row})
 	}
 	if localChunkable(change.Path) {
+		if work.RangeCount > 0 {
+			chunkIndex := int(work.RangeOffset)
+			lineStart := int(work.RangeLineStart)
+			if int64(chunkIndex) != work.RangeOffset || int64(lineStart) != work.RangeLineStart {
+				return fmt.Errorf("source range for %s exceeds local integer limits", change.Path)
+			}
+			return p.chunkLocalSourceRangeEach(
+				ctx,
+				s3Key,
+				change,
+				work.RangeOffset,
+				work.RangeLength,
+				chunkIndex,
+				lineStart,
+				emitChunk,
+			)
+		}
 		sourceLength := change.SourceLength
 		if sourceLength <= 0 {
 			sourceLength = change.Size

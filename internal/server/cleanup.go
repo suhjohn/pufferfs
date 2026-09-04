@@ -14,7 +14,7 @@ import (
 
 func isObjectNotFound(err error) bool {
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "not found") || strings.Contains(msg, "status code: 404")
+	return strings.Contains(msg, "nosuchkey") || strings.Contains(msg, "nosuchupload") || strings.Contains(msg, "not found") || strings.Contains(msg, "status code: 404")
 }
 
 func cleanupSyncArtifactsEnabled() bool {

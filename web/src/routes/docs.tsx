@@ -753,8 +753,9 @@ const ENDPOINTS = [
       ["changes[].path", "string", "required", "Path relative to the root directory."],
       ["changes[].status", "string", "required", "File state such as ADDED, MODIFIED, or DELETED."],
       ["changes[].content_hash", "string", "required for uploaded content", "SHA-256 content identity used for diffing, proof, and dedupe."],
-      ["changes[].size", "number", "required for uploaded content", "File size in bytes. Single-file uploads are limited to 512 MiB."],
+      ["changes[].size", "number", "required for uploaded content", "File size in bytes. Source objects are limited to 10 GiB."],
       ["changes[].source_key", "string", "required for uploaded content", "Object-storage key where the uploaded file bytes can be read by the server pipeline. New clients should use syncs/<generation_id>/sources/... keys."],
+      ["changes[].source_ranges", "array", "optional", "Contiguous line-aware byte ranges for independently chunking a large local text/code source."],
       ["state_ref", "string", "required", "Object-storage reference for the serialized complete root state bundle. Subset clients must merge selected changes into the current committed state before uploading this ref."],
       ["content_proof.root_hash", "string", "required", "Merkle root hash for the submitted filesystem state."],
       ["content_proof.file_hashes", "object", "required", "Per-file proof data keyed by relative path when needed for filtering and validation."],
@@ -1303,9 +1304,11 @@ generated/client/
             <p>
               Sync is asynchronous at the API layer when <code>async=true</code>{" "}
               is set. Query reads only the latest committed generation, so
-              partially indexed data is not visible. Upload limits are 512 MiB
-              per single file and 1024 MiB per bundle. The default sync job
-              timeout is 30 minutes.
+              partially indexed data is not visible. Source objects support up
+              to 10 GiB; current clients upload files at least 64 MiB
+              directly in independently retryable multipart parts. Bundle
+              uploads remain limited to 1024 MiB. The default sync job timeout
+              is 30 minutes.
             </p>
             <p>
               Document-scoped CLI sync sends a small change set for selected

@@ -532,6 +532,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 
 	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
 		t.Setenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES", "65536")
+		t.Setenv("PUFFERFS_MULTIPART_MIN_BYTES", "1048576")
+		t.Setenv("PUFFERFS_MULTIPART_PART_BYTES", "5242880")
+		t.Setenv("PUFFERFS_SOURCE_RANGE_BYTES", "1048576")
 		nats := startE2ENATS(t)
 		env := newQueuedE2EEnv(t, services, nats.ClientURL())
 		homeDir := t.TempDir()
@@ -544,7 +547,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		writeFile(t, projectDir, "docs/notes.txt", "Plain text file chunked locally by the Go worker.\n")
 		writeFile(t, projectDir, "docs/empty.txt", "")
 		writeFile(t, projectDir, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n")
-		writeFile(t, projectDir, "sessions/events.jsonl", strings.Repeat("{\"event\":\"bounded stream integration token\"}\n", 200000))
+		writeFile(t, projectDir, "sessions/events.jsonl", strings.Repeat("{\"event\":\"bounded stream integration token\"}\n", 200000)+"{\"event\":\"multipart terminal range token\"}\n")
 		for i := range 130 {
 			writeFile(t, projectDir, fmt.Sprintf("generated/%03d.txt", i), strings.Repeat("bounded batch file ", 64))
 		}
@@ -557,13 +560,19 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 		requireOutputContains(t, stdout, "Sync complete")
 		requireOutputContains(t, stdout, "Upload progress:")
+		requireOutputContains(t, stdout, "Direct multipart upload completed for 1 large file.")
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
 		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
 		chunkShards, err := strconv.Atoi(strings.TrimSpace(psqlOutput(t,
 			`SELECT COUNT(*) FROM sync_job_shards WHERE stage = 'chunk' AND job_id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`)))
-		if err != nil || chunkShards < 2 {
-			t.Fatalf("chunk work shards = %d (parse error %v), want at least 2", chunkShards, err)
+		if err != nil || chunkShards < 8 {
+			t.Fatalf("chunk work shards = %d (parse error %v), want at least 8", chunkShards, err)
+		}
+		progress := strings.TrimSpace(psqlOutput(t,
+			`SELECT processed || '/' || total_files FROM sync_jobs WHERE id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`))
+		if progress != "135/135" {
+			t.Fatalf("sync progress = %q, want logical files 135/135", progress)
 		}
 		assertDBCountZero(t, "embed shards for vector-disabled sync",
 			`SELECT COUNT(*) FROM sync_job_shards WHERE stage = 'embed' AND job_id = (SELECT sync_job_id FROM sync_generations WHERE id = `+sqlQuote(generationID)+`)`)
@@ -583,6 +592,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertHasTPRows(t, services, namespaces, "sessions/events.jsonl")
 		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "fts", "", "docs/readme.md")
 		assertCLIQuery(t, homeDir, env, "bounded stream integration token", env.rootName, "fts", "", "sessions/events.jsonl")
+		assertCLIQuery(t, homeDir, env, "multipart terminal range token", env.rootName, "fts", "", "sessions/events.jsonl")
 
 		for i := range 130 {
 			content := strings.Repeat("batched close integration token ", 64)
@@ -1229,6 +1239,96 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 		storageEnv:        e2eStorageEnv(),
 	}
 
+	t.Run("multipart source abort removes unfinished upload", func(t *testing.T) {
+		env := newE2EEnv(t, services, "")
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": "/tmp/pufferfs-multipart-abort-test",
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating root: HTTP %d: %s", status, string(body))
+		}
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("sync init: HTTP %d: %s", status, string(body))
+		}
+
+		var upload models.MultipartSourceInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/upload/multipart/init", env.apiKey, models.MultipartSourceInitRequest{
+			GenerationID: syncInit.GenerationID,
+			Path:         "docs/unfinished.md",
+			Size:         6 << 20,
+		}, &upload)
+		if status != http.StatusOK {
+			t.Fatalf("multipart init: HTTP %d: %s", status, string(body))
+		}
+		if upload.Key == "" || upload.UploadID == "" || upload.PartCount != 1 || upload.RangeBytes <= 0 {
+			t.Fatalf("multipart init response = %#v", upload)
+		}
+		assertMultipartUploadExists(t, upload.Key, upload.UploadID, true)
+
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/upload/multipart/abort", env.apiKey, models.MultipartSourceAbortRequest{
+			GenerationID: syncInit.GenerationID,
+			Key:          upload.Key,
+			UploadID:     upload.UploadID,
+		}, nil)
+		if status != http.StatusOK {
+			t.Fatalf("multipart abort: HTTP %d: %s", status, string(body))
+		}
+		assertMultipartUploadExists(t, upload.Key, upload.UploadID, false)
+
+		var maximumUpload models.MultipartSourceInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/upload/multipart/init", env.apiKey, models.MultipartSourceInitRequest{
+			GenerationID: syncInit.GenerationID,
+			Path:         "docs/maximum-size.md",
+			Size:         10 << 30,
+		}, &maximumUpload)
+		if status != http.StatusOK {
+			t.Fatalf("maximum-size multipart init: HTTP %d: %s", status, string(body))
+		}
+		if maximumUpload.PartSize != 16<<20 || maximumUpload.PartCount != 640 {
+			t.Fatalf("maximum-size multipart limits = %d bytes x %d parts, want 16 MiB x 640", maximumUpload.PartSize, maximumUpload.PartCount)
+		}
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/upload/multipart/abort", env.apiKey, models.MultipartSourceAbortRequest{
+			GenerationID: syncInit.GenerationID,
+			Key:          maximumUpload.Key,
+			UploadID:     maximumUpload.UploadID,
+		}, nil)
+		if status != http.StatusOK {
+			t.Fatalf("maximum-size multipart abort: HTTP %d: %s", status, string(body))
+		}
+
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/upload/multipart/init", env.apiKey, models.MultipartSourceInitRequest{
+			GenerationID: syncInit.GenerationID,
+			Path:         "docs/too-large.md",
+			Size:         (10 << 30) + 1,
+		}, nil)
+		if status != http.StatusRequestEntityTooLarge {
+			t.Fatalf("oversized multipart init: HTTP %d, want 413: %s", status, string(body))
+		}
+
+		status, body = jsonRequest(t, http.MethodDelete, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/"+url.PathEscape(syncInit.GenerationID), env.apiKey, nil, nil)
+		if status != http.StatusOK {
+			t.Fatalf("abort sync: HTTP %d: %s", status, string(body))
+		}
+		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{root.ID})
+		cleanupDone = true
+	})
+
 	t.Run("generation uploads and heartbeat renew the pending job lease", func(t *testing.T) {
 		env := newE2EEnv(t, services, "")
 		cleanupDone := false
@@ -1857,6 +1957,38 @@ func putStorageObject(t *testing.T, key, body string) {
 		Body:   strings.NewReader(body),
 	}); err != nil {
 		t.Fatalf("put storage object %s: %v", key, err)
+	}
+}
+
+func assertMultipartUploadExists(t *testing.T, key, uploadID string, want bool) {
+	t.Helper()
+	bucket := e2eMinioBucket
+	if os.Getenv("PUFFERFS_E2E_USE_REAL_S3") == "1" {
+		bucket = os.Getenv("AWS_BUCKET_NAME")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := newMinioClient(t).ListMultipartUploads(context.Background(), &s3sdk.ListMultipartUploadsInput{
+			Bucket: aws.String(bucket),
+			Prefix: aws.String(key),
+		})
+		if err != nil {
+			t.Fatalf("listing multipart uploads for %s: %v", key, err)
+		}
+		found := false
+		for _, upload := range resp.Uploads {
+			if aws.ToString(upload.Key) == key && aws.ToString(upload.UploadId) == uploadID {
+				found = true
+				break
+			}
+		}
+		if found == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("multipart upload %s existence = %t, want %t", key, found, want)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

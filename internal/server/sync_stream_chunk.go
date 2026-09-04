@@ -20,14 +20,16 @@ func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, cha
 	if length <= 0 {
 		length = change.Size
 	}
+	return p.chunkLocalSourceRangeEach(ctx, key, change, change.SourceOffset, length, 0, 1, emit)
+}
+
+func (p *syncPipeline) chunkLocalSourceRangeEach(ctx context.Context, key string, change models.FileChange, offset, length int64, chunkIndex, lineStart int, emit func(map[string]any) error) error {
 	fileType := detectLocalFileType(change.Path)
 	target, overlap := textChunkChars, textOverlapChars
 	if isCodeFile(change.Path) {
 		target, overlap = codeChunkChars, codeOverlapChars
 	}
 	pending := make([]byte, 0, localChunkReadBuffer+target)
-	lineStart := 1
-	chunkIndex := 0
 	emitPiece := func(piece []byte) error {
 		if len(bytes.TrimSpace(piece)) == 0 {
 			return nil
@@ -70,7 +72,7 @@ func (p *syncPipeline) chunkLocalSourceEach(ctx context.Context, key string, cha
 		}
 		return nil
 	}
-	body, err := p.server.s3.Open(ctx, key, change.SourceOffset, length)
+	body, err := p.server.s3.Open(ctx, key, offset, length)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", key, err)
 	}

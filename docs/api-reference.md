@@ -349,7 +349,8 @@ Response `200`:
 ### `POST /roots/{id}/upload?path=<relpath>[&generation_id=<id>]`
 
 Upload a single source file's bytes (normally a large file). Requires `sync`/`write`
-and write-ACL on the path. Body is the raw file. **Max 512 MiB.** With
+and write-ACL on the path. Body is the raw file. **Max 10 GiB.** Current clients
+use this proxied path only below their direct-multipart threshold. With
 `generation_id`, stored as temporary transport at
 `syncs/<generationID>/sources/files/.capture-<captureID>/<path>`, using a unique
 server-generated capture ID for every request. Without `generation_id`, stored
@@ -357,7 +358,28 @@ at legacy `files/<rootID>/<path>`. The response includes the object key plus
 the SHA-256 and length of the exact accepted body:
 `{"key":"...","content_hash":"sha256:...","size":123}`. The server rejects a
 body whose received length differs from `Content-Length` and deletes that
-partial object.
+partial object. For sufficiently large local text/code sources, the response
+also contains contiguous `source_ranges` with byte offsets, lengths, and global
+starting line numbers.
+
+### Direct multipart source upload
+
+Current clients use four authenticated control-plane calls for standalone files
+at least 64 MiB by default:
+
+1. `POST /roots/{id}/upload/multipart/init` with `generation_id`, `path`, and
+   `size` creates a generation-scoped upload and returns its key, upload ID,
+   part size/count, and text range target.
+2. `POST /roots/{id}/upload/multipart/part` returns a short-lived signed PUT URL
+   for one numbered part and exact content length.
+3. `POST /roots/{id}/upload/multipart/complete` supplies ordered part ETags,
+   the SHA-256, and any planned source ranges. The server completes the object
+   and verifies its stored byte length.
+4. `POST /roots/{id}/upload/multipart/abort` aborts an unfinished session.
+
+The CLI overlaps up to four independently retryable parts per file. At the
+default 16 MiB part size, a maximum-size object uses 640 parts. Abandoned
+sessions are also expired by the artifact bucket lifecycle rule.
 
 ### `POST /roots/{id}/upload-bundle?bundle_id=<id>[&generation_id=<id>]`
 
@@ -836,7 +858,8 @@ Deletes return `409` while sync jobs are active and report
 
 | Limit | Value | Source |
 | --- | --- | --- |
-| Single file upload | 512 MiB | `handleUpload` |
+| Single source object | 10 GiB | proxied or direct multipart source upload |
+| Multipart parts | 10,000 parts; non-final parts 5 MiB–5 GiB | S3 multipart protocol |
 | Bundle upload | 1024 MiB | `handleUploadBundle` |
 | Sync artifact upload | 1024 MiB | `handleSyncArtifactUpload` |
 | Upload body idle timeout | 2 min per blocking read | `streamingUploadBody` |

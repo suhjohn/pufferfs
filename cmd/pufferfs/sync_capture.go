@@ -46,6 +46,8 @@ type capturedSource struct {
 	SourceKey    string
 	SourceOffset int64
 	SourceLength int64
+	SourceRanges []models.SourceRange
+	Multipart    bool
 	Dirty        bool
 }
 
@@ -143,6 +145,13 @@ func runCapturedSyncOnce(input captureSyncInput) (*syncCommandResult, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if count := multipartCaptureCount(batch); count > 0 {
+		label := "files"
+		if count == 1 {
+			label = "file"
+		}
+		fmt.Fprintf(input.Log, "Direct multipart upload completed for %d large %s.\n", count, label)
 	}
 	for path, capture := range batch.Files {
 		plan.State[path] = models.FileState{
@@ -546,12 +555,6 @@ type captureFileResult struct {
 	deferred error
 }
 
-type sourceUploadResponse struct {
-	Key         string `json:"key"`
-	ContentHash string `json:"content_hash"`
-	Size        int64  `json:"size"`
-}
-
 type sourceChangedError struct {
 	path string
 	err  error
@@ -585,6 +588,12 @@ func captureStandaloneFile(client *apiClient, rootID, generationID, relPath, loc
 		return capturedSource{}, &sourceChangedError{path: relPath, err: fmt.Errorf("source is no longer a regular file")}
 	}
 	captureSize := before.Size()
+	if captureSize >= multipartUploadMinBytes() && captureSize > 0 {
+		capture, supported, err := captureMultipartSource(client, rootID, generationID, relPath, localPath, file, before)
+		if supported || err != nil {
+			return capture, err
+		}
+	}
 	body := io.NewSectionReader(file, 0, captureSize)
 	path := fmt.Sprintf("/roots/%s/upload?generation_id=%s&path=%s", rootID, url.QueryEscape(generationID), url.QueryEscape(relPath))
 	respBody, uploadErr := client.postStream(path, body, "application/octet-stream")
@@ -599,7 +608,7 @@ func captureStandaloneFile(client *apiClient, rootID, generationID, relPath, loc
 		}
 		return capturedSource{}, uploadErr
 	}
-	var resp sourceUploadResponse
+	var resp models.SourceUploadResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return capturedSource{}, err
 	}
@@ -616,6 +625,7 @@ func captureStandaloneFile(client *apiClient, rootID, generationID, relPath, loc
 		Mtime:        before.ModTime().UnixNano(),
 		SourceKey:    resp.Key,
 		SourceLength: resp.Size,
+		SourceRanges: resp.SourceRanges,
 		Dirty:        dirty,
 	}, nil
 }
@@ -761,6 +771,7 @@ func changesWithCapturedSources(root string, result models.DiffResult, captures 
 		changes[i].SourceKey = capture.SourceKey
 		changes[i].SourceOffset = capture.SourceOffset
 		changes[i].SourceLength = capture.SourceLength
+		changes[i].SourceRanges = capture.SourceRanges
 	}
 	sort.Slice(changes, func(i, j int) bool {
 		if changes[i].SourceKey != changes[j].SourceKey {
@@ -791,6 +802,16 @@ func dirtyCaptureCount(batch captureBatch) int {
 	count := 0
 	for _, capture := range batch.Files {
 		if capture.Dirty {
+			count++
+		}
+	}
+	return count
+}
+
+func multipartCaptureCount(batch captureBatch) int {
+	count := 0
+	for _, capture := range batch.Files {
+		if capture.Multipart {
 			count++
 		}
 	}

@@ -206,14 +206,14 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 		return fmt.Errorf("source_length must be non-negative")
 	}
 	if change.Status != models.StatusAdded && change.Status != models.StatusModified {
-		if change.SourceKey != "" || change.SourceOffset != 0 || change.SourceLength != 0 {
+		if change.SourceKey != "" || change.SourceOffset != 0 || change.SourceLength != 0 || len(change.SourceRanges) > 0 {
 			return fmt.Errorf("source fields are only valid for added or modified files")
 		}
 		return nil
 	}
 	change.SourceKey = strings.TrimSpace(strings.ReplaceAll(change.SourceKey, "\\", "/"))
 	if change.SourceKey == "" {
-		if change.SourceOffset != 0 || change.SourceLength != 0 {
+		if change.SourceOffset != 0 || change.SourceLength != 0 || len(change.SourceRanges) > 0 {
 			return fmt.Errorf("source range requires source_key")
 		}
 		return nil
@@ -230,7 +230,7 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 		if change.SourceOffset != 0 {
 			return fmt.Errorf("source_offset must be zero for file uploads")
 		}
-		return nil
+		return validateChangeSourceRanges(change)
 	}
 
 	if generationID != "" && strings.HasPrefix(change.SourceKey, syncSourceBundlePrefix(generationID)) {
@@ -240,6 +240,9 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 		if change.SourceLength <= 0 {
 			return fmt.Errorf("source_length must be positive for bundled files")
 		}
+		if len(change.SourceRanges) > 0 {
+			return fmt.Errorf("source_ranges are not valid for bundled files")
+		}
 		return nil
 	}
 
@@ -248,7 +251,7 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 		if change.SourceOffset != 0 {
 			return fmt.Errorf("source_offset must be zero for file uploads")
 		}
-		return nil
+		return validateChangeSourceRanges(change)
 	}
 
 	bundlePrefix := fmt.Sprintf("bundles/%s/", rootID)
@@ -260,10 +263,21 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 		if change.SourceLength <= 0 {
 			return fmt.Errorf("source_length must be positive for bundled files")
 		}
+		if len(change.SourceRanges) > 0 {
+			return fmt.Errorf("source_ranges are not valid for bundled files")
+		}
 		return nil
 	}
 
 	return fmt.Errorf("source_key must reference this root's upload, bundle, or generation source")
+}
+
+func validateChangeSourceRanges(change *models.FileChange) error {
+	length := change.SourceLength
+	if length <= 0 {
+		length = change.Size
+	}
+	return validateSourceRanges(change.Path, length, change.SourceRanges)
 }
 
 func validateSyncSourceBundleRef(generationID, ref, field string) error {

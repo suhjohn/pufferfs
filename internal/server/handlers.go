@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -178,6 +176,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
 	s.mux.HandleFunc("DELETE /roots/{id}", s.handleDeleteRoot)
 	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
+	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/init", s.handleMultipartSourceInit)
+	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/part", s.handleMultipartSourcePart)
+	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/complete", s.handleMultipartSourceComplete)
+	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/abort", s.handleMultipartSourceAbort)
 	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
 	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
 	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
@@ -1521,8 +1523,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	const maxUploadSize = 512 << 20
-	if !prepareStreamingUpload(w, r, maxUploadSize) {
+	if !prepareStreamingUpload(w, r, maxSourceUploadBytes) {
 		return
 	}
 
@@ -1541,7 +1542,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		// successful response.
 		s3Key = syncSourceCaptureFileKey(generationID, uuid.NewString(), filePath)
 	}
-	contentHash, size, err := uploadHashedStream(r.Context(), s.s3, s3Key, r.Body, "application/octet-stream", r.ContentLength)
+	capture, err := uploadCapturedSource(r.Context(), s.s3, s3Key, filePath, r.Body, r.ContentLength)
 	if err != nil {
 		if errors.Is(err, errUploadLengthMismatch) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -1555,28 +1556,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"key":          s3Key,
-		"content_hash": contentHash,
-		"size":         size,
-	})
+	writeJSON(w, http.StatusOK, capture)
 }
 
 var errUploadLengthMismatch = errors.New("upload body length changed while streaming")
-
-func uploadHashedStream(ctx context.Context, store objectStore, key string, body io.Reader, contentType string, expectedSize int64) (string, int64, error) {
-	hash := sha256.New()
-	counter := &byteCounter{}
-	body = io.TeeReader(body, io.MultiWriter(hash, counter))
-	if err := store.UploadStream(ctx, key, body, contentType); err != nil {
-		return "", 0, err
-	}
-	if expectedSize >= 0 && counter.n != expectedSize {
-		_ = store.DeleteMany(ctx, []string{key})
-		return "", counter.n, fmt.Errorf("%w: expected %d bytes, received %d", errUploadLengthMismatch, expectedSize, counter.n)
-	}
-	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), counter.n, nil
-}
 
 type byteCounter struct {
 	n int64

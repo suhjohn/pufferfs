@@ -224,22 +224,27 @@ unchanged:
 - Small non-empty files are concatenated into generation-scoped bundle objects up to
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
 - Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` are uploaded as
-  generation-scoped standalone objects. Empty files need no source upload.
+  generation-scoped standalone objects. At 64 MiB by default, the CLI switches
+  from the API proxy to direct S3-compatible multipart upload. Empty files need
+  no source upload.
 - Standalone source uploads, completed source bundles, and independent sync metadata uploads use a bounded
   worker pool controlled by `PUFFERFS_UPLOAD_CONCURRENCY` (default 4, max 16).
   Bundle construction stays serial. Each bundle is capped at 128 files and
   15 MiB, source references are grouped by bundle, and the server preserves
   bundle boundaries when forming work shards. A worker therefore downloads a
   packed source object once. Completed bundle requests can overlap one another
-  and standalone files.
+  and standalone files. A direct multipart source uses up to four concurrent
+  part lanes; aggregate direct part traffic remains capped at 16 lanes.
 - Replayable upload requests are retried up to three times for transport
   failures, `408`, `429`, and `5xx` responses. Buffered bundle retries replay
-  the same bytes. Standalone retries reopen the HTTP request over the same
-  fixed descriptor extent, while each server attempt writes a unique object;
-  only the successful response's key, SHA-256, and byte count become
-  authoritative.
-- Each file change carries `source_key`, `source_offset`, and `source_length`
-  so server/Modal can read exact bytes.
+  the same bytes. Proxied standalone retries reopen the HTTP request over the
+  same fixed descriptor extent, while each server attempt writes a unique
+  object. Direct multipart parts are read once into bounded immutable payloads
+  and retried independently, so the SHA-256 always describes the exact bytes
+  uploaded even if the local file changes during capture.
+- Each file change carries `source_key`, `source_offset`, `source_length`, and,
+  for sufficiently large local text/code, contiguous line-aware
+  `source_ranges` so workers can read exact regions independently.
 - The complete root state is gzip-compressed and streamed to its durable
   generation state object as a `state_ref`.
 - Paths observed changing during capture are persisted in the local root cache
@@ -254,7 +259,10 @@ partial multipart uploads are explicitly aborted with a cleanup context that
 survives client disconnection, and abort failures are returned rather than
 silently leaving unknown cleanup state. Per-read idle deadlines stop stalled
 clients without imposing a total-duration limit on an active or
-storage-backpressured upload.
+storage-backpressured upload. Direct uploads bypass the API body path; the
+server creates the multipart session, signs each bounded part, validates the
+completed object size, and aborts failed sessions. Bucket lifecycle cleanup
+also aborts incomplete sessions older than one day.
 
 For large trees, the CLI uses the manifest-session flow:
 
@@ -305,13 +313,16 @@ both its 10-message limit and its 1 MiB aggregate batch limit.
 
 The pipeline shape is:
 
-1. Prepare input shards from non-unchanged file changes, bounded by 128 files,
-   estimated downstream chunk work, and packed-source bundle boundaries.
+1. Prepare input shards from non-unchanged file changes, bounded by 128 records,
+   estimated downstream chunk work, and packed-source bundle boundaries. A
+   large local text/code source is expanded into contiguous line-aware ranges;
+   each range gets a dedicated shard and can occupy a different worker lane.
 2. Chunk stage:
    - Added/modified code, text, and markdown can be chunked locally in Go.
    - PDFs, Office docs, and images go to Modal.
-   - Large text sources and chunk artifacts stream directly through storage
-     without whole-file materialization.
+   - Large text sources are read by byte range with global line and chunk
+     coordinates; chunk artifacts stream through storage without whole-file
+     materialization.
    - Modified/removed/moved paths emit close operations for active prior rows.
    - Moves/renames query active old rows and copy row metadata/vector into new
      generation rows when safe.
@@ -513,7 +524,7 @@ PufferFS currently supports:
 - Built-in ignore rules plus server-managed org/user policies, `.gitignore`,
   `.tpfsignore`, and global `~/.tpfs/.tpfsignore`.
 - Default exclusion of likely secret filenames before sync state is built.
-- Small-file bundle uploads and standalone large-file uploads.
+- Small-file bundle uploads and direct multipart large-file uploads.
 - Gzip root state storage by object reference.
 - Async sync job tracking and status polling.
 - Optional SQS/NATS-backed queue workers for chunk/embed/index/commit.
