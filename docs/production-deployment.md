@@ -121,10 +121,13 @@ MODAL_OFFICE_TO_PDF_ENDPOINT
 MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
 ```
 
-Add `MODAL_SECRET_KEY` and `TURBOPUFFER_API_KEY` to the Modal secret named by
-`PUFFERFS_MODAL_SECRET_NAME`. The shared key authorizes shard indexing and
-direct calls to the conversion endpoints; the Turbopuffer key lets index shards
-write their bounded batches directly.
+Add `TURBOPUFFER_API_KEY` and the object-store/provider credentials to the Modal
+secret named by `PUFFERFS_MODAL_SECRET_NAME`. Create the separate Modal secret
+named by `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` with one entry:
+`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, set to the same value as the API server's
+`MODAL_SECRET_KEY`. The shared value authorizes shard indexing and direct calls
+to the conversion endpoints; the Turbopuffer key lets index shards write their
+bounded batches directly.
 
 Optional CLI release variables:
 

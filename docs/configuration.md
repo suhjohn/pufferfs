@@ -174,6 +174,7 @@ Source capture tuning uses plain integer byte values:
 | `MODAL_QUERY_EMBED_ENDPOINT` | Query text → embedding endpoint. | — |
 | `MODAL_INDEX_SHARD_ENDPOINT` | Compressed chunk artifact → embedded Turbopuffer rows (queued pipeline). | — |
 | `MODAL_SECRET_KEY` | Shared secret sent by index workers to authorize the state-changing Modal endpoint. | required with `MODAL_INDEX_SHARD_ENDPOINT` |
+| `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` | Modal secret containing `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`; its value must equal the server's `MODAL_SECRET_KEY`. | `pufferfs-endpoint-auth` |
 | `PUFFERFS_MODAL_EMBED_ENCODE_BATCH_SIZE` | Rows per GPU model encode call (max 512). | 64 |
 | `PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS` | Maximum pending shard rows per embedding call. | 64 (max 64) |
 | `PUFFERFS_MODAL_EMBED_GPU` | GPU used by the bulk embedding/index pool. | `L4` |
@@ -204,6 +205,11 @@ completely to ephemeral disk with bounded retries before beginning GPU work.
 Interactive query embeddings use a separate pool and therefore do not wait
 behind long-running index shards.
 
+The dedicated Modal secret named by `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME`
+contains `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, whose value must equal the API
+server's `MODAL_SECRET_KEY`. Keeping the runtime key name distinct prevents the
+general compute secret from overriding endpoint authentication.
+
 The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 
 | Secret variable | Required when |
@@ -213,7 +219,6 @@ The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 | `AWS_ENDPOINT_URL` | Required for non-AWS S3-compatible storage; omit for AWS S3. |
 | `AWS_BUCKET_NAME` | Modal reads source/chunk artifacts and writes page-image artifacts. |
 | `TURBOPUFFER_API_KEY` | Modal index shards write embedded rows directly to Turbopuffer. |
-| `MODAL_SECRET_KEY` | Authorizes shard indexing and direct calls to public conversion endpoints. |
 | `GEMINI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `gemini/...`, or media OCR is enabled. |
 | `OPENAI_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `openai/...`. |
 | `FIREWORKS_API_KEY` | `PUFFERFS_VLLM_MODELS` includes `fireworks/...`. |

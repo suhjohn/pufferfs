@@ -94,17 +94,17 @@ embedding_image = (
 modal_secret = modal.Secret.from_name(
     os.getenv("PUFFERFS_MODAL_SECRET_NAME", "pufferfs"),
 )
-public_endpoint_secret = modal.Secret.from_dict(
-    {"MODAL_SECRET_KEY": os.getenv("MODAL_SECRET_KEY", "")},
+endpoint_auth_secret = modal.Secret.from_name(
+    os.getenv("PUFFERFS_MODAL_ENDPOINT_SECRET_NAME", "pufferfs-endpoint-auth"),
 )
 
 
 def _require_modal_secret(item: dict) -> None:
     from fastapi import HTTPException
 
-    expected = os.environ.get("MODAL_SECRET_KEY", "")
+    expected = os.environ.get("PUFFERFS_MODAL_ENDPOINT_AUTH_KEY", "")
     if not expected:
-        raise HTTPException(status_code=503, detail="MODAL_SECRET_KEY is not configured")
+        raise HTTPException(status_code=503, detail="Modal endpoint authentication is not configured")
     provided = str(item.get("secret_key") or item.get("modal_secret_key") or "")
     if not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="invalid secret_key")
@@ -150,7 +150,7 @@ def office_to_pdf(file_bytes: bytes, file_type: str, file_path: str) -> bytes:
 
 @app.function(
     image=chunking_image,
-    secrets=[modal_secret, public_endpoint_secret],
+    secrets=[modal_secret, endpoint_auth_secret],
     timeout=600,
     memory=2048,
 )
@@ -216,7 +216,7 @@ def pdf_to_page_images(pdf_bytes: bytes, file_path: str) -> list[dict]:
 
 @app.function(
     image=chunking_image,
-    secrets=[modal_secret, public_endpoint_secret],
+    secrets=[modal_secret, endpoint_auth_secret],
     timeout=600,
     memory=2048,
 )
@@ -690,7 +690,7 @@ def _encode_texts(model, device: str, texts: list[str], prefix: str, batch_size:
 
 @app.cls(
     image=embedding_image,
-    secrets=[modal_secret, public_endpoint_secret],
+    secrets=[modal_secret, endpoint_auth_secret],
     gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
     cpu=4,
     timeout=3600,
@@ -951,7 +951,7 @@ class Embedder:
 
 @app.cls(
     image=embedding_image,
-    secrets=[modal_secret, public_endpoint_secret],
+    secrets=[modal_secret, endpoint_auth_secret],
     gpu=os.getenv("PUFFERFS_MODAL_QUERY_EMBED_GPU", "L4"),
     cpu=2,
     timeout=300,

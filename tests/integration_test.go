@@ -1833,7 +1833,7 @@ func waitForPostgres(t *testing.T, timeout time.Duration) {
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		cmd := exec.Command("docker", "exec", e2ePgContainer, "pg_isready", "-U", e2eDBUser)
+		cmd := exec.Command("docker", "exec", e2ePgContainer, "pg_isready", "-h", "127.0.0.1", "-U", e2eDBUser)
 		if err := cmd.Run(); err == nil {
 			return
 		}
