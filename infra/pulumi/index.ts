@@ -953,7 +953,7 @@ const apiService = new aws.ecs.Service(name("api"), {
 
 const workerDefaults: Record<string, number> = {
   chunk: 16,
-  index: 16,
+  index: 64,
   commit: 2,
 };
 

@@ -68,4 +68,5 @@ config:
   pufferfs:worker-chunkDesiredCount: 1
   pufferfs:worker-indexDesiredCount: 1
   pufferfs:worker-commitDesiredCount: 1
+  pufferfs:workerIndexConcurrency: 64
   pufferfs:tpNamespaceShards: 4

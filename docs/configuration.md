@@ -179,7 +179,7 @@ Source capture tuning uses plain integer byte values:
 | `PUFFERFS_MODAL_SHARD_EMBED_BATCH_ROWS` | Maximum pending shard rows per embedding call. | 64 (max 64) |
 | `PUFFERFS_MODAL_EMBED_GPU` | GPU used by the bulk embedding/index pool. | `L4` |
 | `PUFFERFS_MODAL_EMBED_MIN_CONTAINERS` | Warm bulk embedding/index containers. Model weights are baked into the image, so the default does not keep an idle bulk GPU. | 0 |
-| `PUFFERFS_MODAL_EMBED_MAX_CONTAINERS` | Maximum concurrent bulk embedding/index containers. | 16 |
+| `PUFFERFS_MODAL_EMBED_MAX_CONTAINERS` | Maximum concurrent bulk embedding/index containers. Production matches this to the index worker's 64 concurrent jobs. | 64 |
 | `PUFFERFS_MODAL_QUERY_EMBED_GPU` | GPU used by the latency-isolated query embedding pool. | `L4` |
 | `PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS` | Warm query embedding containers kept separate from bulk indexing. | 1 |
 | `PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS` | Maximum concurrent query embedding containers. | 2 |
@@ -298,6 +298,10 @@ per stage so failures and capacity are isolated.
 | `PUFFERFS_PROCESS` | `/pufferfs-runtime` execs the worker instead of the server when set to `worker`. |
 | `PUFFERFS_WORKER_STAGE` | Selects the worker stage: `chunk`, `index`, or `commit`. Setting it also implies worker mode. |
 | `PUFFERFS_WORKER_CONCURRENCY` | Maximum concurrent jobs in one worker process; default 4, max 64. |
+
+Production task defaults are 16 concurrent chunk jobs, 64 concurrent index
+jobs, and 2 concurrent commit jobs. The index value matches Modal's bulk
+container ceiling so every in-flight request can obtain its own GPU container.
 
 ### Billing (Stripe)
 

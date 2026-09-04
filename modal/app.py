@@ -696,7 +696,7 @@ def _encode_texts(model, device: str, texts: list[str], prefix: str, batch_size:
     timeout=3600,
     memory=8192,
     min_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MIN_CONTAINERS", "0")),
-    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "16")),
+    max_containers=int(os.getenv("PUFFERFS_MODAL_EMBED_MAX_CONTAINERS", "64")),
     scaledown_window=900,
 )
 class Embedder:
