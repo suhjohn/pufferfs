@@ -532,11 +532,12 @@ def _iter_jsonl(s3, key: str):
 
     bucket = os.environ["AWS_BUCKET_NAME"]
     started = time.perf_counter()
-    with tempfile.SpooledTemporaryFile(max_size=16 << 20) as payload:
-        s3.download_fileobj(
+    with tempfile.TemporaryDirectory() as temp_dir:
+        payload_path = os.path.join(temp_dir, "chunk-artifact")
+        s3.download_file(
             bucket,
             key,
-            payload,
+            payload_path,
             Config=TransferConfig(
                 multipart_threshold=8 << 20,
                 multipart_chunksize=8 << 20,
@@ -544,20 +545,18 @@ def _iter_jsonl(s3, key: str):
                 num_download_attempts=5,
             ),
         )
-        payload_bytes = payload.tell()
+        payload_bytes = os.path.getsize(payload_path)
         download_elapsed = time.perf_counter() - started
-        payload.seek(0)
         print(
             f"timing stage=index_shard_artifact_download key={key} "
             f"bytes={payload_bytes} elapsed={download_elapsed:.3f}s",
             flush=True,
         )
-        lines = gzip.GzipFile(fileobj=payload) if key.endswith(".gz") else payload
-        for line in lines:
-            if line.strip():
-                yield json.loads(line)
-        if key.endswith(".gz"):
-            lines.close()
+        opener = gzip.open if key.endswith(".gz") else open
+        with opener(payload_path, "rb") as lines:
+            for line in lines:
+                if line.strip():
+                    yield json.loads(line)
 
 
 TP_SCHEMA = {

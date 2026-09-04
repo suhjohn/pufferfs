@@ -200,9 +200,9 @@ Source capture tuning uses plain integer byte values:
 Nomic runs in FP16 on CUDA. The pinned model and remote-code revisions are
 baked into the Modal image, so new containers do not download mutable model
 files at startup. Bulk index workers download each compressed chunk artifact
-completely, with bounded retries and disk spill above 16 MiB, before beginning
-GPU work. Interactive query embeddings use a separate pool and therefore do
-not wait behind long-running index shards.
+completely to ephemeral disk with bounded retries before beginning GPU work.
+Interactive query embeddings use a separate pool and therefore do not wait
+behind long-running index shards.
 
 The Modal secret named by `PUFFERFS_MODAL_SECRET_NAME` should contain:
 
