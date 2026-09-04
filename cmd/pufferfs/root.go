@@ -174,11 +174,12 @@ does not delete the original source files.`),
 }
 
 type deleteRootResponse struct {
-	Status           string `json:"status"`
-	RootID           string `json:"root_id"`
-	Name             string `json:"name"`
-	TurbopufferNS    string `json:"turbopuffer_ns"`
-	S3ObjectsDeleted int    `json:"s3_objects_deleted"`
+	Status            string `json:"status"`
+	RootID            string `json:"root_id"`
+	Name              string `json:"name"`
+	TurbopufferNS     string `json:"turbopuffer_ns"`
+	S3ObjectsDeleted  int    `json:"s3_objects_deleted"`
+	SyncJobsCancelled int    `json:"sync_jobs_cancelled"`
 }
 
 func runRootDelete(cfg *appconfig.Config, rootRef string, yes bool) error {
@@ -232,6 +233,9 @@ func runRootDelete(cfg *appconfig.Config, rootRef string, yes bool) error {
 	}
 
 	fmt.Printf("Deleted root %s (%s)\n", resp.Name, resp.RootID)
+	if resp.SyncJobsCancelled > 0 {
+		fmt.Printf("Cancelled %d active sync job(s)\n", resp.SyncJobsCancelled)
+	}
 	fmt.Printf("Deleted Turbopuffer namespace: %s\n", resp.TurbopufferNS)
 	fmt.Printf("Deleted %d storage objects\n", resp.S3ObjectsDeleted)
 	return nil
@@ -239,6 +243,7 @@ func runRootDelete(cfg *appconfig.Config, rootRef string, yes bool) error {
 
 func confirmRootDelete(rootID, name string) error {
 	fmt.Fprintf(os.Stderr, "This deletes PufferFS copies, index rows, metadata, and local cache for root %q (%s).\n", name, rootID)
+	fmt.Fprintln(os.Stderr, "Any active sync for this root will be cancelled.")
 	fmt.Fprintln(os.Stderr, "It does not delete the original source files.")
 	fmt.Fprintf(os.Stderr, "Type the root ID to confirm: ")
 

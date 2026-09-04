@@ -162,8 +162,10 @@ CLI-side filtering for the syncing machine.
   `states/`, `chunks/`, and `syncs/` for its generations, plus the local
   `~/.tpfs/roots/<id>/` cache. **It does not delete source files on the user's
   machine.**
-- Deletion is **blocked (`409`) while sync jobs are active**; org/user deletes
-  cascade to owned roots under the same rule.
+- Root deletion atomically stops active sync jobs before cleanup. Queued and
+  late worker deliveries re-run root cleanup, preventing work that was already
+  in flight from restoring deleted objects or index namespaces. Organization
+  and user deletion remain blocked while their sync jobs are active.
 - Deletion does not imply deletion of already exported logs, provider billing
   records, or vendor-side operational records unless those are covered by the
   deployment's separate retention process.

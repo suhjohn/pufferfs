@@ -60,6 +60,7 @@ type EmailLoginChallenge struct {
 
 var errSyncInProgress = errors.New("sync already in progress for root")
 var errStaleSyncBase = errors.New("sync base generation is stale")
+var errRootDeleting = errors.New("root is being deleted")
 
 // NewDB creates a connection pool and runs migrations.
 func NewDB(databaseURL string) (*DB, error) {
@@ -250,8 +251,9 @@ func (db *DB) migrateFallback() error {
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS vector_disabled BOOLEAN NOT NULL DEFAULT FALSE;
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS visible_generation_id TEXT NOT NULL DEFAULT '';
 		ALTER TABLE roots ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'org';
-			ALTER TABLE roots ADD COLUMN IF NOT EXISTS owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
-			CREATE INDEX IF NOT EXISTS idx_roots_owner ON roots(owner_user_id) WHERE owner_user_id IS NOT NULL;
+		ALTER TABLE roots ADD COLUMN IF NOT EXISTS owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
+		ALTER TABLE roots ADD COLUMN IF NOT EXISTS deleting_at TIMESTAMPTZ;
+		CREATE INDEX IF NOT EXISTS idx_roots_owner ON roots(owner_user_id) WHERE owner_user_id IS NOT NULL;
 
 			CREATE TABLE IF NOT EXISTS root_index_namespaces (
 				id          TEXT PRIMARY KEY,
@@ -1526,6 +1528,58 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 	return nil
 }
 
+// PrepareRootDeletion makes deletion terminal before remote cleanup starts.
+// The root row stays present so a failed cleanup can be retried, while the
+// deleting marker prevents a concurrent sync from creating another generation.
+func (db *DB) PrepareRootDeletion(ctx context.Context, orgID, rootID string) (int, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE roots
+		 SET deleting_at = COALESCE(deleting_at, NOW()), updated_at = NOW()
+		 WHERE id = $1 AND org_id = $2`,
+		rootID, orgID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if tag.RowsAffected() == 0 {
+		return 0, pgx.ErrNoRows
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE sync_generations
+		 SET status = 'failed'
+		 WHERE org_id = $1 AND root_id = $2 AND status = 'building'`,
+		orgID, rootID,
+	); err != nil {
+		return 0, err
+	}
+
+	tag, err = tx.Exec(ctx,
+		`UPDATE sync_jobs
+		 SET status = 'failed',
+		     finished_at = NOW(),
+		     updated_at = NOW(),
+		     errors = errors || '[{"error":"root deleted while sync was active"}]'::jsonb
+		 WHERE org_id = $1 AND root_id = $2
+		   AND status NOT IN ('completed', 'failed')`,
+		orgID, rootID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	cancelled := int(tag.RowsAffected())
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return cancelled, nil
+}
+
 func (db *DB) CreateRootGrant(ctx context.Context, orgID, rootID, principalType, principalID string, permissions []string) (*models.RootGrant, error) {
 	grant := &models.RootGrant{}
 	err := db.pool.QueryRow(ctx,
@@ -1989,11 +2043,15 @@ func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID
 	defer tx.Rollback(ctx)
 
 	var baseGenerationID string
+	var deletingAt *time.Time
 	err = tx.QueryRow(ctx,
-		`SELECT visible_generation_id FROM roots WHERE id = $1 FOR UPDATE`, rootID,
-	).Scan(&baseGenerationID)
+		`SELECT visible_generation_id, deleting_at FROM roots WHERE id = $1 FOR UPDATE`, rootID,
+	).Scan(&baseGenerationID, &deletingAt)
 	if err != nil {
 		return nil, err
+	}
+	if deletingAt != nil {
+		return nil, errRootDeleting
 	}
 
 	staleCutoff := time.Now().Add(-syncJobTimeout())
@@ -2559,7 +2617,9 @@ func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors 
 		errors = []map[string]string{}
 	}
 	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1, finished_at = NOW(), updated_at = NOW(), errors = $2 WHERE id = $3`,
+		`UPDATE sync_jobs
+		 SET status = $1, finished_at = NOW(), updated_at = NOW(), errors = $2
+		 WHERE id = $3 AND status NOT IN ('completed', 'failed')`,
 		status, errors, jobID,
 	)
 	return err

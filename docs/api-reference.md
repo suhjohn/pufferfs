@@ -28,7 +28,7 @@ done over HTTP.
 | `401 Unauthorized` | Missing or invalid credentials. |
 | `403 Forbidden` | Authenticated but lacking the required scope or role. |
 | `404 Not Found` | Resource missing, or hidden because the caller cannot read it. |
-| `409 Conflict` | Stale sync base generation, sync already in progress, or active sync blocks deletion. |
+| `409 Conflict` | Stale sync base generation, sync already in progress, or a sync targets a root being deleted. |
 | `500 Internal Server Error` | Unexpected server-side failure. |
 | `503 Service Unavailable` | Readiness probe failed (database unreachable). |
 
@@ -174,10 +174,11 @@ CLI response `200`:
 
 ### `GET /auth/me`
 
-Returns the authenticated user plus org context.
+Returns the authenticated user, org context, and scopes carried by the current
+credential. An empty `scopes` array means the credential is unrestricted.
 
 ```json
-{ "user": { "id": "...", "email": "...", "name": "..." }, "org_id": "...", "role": "editor" }
+{ "user": { "id": "...", "email": "...", "name": "..." }, "org_id": "...", "role": "editor", "scopes": ["sync", "query"] }
 ```
 
 ### `POST /auth/api-keys`
@@ -328,7 +329,10 @@ Delete a root and all its PufferFS artifacts. Requires
 (admin+ for org roots; owner or admin+ for user roots; grant/admin access for
 restricted roots).
 
-- `409` if the root has active sync jobs.
+- Active sync jobs are atomically failed before cleanup. New work for the root
+  is rejected, queued work is discarded, and workers that were already running
+  repeat full root cleanup after they finish so late writes cannot recreate
+  deleted storage objects or index namespaces.
 - Removes Turbopuffer namespaces and S3 objects under `files/`, `bundles/`,
   `states/`, `chunks/`, and `syncs/` for the root's generations. **Source files
   on the user's machine are not touched.**
@@ -342,7 +346,8 @@ Response `200`:
   "name": "workspace",
   "turbopuffer_ns": "org-...-root-...",
   "turbopuffer_namespaces": ["..."],
-  "s3_objects_deleted": 1234
+  "s3_objects_deleted": 1234,
+  "sync_jobs_cancelled": 1
 }
 ```
 

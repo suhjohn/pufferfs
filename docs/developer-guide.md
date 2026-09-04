@@ -563,7 +563,9 @@ What to expect:
   artifacts, durable state, chunk/page artifacts, and Turbopuffer namespaces.
 - Root deletion removes the local PufferFS cache for that root.
 - It does not delete local source files.
-- Roots with active sync jobs cannot be deleted until jobs finish.
+- Active sync jobs are cancelled automatically. Any queued or already-running
+  shard is prevented from committing and repeats root cleanup before it is
+  acknowledged.
 
 ## Permissions and Access
 

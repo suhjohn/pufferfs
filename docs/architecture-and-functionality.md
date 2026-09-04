@@ -55,6 +55,8 @@ hybrid text/vector retrieval. The system is split into:
 
 The CLI root command is `pufferfs` and includes:
 
+- `whoami`: display the authenticated email, user and organization IDs, role,
+  and current credential scopes; `--json` returns the `/auth/me` response.
 - `sync [path]` / `sync --root <path>`: scan a directory, compute a diff,
   upload changed file content, submit a sync request, poll for async
   completion, and update local cache. If `--name` is omitted, the root name
@@ -181,8 +183,10 @@ Object storage carries the high-volume data plane:
 - `chunks/<rootID>/...`: rendered document page images and indexed image
   artifacts.
 
-Root deletion removes root file objects, bundles, states, chunk artifacts, sync
-artifacts for known generations, and active Turbopuffer namespaces.
+Root deletion first marks the root as deleting and fails its active sync jobs.
+It then removes root file objects, bundles, states, chunk artifacts, sync
+artifacts for known generations, and all Turbopuffer namespaces. A late queue
+completion repeats the whole cleanup after its work stops.
 
 ## Sync Architecture
 

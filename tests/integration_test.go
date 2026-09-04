@@ -34,6 +34,7 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 
 	"github.com/pufferfs/pufferfs/internal/queue"
+	pufferserver "github.com/pufferfs/pufferfs/internal/server"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -121,6 +122,35 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		memberAKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query"})
 		memberASyncKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberA.ID, []string{"query", "sync"})
 		memberBKey := adminCreateMemberAPIKey(t, serverURL, org.ID, memberB.ID, []string{"query"})
+
+		stdout, stderr, err := runPufferfs(t, t.TempDir(), serverURL, adminMemberKey, "whoami")
+		if err != nil {
+			t.Fatalf("whoami failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		for _, want := range []string{
+			"email: " + adminUser.Email,
+			"user_id: " + adminUser.ID,
+			"org_id: " + org.ID,
+			"role: admin",
+			"scopes: query,root:delete",
+		} {
+			requireOutputContains(t, stdout, want)
+		}
+
+		stdout, stderr, err = runPufferfs(t, t.TempDir(), serverURL, adminMemberKey, "whoami", "--json")
+		if err != nil {
+			t.Fatalf("whoami --json failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		var identity models.AuthMeResponse
+		if err := json.Unmarshal([]byte(stdout), &identity); err != nil {
+			t.Fatalf("decoding whoami JSON: %v\noutput: %s", err, stdout)
+		}
+		if identity.User.Email != adminUser.Email || identity.User.ID != adminUser.ID || identity.OrgID != org.ID || identity.Role != "admin" {
+			t.Fatalf("unexpected whoami identity: %#v", identity)
+		}
+		if strings.Join(identity.Scopes, ",") != "query,root:delete" {
+			t.Fatalf("whoami scopes = %v, want [query root:delete]", identity.Scopes)
+		}
 
 		assertSelfServiceAPIKeyScopes(t, serverURL, adminKeyWriteKey)
 
@@ -232,7 +262,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		}
 
 		homeDir := t.TempDir()
-		stdout, stderr, err := runPufferfs(t, homeDir, serverURL, memberAKey, "root", "delete", orgRoot.ID, "--yes")
+		stdout, stderr, err = runPufferfs(t, homeDir, serverURL, memberAKey, "root", "delete", orgRoot.ID, "--yes")
 		if err == nil {
 			t.Fatalf("query-only member key unexpectedly deleted root\nstdout: %s\nstderr: %s", stdout, stderr)
 		}
@@ -484,6 +514,147 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		assertCLIQuery(t, homeDir, env, "failed indexing retry", env.rootName, "hybrid", "", "docs/deep/retry/incident.md")
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
+		cleanupDone = true
+	})
+
+	t.Run("root deletion cancels active sync and cleans late worker writes", func(t *testing.T) {
+		nats := startE2ENATS(t)
+		env := newQueuedE2EEnv(t, services, nats.ClientURL())
+		homeDir := t.TempDir()
+		initPufferFS(t, env, homeDir)
+
+		var root models.RootMetadata
+		status, body := jsonRequest(t, http.MethodPost, env.serverURL+"/roots", env.apiKey, map[string]any{
+			"name":        env.rootName,
+			"source_path": filepath.Join(homeDir, "deleting-workspace"),
+			"scope":       "org",
+		}, &root)
+		if status != http.StatusCreated {
+			t.Fatalf("creating deletion-race root: HTTP %d: %s", status, string(body))
+		}
+		namespaces := rootIndexNamespaces(t, root.ID)
+		cleanupDone := false
+		t.Cleanup(func() {
+			if !cleanupDone {
+				deleteTPNamespaces(t, services, namespaces)
+				adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
+			}
+		})
+
+		var syncInit models.SyncInitResponse
+		status, body = jsonRequest(t, http.MethodPost, env.serverURL+"/roots/"+url.PathEscape(root.ID)+"/sync/init", env.apiKey, models.SyncInitRequest{
+			ProtocolVersion: models.SyncProtocolVersion,
+			TotalFiles:      1,
+		}, &syncInit)
+		if status != http.StatusOK {
+			t.Fatalf("starting deletion-race sync: HTTP %d: %s", status, string(body))
+		}
+
+		initialPath := "before-delete.txt"
+		upsertTPTestRow(t, services, namespaces[0], root.ID, syncInit.GenerationID, initialPath)
+		putStorageObject(t, fmt.Sprintf("syncs/%s/chunks/before-delete.jsonl.gz", syncInit.GenerationID), "before delete")
+		putStorageObject(t, fmt.Sprintf("chunks/%s/before-delete.bin", root.ID), "before delete")
+
+		modalStarted := make(chan queue.JobMessage, 1)
+		releaseModal := make(chan struct{})
+		var releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(releaseModal) }) })
+		const modalSecret = "root-delete-race-secret"
+		modalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				SecretKey string           `json:"secret_key"`
+				Job       queue.JobMessage `json:"job"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid request", http.StatusBadRequest)
+				return
+			}
+			if req.SecretKey != modalSecret {
+				http.Error(w, "invalid secret", http.StatusUnauthorized)
+				return
+			}
+			select {
+			case modalStarted <- req.Job:
+			default:
+			}
+			<-releaseModal
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"indexed"}`)
+		}))
+		defer modalServer.Close()
+
+		indexNamespaces := make([]queue.IndexNamespace, 0, len(namespaces))
+		for shard, namespace := range namespaces {
+			indexNamespaces = append(indexNamespaces, queue.IndexNamespace{
+				Namespace:  namespace,
+				ShardIndex: shard,
+				ShardCount: len(namespaces),
+			})
+		}
+		lateJob := queue.JobMessage{
+			JobID:             syncInit.GenerationID + "-late-index",
+			SyncJobID:         syncInit.SyncJobID,
+			UserID:            env.userID,
+			OrgID:             env.orgID,
+			RootID:            root.ID,
+			GenerationID:      syncInit.GenerationID,
+			GenerationSeq:     syncInit.GenerationSeq,
+			BaseGenerationID:  syncInit.BaseGenerationID,
+			BaseGenerationSeq: syncInit.BaseGenerationSeq,
+			Stage:             queue.StageIndex,
+			PayloadRef:        fmt.Sprintf("syncs/%s/chunks/before-delete.jsonl.gz", syncInit.GenerationID),
+			IndexNamespaces:   indexNamespaces,
+			TotalShards:       1,
+			FilesInShard:      1,
+		}
+		q, err := queue.NewNATSQueue(nats.ClientURL())
+		if err != nil {
+			t.Fatalf("connecting deletion-race queue: %v", err)
+		}
+		defer q.Close()
+		if err := q.Enqueue(context.Background(), queue.StageIndex, lateJob); err != nil {
+			t.Fatalf("enqueueing deletion-race index job: %v", err)
+		}
+		workerServices := services
+		workerServices.modalIndexShardURL = modalServer.URL
+		workerServices.modalSecretKey = modalSecret
+		workers := startStageWorkers(t, workerServices, nats.ClientURL(), queue.StageIndex)
+		defer stopWorkerProcesses(t, workers)
+
+		select {
+		case received := <-modalStarted:
+			if received.JobID != lateJob.JobID {
+				t.Fatalf("Modal received job %q, want %q", received.JobID, lateJob.JobID)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("index worker did not begin the deletion-race Modal request")
+		}
+
+		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "root", "delete", root.ID, "--yes")
+		if err != nil {
+			t.Fatalf("deleting root with active sync: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+		}
+		requireOutputContains(t, stdout, "Deleted root")
+		requireOutputContains(t, stdout, "Cancelled 1 active sync job(s)")
+		jobState := strings.TrimSpace(psqlOutput(t,
+			`SELECT status || '|' || COALESCE(root_id, '') || '|' || jsonb_array_length(errors) FROM sync_jobs WHERE id = `+sqlQuote(syncInit.SyncJobID)))
+		if jobState != "failed||1" {
+			t.Fatalf("deleted root sync job state = %q, want failed||1", jobState)
+		}
+		assertDBCountZero(t, "deleted root metadata", `SELECT COUNT(*) FROM roots WHERE id = `+sqlQuote(root.ID))
+		assertDBCountZero(t, "deleted root generation", `SELECT COUNT(*) FROM sync_generations WHERE id = `+sqlQuote(syncInit.GenerationID))
+
+		latePath := "late-after-delete.txt"
+		upsertTPTestRow(t, services, namespaces[0], root.ID, syncInit.GenerationID, latePath)
+		putStorageObject(t, fmt.Sprintf("syncs/%s/chunks/late-after-delete.jsonl.gz", syncInit.GenerationID), "late write")
+		putStorageObject(t, fmt.Sprintf("chunks/%s/late-after-delete.bin", root.ID), "late write")
+		releaseOnce.Do(func() { close(releaseModal) })
+
+		eventuallyNoTPRows(t, services, namespaces, latePath, 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("syncs/%s/", syncInit.GenerationID), 30*time.Second)
+		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("chunks/%s/", root.ID), 30*time.Second)
+
+		adminDelete(t, env.serverURL, "/admin/orgs/"+url.PathEscape(env.orgID))
 		cleanupDone = true
 	})
 
@@ -3852,6 +4023,48 @@ func deleteTPNamespace(t *testing.T, services realServices, namespace string) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		t.Logf("cleaning TP namespace %s: HTTP %d: %s", namespace, resp.StatusCode, string(body))
+	}
+}
+
+func upsertTPTestRow(t *testing.T, services realServices, namespace, rootID, generationID, relPath string) {
+	t.Helper()
+	client := pufferserver.NewTPClientWithURL(services.turbopufferAPIKey, tpBaseURL(services))
+	idHash := sha256.Sum256([]byte(generationID + "\x00" + relPath))
+	err := client.UpsertRows(namespace, []map[string]any{{
+		"id":                        "integration-" + hex.EncodeToString(idHash[:20]),
+		"content":                   "root deletion race integration row",
+		"file_path":                 relPath,
+		"absolute_path":             "/integration/" + relPath,
+		"chunk_index":               0,
+		"content_hash":              "sha256:root-delete-race",
+		"file_hash":                 "sha256:root-delete-race",
+		"file_type":                 "txt",
+		"page_number":               0,
+		"image_path":                "",
+		"root_id":                   rootID,
+		"generation_id":             generationID,
+		"valid_from_generation":     generationID,
+		"valid_from_generation_seq": 1,
+		"valid_to_generation":       "",
+		"valid_to_generation_seq":   0,
+	}}, "")
+	if err != nil {
+		t.Fatalf("upserting TP test row %s: %v", relPath, err)
+	}
+}
+
+func eventuallyNoTPRows(t *testing.T, services realServices, namespaces []string, relPath string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		rows := queryTPRowsForPath(t, services, namespaces, relPath)
+		if len(rows) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected no TP rows for %s; remaining rows: %#v", relPath, rows)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 

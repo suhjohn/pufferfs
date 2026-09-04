@@ -30,6 +30,7 @@ func main() {
 	root.AddCommand(adminCmd())
 	root.AddCommand(ignorePolicyCmd())
 	root.AddCommand(serviceCmd())
+	root.AddCommand(whoamiCmd())
 	root.AddCommand(initCmd())
 	root.AddCommand(upgradeCmd())
 

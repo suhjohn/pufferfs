@@ -51,6 +51,14 @@ type User struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// AuthMeResponse describes the identity and credential scopes for the current request.
+type AuthMeResponse struct {
+	User   User     `json:"user"`
+	OrgID  string   `json:"org_id"`
+	Role   string   `json:"role"`
+	Scopes []string `json:"scopes"`
+}
+
 // OrgMember is a user's membership in an org.
 type OrgMember struct {
 	UserID    string    `json:"user_id"`

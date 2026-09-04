@@ -31,6 +31,7 @@ Initialize your account:
 
 ```sh
 pufferfs init
+pufferfs whoami
 ```
 
 Preview a sync before uploading:

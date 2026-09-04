@@ -189,7 +189,18 @@ func (d *SyncDispatcher) cleanupLateGeneration(ctx context.Context, msg queue.Jo
 	}
 	status, err := d.server.db.GetSyncGenerationStatus(ctx, msg.GenerationID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return d.server.cleanupTerminalSyncObjects(ctx, msg.RootID, msg.GenerationID, d.server.syncRequestForCleanup(ctx, msg.GenerationID), true)
+		namespaces := make([]string, 0, len(msg.IndexNamespaces))
+		for _, namespace := range msg.IndexNamespaces {
+			namespaces = append(namespaces, namespace.Namespace)
+		}
+		if len(namespaces) == 0 {
+			namespaces = append(namespaces, tpNamespace(msg.OrgID, msg.RootID))
+			for shard := range rootIndexNamespaceShardCount() {
+				namespaces = append(namespaces, rootIndexNamespaceName(msg.OrgID, msg.RootID, shard))
+			}
+		}
+		_, cleanupErr := d.server.deleteKnownRootArtifacts(ctx, msg.OrgID, msg.RootID, []string{msg.GenerationID}, namespaces)
+		return cleanupErr
 	}
 	if err != nil {
 		return err
@@ -279,7 +290,7 @@ func (d *SyncDispatcher) recordStageProgress(ctx context.Context, msg queue.JobM
 		return msg.TotalShards, nil
 	}
 	completed, status, err := d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, stage, msg.ShardIndex, files)
-	if err == nil && (status == "failed" || status == "cleaning" || status == "superseded" || status == "visible") {
+	if err == nil && status != "building" {
 		err = errSyncGenerationStopped
 	}
 	return completed, err

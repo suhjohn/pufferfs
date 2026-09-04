@@ -302,10 +302,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user":   user,
-		"org_id": id.OrgID,
-		"role":   id.Role,
+	scopes := append([]string{}, id.Scopes...)
+	writeJSON(w, http.StatusOK, models.AuthMeResponse{
+		User:   *user,
+		OrgID:  id.OrgID,
+		Role:   string(id.Role),
+		Scopes: scopes,
 	})
 }
 
@@ -1107,13 +1109,9 @@ func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	active, err := s.db.RootHasActiveSync(r.Context(), root.OrgID, root.ID)
+	cancelled, err := s.db.PrepareRootDeletion(r.Context(), root.OrgID, root.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
-		return
-	}
-	if active {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "root has active sync jobs; wait for them to finish before deleting"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
 		return
 	}
 	result, err := s.deleteRootArtifacts(r.Context(), root.OrgID, root.ID)
@@ -1133,6 +1131,7 @@ func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"turbopuffer_ns":         result.TurbopufferNamespace,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
+		"sync_jobs_cancelled":    cancelled,
 	})
 }
 
@@ -1383,13 +1382,9 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	active, err := s.db.RootHasActiveSync(r.Context(), id.OrgID, rootID)
+	cancelled, err := s.db.PrepareRootDeletion(r.Context(), id.OrgID, rootID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
-		return
-	}
-	if active {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "root has active sync jobs; wait for them to finish before deleting"})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
 		return
 	}
 	result, err := s.deleteRootArtifacts(r.Context(), id.OrgID, rootID)
@@ -1408,6 +1403,7 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"had_visible_generation": root.VisibleGenerationID != "" || root.VisibleGenerationSeq > 0,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
+		"sync_jobs_cancelled":    cancelled,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                 "deleted",
@@ -1416,6 +1412,7 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"turbopuffer_ns":         result.TurbopufferNamespace,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
+		"sync_jobs_cancelled":    cancelled,
 	})
 }
 
@@ -1426,27 +1423,44 @@ type rootArtifactDeleteResult struct {
 }
 
 func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) (rootArtifactDeleteResult, error) {
-	result := rootArtifactDeleteResult{}
-
 	generationIDs, err := s.db.ListSyncGenerationIDs(ctx, orgID, rootID)
 	if err != nil {
-		return result, fmt.Errorf("listing sync generations: %w", err)
+		return rootArtifactDeleteResult{}, fmt.Errorf("listing sync generations: %w", err)
 	}
 	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
 	if err != nil {
-		return result, fmt.Errorf("listing root index namespaces: %w", err)
+		return rootArtifactDeleteResult{}, fmt.Errorf("listing root index namespaces: %w", err)
 	}
-	for _, ns := range activeRootIndexNamespaces(indexNamespaces) {
-		result.TurbopufferNamespaces = append(result.TurbopufferNamespaces, ns.Namespace)
+	namespaces := make([]string, 0, len(indexNamespaces))
+	for _, ns := range indexNamespaces {
+		namespaces = append(namespaces, ns.Namespace)
+	}
+	return s.deleteKnownRootArtifacts(ctx, orgID, rootID, generationIDs, namespaces)
+}
+
+// deleteKnownRootArtifacts does not consult root metadata, so a late worker
+// can repeat the cleanup after the root and its generation rows are gone.
+func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID string, generationIDs, namespaces []string) (rootArtifactDeleteResult, error) {
+	result := rootArtifactDeleteResult{}
+	seenNamespaces := make(map[string]bool, len(namespaces)+1)
+	for _, namespace := range namespaces {
+		namespace = strings.TrimSpace(namespace)
+		if namespace == "" || seenNamespaces[namespace] {
+			continue
+		}
+		seenNamespaces[namespace] = true
+		result.TurbopufferNamespaces = append(result.TurbopufferNamespaces, namespace)
 	}
 	if len(result.TurbopufferNamespaces) == 0 {
 		result.TurbopufferNamespaces = []string{tpNamespace(orgID, rootID)}
 	}
 	result.TurbopufferNamespace = result.TurbopufferNamespaces[0]
+
+	var cleanupErr error
 	if s.tp != nil {
 		for _, namespace := range result.TurbopufferNamespaces {
 			if err := s.tp.DeleteNamespace(namespace); err != nil {
-				return result, fmt.Errorf("deleting turbopuffer namespace %s: %w", namespace, err)
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("deleting turbopuffer namespace %s: %w", namespace, err))
 			}
 		}
 	}
@@ -1458,19 +1472,22 @@ func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) 
 		fmt.Sprintf("chunks/%s/", rootID),
 	}
 	for _, generationID := range generationIDs {
-		prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
+		if generationID = strings.TrimSpace(generationID); generationID != "" {
+			prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
+		}
 	}
 	if s.s3 == nil {
-		return result, nil
+		return result, cleanupErr
 	}
 	for _, prefix := range prefixes {
 		count, err := s.s3.DeletePrefix(ctx, prefix)
 		if err != nil {
-			return result, fmt.Errorf("deleting storage prefix %s: %w", prefix, err)
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("deleting storage prefix %s: %w", prefix, err))
+			continue
 		}
 		result.S3ObjectsDeleted += count
 	}
-	return result, nil
+	return result, cleanupErr
 }
 
 func (s *Server) finishGenerationUpload(ctx context.Context, generation *SyncGeneration) error {
@@ -1552,6 +1569,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
 		writeGenerationUploadLookupError(w, err)
 		return
 	}
@@ -1624,6 +1642,7 @@ func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
 		writeGenerationUploadLookupError(w, err)
 		return
 	}
@@ -1792,6 +1811,7 @@ func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
+		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
 		writeGenerationUploadLookupError(w, err)
 		return
 	}
@@ -1910,7 +1930,7 @@ func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		status := http.StatusInternalServerError
-		if errors.Is(err, errSyncInProgress) {
+		if errors.Is(err, errSyncInProgress) || errors.Is(err, errRootDeleting) {
 			status = http.StatusConflict
 		}
 		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
@@ -2031,7 +2051,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			status := http.StatusInternalServerError
-			if errors.Is(err, errSyncInProgress) {
+			if errors.Is(err, errSyncInProgress) || errors.Is(err, errRootDeleting) {
 				status = http.StatusConflict
 			}
 			writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
