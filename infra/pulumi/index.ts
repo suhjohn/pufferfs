@@ -3,6 +3,13 @@ import * as docker from "@pulumi/docker";
 import * as pulumi from "@pulumi/pulumi";
 
 const cfg = new pulumi.Config();
+const requireNonBlank = (key: string): string => {
+  const value = cfg.require(key).trim();
+  if (value.length === 0) {
+    throw new Error(`pufferfs:${key} must not be blank or whitespace`);
+  }
+  return value;
+};
 const stack = pulumi.getStack();
 const project = cfg.get("projectName") ?? "pufferfs";
 const name = (suffix: string) => `${project}-${stack}-${suffix}`;
@@ -685,12 +692,12 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "NATS_URL", value: natsURL },
   { name: "PUFFERFS_QUEUE_REPLICAS", value: natsNodes.length.toString() },
   { name: "PUFFERFS_QUEUE_BACKEND", value: queueBackend },
-  { name: "MODAL_CHUNK_ENDPOINT", value: cfg.require("modalChunkEndpoint") },
-  { name: "MODAL_EMBED_ENDPOINT", value: cfg.require("modalEmbedEndpoint") },
-  { name: "MODAL_QUERY_EMBED_ENDPOINT", value: cfg.require("modalQueryEmbedEndpoint") },
-  { name: "MODAL_CHUNK_SHARD_ENDPOINT", value: cfg.require("modalChunkShardEndpoint") },
-  { name: "MODAL_EMBED_SHARD_ENDPOINT", value: cfg.require("modalEmbedShardEndpoint") },
-  { name: "MODAL_INDEX_SHARD_ENDPOINT", value: cfg.require("modalIndexShardEndpoint") },
+  { name: "MODAL_CHUNK_ENDPOINT", value: requireNonBlank("modalChunkEndpoint") },
+  { name: "MODAL_EMBED_ENDPOINT", value: requireNonBlank("modalEmbedEndpoint") },
+  { name: "MODAL_QUERY_EMBED_ENDPOINT", value: requireNonBlank("modalQueryEmbedEndpoint") },
+  { name: "MODAL_CHUNK_SHARD_ENDPOINT", value: requireNonBlank("modalChunkShardEndpoint") },
+  { name: "MODAL_EMBED_SHARD_ENDPOINT", value: requireNonBlank("modalEmbedShardEndpoint") },
+  { name: "MODAL_INDEX_SHARD_ENDPOINT", value: requireNonBlank("modalIndexShardEndpoint") },
   { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },

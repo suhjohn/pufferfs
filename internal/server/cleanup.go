@@ -43,6 +43,22 @@ func cleanupDeleteBatchSize() int {
 	return size
 }
 
+func cleanupMessageMaxBytes() int {
+	const defaultBytes = 200 << 10
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_CLEANUP_MESSAGE_MAX_BYTES"))
+	if raw == "" {
+		return defaultBytes
+	}
+	size, err := strconv.Atoi(raw)
+	if err != nil || size < 1024 {
+		return defaultBytes
+	}
+	if size > 240<<10 {
+		return 240 << 10
+	}
+	return size
+}
+
 func enqueueCleanupBatches(ctx context.Context, q queue.Queue, base queue.JobMessage, keys []string) error {
 	if !cleanupSyncArtifactsEnabled() {
 		return nil
@@ -52,13 +68,10 @@ func enqueueCleanupBatches(ctx context.Context, q queue.Queue, base queue.JobMes
 		return nil
 	}
 	batchSize := cleanupDeleteBatchSize()
+	maxBytes := cleanupMessageMaxBytes()
 	msgs := make([]queue.JobMessage, 0, (len(keys)+batchSize-1)/batchSize)
-	for start := 0; start < len(keys); start += batchSize {
-		end := start + batchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-		msgs = append(msgs, queue.JobMessage{
+	for start := 0; start < len(keys); {
+		msg := queue.JobMessage{
 			JobID:             fmt.Sprintf("cleanup-%s-%s", base.GenerationID, uuid.NewString()),
 			SyncJobID:         base.SyncJobID,
 			UserID:            base.UserID,
@@ -69,11 +82,28 @@ func enqueueCleanupBatches(ctx context.Context, q queue.Queue, base queue.JobMes
 			BaseGenerationID:  base.BaseGenerationID,
 			BaseGenerationSeq: base.BaseGenerationSeq,
 			Stage:             syncStageCleanup,
-			CleanupKeys:       append([]string(nil), keys[start:end]...),
 			ShardIndex:        base.ShardIndex,
 			TotalShards:       base.TotalShards,
 			Priority:          base.Priority,
-		})
+		}
+		baseJSON, _ := json.Marshal(msg)
+		bytesUsed := len(baseJSON) + len(`,"cleanup_keys":[]`)
+		end := start
+		for end < len(keys) && end-start < batchSize {
+			encodedKey, _ := json.Marshal(keys[end])
+			separator := 0
+			if end > start {
+				separator = 1
+			}
+			if end > start && bytesUsed+len(encodedKey)+separator > maxBytes {
+				break
+			}
+			bytesUsed += len(encodedKey) + separator
+			end++
+		}
+		msg.CleanupKeys = append([]string(nil), keys[start:end]...)
+		msgs = append(msgs, msg)
+		start = end
 	}
 	return q.Enqueue(ctx, syncStageCleanup, msgs...)
 }

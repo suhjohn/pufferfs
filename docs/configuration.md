@@ -85,7 +85,10 @@ moves. Byte values are plain integers (bytes).
 | --- | --- | --- |
 | `PUFFERFS_UPLOAD_CONCURRENCY` | Max concurrent CLI upload requests. Invalid values use the default; values above 16 are capped at 16. | 4 |
 | `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` | Files at or below this size are packed into bundles; larger files upload standalone. | 8 MiB (`8<<20`) |
-| `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object. | 256 MiB (`256<<20`) |
+| `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES` | Max size of a single packed bundle object. Bundles upload concurrently within the shared upload limit. | 32 MiB (`32<<20`) |
+| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES` | Maximum file changes in one uploaded change manifest. | 128 |
+| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_BYTES` | Maximum source bytes represented by one change manifest; an oversize file is isolated. | 32 MiB (`32<<20`) |
+| `PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_CHUNKS` | Maximum estimated downstream chunks represented by one change manifest; an oversize file is isolated. | 8192 |
 | `PUFFERFS_MOVE_REUSE_MAX_BYTES` | Max file size for which moved-file index reuse is attempted; larger moves are handled conservatively. | 64 MiB (`64<<20`) |
 | `PUFFERFS_SYNC_POLL_TIMEOUT` | How long the CLI polls an async sync job before giving up. Go duration. | 35m |
 
@@ -246,11 +249,16 @@ compatibility aliases, but new deployments should use the transactional names.
 | `PUFFERFS_SYNC_JOB_TIMEOUT` | Max time without persisted job progress before an async sync job is marked failed. Go duration. | 30m |
 | `PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL` | How often the cleanup worker reconciles stalled or inconsistent jobs. Go duration. | 1m |
 | `PUFFERFS_SYNC_MAX_IN_FLIGHT_SHARDS` | Max concurrent in-flight shards in the queued pipeline. | 32 |
+| `PUFFERFS_SYNC_ARTIFACT_PART_RECORDS` | Maximum records per chunk/index artifact part. | 512 (max 10000) |
+| `PUFFERFS_SYNC_ARTIFACT_PART_BYTES` | Maximum encoded bytes per chunk/index artifact part. | 8 MiB (max 64 MiB) |
+| `PUFFERFS_SYNC_EMBED_BATCH_ROWS` | Maximum rows retained by one sync embedding work batch. | 128 (max 512) |
+| `PUFFERFS_SYNC_LOCAL_STREAM_THRESHOLD_BYTES` | Local text sources above this size are range-read and chunked incrementally. | 8 MiB |
 | `PUFFERFS_EMBED_BATCH_SIZE` | Chunks per Modal embed batch. | 16 |
 | `PUFFERFS_EMBED_BATCH_CONCURRENCY` | Concurrent embed batches. | 4 |
 | `PUFFERFS_EMBEDDING_CACHE_QUERY_BATCH_SIZE` | Embedding-cache lookup batch size. | 500 |
 | `PUFFERFS_EMBEDDING_CACHE_QUERY_CONCURRENCY` | Concurrent embedding-cache lookups. | 4 |
-| `PUFFERFS_CLEANUP_BATCH_SIZE` | Rows per cleanup batch. | 1000 |
+| `PUFFERFS_CLEANUP_BATCH_SIZE` | Object keys per cleanup batch. | 1000 |
+| `PUFFERFS_CLEANUP_MESSAGE_MAX_BYTES` | Maximum estimated encoded cleanup queue-message size. | 200 KiB (max 240 KiB) |
 | `PUFFERFS_CLEANUP_SYNC_ARTIFACTS` | Whether terminal syncs delete transient source/sync artifacts. Set `0`, `false`, `no`, or `off` to disable. | enabled |
 
 ### Queue (Amazon SQS FIFO or NATS JetStream)

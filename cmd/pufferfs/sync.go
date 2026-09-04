@@ -435,7 +435,7 @@ func waitForSyncJob(client *apiClient, rootID, jobID string, interval time.Durat
 			return job, fmt.Errorf("sync job failed: %s", string(job.Errors))
 		default:
 			if logProgress {
-				fmt.Fprintf(os.Stdout, "Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
+				printSyncProgress(os.Stdout, job)
 			}
 			time.Sleep(normalizeSyncPollInterval(interval))
 		}
@@ -735,7 +735,8 @@ func printSyncJob(w io.Writer, job *models.SyncJob) {
 	fmt.Fprintf(w, "sync_job_id: %s\n", job.ID)
 	fmt.Fprintf(w, "root_id: %s\n", job.RootID)
 	fmt.Fprintf(w, "status: %s\n", job.Status)
-	fmt.Fprintf(w, "progress: %d/%d files\n", job.Processed, job.TotalFiles)
+	fmt.Fprintf(w, "progress: %d/%d files\n", syncJobCurrentProgress(job), job.TotalFiles)
+	fmt.Fprintf(w, "stages: chunked=%d embedded=%d indexed=%d\n", job.Chunked, job.Embedded, job.Indexed)
 	fmt.Fprintf(w, "started_at: %s\n", job.StartedAt.Format(time.RFC3339))
 	if job.FinishedAt != nil {
 		fmt.Fprintf(w, "finished_at: %s\n", job.FinishedAt.Format(time.RFC3339))
@@ -743,6 +744,31 @@ func printSyncJob(w io.Writer, job *models.SyncJob) {
 	if len(job.Errors) > 0 && string(job.Errors) != "null" {
 		fmt.Fprintf(w, "errors: %s\n", string(job.Errors))
 	}
+}
+
+func syncJobCurrentProgress(job *models.SyncJob) int {
+	if job == nil {
+		return 0
+	}
+	switch job.Status {
+	case "chunking":
+		return job.Chunked
+	case "embedding":
+		return job.Embedded
+	case "indexing", "upserting", "committing", "completed":
+		if job.Indexed > job.Processed {
+			return job.Indexed
+		}
+	}
+	return job.Processed
+}
+
+func printSyncProgress(w io.Writer, job *models.SyncJob) {
+	if job == nil {
+		return
+	}
+	fmt.Fprintf(w, "Sync status: %s (%d/%d files; chunked=%d embedded=%d indexed=%d)\n",
+		job.Status, syncJobCurrentProgress(job), job.TotalFiles, job.Chunked, job.Embedded, job.Indexed)
 }
 
 func printSyncJobs(w io.Writer, jobs []models.SyncJob) {
@@ -1788,7 +1814,7 @@ func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*model
 		case "failed":
 			return &job, fmt.Errorf("sync job failed: %s", string(job.Errors))
 		default:
-			fmt.Fprintf(log, "Sync status: %s (%d/%d files)\n", job.Status, job.Processed, job.TotalFiles)
+			printSyncProgress(log, &job)
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -2150,8 +2176,12 @@ func initSyncSession(client *apiClient, rootID, baseGenerationID string, baseGen
 }
 
 func uploadSyncArtifact(client *apiClient, rootID, generationID, kind, name string, data []byte, contentType string) (string, error) {
+	return uploadSyncArtifactReader(client, rootID, generationID, kind, name, bytes.NewReader(data), contentType)
+}
+
+func uploadSyncArtifactReader(client *apiClient, rootID, generationID, kind, name string, body io.Reader, contentType string) (string, error) {
 	path := fmt.Sprintf("/roots/%s/sync/%s/upload?kind=%s&name=%s", rootID, generationID, url.QueryEscape(kind), url.QueryEscape(name))
-	respBody, err := client.postRaw(path, data, contentType)
+	respBody, err := client.postStream(path, body, contentType)
 	if err != nil {
 		return "", err
 	}
@@ -2179,23 +2209,23 @@ type syncMetadataRefs struct {
 }
 
 func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes []models.FileChange, proof *models.ContentProofData, state map[string]models.FileState) (syncMetadataRefs, error) {
-	shardSize := uploadChangeShardMaxFiles()
-	shardCount := (len(changes) + shardSize - 1) / shardSize
+	changeShards := shardUploadChanges(changes, uploadChangeShardLimits{
+		MaxFiles:           uploadChangeShardMaxFiles(),
+		MaxSourceBytes:     uploadChangeShardMaxBytes(),
+		MaxEstimatedChunks: uploadChangeShardMaxChunks(),
+	})
+	shardCount := len(changeShards)
 	refs := syncMetadataRefs{ChangeRefs: make([]string, shardCount)}
 	uploads := newBoundedUploadGroup(uploadConcurrency())
 	heavyMetadata := make(chan struct{}, 1)
 
-	for shardIndex, start := 0, 0; start < len(changes); shardIndex, start = shardIndex+1, start+shardSize {
-		end := start + shardSize
-		if end > len(changes) {
-			end = len(changes)
-		}
+	for shardIndex, shard := range changeShards {
 		ordinal := shardIndex
-		shard := changes[start:end]
+		shardItems := shard
 		if !uploads.Go(ordinal, func() error {
 			var buf bytes.Buffer
 			enc := json.NewEncoder(&buf)
-			for _, change := range shard {
+			for _, change := range shardItems {
 				if err := enc.Encode(change); err != nil {
 					return fmt.Errorf("encoding change shard %d: %w", ordinal, err)
 				}
@@ -2268,16 +2298,27 @@ func uploadBundle(client *apiClient, rootID, generationID, bundleID string, data
 }
 
 func uploadRootState(client *apiClient, rootID, generationID string, state map[string]models.FileState) (string, error) {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(gz).Encode(state); err != nil {
-		_ = gz.Close()
-		return "", err
+	reader, writer := io.Pipe()
+	encoded := make(chan error, 1)
+	go func() {
+		gz := gzip.NewWriter(writer)
+		err := json.NewEncoder(gz).Encode(state)
+		if closeErr := gz.Close(); err == nil {
+			err = closeErr
+		}
+		_ = writer.CloseWithError(err)
+		encoded <- err
+	}()
+	key, uploadErr := uploadSyncArtifactReader(client, rootID, generationID, "state", "state.json.gz", reader, "application/gzip")
+	_ = reader.CloseWithError(uploadErr)
+	encodeErr := <-encoded
+	if uploadErr != nil {
+		return "", uploadErr
 	}
-	if err := gz.Close(); err != nil {
-		return "", err
+	if encodeErr != nil {
+		return "", encodeErr
 	}
-	return uploadSyncArtifact(client, rootID, generationID, "state", "state.json.gz", buf.Bytes(), "application/gzip")
+	return key, nil
 }
 
 func uploadBundleSmallFileLimit() int64 {
@@ -2294,7 +2335,7 @@ func uploadBundleSmallFileLimit() int64 {
 }
 
 func uploadBundleMaxBytes() int64 {
-	const defaultBytes = 256 << 20
+	const defaultBytes = 32 << 20
 	raw := os.Getenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES")
 	if raw == "" {
 		return defaultBytes
@@ -2322,7 +2363,7 @@ func uploadConcurrency() int {
 }
 
 func uploadChangeShardMaxFiles() int {
-	const defaultFiles = 5000
+	const defaultFiles = 128
 	raw := os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES")
 	if raw == "" {
 		return defaultFiles
@@ -2332,6 +2373,85 @@ func uploadChangeShardMaxFiles() int {
 		return defaultFiles
 	}
 	return value
+}
+
+func uploadChangeShardMaxBytes() int64 {
+	const defaultBytes = 32 << 20
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_BYTES"))
+	if raw == "" {
+		return defaultBytes
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 1 {
+		return defaultBytes
+	}
+	return value
+}
+
+func uploadChangeShardMaxChunks() int64 {
+	const defaultChunks = 8192
+	raw := strings.TrimSpace(os.Getenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_CHUNKS"))
+	if raw == "" {
+		return defaultChunks
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 1 {
+		return defaultChunks
+	}
+	return value
+}
+
+type uploadChangeShardLimits struct {
+	MaxFiles           int
+	MaxSourceBytes     int64
+	MaxEstimatedChunks int64
+}
+
+func shardUploadChanges(changes []models.FileChange, limits uploadChangeShardLimits) [][]models.FileChange {
+	var shards [][]models.FileChange
+	var current []models.FileChange
+	var sourceBytes, estimatedChunks int64
+	for _, change := range changes {
+		size := change.SourceLength
+		if size <= 0 {
+			size = change.Size
+		}
+		if size < 0 {
+			size = 0
+		}
+		work := estimatedChangeChunks(change, size)
+		full := len(current) > 0 && (len(current) >= limits.MaxFiles ||
+			sourceBytes+size > limits.MaxSourceBytes ||
+			estimatedChunks+work > limits.MaxEstimatedChunks)
+		if full {
+			shards = append(shards, current)
+			current = nil
+			sourceBytes = 0
+			estimatedChunks = 0
+		}
+		current = append(current, change)
+		sourceBytes += size
+		estimatedChunks += work
+	}
+	if len(current) > 0 {
+		shards = append(shards, current)
+	}
+	return shards
+}
+
+func estimatedChangeChunks(change models.FileChange, size int64) int64 {
+	switch change.Status {
+	case models.StatusAdded, models.StatusModified:
+		// Text chunks advance by roughly 2 KiB after overlap. Rich documents can
+		// expand more, but the byte limit remains a second independent guard.
+		const effectiveChunkBytes = 2000
+		if size <= 0 {
+			return 1
+		}
+		return (size + effectiveChunkBytes - 1) / effectiveChunkBytes
+	default:
+		return 1
+	}
 }
 
 func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileState, error) {

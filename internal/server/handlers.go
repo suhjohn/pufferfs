@@ -3495,24 +3495,6 @@ func syncWorkerCount() int {
 	return workers
 }
 
-func (s *Server) writeIndexRowsArtifact(ctx context.Context, generationID, reason string, rows []map[string]any) error {
-	if generationID == "" || len(rows) == 0 {
-		return nil
-	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	for _, row := range rows {
-		if err := enc.Encode(row); err != nil {
-			return fmt.Errorf("encoding index row artifact: %w", err)
-		}
-	}
-	key := fmt.Sprintf("syncs/%s/index_rows/%d-%s.jsonl", generationID, time.Now().UnixNano(), safeObjectName(reason))
-	if err := s.s3.Upload(ctx, key, buf.Bytes(), "application/x-ndjson"); err != nil {
-		return fmt.Errorf("uploading index row artifact %s: %w", key, err)
-	}
-	return nil
-}
-
 func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pending []pendingEmbedding) error {
 	chunks := make([]map[string]any, len(pending))
 	for i, item := range pending {

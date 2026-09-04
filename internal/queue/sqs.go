@@ -17,6 +17,8 @@ import (
 
 const (
 	maxSQSBatchSize       = 10
+	maxSQSBatchBytes      = 1 << 20
+	maxSQSMessageBytes    = 256 << 10
 	maxSQSWaitTime        = 20 * time.Second
 	maxSQSVisibilityDelay = 12 * time.Hour
 	defaultSQSVisibility  = 5 * time.Minute
@@ -60,30 +62,11 @@ func (q *SQSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage
 	if err != nil {
 		return err
 	}
-	for start := 0; start < len(msgs); start += maxSQSBatchSize {
-		end := start + maxSQSBatchSize
-		if end > len(msgs) {
-			end = len(msgs)
-		}
-		entries := make([]types.SendMessageBatchRequestEntry, 0, end-start)
-		for i, msg := range msgs[start:end] {
-			if msg.JobID == "" {
-				return errors.New("queue job_id is required")
-			}
-			if msg.EnqueuedAt.IsZero() {
-				msg.EnqueuedAt = time.Now().UTC()
-			}
-			msg.Stage = stage
-			body, marshalErr := json.Marshal(msg)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			entries = append(entries, types.SendMessageBatchRequestEntry{
-				Id:                     aws.String(strconv.Itoa(i)),
-				MessageBody:            aws.String(string(body)),
-				MessageGroupId:         aws.String(sqsStableID(msg.OrgID, msg.RootID)),
-				MessageDeduplicationId: aws.String(sqsStableID(msg.JobID)),
-			})
+	entries := make([]types.SendMessageBatchRequestEntry, 0, maxSQSBatchSize)
+	batchBytes := 0
+	flush := func() error {
+		if len(entries) == 0 {
+			return nil
 		}
 		output, sendErr := q.client.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
 			QueueUrl: aws.String(queueURL),
@@ -96,8 +79,39 @@ func (q *SQSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage
 			failure := output.Failed[0]
 			return fmt.Errorf("SQS rejected %d messages (first id=%s code=%s): %s", len(output.Failed), aws.ToString(failure.Id), aws.ToString(failure.Code), aws.ToString(failure.Message))
 		}
+		entries = make([]types.SendMessageBatchRequestEntry, 0, maxSQSBatchSize)
+		batchBytes = 0
+		return nil
 	}
-	return nil
+	for _, msg := range msgs {
+		if msg.JobID == "" {
+			return errors.New("queue job_id is required")
+		}
+		if msg.EnqueuedAt.IsZero() {
+			msg.EnqueuedAt = time.Now().UTC()
+		}
+		msg.Stage = stage
+		body, marshalErr := json.Marshal(msg)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if len(body) > maxSQSMessageBytes {
+			return fmt.Errorf("SQS message %s is %d bytes; maximum is %d", msg.JobID, len(body), maxSQSMessageBytes)
+		}
+		if len(entries) == maxSQSBatchSize || (len(entries) > 0 && batchBytes+len(body) > maxSQSBatchBytes) {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+		entries = append(entries, types.SendMessageBatchRequestEntry{
+			Id:                     aws.String(strconv.Itoa(len(entries))),
+			MessageBody:            aws.String(string(body)),
+			MessageGroupId:         aws.String(sqsMessageGroupID(stage, msg)),
+			MessageDeduplicationId: aws.String(sqsStableID(msg.JobID)),
+		})
+		batchBytes += len(body)
+	}
+	return flush()
 }
 
 func (q *SQSQueue) Pull(ctx context.Context, stage string, batchSize int, timeout time.Duration) ([]ReceivedMessage, error) {
@@ -223,6 +237,19 @@ func sqsStableID(parts ...string) string {
 		hash.Write([]byte{0})
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func sqsMessageGroupID(stage string, msg JobMessage) string {
+	// Commit mutates the visible root pointer and must remain root-ordered.
+	// Data stages are independent by generation/shard; grouping them by root
+	// silently reduces every stage to one in-flight job.
+	if stage == StageCommit {
+		return sqsStableID(msg.OrgID, msg.RootID, stage)
+	}
+	if stage == StageCleanup {
+		return sqsStableID(msg.OrgID, msg.RootID, msg.GenerationID, stage, msg.JobID)
+	}
+	return sqsStableID(msg.OrgID, msg.RootID, msg.GenerationID, stage, strconv.Itoa(msg.ShardIndex))
 }
 
 func allStages() []string {

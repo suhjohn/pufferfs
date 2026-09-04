@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
@@ -132,7 +133,15 @@ func runCapturedSyncOnce(input captureSyncInput) (*syncCommandResult, error) {
 	heartbeat := startSyncSessionHeartbeat(input.Client, input.RootID, syncInit.GenerationID, input.Log)
 	defer heartbeat.Stop()
 
-	batch, err := captureFiles(input.Client, input.RootID, syncInit.GenerationID, input.Dir, plan.Candidates)
+	progressStep := len(plan.Candidates) / 20
+	if progressStep < 1 {
+		progressStep = 1
+	}
+	batch, err := captureFiles(input.Client, input.RootID, syncInit.GenerationID, input.Dir, plan.Candidates, func(files int, bytes int64) {
+		if files == len(plan.Candidates) || files%progressStep == 0 {
+			fmt.Fprintf(input.Log, "Upload progress: %d/%d files (%.1f MiB)\n", files, len(plan.Candidates), float64(bytes)/(1<<20))
+		}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -394,7 +403,7 @@ func discoverCapturePlan(root string, matcher *ignore.Matcher, baseState, hashCa
 	return plan, nil
 }
 
-func captureFiles(client *apiClient, rootID, generationID, dir string, candidates []captureCandidate) (captureBatch, error) {
+func captureFiles(client *apiClient, rootID, generationID, dir string, candidates []captureCandidate, progress ...func(int, int64)) (captureBatch, error) {
 	smallLimit := uploadBundleSmallFileLimit()
 	maxBundleBytes := uploadBundleMaxBytes()
 	uploads := newBoundedUploadGroup(uploadConcurrency())
@@ -403,26 +412,41 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 	var bundleCandidates []int
 	bundleID := fmt.Sprintf("%d", time.Now().UnixNano())
 	bundleIndex := 0
+	var progressMu sync.Mutex
+	completedFiles := 0
+	var completedBytes int64
+	reportProgress := func(files int, bytes int64) {
+		if len(progress) == 0 || progress[0] == nil {
+			return
+		}
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		completedFiles += files
+		completedBytes += bytes
+		progress[0](completedFiles, completedBytes)
+	}
 
 	flushBundle := func() bool {
 		if bundle.Len() == 0 {
 			return true
 		}
-		var key string
 		bundleName := fmt.Sprintf("%s-%06d", bundleID, bundleIndex)
 		order := bundleCandidates[0]
-		if !uploads.Do(order, func() error {
-			var err error
-			key, err = uploadBundle(client, rootID, generationID, bundleName, bundle.Bytes(), "application/octet-stream")
+		bundleData := append([]byte(nil), bundle.Bytes()...)
+		candidateIndexes := append([]int(nil), bundleCandidates...)
+		bundleBytes := int64(len(bundleData))
+		if !uploads.Go(order, func() error {
+			key, err := uploadBundle(client, rootID, generationID, bundleName, bundleData, "application/octet-stream")
 			if err != nil {
 				return fmt.Errorf("uploading source bundle %s: %w", bundleName, err)
 			}
+			for _, candidateIndex := range candidateIndexes {
+				results[candidateIndex].capture.SourceKey = key
+			}
+			reportProgress(len(candidateIndexes), bundleBytes)
 			return nil
 		}) {
 			return false
-		}
-		for _, candidateIndex := range bundleCandidates {
-			results[candidateIndex].capture.SourceKey = key
 		}
 		bundle.Reset()
 		bundleCandidates = bundleCandidates[:0]
@@ -440,11 +464,13 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 					var changed *sourceChangedError
 					if errors.As(err, &changed) {
 						results[candidateIndex].deferred = err
+						reportProgress(1, 0)
 						return nil
 					}
 					return fmt.Errorf("capturing %s: %w", candidate.Path, err)
 				}
 				results[candidateIndex] = captureFileResult{ready: true, capture: capture}
+				reportProgress(1, capture.Size)
 				return nil
 			}) {
 				return false
@@ -469,6 +495,7 @@ func captureFiles(client *apiClient, rootID, generationID, dir string, candidate
 			var changed *sourceChangedError
 			if errors.As(err, &changed) {
 				results[i].deferred = err
+				reportProgress(1, 0)
 				continue
 			}
 			uploads.Fail(i, fmt.Errorf("capturing %s: %w", candidate.Path, err))

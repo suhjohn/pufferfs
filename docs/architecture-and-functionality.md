@@ -230,10 +230,11 @@ unchanged:
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
 - Files over `PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES` and empty files are
   uploaded as generation-scoped standalone objects.
-- Standalone source uploads and independent sync metadata uploads use a bounded
+- Standalone source uploads, completed source bundles, and independent sync metadata uploads use a bounded
   worker pool controlled by `PUFFERFS_UPLOAD_CONCURRENCY` (default 4, max 16).
-  Bundle construction stays serial to keep client memory bounded, but bundle
-  requests share the same source-upload limit and can overlap standalone files.
+  Bundle construction stays serial and each bundle is capped at 32 MiB to keep
+  client memory bounded; completed bundle requests can overlap one another and
+  standalone files.
 - Replayable upload requests are retried up to three times for transport
   failures, `408`, `429`, and `5xx` responses. Buffered bundle retries replay
   the same bytes. Standalone retries reopen the HTTP request over the same
@@ -301,12 +302,19 @@ There are two execution modes:
   chunk jobs; dedicated workers advance chunk, embed, index, commit, and cleanup
   stages.
 
+Queued data shards use independent FIFO message groups so workers can process
+them concurrently; commits remain ordered per root. SQS sends are bounded by
+both its 10-message limit and its 1 MiB aggregate batch limit.
+
 The pipeline shape is:
 
-1. Prepare input shards from non-unchanged file changes.
+1. Prepare input shards from non-unchanged file changes, bounded independently
+   by file count, source bytes, and estimated downstream chunk work.
 2. Chunk stage:
    - Added/modified code, text, and markdown can be chunked locally in Go.
    - PDFs, Office docs, and images go to Modal.
+   - Large text sources are range-read and emitted incrementally; chunk artifacts
+     are partitioned into bounded JSONL parts behind a small manifest.
    - Modified/removed/moved paths emit close operations for active prior rows.
    - Moves/renames query active old rows and copy row metadata/vector into new
      generation rows when safe.
@@ -315,7 +323,8 @@ The pipeline shape is:
    - Existing rows with vectors are reused.
    - Missing vectors are resolved through the Postgres embedding cache or Modal
      embedding endpoint.
-   - New rows are written as index-row artifacts.
+   - Embedding works in bounded row batches and new rows are written as bounded
+     index-row artifact parts.
 4. Index stage:
    - Rows are routed by stable hash of `file_path` to an active root namespace
      shard.

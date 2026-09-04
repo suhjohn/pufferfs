@@ -507,18 +507,86 @@ def _s3_client():
     )
 
 
-def _read_jsonl(s3, key: str) -> list[dict]:
+def _artifact_refs(s3, key: str) -> list[str]:
     bucket = os.environ["AWS_BUCKET_NAME"]
-    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
-    return [json.loads(line) for line in body.splitlines() if line.strip()]
+    if not key.endswith(".manifest.json"):
+        return [key]
+    stream = s3.get_object(Bucket=bucket, Key=key)["Body"]
+    try:
+        manifest = json.loads(stream.read())
+    finally:
+        stream.close()
+    if int(manifest.get("version") or 0) != 1:
+        raise RuntimeError(f"unsupported artifact manifest version in {key}")
+    return list(manifest.get("refs") or [])
 
 
-def _write_jsonl(s3, generation_id: str, dirname: str, name: str, rows: list[dict]) -> str:
+def _iter_jsonl(s3, key: str):
     bucket = os.environ["AWS_BUCKET_NAME"]
-    key = f"syncs/{generation_id}/{dirname}/{name}.jsonl"
-    data = "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows).encode("utf-8")
-    s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType="application/x-ndjson")
-    return key
+    for ref in _artifact_refs(s3, key):
+        body = s3.get_object(Bucket=bucket, Key=ref)["Body"]
+        try:
+            for line in body.iter_lines():
+                if line.strip():
+                    yield json.loads(line)
+        finally:
+            body.close()
+
+
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+class _ArtifactWriter:
+    def __init__(self, s3, generation_id: str, dirname: str, name: str):
+        self.s3 = s3
+        self.bucket = os.environ["AWS_BUCKET_NAME"]
+        self.prefix = f"syncs/{generation_id}/{dirname}/{name}"
+        self.max_rows = _bounded_env_int("PUFFERFS_SYNC_ARTIFACT_PART_RECORDS", 512, 1, 10000)
+        self.max_bytes = _bounded_env_int("PUFFERFS_SYNC_ARTIFACT_PART_BYTES", 8 << 20, 65536, 64 << 20)
+        self.data = bytearray()
+        self.part_rows = 0
+        self.records = 0
+        self.total_bytes = 0
+        self.refs: list[str] = []
+
+    def append(self, row: dict) -> None:
+        line = (json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+        if self.part_rows and (self.part_rows >= self.max_rows or len(self.data) + len(line) > self.max_bytes):
+            self._flush()
+        self.data.extend(line)
+        self.part_rows += 1
+        self.records += 1
+        self.total_bytes += len(line)
+
+    def _flush(self) -> None:
+        if not self.part_rows:
+            return
+        key = f"{self.prefix}.part-{len(self.refs):06d}.jsonl"
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=bytes(self.data), ContentType="application/x-ndjson")
+        self.refs.append(key)
+        self.data.clear()
+        self.part_rows = 0
+
+    def close(self) -> str:
+        self._flush()
+        if len(self.refs) == 1:
+            return self.refs[0]
+        key = f"{self.prefix}.manifest.json"
+        manifest = {"version": 1, "refs": self.refs, "records": self.records, "bytes": self.total_bytes}
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=json.dumps(manifest).encode(), ContentType="application/json")
+        return key
+
+
+def _write_jsonl(s3, generation_id: str, dirname: str, name: str, rows) -> str:
+    writer = _ArtifactWriter(s3, generation_id, dirname, name)
+    for row in rows:
+        writer.append(row)
+    return writer.close()
 
 
 def _source_bytes(s3, change: dict) -> bytes:
@@ -529,7 +597,116 @@ def _source_bytes(s3, change: dict) -> bytes:
     if length > 0:
         offset = int(change.get("source_offset") or 0)
         kwargs["Range"] = f"bytes={offset}-{offset + length - 1}"
-    return s3.get_object(**kwargs)["Body"].read()
+    body = s3.get_object(**kwargs)["Body"]
+    try:
+        return body.read()
+    finally:
+        body.close()
+
+
+def _source_body(s3, change: dict):
+    bucket = os.environ["AWS_BUCKET_NAME"]
+    key = change.get("source_key") or f"files/{change['root_id']}/{change['path']}"
+    kwargs = {"Bucket": bucket, "Key": key}
+    length = int(change.get("source_length") or 0)
+    if length > 0:
+        offset = int(change.get("source_offset") or 0)
+        kwargs["Range"] = f"bytes={offset}-{offset + length - 1}"
+    return s3.get_object(**kwargs)["Body"]
+
+
+def _iter_source_lines(s3, change: dict):
+    body = _source_body(s3, change)
+    try:
+        yield from body.iter_lines(chunk_size=65536, keepends=True)
+    finally:
+        body.close()
+
+
+def _is_heading_line(line: str) -> bool:
+    hashes = len(line) - len(line.lstrip("#"))
+    return 1 <= hashes <= 6 and len(line) > hashes and line[hashes].isspace()
+
+
+def _iter_text_chunks(s3, change: dict, root_id: str, file_type: str):
+    """Bounded-memory counterpart to chunk_code/chunk_markdown for shard jobs."""
+    from models import Chunk
+
+    file_path = change["path"]
+    absolute_path = change.get("absolute_path", "")
+    chunk_index = 0
+
+    def make(content: str, line_start: int | None = None, line_end: int | None = None) -> dict:
+        nonlocal chunk_index
+        chunk = Chunk(
+            id=Chunk.make_id(root_id, file_path, chunk_index),
+            root_id=root_id,
+            file_path=file_path,
+            chunk_index=chunk_index,
+            content=content,
+            content_hash=Chunk.hash_content(content),
+            file_type=file_type,
+            absolute_path=absolute_path,
+            line_start=line_start,
+            line_end=line_end,
+        )
+        chunk_index += 1
+        return asdict(chunk)
+
+    if file_type in {
+        "python", "javascript", "typescript", "go", "rust", "java", "c", "cpp",
+        "csharp", "ruby", "php", "swift", "kotlin", "scala", "shell", "bash",
+        "lua", "perl", "r", "sql", "html", "css", "scss", "yaml", "toml",
+        "json", "xml", "proto", "graphql", "hcl", "terraform", "dockerfile", "makefile",
+    }:
+        lines: list[str] = []
+        first_line = 1
+        for raw_line in _iter_source_lines(s3, change):
+            lines.append(raw_line.decode("utf-8", errors="replace"))
+            if len(lines) == 300:
+                content = "".join(lines)
+                if content.strip():
+                    yield make(content, first_line, first_line + len(lines) - 1)
+                lines = lines[-50:]
+                first_line += 250
+        if len(lines) > 50 or (lines and chunk_index == 0):
+            content = "".join(lines)
+            if content.strip():
+                yield make(content, first_line, first_line + len(lines) - 1)
+        return
+
+    max_chars = 2000
+    overlap = 200
+    section = ""
+    section_line = 1
+    current_line = 1
+
+    def drain(final: bool):
+        nonlocal section, section_line
+        while len(section) > max_chars or (final and section):
+            end = min(max_chars, len(section))
+            piece = section[:end]
+            if piece.strip():
+                line_end = section_line + piece.count("\n")
+                if piece.endswith("\n"):
+                    line_end -= 1
+                yield make(piece, section_line, max(section_line, line_end))
+            if end == len(section):
+                section = ""
+                break
+            advance = end - overlap
+            section_line += section[:advance].count("\n")
+            section = section[advance:]
+
+    for raw_line in _iter_source_lines(s3, change):
+        line = raw_line.decode("utf-8", errors="replace")
+        if _is_heading_line(line) and section:
+            yield from drain(True)
+            section_line = current_line
+        section += line
+        yield from drain(False)
+        current_line += line.count("\n") or 1
+    yield from drain(True)
 
 
 def _safe_object_name(name: str) -> str:
@@ -768,48 +945,59 @@ def chunk_shard_endpoint(item: dict) -> dict:
 
     job = item["job"]
     s3 = _s3_client()
-    changes = _read_jsonl(s3, job["payload_ref"])
-    artifacts: list[dict] = []
-    for change in changes:
+    writer = _ArtifactWriter(s3, job["generation_id"], "chunks", _safe_object_name(job["job_id"]))
+    count = 0
+
+    def emit(artifact: dict) -> None:
+        nonlocal count
+        writer.append(artifact)
+        count += 1
+
+    for change in _iter_jsonl(s3, job["payload_ref"]):
         change["root_id"] = job["root_id"]
         status = change.get("status")
         if status in ("ADDED", "MODIFIED"):
             if status == "MODIFIED":
-                artifacts.append({"op": "close", "change": change})
+                emit({"op": "close", "change": change})
             s3_key = change.get("source_key") or f"files/{job['root_id']}/{change['path']}"
-            chunks = file_to_chunks.remote(
-                s3_key=s3_key,
-                file_path=change["path"],
-                absolute_path=change.get("absolute_path", ""),
-                file_type=detect_file_type(change["path"]),
-                root_id=job["root_id"],
-                content_b64=None
-                if _modal_can_read_source_directly(s3_key, change)
-                else base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
-            )
-            artifacts.extend({"op": "chunk", "change": change, "chunk": chunk} for chunk in chunks)
+            file_type = detect_file_type(change["path"])
+            if file_type not in ("pdf", "docx", "pptx", "image", "eml", "msg", "vcf", "ics", "audio", "video"):
+                chunks = _iter_text_chunks(s3, change, job["root_id"], file_type)
+            else:
+                chunks = file_to_chunks.remote(
+                    s3_key=s3_key,
+                    file_path=change["path"],
+                    absolute_path=change.get("absolute_path", ""),
+                    file_type=file_type,
+                    root_id=job["root_id"],
+                    content_b64=None
+                    if _modal_can_read_source_directly(s3_key, change)
+                    else base64.b64encode(_source_bytes(s3, change)).decode("ascii"),
+                )
+            for chunk in chunks:
+                emit({"op": "chunk", "change": change, "chunk": chunk})
         elif status == "REMOVED":
-            artifacts.append({"op": "close", "change": change})
+            emit({"op": "close", "change": change})
         elif status in ("MOVED", "RENAMED"):
             old_path = change.get("old_path", "")
-            artifacts.append({"op": "close", "change": {"path": old_path, "status": "REMOVED"}})
+            emit({"op": "close", "change": {"path": old_path, "status": "REMOVED"}})
             rows = _query_active_rows(
                 job,
                 old_path,
                 ["content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "vector"],
             )
             for idx, existing in enumerate(rows):
-                artifacts.append(
+                emit(
                     {
                         "op": "row",
                         "change": change,
                         "row": _row_from_existing(job, change["path"], change.get("absolute_path", ""), change.get("content_hash", ""), existing, idx),
                     }
                 )
-    if not artifacts:
-        artifacts.append({"op": "noop"})
-    result_ref = _write_jsonl(s3, job["generation_id"], "chunks", _safe_object_name(job["job_id"]), artifacts)
-    return {"result_ref": result_ref, "count": len(artifacts)}
+    if not count:
+        emit({"op": "noop"})
+    result_ref = writer.close()
+    return {"result_ref": result_ref, "count": count}
 
 
 # ---------------------------------------------------------------------------
@@ -901,23 +1089,45 @@ class Embedder:
         job = item["job"]
         disable_vector = bool(job.get("disable_vector"))
         s3 = _s3_client()
-        artifacts = _read_jsonl(s3, job["payload_ref"])
-        out: list[dict] = []
+        writer = _ArtifactWriter(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]))
         pending: list[tuple[dict, dict]] = []
-        for artifact in artifacts:
+        batch_size = _bounded_env_int("PUFFERFS_SYNC_EMBED_BATCH_ROWS", 128, 1, 512)
+        count = 0
+
+        def emit(row: dict) -> None:
+            nonlocal count
+            writer.append(row)
+            count += 1
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            embedded = self._embed_chunks([chunk for chunk, _ in pending])
+            if len(embedded) != len(pending):
+                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(pending)} pending rows")
+            for (_, row), result in zip(pending, embedded):
+                embedding = result.get("embedding")
+                if embedding is None:
+                    raise RuntimeError("embedding result missing embedding vector")
+                row["vector"] = embedding
+                emit({"op": "upsert", "row": row})
+            pending.clear()
+
+        for artifact in _iter_jsonl(s3, job["payload_ref"]):
             op = artifact.get("op")
             if op == "close":
                 path = artifact.get("change", {}).get("path", "")
                 if path:
-                    out.append({"op": "close", "close_path": path})
+                    flush_pending()
+                    emit({"op": "close", "close_path": path})
             elif op == "row" and artifact.get("row"):
                 row = artifact["row"]
                 if disable_vector:
                     row.pop("vector", None)
-                    out.append({"op": "upsert", "row": row})
+                    emit({"op": "upsert", "row": row})
                     continue
                 if row.get("vector") is not None:
-                    out.append({"op": "upsert", "row": row})
+                    emit({"op": "upsert", "row": row})
                 else:
                     pending.append(
                         (
@@ -938,25 +1148,20 @@ class Embedder:
                             row,
                         )
                     )
+                    if len(pending) >= batch_size:
+                        flush_pending()
             elif op == "chunk" and artifact.get("chunk"):
                 row = _row_from_chunk(job, artifact.get("change", {}).get("content_hash", ""), artifact["chunk"])
                 if disable_vector:
                     row.pop("vector", None)
-                    out.append({"op": "upsert", "row": row})
+                    emit({"op": "upsert", "row": row})
                 else:
                     pending.append((artifact["chunk"], row))
-        if pending:
-            embedded = self._embed_chunks([chunk for chunk, _ in pending])
-            if len(embedded) != len(pending):
-                raise RuntimeError(f"embedded {len(embedded)} chunks for {len(pending)} pending rows")
-            for (_, row), result in zip(pending, embedded):
-                embedding = result.get("embedding")
-                if embedding is None:
-                    raise RuntimeError("embedding result missing embedding vector")
-                row["vector"] = embedding
-                out.append({"op": "upsert", "row": row})
-        result_ref = _write_jsonl(s3, job["generation_id"], "index_rows", _safe_object_name(job["job_id"]), out)
-        return {"result_ref": result_ref, "count": len(out)}
+                    if len(pending) >= batch_size:
+                        flush_pending()
+        flush_pending()
+        result_ref = writer.close()
+        return {"result_ref": result_ref, "count": count}
 
 
 def _tp_upsert_rows(namespace: str, rows: list[dict], *, disable_vector: bool = False) -> None:
@@ -1009,25 +1214,36 @@ def index_shard_endpoint(item: dict) -> dict:
     job = item["job"]
     disable_vector = bool(job.get("disable_vector"))
     s3 = _s3_client()
-    records = _read_jsonl(s3, job["payload_ref"])
-    upserts: list[dict] = []
-    close_paths: set[str] = set()
-    for record in records:
-        if record.get("op") == "upsert" and record.get("row"):
-            upserts.append(record["row"])
-        elif record.get("op") == "close" and record.get("close_path"):
-            close_paths.add(record["close_path"])
-    upserts_by_namespace: dict[str, list[dict]] = {}
-    for row in upserts:
-        file_path = row.get("file_path", "")
-        namespace = _namespace_for_path(job, file_path)
-        upserts_by_namespace.setdefault(namespace, []).append(row)
-    for namespace, rows in upserts_by_namespace.items():
-        _tp_upsert_rows(namespace, rows, disable_vector=disable_vector)
+    batch_size = _bounded_env_int("PUFFERFS_TP_WRITE_BATCH_ROWS", 512, 1, 5000)
+    buffers: dict[str, list[dict]] = {}
+    upserted = 0
     closed = 0
-    for path in close_paths:
-        closed += _close_rows_for_path(job, path)
-    return {"count": len(upserts) + closed}
+
+    def flush(namespace: str) -> None:
+        nonlocal upserted
+        rows = buffers.get(namespace) or []
+        if not rows:
+            return
+        _tp_upsert_rows(namespace, rows, disable_vector=disable_vector)
+        upserted += len(rows)
+        rows.clear()
+
+    def flush_all() -> None:
+        for namespace in list(buffers):
+            flush(namespace)
+
+    for record in _iter_jsonl(s3, job["payload_ref"]):
+        if record.get("op") == "upsert" and record.get("row"):
+            row = record["row"]
+            namespace = _namespace_for_path(job, row.get("file_path", ""))
+            buffers.setdefault(namespace, []).append(row)
+            if len(buffers[namespace]) >= batch_size:
+                flush(namespace)
+        elif record.get("op") == "close" and record.get("close_path"):
+            flush_all()
+            closed += _close_rows_for_path(job, record["close_path"])
+    flush_all()
+    return {"count": upserted + closed}
 
 
 # ---------------------------------------------------------------------------

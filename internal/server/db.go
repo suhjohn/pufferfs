@@ -2380,7 +2380,24 @@ func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID, modelVersion stri
 	if len(entries) == 0 {
 		return nil
 	}
+	const batchSize = 500
+	batch := make(map[string][]float64, batchSize)
+	for hash, embedding := range entries {
+		batch[hash] = embedding
+		if len(batch) == batchSize {
+			if err := db.saveCachedEmbeddingBatch(ctx, orgID, modelVersion, batch); err != nil {
+				return err
+			}
+			batch = make(map[string][]float64, batchSize)
+		}
+	}
+	if len(batch) > 0 {
+		return db.saveCachedEmbeddingBatch(ctx, orgID, modelVersion, batch)
+	}
+	return nil
+}
 
+func (db *DB) saveCachedEmbeddingBatch(ctx context.Context, orgID, modelVersion string, entries map[string][]float64) error {
 	var sb strings.Builder
 	sb.WriteString(`INSERT INTO embedding_cache (org_id, model_version, content_hash, embedding, created_at) VALUES `)
 	args := make([]any, 0, len(entries)*2+2)
@@ -2520,7 +2537,17 @@ func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, t
 // UpdateSyncJobStatus updates only the phase/status of a sync job.
 func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) error {
 	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1, updated_at = NOW() WHERE id = $2`,
+		`UPDATE sync_jobs SET status = $1, updated_at = NOW()
+		 WHERE id = $2
+		   AND status NOT IN ('completed', 'failed')
+		   AND CASE status
+		       WHEN 'pending' THEN 0 WHEN 'queued' THEN 1 WHEN 'chunking' THEN 2
+		       WHEN 'embedding' THEN 3 WHEN 'indexing' THEN 4 WHEN 'upserting' THEN 4
+		       WHEN 'committing' THEN 5 ELSE 0 END
+		       <= CASE $1
+		       WHEN 'pending' THEN 0 WHEN 'queued' THEN 1 WHEN 'chunking' THEN 2
+		       WHEN 'embedding' THEN 3 WHEN 'indexing' THEN 4 WHEN 'upserting' THEN 4
+		       WHEN 'committing' THEN 5 ELSE 0 END`,
 		status, jobID,
 	)
 	return err
@@ -2623,6 +2650,16 @@ func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shard
 	return tx.Commit(ctx)
 }
 
+func (db *DB) CountCompletedSyncJobShards(ctx context.Context, jobID, stage string) (int, error) {
+	var count int
+	err := db.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM sync_job_shards
+		 WHERE job_id = $1 AND stage = $2 AND status = 'completed'`,
+		jobID, stage,
+	).Scan(&count)
+	return count, err
+}
+
 // CompleteSyncJob marks a sync job as completed or failed.
 func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors []map[string]string) error {
 	if errors == nil {
@@ -2639,10 +2676,14 @@ func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors 
 func (db *DB) GetSyncJob(ctx context.Context, orgID, jobID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
+		        errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE id = $1 AND org_id = $2`, jobID, orgID,
 	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
+		&job.Processed, &job.Chunked, &job.Embedded, &job.Indexed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -2655,7 +2696,11 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 		limit = 20
 	}
 	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
+		        errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT $3`,
 		orgID, rootID, limit,
@@ -2669,7 +2714,7 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 	for rows.Next() {
 		var j models.SyncJob
 		if err := rows.Scan(&j.ID, &j.OrgID, &j.RootID, &j.UserID, &j.Status, &j.TotalFiles,
-			&j.Processed, &j.Errors, &j.StartedAt, &j.UpdatedAt, &j.FinishedAt); err != nil {
+			&j.Processed, &j.Chunked, &j.Embedded, &j.Indexed, &j.Errors, &j.StartedAt, &j.UpdatedAt, &j.FinishedAt); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, j)
@@ -2681,12 +2726,16 @@ func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int)
 func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*models.SyncJob, error) {
 	job := &models.SyncJob{}
 	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed, errors, started_at, updated_at, finished_at
+		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
+		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
+		        errors, started_at, updated_at, finished_at
 		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
 		 ORDER BY started_at DESC LIMIT 1`,
 		orgID, rootID,
 	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
+		&job.Processed, &job.Chunked, &job.Embedded, &job.Indexed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
 	if err != nil {
 		return nil, err
 	}

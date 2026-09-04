@@ -4,7 +4,8 @@ set -eu
 require_env() {
   key="$1"
   eval "value=\${$key:-}"
-  if [ -z "$value" ]; then
+  compact_value=$(printf '%s' "$value" | tr -d '[:space:]')
+  if [ -z "$compact_value" ]; then
     echo "Missing required environment variable: $key" >&2
     exit 1
   fi

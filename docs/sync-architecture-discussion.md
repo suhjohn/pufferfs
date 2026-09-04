@@ -623,8 +623,9 @@ Key properties:
 - **Backward compatible**: inline `changes` without `generation_id` still works
   for small syncs or old clients.
 - **Scalability contract**: the final sync request size is bounded by shard
-  count, not file count. At 1M files with 5000 files/shard, the finalize request
-  carries ~200 refs instead of 1M inline change records.
+  count, not file count. Shards close on file count, represented source bytes,
+  or estimated chunk work, so neither many tiny files nor a few huge files can
+  create an unbounded worker unit.
 
 This is the recommended path for any sync exceeding a few thousand files. The
 CLI uses this flow by default.

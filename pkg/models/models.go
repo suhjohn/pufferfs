@@ -451,6 +451,9 @@ type SyncJob struct {
 	Status     string          `json:"status"`
 	TotalFiles int             `json:"total_files"`
 	Processed  int             `json:"processed"`
+	Chunked    int             `json:"chunked"`
+	Embedded   int             `json:"embedded"`
+	Indexed    int             `json:"indexed"`
 	Errors     json.RawMessage `json:"errors"`
 	StartedAt  time.Time       `json:"started_at"`
 	UpdatedAt  time.Time       `json:"updated_at"`

@@ -530,6 +530,10 @@ func TestPufferFSEndToEnd(t *testing.T) {
 	})
 
 	t.Run("queued text-only sync (no Modal chunking)", func(t *testing.T) {
+		t.Setenv("PUFFERFS_UPLOAD_CHANGE_SHARD_MAX_FILES", "2")
+		t.Setenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES", "65536")
+		t.Setenv("PUFFERFS_SYNC_ARTIFACT_PART_RECORDS", "2")
+		t.Setenv("PUFFERFS_SYNC_LOCAL_STREAM_THRESHOLD_BYTES", "65536")
 		nats := startE2ENATS(t)
 		env := newQueuedE2EEnv(t, services, nats.ClientURL())
 		homeDir := t.TempDir()
@@ -541,6 +545,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		writeFile(t, projectDir, "docs/readme.md", "# Local Chunking\n\nThis file is chunked entirely in Go without calling Modal.\n")
 		writeFile(t, projectDir, "docs/notes.txt", "Plain text file chunked locally by the Go worker.\n")
 		writeFile(t, projectDir, "src/main.go", "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}\n")
+		writeFile(t, projectDir, "sessions/events.jsonl", strings.Repeat("{\"event\":\"bounded stream integration token\"}\n", 4000))
 
 		syncStart := time.Now()
 		stdout, stderr, err := runPufferfs(t, homeDir, env.serverURL, env.apiKey, "sync", projectDir, "--name", env.rootName)
@@ -549,6 +554,7 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			t.Fatalf("text-only queued sync failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
 		}
 		requireOutputContains(t, stdout, "Sync complete")
+		requireOutputContains(t, stdout, "Upload progress:")
 
 		rootID := resolveRootID(t, env.serverURL, env.apiKey, env.rootName)
 		generationID := visibleGenerationID(t, env.serverURL, env.apiKey, rootID)
@@ -565,7 +571,9 @@ func TestPufferFSEndToEnd(t *testing.T) {
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("files/%s/", rootID), 30*time.Second)
 		eventuallyStoragePrefixEmpty(t, fmt.Sprintf("bundles/%s/", rootID), 30*time.Second)
 		assertHasTPRows(t, services, namespaces, "docs/readme.md")
+		assertHasTPRows(t, services, namespaces, "sessions/events.jsonl")
 		assertCLIQuery(t, homeDir, env, "chunked locally Go worker", env.rootName, "hybrid", "", "docs/readme.md")
+		assertCLIQuery(t, homeDir, env, "bounded stream integration token", env.rootName, "hybrid", "", "sessions/events.jsonl")
 
 		deleteCreatedDataAndAssertGone(t, env.serverURL, env.orgID, []string{env.userID}, []string{rootID})
 		cleanupDone = true

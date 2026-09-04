@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/pufferfs/pufferfs/internal/queue"
@@ -29,28 +30,31 @@ func NewSyncDispatcher(s *Server, q queue.Queue, stage string, concurrency int) 
 }
 
 func (d *SyncDispatcher) Run(ctx context.Context) error {
-	sem := make(chan struct{}, d.concurrency)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		msgs, err := d.queue.Pull(ctx, d.stage, d.concurrency, 30*time.Second)
+	var wg sync.WaitGroup
+	wg.Add(d.concurrency)
+	for range d.concurrency {
+		go func() {
+			defer wg.Done()
+			d.runWorker(ctx)
+		}()
+	}
+	wg.Wait()
+	return ctx.Err()
+}
+
+func (d *SyncDispatcher) runWorker(ctx context.Context) {
+	for ctx.Err() == nil {
+		msgs, err := d.queue.Pull(ctx, d.stage, 1, 30*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return
 			}
 			log.Printf("pulling %s jobs: %v", d.stage, err)
 			time.Sleep(time.Second)
 			continue
 		}
-		for _, msg := range msgs {
-			sem <- struct{}{}
-			go func(msg queue.ReceivedMessage) {
-				defer func() { <-sem }()
-				d.processReceived(ctx, msg)
-			}(msg)
+		if len(msgs) == 1 {
+			d.processReceived(ctx, msgs[0])
 		}
 	}
 }
@@ -176,6 +180,9 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			if err != nil {
 				return err
 			}
+			if err := d.recordStageProgress(ctx, msg, syncStageChunk, filesInShard); err != nil {
+				return err
+			}
 			next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resp.ResultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
 			next.CleanupKeys = cleanupKeys
 			return d.queue.Enqueue(ctx, syncStageEmbed, next)
@@ -183,6 +190,9 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		sourceCache := newSyncSourceCache(d.server.s3)
 		resultRef, err := p.processChunkJob(ctx, objectQueueJobFromMessage(msg), sourceCache)
 		if err != nil {
+			return err
+		}
+		if err := d.recordStageProgress(ctx, msg, syncStageChunk, filesInShard); err != nil {
 			return err
 		}
 		next := p.jobMessage(syncStageEmbed, msg.JobID+"-embed", resultRef, msg.ShardIndex, msg.TotalShards, filesInShard)
@@ -205,12 +215,18 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			if err != nil {
 				return err
 			}
+			if err := d.recordStageProgress(ctx, msg, syncStageEmbed, msg.FilesInShard); err != nil {
+				return err
+			}
 			next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resp.ResultRef, msg.ShardIndex, msg.TotalShards, msg.FilesInShard)
 			next.CleanupKeys = cleanupKeys
 			return d.queue.Enqueue(ctx, syncStageIndex, next)
 		}
 		resultRef, err := p.processEmbedJob(ctx, objectQueueJobFromMessage(msg))
 		if err != nil {
+			return err
+		}
+		if err := d.recordStageProgress(ctx, msg, syncStageEmbed, msg.FilesInShard); err != nil {
 			return err
 		}
 		next := p.jobMessage(syncStageIndex, msg.JobID+"-index", resultRef, msg.ShardIndex, msg.TotalShards, msg.FilesInShard)
@@ -221,11 +237,13 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 			_ = d.server.db.UpdateSyncJobStatus(ctx, msg.SyncJobID, "indexing")
 		}
 		indexJob := objectQueueJobFromMessage(msg)
-		indexArtifactFiles, err := p.countIndexJobFiles(ctx, indexJob)
-		if err != nil {
-			return err
-		}
+		indexArtifactFiles := 0
 		if d.server.modal.HasIndexShardEndpoint() {
+			var err error
+			indexArtifactFiles, err = p.countIndexJobFiles(ctx, indexJob)
+			if err != nil {
+				return err
+			}
 			modalPayload, err := d.modalJob(ctx, msg)
 			if err != nil {
 				return err
@@ -234,20 +252,20 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 				return err
 			}
 		} else {
-			if _, err := p.processIndexJob(ctx, indexJob); err != nil {
-				return err
-			}
-		}
-		if msg.SyncJobID != "" {
-			progressFiles, err := p.progressFileCount(ctx, indexJob, indexArtifactFiles)
+			var err error
+			indexArtifactFiles, err = p.processIndexJob(ctx, indexJob)
 			if err != nil {
-				return err
-			}
-			if err := d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, syncStageIndex, msg.ShardIndex, progressFiles); err != nil {
 				return err
 			}
 		}
 		if err := d.writeShardDone(ctx, msg); err != nil {
+			return err
+		}
+		progressFiles, err := p.progressFileCount(ctx, indexJob, indexArtifactFiles)
+		if err != nil {
+			return err
+		}
+		if err := d.recordStageProgress(ctx, msg, syncStageIndex, progressFiles); err != nil {
 			return err
 		}
 		if err := d.enqueueNextChunkShard(ctx, msg); err != nil {
@@ -256,7 +274,7 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 		if err := enqueueCleanupBatches(ctx, d.queue, msg, cleanupShardKeys(msg)); err != nil {
 			return err
 		}
-		return d.queue.Enqueue(ctx, syncStageCommit, p.jobMessage(syncStageCommit, msg.JobID+"-commit", syncRequestKey(msg.GenerationID), msg.ShardIndex, msg.TotalShards, 0))
+		return d.enqueueCommitWhenReady(ctx, msg, p)
 	case syncStageCommit:
 		return d.processCommit(ctx, msg)
 	case syncStageCleanup:
@@ -264,6 +282,27 @@ func (d *SyncDispatcher) Process(ctx context.Context, msg queue.JobMessage) erro
 	default:
 		return fmt.Errorf("unknown sync stage %q", msg.Stage)
 	}
+}
+
+func (d *SyncDispatcher) recordStageProgress(ctx context.Context, msg queue.JobMessage, stage string, files int) error {
+	if msg.SyncJobID == "" || d.server == nil || d.server.db == nil {
+		return nil
+	}
+	return d.server.db.RecordSyncJobShard(ctx, msg.SyncJobID, stage, msg.ShardIndex, files)
+}
+
+func (d *SyncDispatcher) enqueueCommitWhenReady(ctx context.Context, msg queue.JobMessage, p *syncPipeline) error {
+	if msg.TotalShards > 1 && msg.SyncJobID != "" && d.server != nil && d.server.db != nil {
+		completed, err := d.server.db.CountCompletedSyncJobShards(ctx, msg.SyncJobID, syncStageIndex)
+		if err != nil {
+			return err
+		}
+		if completed < msg.TotalShards {
+			return nil
+		}
+	}
+	commit := p.jobMessage(syncStageCommit, msg.GenerationID+"-commit", syncRequestKey(msg.GenerationID), 0, msg.TotalShards, 0)
+	return d.queue.Enqueue(ctx, syncStageCommit, commit)
 }
 
 func (d *SyncDispatcher) pipelineFor(msg queue.JobMessage) *syncPipeline {

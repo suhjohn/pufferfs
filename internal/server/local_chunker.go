@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // localChunkable returns true if the file type can be chunked locally without Modal.
@@ -25,16 +26,24 @@ func localChunkable(filePath string) bool {
 // chunkLocally splits text content into chunks matching the Python chunker output format.
 // Returns []map[string]any matching Modal's Chunk dataclass (asdict).
 func chunkLocally(content []byte, rootID, filePath string) []map[string]any {
+	var chunks []map[string]any
+	_ = chunkLocallyEach(content, rootID, filePath, func(chunk map[string]any) error {
+		chunks = append(chunks, chunk)
+		return nil
+	})
+	return chunks
+}
+
+func chunkLocallyEach(content []byte, rootID, filePath string, visit func(map[string]any) error) error {
 	text := string(content)
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
-
-	ft := detectLocalFileType(filePath)
+	fileType := detectLocalFileType(filePath)
 	if isCodeFile(filePath) {
-		return chunkCode(text, rootID, filePath, ft)
+		return walkCodeChunks(text, rootID, filePath, fileType, visit)
 	}
-	return chunkMarkdown(text, rootID, filePath, ft)
+	return walkMarkdownChunks(text, rootID, filePath, fileType, visit)
 }
 
 const (
@@ -46,12 +55,20 @@ const (
 
 // chunkCode uses a sliding window with line-boundary overlap.
 func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
+	var chunks []map[string]any
+	_ = walkCodeChunks(text, rootID, filePath, fileType, func(chunk map[string]any) error {
+		chunks = append(chunks, chunk)
+		return nil
+	})
+	return chunks
+}
+
+func walkCodeChunks(text, rootID, filePath, fileType string, visit func(map[string]any) error) error {
 	lines := strings.SplitAfter(text, "\n")
 	if len(lines) == 0 {
 		return nil
 	}
 
-	var chunks []map[string]any
 	start := 0
 	idx := 0
 
@@ -68,7 +85,9 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 			if end == len(lines) && lines[end-1] == "" {
 				lineEnd--
 			}
-			chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece, fileType, start+1, lineEnd))
+			if err := visit(makeChunkMap(rootID, filePath, idx, piece, fileType, start+1, lineEnd)); err != nil {
+				return err
+			}
 			idx++
 		}
 		if end >= len(lines) {
@@ -86,25 +105,48 @@ func chunkCode(text, rootID, filePath, fileType string) []map[string]any {
 			start = overlapStart
 		}
 	}
-	return chunks
+	return nil
 }
 
 // chunkMarkdown splits by headings, then uses a boundary-aware sliding window with overlap.
 func chunkMarkdown(text, rootID, filePath, fileType string) []map[string]any {
-	sections := splitByHeadingsWithOffsets(text)
 	var chunks []map[string]any
+	_ = walkMarkdownChunks(text, rootID, filePath, fileType, func(chunk map[string]any) error {
+		chunks = append(chunks, chunk)
+		return nil
+	})
+	return chunks
+}
+
+func walkMarkdownChunks(text, rootID, filePath, fileType string, visit func(map[string]any) error) error {
+	sections := splitByHeadingsWithOffsets(text)
 	idx := 0
+	lineCursorOffset := 0
+	lineCursorNumber := 1
 
 	for _, section := range sections {
 		for _, piece := range splitTextWithOverlapOffsets(section.text, section.start, textChunkChars, textOverlapChars) {
 			if strings.TrimSpace(piece.text) != "" {
-				lineStart, lineEnd := lineSpanForByteRange(text, piece.start, piece.end)
-				chunks = append(chunks, makeChunkMap(rootID, filePath, idx, piece.text, fileType, lineStart, lineEnd))
+				if piece.start >= lineCursorOffset {
+					lineCursorNumber += strings.Count(text[lineCursorOffset:piece.start], "\n")
+					lineCursorOffset = piece.start
+				}
+				lineStart := lineCursorNumber
+				lineEnd := lineStart + strings.Count(piece.text, "\n")
+				if strings.HasSuffix(piece.text, "\n") {
+					lineEnd--
+				}
+				if lineEnd < lineStart {
+					lineEnd = lineStart
+				}
+				if err := visit(makeChunkMap(rootID, filePath, idx, piece.text, fileType, lineStart, lineEnd)); err != nil {
+					return err
+				}
 				idx++
 			}
 		}
 	}
-	return chunks
+	return nil
 }
 
 var headingRE = regexp.MustCompile(`(?m)^#{1,6}\s`)
@@ -179,6 +221,9 @@ func splitTextWithOverlapOffsets(text string, baseOffset, targetChars, overlapCh
 			break
 		}
 		nextStart := end - overlapChars
+		for nextStart < len(text) && !utf8.RuneStart(text[nextStart]) {
+			nextStart++
+		}
 		if nextStart <= start {
 			nextStart = end
 		}
@@ -211,7 +256,7 @@ func lineSpanForByteRange(text string, start, end int) (int, int) {
 func bestTextBoundary(text string, start, hardEnd, minSize int) int {
 	minEnd := start + minSize
 	if minEnd >= hardEnd {
-		return hardEnd
+		return utf8BoundaryAtOrBefore(text, hardEnd)
 	}
 	window := text[minEnd:hardEnd]
 	for _, sep := range []string{"\n\n", "\n", ". ", " ", ""} {
@@ -222,7 +267,17 @@ func bestTextBoundary(text string, start, hardEnd, minSize int) int {
 			return minEnd + idx + len(sep)
 		}
 	}
-	return hardEnd
+	return utf8BoundaryAtOrBefore(text, hardEnd)
+}
+
+func utf8BoundaryAtOrBefore(text string, offset int) int {
+	if offset > len(text) {
+		offset = len(text)
+	}
+	for offset > 0 && offset < len(text) && !utf8.RuneStart(text[offset]) {
+		offset--
+	}
+	return offset
 }
 
 func makeChunkMap(rootID, filePath string, chunkIndex int, content, fileType string, lineStart, lineEnd int) map[string]any {
@@ -251,6 +306,9 @@ func hashContent(content string) string {
 
 // detectLocalFileType returns a file_type string matching the Python chunkers convention.
 func detectLocalFileType(path string) string {
+	if strings.EqualFold(extOf(path), ".jsonl") || strings.EqualFold(extOf(path), ".ndjson") {
+		return "jsonl"
+	}
 	if strings.EqualFold(extOf(path), ".svg") {
 		return "svg"
 	}

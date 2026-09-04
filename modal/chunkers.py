@@ -1248,6 +1248,7 @@ FILE_TYPE_MAP: dict[str, str] = {
     ".proto": "proto", ".graphql": "graphql",
     ".tf": "terraform", ".hcl": "hcl",
     ".md": "markdown", ".rst": "markdown", ".txt": "text",
+    ".jsonl": "jsonl", ".ndjson": "jsonl",
     ".pdf": "pdf",
     ".docx": "docx", ".doc": "docx",
     ".pptx": "pptx", ".ppt": "pptx",
