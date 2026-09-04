@@ -63,9 +63,9 @@ embedding_image = (
         "sentence-transformers>=3.0.0",
         "torch>=2.0.0",
         "einops>=0.7.0",
-        "turbopuffer>=2.9.0,<3",
         "fastapi[standard]",
     )
+    .pip_install("turbopuffer>=2.9.0,<3")
     .add_local_file("models.py", "/root/models.py")
 )
 
