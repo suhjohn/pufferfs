@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
@@ -1579,9 +1582,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer stopLease()
-		s3Key = syncSourceFileKey(generationID, filePath)
+		// Each request gets an immutable object key. A client may retry after the
+		// server stored the body but its response was lost; sharing a key between
+		// attempts would let a late request overwrite the bytes described by a
+		// successful response.
+		s3Key = syncSourceCaptureFileKey(generationID, uuid.NewString(), filePath)
 	}
-	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, "application/octet-stream"); err != nil {
+	contentHash, size, err := uploadHashedStream(r.Context(), s.s3, s3Key, r.Body, "application/octet-stream", r.ContentLength)
+	if err != nil {
+		if errors.Is(err, errUploadLengthMismatch) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
 		writeUploadFailure(w, r, err)
 		return
 	}
@@ -1590,7 +1602,36 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"key":          s3Key,
+		"content_hash": contentHash,
+		"size":         size,
+	})
+}
+
+var errUploadLengthMismatch = errors.New("upload body length changed while streaming")
+
+func uploadHashedStream(ctx context.Context, store objectStore, key string, body io.Reader, contentType string, expectedSize int64) (string, int64, error) {
+	hash := sha256.New()
+	counter := &byteCounter{}
+	body = io.TeeReader(body, io.MultiWriter(hash, counter))
+	if err := store.UploadStream(ctx, key, body, contentType); err != nil {
+		return "", 0, err
+	}
+	if expectedSize >= 0 && counter.n != expectedSize {
+		_ = store.DeleteMany(ctx, []string{key})
+		return "", counter.n, fmt.Errorf("%w: expected %d bytes, received %d", errUploadLengthMismatch, expectedSize, counter.n)
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), counter.n, nil
+}
+
+type byteCounter struct {
+	n int64
+}
+
+func (c *byteCounter) Write(p []byte) (int, error) {
+	c.n += int64(len(p))
+	return len(p), nil
 }
 
 func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
@@ -2057,6 +2098,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "loading sync job: " + err.Error()})
 				return
 			}
+			if err := s.db.UpdateSyncJobTotalFiles(r.Context(), job.ID, actionableFiles); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "updating sync job total: " + err.Error()})
+				return
+			}
+			job.TotalFiles = actionableFiles
 		}
 	} else {
 		job, err = s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)

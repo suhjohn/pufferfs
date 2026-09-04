@@ -2526,6 +2526,20 @@ func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) err
 	return err
 }
 
+// UpdateSyncJobTotalFiles replaces the discovery-time estimate with the
+// authoritative change count supplied when a manifest session is finalized.
+func (db *DB) UpdateSyncJobTotalFiles(ctx context.Context, jobID string, totalFiles int) error {
+	if jobID == "" {
+		return nil
+	}
+	_, err := db.pool.Exec(ctx,
+		`UPDATE sync_jobs SET total_files = $1, updated_at = NOW()
+		 WHERE id = $2 AND status NOT IN ('completed', 'failed')`,
+		totalFiles, jobID,
+	)
+	return err
+}
+
 // TouchSyncJob persists liveness for a worker that is still processing a
 // potentially long-running shard.
 func (db *DB) TouchSyncJob(ctx context.Context, jobID string) error {

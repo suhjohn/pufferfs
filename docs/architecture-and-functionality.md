@@ -159,8 +159,11 @@ ACLs, API keys, org members, and sync jobs.
 
 Object storage carries the high-volume data plane:
 
-- `syncs/<generationID>/sources/files/<path>`: generation-scoped standalone
-  source uploads for large or empty changed files.
+- `syncs/<generationID>/sources/files/.capture-<captureID>/<path>`:
+  generation-scoped standalone source captures for large or empty files. Each
+  request gets a unique capture ID so a retried request cannot overwrite bytes
+  accepted from another attempt. Legacy generation-scoped keys without a
+  capture ID are still accepted when finalizing older clients.
 - `syncs/<generationID>/sources/bundles/<bundleID>`: generation-scoped packed
   small-file source transport bundles and source manifests.
 - `files/<rootID>/<path>` and `bundles/<rootID>/<bundleID>`: legacy
@@ -190,10 +193,26 @@ artifacts for known generations, and active Turbopuffer namespaces.
 
 ### Client-Side Sync
 
-The CLI builds a Merkle tree over the target directory using SHA-256 leaf hashes
-and deterministic directory hashes. It honors built-in ignores, `.gitignore`,
-`.tpfsignore`, and `~/.tpfs/.tpfsignore`. It skips matching Merkle subtrees and
-falls back to flat state diffing when local tree cache is unavailable.
+The CLI first discovers regular files and their metadata while honoring
+built-in ignores, `.gitignore`, `.tpfsignore`, and `~/.tpfs/.tpfsignore`.
+Metadata can prove that a file still matches the committed local cache, but is
+never treated as the identity of uncached content. Files that need capture are
+read or streamed once; the SHA-256, size, source ranges, final flat state,
+Merkle tree, SimHash, and content proof are then derived from the bytes that
+were actually accepted for that generation.
+
+This is a captured-version sync, not an instantaneous filesystem snapshot. A
+large regular file is streamed from an open descriptor through a fixed-length
+section, so appends after capture starts are excluded without copying the tree
+to a staging directory. Small files are held in the bounded bundle buffer. The
+CLI checks descriptor and path identity, size, and modification time after the
+read. If a file changed while its captured bytes remained valid, that exact
+captured version can commit and the path is marked dirty for a follow-up sync.
+If a complete version cannot be captured (for example, the opened file is
+truncated before its fixed extent can be read), the path is deferred and its
+previously committed version remains visible. Replacing the path does not
+invalidate bytes already available through the open descriptor, but does mark
+the path dirty. This applies to all regular files, independent of file type.
 
 The model defines statuses for added, removed, modified, moved, renamed,
 copied, moved-and-modified, and unchanged files. The current CLI diff paths
@@ -203,8 +222,9 @@ moved files can be treated more conservatively via
 `PUFFERFS_MOVE_REUSE_MAX_BYTES`.
 
 Likely secret filenames are excluded by the ignore matcher before state is
-created. For included files, the CLI uploads changed source content to the
-server:
+created. For included files, the CLI uploads source content that requires
+capture; a final byte-hash diff discards speculative captures whose content is
+unchanged:
 
 - Small non-empty files are concatenated into generation-scoped bundle objects up to
   `PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES`.
@@ -215,12 +235,19 @@ server:
   Bundle construction stays serial to keep client memory bounded, but bundle
   requests share the same source-upload limit and can overlap standalone files.
 - Replayable upload requests are retried up to three times for transport
-  failures, `408`, `429`, and `5xx` responses. Every retry replays the same
-  bytes to the same generation-scoped object key.
+  failures, `408`, `429`, and `5xx` responses. Buffered bundle retries replay
+  the same bytes. Standalone retries reopen the HTTP request over the same
+  fixed descriptor extent, while each server attempt writes a unique object;
+  only the successful response's key, SHA-256, and byte count become
+  authoritative.
 - Each file change carries `source_key`, `source_offset`, and `source_length`
   so server/Modal can read exact bytes.
 - The complete root state is gzip-compressed and uploaded through the bundle
   endpoint as a `state_ref`.
+- Paths observed changing during capture are persisted in the local root cache
+  and forcibly recaptured on the next sync. Follow mode schedules these
+  reconciliation passes at least 30 seconds apart, even if a writer never
+  becomes quiet.
 
 Upload handlers stream request bodies into bounded-memory S3 multipart uploads
 instead of first copying the complete body to local disk. Each request uses at
@@ -235,10 +262,12 @@ For large trees, the CLI uses the manifest-session flow:
 
 1. Call `POST /roots/{id}/sync/init` to create a sync generation and obtain a
    `generation_id` and `manifest_prefix`.
-2. Upload file-change manifest shards (JSONL) under the generation's artifact
+2. Capture and upload candidate source bytes. Build the final state, Merkle
+   tree, SimHash, and content proof from the successful captures.
+3. Upload file-change manifest shards (JSONL) under the generation's artifact
    namespace via `POST /roots/{id}/sync/{generation_id}/upload`.
-3. Upload the content proof and compressed state via the same artifact endpoint.
-4. Submit a small finalize request (`POST /roots/{id}/sync`) with `generation_id`
+4. Upload the content proof and compressed state via the same artifact endpoint.
+5. Submit a small finalize request (`POST /roots/{id}/sync`) with `generation_id`
    and `change_refs` pointing to the uploaded shards — no inline `changes` needed.
 
 If client upload fails before finalize, `DELETE /roots/{id}/sync/{generation_id}`
@@ -250,8 +279,8 @@ under `states/<rootID>/...`, and rendered/indexed media remains under
 
 For backward compatibility the sync request still accepts inline changes without
 a prior `sync/init` call. If the server reports a stale base generation, the CLI
-reloads remote state, recomputes the diff, and retries once against the latest
-generation.
+reloads remote state, rediscovers and recaptures local candidates, recomputes
+the final state and diff, and retries once against the latest generation.
 
 For subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`),
 the CLI matches root-relative glob patterns, treats repeated includes as OR, and

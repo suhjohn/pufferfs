@@ -41,7 +41,7 @@ PufferFS CLI connected.`,
     name: "sync",
     usage: "pufferfs sync ./handbook --name handbook",
     detail:
-      "Scans the folder, computes a Merkle diff, uploads changed files, and blocks until the new generation is committed. Use --root as the folder to sync; if --name is omitted, the root name defaults to the lowest directory name. Add one or more --include flags to sync a subset; repeated includes are additive and --exclude wins.",
+      "Discovers the folder, captures candidate file bytes, computes the final Merkle diff from those exact bytes, and blocks until the new generation is committed. Use --root as the folder to sync; if --name is omitted, the root name defaults to the lowest directory name. Add one or more --include flags to sync a subset; repeated includes are additive and --exclude wins.",
     flags: [
       "--name, -n <name>: assign or reuse a root alias",
       "--id <root-id>: attach to an existing root",
@@ -72,12 +72,12 @@ Excluded:
 
 $ pufferfs sync --root /Users/me/Documents/handbook
 Created root: handbook (root_8z7m)
-Building Merkle tree for /Users/me/Documents/handbook...
+Capturing and uploading 1,284 files to root root_8z7m...
 Sync complete: 1,284 files processed, 14,602 chunks added
 
 $ pufferfs sync ./handbook --name handbook
-Building Merkle tree for /Users/me/Documents/handbook...
-Merkle diff found 1,284 changed files
+Capturing and uploading 1,284 files to root root_8z7m...
+Merkle diff found 1,284 changed files (captured bytes are authoritative)
 Syncing 1,284 changes to root root_8z7m...
 Sync job sync_2bd3 started; polling until committed...
 Sync status: indexing (912/1,284 files)
@@ -93,7 +93,7 @@ Created root: logs (root_91kq)
 Sync complete: 318 files processed, 982 chunks added
 
 $ pufferfs sync ./handbook --name handbook --force
-Building Merkle tree for /Users/me/Documents/handbook...
+Capturing and uploading 1,284 files to root root_8z7m...
 Syncing 1,284 changes to root root_8z7m...
 Sync complete: 1,284 files processed, 14,602 chunks added`,
     note: "Normal sync is blocking from the user's point of view: the command returns after the server commits or fails the sync. Subset sync accepts root-relative glob includes/excludes and preserves unselected files in existing roots. --force is a one-shot recovery path for rebuilding index rows after propagation failures; it cannot be combined with --follow. --no-vector is a root creation setting: existing vector-enabled roots reject it instead of changing capabilities during sync.",
@@ -734,7 +734,7 @@ const ENDPOINTS = [
       "status": "MODIFIED",
       "content_hash": "sha256:...",
       "size": 18422,
-      "source_key": "syncs/gen_new/sources/files/policies/time-off.pdf"
+      "source_key": "syncs/gen_new/sources/files/.capture-<capture-id>/policies/time-off.pdf"
     }
   ],
   "state_ref": "syncs/gen_new/state/state.json.gz",

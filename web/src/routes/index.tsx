@@ -162,8 +162,8 @@ pufferfs service install ./handbook --name handbook && pufferfs service start ha
               <pre className="code-pane solo">{`$ cd ~/Documents/handbook
 $ pufferfs sync . --name handbook
 Created root: handbook (root_8z7m)
-Building Merkle tree for /Users/me/Documents/handbook...
-Merkle diff found 1,284 changed files
+Capturing and uploading 1,284 files to root root_8z7m...
+Merkle diff found 1,284 changed files (captured bytes are authoritative)
 Sync job sync_2bd3 started; polling until committed...
 Sync status: indexing (912/1,284 files)
 Sync complete: 1,284 files processed, 14,602 chunks added

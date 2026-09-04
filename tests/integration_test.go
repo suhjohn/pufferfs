@@ -904,15 +904,22 @@ func TestPufferFSEndToEnd(t *testing.T) {
 			url.QueryEscape("docs/a.md"),
 		)
 		var fileUpload struct {
-			Key string `json:"key"`
+			Key         string `json:"key"`
+			ContentHash string `json:"content_hash"`
+			Size        int64  `json:"size"`
 		}
-		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Abort\n\nTemporary source bytes.\n"), "application/octet-stream", &fileUpload)
+		fileBytes := []byte("# Abort\n\nTemporary source bytes.\n")
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, fileBytes, "application/octet-stream", &fileUpload)
 		if status != http.StatusOK {
 			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
 		}
-		wantFileKey := fmt.Sprintf("syncs/%s/sources/files/docs/a.md", syncInit.GenerationID)
-		if fileUpload.Key != wantFileKey {
-			t.Fatalf("file upload key = %q, want %q", fileUpload.Key, wantFileKey)
+		wantFilePrefix := fmt.Sprintf("syncs/%s/sources/files/.capture-", syncInit.GenerationID)
+		if !strings.HasPrefix(fileUpload.Key, wantFilePrefix) || !strings.HasSuffix(fileUpload.Key, "/docs/a.md") {
+			t.Fatalf("file upload key = %q, want capture key for docs/a.md", fileUpload.Key)
+		}
+		wantFileHash := sha256.Sum256(fileBytes)
+		if fileUpload.ContentHash != "sha256:"+hex.EncodeToString(wantFileHash[:]) || fileUpload.Size != int64(len(fileBytes)) {
+			t.Fatalf("file upload capture = %#v", fileUpload)
 		}
 
 		bundleUploadPath := fmt.Sprintf("%s/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s",
@@ -1268,15 +1275,22 @@ func TestSyncTransportCleanupIntegration(t *testing.T) {
 			url.QueryEscape("docs/a.md"),
 		)
 		var fileUpload struct {
-			Key string `json:"key"`
+			Key         string `json:"key"`
+			ContentHash string `json:"content_hash"`
+			Size        int64  `json:"size"`
 		}
-		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, []byte("# Abort\n\nTemporary source bytes.\n"), "application/octet-stream", &fileUpload)
+		fileBytes := []byte("# Abort\n\nTemporary source bytes.\n")
+		status, body = rawRequest(t, http.MethodPost, fileUploadPath, env.apiKey, fileBytes, "application/octet-stream", &fileUpload)
 		if status != http.StatusOK {
 			t.Fatalf("upload source file: HTTP %d: %s", status, string(body))
 		}
-		wantFileKey := fmt.Sprintf("syncs/%s/sources/files/docs/a.md", syncInit.GenerationID)
-		if fileUpload.Key != wantFileKey {
-			t.Fatalf("file upload key = %q, want %q", fileUpload.Key, wantFileKey)
+		wantFilePrefix := fmt.Sprintf("syncs/%s/sources/files/.capture-", syncInit.GenerationID)
+		if !strings.HasPrefix(fileUpload.Key, wantFilePrefix) || !strings.HasSuffix(fileUpload.Key, "/docs/a.md") {
+			t.Fatalf("file upload key = %q, want capture key for docs/a.md", fileUpload.Key)
+		}
+		wantFileHash := sha256.Sum256(fileBytes)
+		if fileUpload.ContentHash != "sha256:"+hex.EncodeToString(wantFileHash[:]) || fileUpload.Size != int64(len(fileBytes)) {
+			t.Fatalf("file upload capture = %#v", fileUpload)
 		}
 
 		bundleUploadPath := fmt.Sprintf("%s/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s",

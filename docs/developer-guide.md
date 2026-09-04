@@ -172,11 +172,18 @@ pufferfs sync wait --root workspace --include "docs/**" --json
 
 What to expect:
 
-- The CLI hashes the folder and builds a Merkle tree.
-- It compares the current tree to local cache when possible.
+- The CLI discovers file metadata, then captures bytes for files that cannot be
+  proven unchanged from the committed local cache.
+- It builds the final state and Merkle tree from cached committed hashes and the
+  exact bytes accepted by the current sync generation.
 - If local cache is stale relative to the server, it fetches remote state and
   diffs against that.
-- It uploads only changed content.
+- A file that changes while being captured does not fail the whole sync. A
+  complete captured version can commit and is marked for reconciliation; an
+  incomplete capture is deferred and its prior committed version stays visible.
+- This is generic regular-file handling and does not require copying the root to
+  a local snapshot directory. It does not claim an instantaneous filesystem-wide
+  snapshot when writers remain active.
 - Small files are packed into bundle objects; large and empty files are
   uploaded individually.
 - With `--root <path>` and no subset flags, the CLI syncs that folder as the

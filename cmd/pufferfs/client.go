@@ -217,7 +217,8 @@ func isRetryableUploadError(err error) bool {
 	var apiErr *apiError
 	if !errors.As(err, &apiErr) {
 		// Transport failures and truncated responses are safe to retry because
-		// upload object keys are deterministic within a sync generation.
+		// buffered bodies are replayable and generation-scoped standalone upload
+		// attempts are stored under distinct immutable object keys.
 		return true
 	}
 	return apiErr.StatusCode == http.StatusRequestTimeout ||

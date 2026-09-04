@@ -97,11 +97,14 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 
 	fmt.Println("Running initial sync...")
 	failures := followFailureTracker{}
+	initialDirty := false
 	for {
-		if err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options); err != nil {
+		captureDirty, err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options)
+		if err != nil {
 			return fmt.Errorf("initial sync: %w", err)
 		}
 		if !failures.Active {
+			initialDirty = captureDirty
 			break
 		}
 		delay := failures.NextDelay(options)
@@ -128,7 +131,10 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 		<-timer.C
 	}
 	pending := false
-	dirty := false
+	dirty := initialDirty
+	if dirty {
+		resetFollowTimer(timer, &pending, followCaptureReconcileDelay(options))
+	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
@@ -166,7 +172,9 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) ||
 				event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 				dirty = true
-				resetFollowTimer(timer, &pending, options.Debounce)
+				if !pending {
+					resetFollowTimer(timer, &pending, options.Debounce)
+				}
 			}
 
 		case err, ok := <-watcher.Errors:
@@ -174,6 +182,10 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 				return nil
 			}
 			log.Printf("watcher error: %v", err)
+			dirty = true
+			if !pending {
+				resetFollowTimer(timer, &pending, options.Debounce)
+			}
 
 		case <-timer.C:
 			pending = false
@@ -184,7 +196,8 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 				return fmt.Errorf("watched directory unavailable: %w", err)
 			}
 			fmt.Println("\nChanges detected, syncing...")
-			if err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options); err != nil {
+			captureDirty, err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options)
+			if err != nil {
 				return err
 			}
 			if failures.Active {
@@ -194,7 +207,10 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 				resetFollowTimer(timer, &pending, delay)
 				continue
 			}
-			dirty = false
+			dirty = captureDirty
+			if dirty {
+				resetFollowTimer(timer, &pending, followCaptureReconcileDelay(options))
+			}
 		}
 	}
 }
@@ -229,21 +245,29 @@ func resetFollowTimer(timer *time.Timer, pending *bool, delay time.Duration) {
 	*pending = true
 }
 
-func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions) error {
-	_, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, true, os.Stdout)
+func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions) (bool, error) {
+	result, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, true, os.Stdout)
 	if err == nil {
 		failures.Reset()
-		return nil
+		return result != nil && len(result.dirtyPaths) > 0, nil
 	}
 	class := classifyFollowError(err)
 	failures.Record(err, class)
 	if class.Permanent {
-		return fmt.Errorf("permanent sync failure: %w", err)
+		return false, fmt.Errorf("permanent sync failure: %w", err)
 	}
 	if failures.ShouldExit(options) {
-		return fmt.Errorf("same sync failure repeated %d times over %s: %w", failures.SameCount, time.Since(failures.FirstSeen).Round(time.Second), err)
+		return false, fmt.Errorf("same sync failure repeated %d times over %s: %w", failures.SameCount, time.Since(failures.FirstSeen).Round(time.Second), err)
 	}
-	return nil
+	return false, nil
+}
+
+func followCaptureReconcileDelay(options followOptions) time.Duration {
+	const minimum = 30 * time.Second
+	if options.Debounce > minimum {
+		return options.Debounce
+	}
+	return minimum
 }
 
 type followErrorClass struct {

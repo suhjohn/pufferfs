@@ -351,8 +351,13 @@ Response `200`:
 Upload a single source file's bytes (large/empty files). Requires `sync`/`write`
 and write-ACL on the path. Body is the raw file. **Max 512 MiB.** With
 `generation_id`, stored as temporary transport at
-`syncs/<generationID>/sources/files/<path>`. Without `generation_id`, stored at
-legacy `files/<rootID>/<path>`. Response `{"key": "..."}`.
+`syncs/<generationID>/sources/files/.capture-<captureID>/<path>`, using a unique
+server-generated capture ID for every request. Without `generation_id`, stored
+at legacy `files/<rootID>/<path>`. The response includes the object key plus
+the SHA-256 and length of the exact accepted body:
+`{"key":"...","content_hash":"sha256:...","size":123}`. The server rejects a
+body whose received length differs from `Content-Length` and deletes that
+partial object.
 
 ### `POST /roots/{id}/upload-bundle?bundle_id=<id>[&generation_id=<id>]`
 
@@ -576,9 +581,10 @@ Rules:
 - Exactly one of `state` (inline map) or `state_ref` (object key) is required.
   Inline state is gzipped and persisted by the server as a state ref.
 - `source_key` values for uploaded content should reference
-  `syncs/<generation_id>/sources/files/<path>` or
+  `syncs/<generation_id>/sources/files/.capture-<capture_id>/<path>` or
   `syncs/<generation_id>/sources/bundles/<bundle_id>` for new clients. Legacy
-  `files/<root_id>/...` and `bundles/<root_id>/...` refs are still accepted.
+  generation-scoped file keys without a capture ID, `files/<root_id>/...`, and
+  `bundles/<root_id>/...` refs are still accepted.
 - Central org/user ignore policy is enforced during finalize. New content under
   ignored paths returns `400`; removals for ignored paths are allowed so policy
   changes can remove existing indexed rows.

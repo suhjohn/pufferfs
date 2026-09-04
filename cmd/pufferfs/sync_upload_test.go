@@ -17,17 +17,17 @@ import (
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
-func TestUploadChangedFilesParallelizesStandaloneUploadsAndPreservesOrder(t *testing.T) {
+func TestCaptureFilesParallelizesStandaloneUploadsAndPreservesOrder(t *testing.T) {
 	t.Setenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES", "1")
 	t.Setenv("PUFFERFS_UPLOAD_CONCURRENCY", "2")
 	dir := t.TempDir()
-	changes := make([]models.FileChange, 4)
-	for i := range changes {
+	candidates := make([]captureCandidate, 4)
+	for i := range candidates {
 		name := fmt.Sprintf("%d.txt", i)
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("ok"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		changes[i] = models.FileChange{Path: name, Status: models.StatusAdded, ContentHash: fmt.Sprintf("hash-%d", i), Size: 2}
+		candidates[i] = captureCandidate{Path: name, Size: 2}
 	}
 
 	var active atomic.Int32
@@ -53,12 +53,13 @@ func TestUploadChangedFilesParallelizesStandaloneUploadsAndPreservesOrder(t *tes
 			case <-time.After(time.Second):
 				t.Error("second standalone upload did not start")
 			}
-			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
 				t.Errorf("reading upload: %v", err)
 			}
 			path := r.URL.Query().Get("path")
 			time.Sleep(time.Duration(4-int(path[0]-'0')) * time.Millisecond)
-			_ = json.NewEncoder(w).Encode(map[string]string{"key": "objects/" + path})
+			_ = json.NewEncoder(w).Encode(sourceUploadResponse{Key: "objects/" + path, ContentHash: contentHashForTest(data), Size: int64(len(data))})
 		case "/roots/root-1/upload-bundle":
 			manifestRequests.Add(1)
 			if !strings.HasSuffix(r.URL.Query().Get("bundle_id"), "-manifest") {
@@ -78,12 +79,12 @@ func TestUploadChangedFilesParallelizesStandaloneUploadsAndPreservesOrder(t *tes
 	}))
 	defer server.Close()
 
-	manifestRef, err := uploadChangedFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, changes)
+	batch, err := captureFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, candidates)
 	if err != nil {
-		t.Fatalf("uploadChangedFiles: %v", err)
+		t.Fatalf("captureFiles: %v", err)
 	}
-	if manifestRef != "manifest-key" {
-		t.Fatalf("manifest ref = %q, want manifest-key", manifestRef)
+	if batch.ManifestRef != "manifest-key" {
+		t.Fatalf("manifest ref = %q, want manifest-key", batch.ManifestRef)
 	}
 	if got := maxActive.Load(); got != 2 {
 		t.Fatalf("max concurrent standalone uploads = %d, want 2", got)
@@ -97,14 +98,15 @@ func TestUploadChangedFilesParallelizesStandaloneUploadsAndPreservesOrder(t *tes
 
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
-	if len(manifest) != len(changes) {
-		t.Fatalf("manifest entries = %d, want %d", len(manifest), len(changes))
+	if len(manifest) != len(candidates) {
+		t.Fatalf("manifest entries = %d, want %d", len(manifest), len(candidates))
 	}
-	for i := range changes {
+	for i := range candidates {
 		wantPath := fmt.Sprintf("%d.txt", i)
 		wantKey := "objects/" + wantPath
-		if changes[i].SourceKey != wantKey || changes[i].SourceOffset != 0 || changes[i].SourceLength != 2 {
-			t.Fatalf("change %d source = %#v", i, changes[i])
+		capture := batch.Files[wantPath]
+		if capture.SourceKey != wantKey || capture.SourceOffset != 0 || capture.SourceLength != 2 {
+			t.Fatalf("capture %d source = %#v", i, capture)
 		}
 		if manifest[i].Path != wantPath || manifest[i].ObjectKey != wantKey || manifest[i].Length != 2 {
 			t.Fatalf("manifest entry %d = %#v", i, manifest[i])
@@ -112,7 +114,7 @@ func TestUploadChangedFilesParallelizesStandaloneUploadsAndPreservesOrder(t *tes
 	}
 }
 
-func TestUploadChangedFilesBundlesOverlapStandaloneUploadsWithinLimit(t *testing.T) {
+func TestCaptureFilesBundlesOverlapStandaloneUploadsWithinLimit(t *testing.T) {
 	t.Setenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES", "3")
 	t.Setenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES", "3")
 	t.Setenv("PUFFERFS_UPLOAD_CONCURRENCY", "2")
@@ -125,12 +127,12 @@ func TestUploadChangedFilesBundlesOverlapStandaloneUploadsWithinLimit(t *testing
 		{path: "a.txt", data: "aa"},
 		{path: "b.txt", data: "bb"},
 	}
-	changes := make([]models.FileChange, len(files))
+	candidates := make([]captureCandidate, len(files))
 	for i, file := range files {
 		if err := os.WriteFile(filepath.Join(dir, file.path), []byte(file.data), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		changes[i] = models.FileChange{Path: file.path, Status: models.StatusAdded, ContentHash: "hash-" + file.path, Size: int64(len(file.data))}
+		candidates[i] = captureCandidate{Path: file.path, Size: int64(len(file.data))}
 	}
 
 	var active atomic.Int32
@@ -167,7 +169,8 @@ func TestUploadChangedFilesBundlesOverlapStandaloneUploadsWithinLimit(t *testing
 			case <-time.After(time.Second):
 				t.Error("source bundle did not overlap standalone upload")
 			}
-			_ = json.NewEncoder(w).Encode(map[string]string{"key": "file/large.txt"})
+			data, _ := io.ReadAll(r.Body)
+			_ = json.NewEncoder(w).Encode(sourceUploadResponse{Key: "file/large.txt", ContentHash: contentHashForTest(data), Size: int64(len(data))})
 		case "/roots/root-1/upload-bundle":
 			bundleOnce.Do(func() { close(bundleStarted) })
 			select {
@@ -183,35 +186,36 @@ func TestUploadChangedFilesBundlesOverlapStandaloneUploadsWithinLimit(t *testing
 	}))
 	defer server.Close()
 
-	if _, err := uploadChangedFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, changes); err != nil {
-		t.Fatalf("uploadChangedFiles: %v", err)
+	batch, err := captureFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, candidates)
+	if err != nil {
+		t.Fatalf("captureFiles: %v", err)
 	}
 	if got := maxActive.Load(); got != 2 {
 		t.Fatalf("max concurrent source uploads = %d, want 2", got)
 	}
-	if changes[0].SourceKey != "file/large.txt" {
-		t.Fatalf("standalone source key = %q", changes[0].SourceKey)
+	if batch.Files[files[0].path].SourceKey != "file/large.txt" {
+		t.Fatalf("standalone source key = %q", batch.Files[files[0].path].SourceKey)
 	}
-	if changes[1].SourceKey == "" || changes[2].SourceKey == "" || changes[1].SourceKey == changes[2].SourceKey {
-		t.Fatalf("bundle source keys = %q, %q", changes[1].SourceKey, changes[2].SourceKey)
+	if batch.Files[files[1].path].SourceKey == "" || batch.Files[files[2].path].SourceKey == "" || batch.Files[files[1].path].SourceKey == batch.Files[files[2].path].SourceKey {
+		t.Fatalf("bundle source keys = %q, %q", batch.Files[files[1].path].SourceKey, batch.Files[files[2].path].SourceKey)
 	}
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
-	if len(manifest) != 3 || manifest[0].ObjectKey != changes[0].SourceKey || manifest[1].BundleKey != changes[1].SourceKey || manifest[2].BundleKey != changes[2].SourceKey {
-		t.Fatalf("manifest/source mapping mismatch: manifest=%#v changes=%#v", manifest, changes)
+	if len(manifest) != 3 || manifest[0].ObjectKey != batch.Files[files[0].path].SourceKey || manifest[1].BundleKey != batch.Files[files[1].path].SourceKey || manifest[2].BundleKey != batch.Files[files[2].path].SourceKey {
+		t.Fatalf("manifest/source mapping mismatch: manifest=%#v captures=%#v", manifest, batch.Files)
 	}
 }
 
-func TestUploadChangedFilesWaitsForInFlightUploadsOnError(t *testing.T) {
+func TestCaptureFilesWaitsForInFlightUploadsOnError(t *testing.T) {
 	t.Setenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES", "1")
 	t.Setenv("PUFFERFS_UPLOAD_CONCURRENCY", "2")
 	dir := t.TempDir()
-	changes := []models.FileChange{
-		{Path: "slow.txt", Status: models.StatusAdded, Size: 2},
-		{Path: "bad.txt", Status: models.StatusAdded, Size: 2},
+	candidates := []captureCandidate{
+		{Path: "slow.txt", Size: 2},
+		{Path: "bad.txt", Size: 2},
 	}
-	for _, change := range changes {
-		if err := os.WriteFile(filepath.Join(dir, change.Path), []byte("ok"), 0o644); err != nil {
+	for _, candidate := range candidates {
+		if err := os.WriteFile(filepath.Join(dir, candidate.Path), []byte("ok"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,12 +256,12 @@ func TestUploadChangedFilesWaitsForInFlightUploadsOnError(t *testing.T) {
 			t.Error("failing upload did not finish")
 		}
 		time.Sleep(20 * time.Millisecond)
-		_ = json.NewEncoder(w).Encode(map[string]string{"key": "file/slow.txt"})
+		_ = json.NewEncoder(w).Encode(sourceUploadResponse{Key: "file/slow.txt", ContentHash: contentHashForTest([]byte("ok")), Size: 2})
 	}))
 	defer server.Close()
 
-	_, err := uploadChangedFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, changes)
-	if err == nil || !strings.Contains(err.Error(), "uploading bad.txt") {
+	_, err := captureFiles(&apiClient{baseURL: server.URL, httpClient: server.Client()}, "root-1", "gen-1", dir, candidates)
+	if err == nil || !strings.Contains(err.Error(), "capturing bad.txt") {
 		t.Fatalf("err = %v, want bad.txt upload error", err)
 	}
 	if got := active.Load(); got != 0 {

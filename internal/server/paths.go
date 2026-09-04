@@ -5,6 +5,7 @@ import (
 	pathpkg "path"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -226,8 +227,8 @@ func validateSourceRef(rootID, generationID string, change *models.FileChange) e
 	}
 
 	if generationID != "" && strings.HasPrefix(change.SourceKey, syncSourceFilePrefix(generationID)) {
-		path := strings.TrimPrefix(change.SourceKey, syncSourceFilePrefix(generationID))
-		if path != change.Path {
+		path, ok := syncSourceFilePath(generationID, change.SourceKey)
+		if !ok || path != change.Path {
 			return fmt.Errorf("source file key must match change path")
 		}
 		if change.SourceOffset != 0 {
@@ -307,6 +308,34 @@ func syncSourceBundlePrefix(generationID string) string {
 
 func syncSourceFileKey(generationID, filePath string) string {
 	return syncSourceFilePrefix(generationID) + filePath
+}
+
+func syncSourceCaptureFileKey(generationID, captureID, filePath string) string {
+	return syncSourceFilePrefix(generationID) + ".capture-" + safeObjectName(captureID) + "/" + filePath
+}
+
+func syncSourceFilePath(generationID, ref string) (string, bool) {
+	prefix := syncSourceFilePrefix(generationID)
+	if prefix == "" || !strings.HasPrefix(ref, prefix) {
+		return "", false
+	}
+	remainder := strings.TrimPrefix(ref, prefix)
+	if remainder == "" {
+		return "", false
+	}
+
+	// Protocol-v1 clients used a deterministic key with the path directly
+	// after the prefix. New capture keys insert a safe attempt ID so retries
+	// cannot overwrite one another.
+	if slash := strings.IndexByte(remainder, '/'); slash > 0 {
+		captureID := strings.TrimPrefix(remainder[:slash], ".capture-")
+		if captureID != remainder[:slash] {
+			if _, err := uuid.Parse(captureID); err == nil {
+				return remainder[slash+1:], remainder[slash+1:] != ""
+			}
+		}
+	}
+	return remainder, true
 }
 
 func syncSourceBundleKey(generationID, bundleID string) string {
