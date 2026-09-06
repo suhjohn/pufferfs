@@ -8,7 +8,7 @@ app = modal.App("pufferfs-index-cpu")
 
 
 @app.function(image=index_image, secrets=[worker_secret, endpoint_secret], cpu=2, memory=4096,
-              timeout=3600, max_containers=32)
+              timeout=3600, max_containers=int(os.getenv("PUFFERFS_MODAL_INDEX_MAX_CONTAINERS", "16")))
 @modal.fastapi_endpoint(method="POST", label="pufferfs-file-index-cpu")
 def index(item: dict):
     from aws_clients import client

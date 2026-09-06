@@ -111,6 +111,7 @@ variables. Group by concern below.
 | Variable | Meaning | Default / notes |
 | --- | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. | **Required.** |
+| `PUFFERFS_DB_MAX_CONNS` | Maximum PostgreSQL connections per Go API/consumer process; 1–64. Idle connections expire after one minute. | `4` |
 | `PORT` | HTTP listen port. | server default |
 | `LISTEN_ADDR` | Full listen address (overrides `PORT` when set). | — |
 | `MIGRATIONS_DIR` | Path to SQL migrations applied on boot. | bundled |

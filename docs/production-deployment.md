@@ -81,7 +81,7 @@ a successful local suite.
 
 `python3 scripts/deploy/audit-worker-cloud.py` checks STS identity, S3 object/
 multipart listing and configured SQS attributes from a temporary Modal CPU
-sandbox using `PUFFERFS_WORKER_SECRET_NAME` (default `pufferfs-workers`). It is
+Function using `PUFFERFS_WORKER_SECRET_NAME` (default `pufferfs-workers`). It is
 a read-only deployment diagnostic, not a full E2E suite: it never reads source
 bodies, receives messages, creates queues or changes IAM. Missing secrets or
 queue configuration fail explicitly. Write/abort/delete permissions and the
@@ -226,6 +226,15 @@ queues. Pulumi creates the Modal OIDC provider unless
 The workflow also updates `pufferfs-endpoint-auth` with
 `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, matching the API/consumer
 `MODAL_SECRET_KEY`. The query deployment uses this secret.
+
+Size connections and execution together. `PUFFERFS_DB_MAX_CONNS` bounds each
+API/consumer pool (default 4). `PUFFERFS_TRANSFORM_MAX_CONTAINERS` and
+`PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` set both the respective consumer
+concurrency and worker container caps (default 16). Budget across every replica,
+overlapping deployments, worker DB operations, collector, reconciliation and
+administrative connections. For a small database, begin with 2 for all three
+settings and increase only with measured headroom. Compose limits Postgres to
+25 connections and Go pools to 2 to exercise this constraint.
 
 Optional CLI release variables:
 

@@ -77,6 +77,9 @@ pulumi config set pufferfs:modalFileCpuIndexEndpoint "$MODAL_FILE_CPU_INDEX_ENDP
 pulumi config set pufferfs:modalWorkspaceId "$MODAL_WORKSPACE_ID"
 pulumi config set pufferfs:modalEnvironment "$MODAL_ENVIRONMENT"
 set_config_if_present pufferfs:modalOidcProviderArn "${MODAL_OIDC_PROVIDER_ARN:-}"
+set_config_if_present pufferfs:dbMaxConnections "${PUFFERFS_DB_MAX_CONNS:-}"
+set_config_if_present pufferfs:workerTransformConcurrency "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}"
+set_config_if_present pufferfs:workerIndexConcurrency "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}"
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
 

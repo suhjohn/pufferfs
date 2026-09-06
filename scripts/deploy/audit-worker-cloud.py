@@ -1,14 +1,13 @@
 """Read-only AWS checks using the actual configured Modal worker secret.
 
 This is a deployment diagnostic, not an end-to-end test or a permission grant.
-It creates a temporary CPU sandbox, never deploys/replaces an application, never
+It creates a temporary CPU Function, never deploys/replaces an application, never
 reads source bodies and never receives queue messages. No secret values print.
 S3 write/abort/delete and bulk GPU execution still need staging E2E validation.
 """
 
 import os
 from pathlib import Path
-import uuid
 
 import modal
 
@@ -69,28 +68,29 @@ raise SystemExit(0 if all(item["status"]=="passed" for item in results) else 1)
 '''
 
 
+app = modal.App("pufferfs-worker-audit")
+image = modal.Image.debian_slim(python_version="3.12").pip_install("boto3>=1.34")
+if modal.is_local():
+    image = image.add_local_file(Path(__file__).resolve().parents[2] / "modal/aws_clients.py", "/root/aws_clients.py", copy=True)
+secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"))
+
+
+@app.function(image=image, secrets=[secret], timeout=180, cpu=0.25, memory=256)
+def audit():
+    # A Function receives the same OIDC identity shape as deployed workers.
+    try:
+        exec(PROBE, {})
+    except SystemExit as result:
+        return result.code == 0
+    except Exception as error:
+        print({"check": "probe setup", "status": "failed", "error_code": type(error).__name__}, flush=True)
+        return False
+
+
 def main():
-    app = modal.App("pufferfs-worker-audit")
-    image = (modal.Image.debian_slim(python_version="3.12").pip_install("boto3>=1.34")
-             .add_local_file(Path(__file__).resolve().parents[2] / "modal/aws_clients.py", "/root/aws_clients.py", copy=True))
-    secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"))
     with modal.enable_output(), app.run():
-        # Setup errors print only their class, never a credentials-provider
-        # traceback, URL or environment value from the remote worker secret.
-        command = "import json\ntry:\n    exec(" + repr(PROBE) + ")\nexcept Exception as error:\n    print(json.dumps({'check':'probe setup','status':'failed','error_code':type(error).__name__}),flush=True)\n    raise SystemExit(1)"
-        sandbox = modal.Sandbox.create("python", "-c", command, app=app, image=image,
-            secrets=[secret], timeout=180, cpu=0.25, memory=256, include_oidc_identity_token=True)
-        try:
-            print("Temporary worker-credential audit:", sandbox.object_id, flush=True)
-            # The remote program emits only selected nonsecret fields and error
-            # codes, not environment values, URLs, response bodies or tracebacks.
-            for line in sandbox.stdout:
-                print(line, end="", flush=True)
-            sandbox.wait()
-            if sandbox.returncode:
-                raise RuntimeError("worker cloud audit failed; inspect the reported checks and secret availability")
-        finally:
-            sandbox.terminate()
+        if not audit.remote():
+            raise RuntimeError("worker cloud audit failed; inspect the reported checks")
 
 
 if __name__ == "__main__":

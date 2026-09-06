@@ -2,6 +2,7 @@ name: pufferfs-e2e
 
 x-environment: &environment
   DATABASE_URL: postgres://postgres:e2e-only@postgres:5432/pufferfs_e2e?sslmode=disable
+  PUFFERFS_DB_MAX_CONNS: '2'
   AWS_ACCESS_KEY_ID: test
   AWS_SECRET_ACCESS_KEY: test
   AWS_REGION: us-east-1
@@ -60,6 +61,7 @@ services:
 
   postgres:
     image: postgres:17-alpine
+    command: [postgres, -c, max_connections=25]
     environment:
       POSTGRES_DB: pufferfs_e2e
       POSTGRES_USER: postgres

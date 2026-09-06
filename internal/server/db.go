@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -52,7 +53,21 @@ var errRootDeleting = errors.New("root is being deleted")
 
 // NewDB creates a connection pool and runs migrations.
 func NewDB(databaseURL string) (*DB, error) {
-	pool, err := pgxpool.New(context.Background(), databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("configuring database: %w", err)
+	}
+	// Host CPU counts are not a database connection budget, especially on ECS.
+	maxConnections := 4
+	if raw := os.Getenv("PUFFERFS_DB_MAX_CONNS"); raw != "" {
+		maxConnections, err = strconv.Atoi(raw)
+		if err != nil || maxConnections < 1 || maxConnections > 64 {
+			return nil, fmt.Errorf("PUFFERFS_DB_MAX_CONNS must be between 1 and 64")
+		}
+	}
+	config.MaxConns = int32(maxConnections)
+	config.MaxConnIdleTime = time.Minute
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to database: %w", err)
 	}

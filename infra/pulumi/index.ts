@@ -645,6 +645,7 @@ const secrets = Object.entries(secretValues).map(([key, value]) => {
 
 const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "PORT", value: containerPort.toString() },
+  { name: "PUFFERFS_DB_MAX_CONNS", value: (cfg.getNumber("dbMaxConnections") ?? 4).toString() },
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
   { name: "AWS_REGION", value: deployRegion },
   { name: "AWS_ENDPOINT_URL", value: "" },
