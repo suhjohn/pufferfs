@@ -278,14 +278,15 @@ component: backend | frontend | installer | cli-release | all
 Component behavior:
 
 - `backend`: configures Pulumi, previews, builds an immutable Docker image tagged
-  with the workflow commit SHA, pushes to ECR, and runs `pulumi up`.
+  with the workflow commit SHA, pushes to ECR, runs `pulumi up`, waits for the API
+  and consumers, then configures and deploys the six Modal roles.
 - `frontend`: builds `web/`, syncs `dist/client/` to the Pulumi-managed web
   bucket, and invalidates CloudFront.
 - `installer`: uploads `scripts/install.sh` to `/install.sh` in the web bucket
   and invalidates only that path.
 - `cli-release`: mirrors a tagged CLI release to `/releases/<tag>/` in the web
   bucket, writes `/releases/latest.txt`, and invalidates those paths.
-- `all`: runs backend, frontend, then installer.
+- `all`: runs backend, frontend, installer and CLI release mirroring.
 
 ## CLI Releases
 

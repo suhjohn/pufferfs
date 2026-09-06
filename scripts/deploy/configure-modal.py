@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 
 def main():
@@ -31,9 +32,14 @@ def main():
         (os.getenv("PUFFERFS_MODAL_ENDPOINT_SECRET_NAME", "pufferfs-endpoint-auth"),
          {"PUFFERFS_MODAL_ENDPOINT_AUTH_KEY": os.environ["MODAL_SECRET_KEY"]}),
     ):
-        subprocess.run([sys.executable, "-m", "modal", "secret", "create", "--force", name,
-                        "--env", os.environ["MODAL_ENVIRONMENT"], "--from-json", "/dev/stdin"],
-                       input=json.dumps(contents), text=True, check=True)
+        # Modal requires a regular file. NamedTemporaryFile creates it with
+        # mode 0600 and removes it after the CLI returns, including failures.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as config:
+            json.dump(contents, config)
+            config.flush()
+            subprocess.run([sys.executable, "-m", "modal", "secret", "create", "--force", name,
+                            "--env", os.environ["MODAL_ENVIRONMENT"], "--from-json", config.name],
+                           check=True)
 
 
 if __name__ == "__main__":
