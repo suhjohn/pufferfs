@@ -27,7 +27,7 @@ class QueryEmbedder:
         self.model, self.device = load_model(os.getenv("PUFFERFS_EMBEDDING_DEVICE", "cuda"))
         print(f"Query model ready: device={self.device}, dtype={next(self.model.parameters()).dtype}", flush=True)
 
-    @modal.fastapi_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST", label=os.getenv("PUFFERFS_QUERY_ENDPOINT_LABEL", "pufferfs-query-embed"))
     def embed_query_endpoint(self, item: dict) -> dict:
         from fastapi import HTTPException
         from nomic_model import encode_texts

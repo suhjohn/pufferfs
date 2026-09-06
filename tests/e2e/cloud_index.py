@@ -161,7 +161,7 @@ def main():
         # reused even while the temporary application is running.
         os.environ.update(PUFFERFS_WORKER_SECRET_NAME=worker_name, PUFFERFS_MODAL_ENDPOINT_SECRET_NAME=auth_name,
             PUFFERFS_INDEX_GPU_APP_NAME=identifier + "-index", PUFFERFS_INDEX_GPU_ENDPOINT_LABEL=identifier + "-index",
-            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_MODAL_INDEX_MAX_CONTAINERS="1",
+            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query", PUFFERFS_MODAL_INDEX_MAX_CONTAINERS="1",
             PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS="0", PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS="1")
         sys.path.insert(0, str(REPOSITORY / "modal"))
         os.chdir(REPOSITORY / "modal")

@@ -7,6 +7,7 @@ S3 write/abort/delete and bulk GPU execution still need staging E2E validation.
 """
 
 import os
+from pathlib import Path
 import uuid
 
 import modal
@@ -15,7 +16,7 @@ import modal
 PROBE = r'''
 import json, os, uuid
 from contextlib import closing
-import boto3
+from aws_clients import client
 from botocore.config import Config
 
 config = Config(connect_timeout=5,read_timeout=10,retries={"total_max_attempts":1})
@@ -30,7 +31,7 @@ def check(name, operation):
         code = getattr(error,"response",{}).get("Error",{}).get("Code",type(error).__name__)
         results.append({"check":name,"status":"failed","error_code":str(code)})
 
-with closing(boto3.client("sts",config=config,region_name=region)) as sts:
+with closing(client("sts",config=config,region_name=region)) as sts:
     def identity():
         caller=sts.get_caller_identity()
         return {"account":caller["Account"],"principal":caller["Arn"]}
@@ -39,7 +40,7 @@ bucket=os.environ.get("AWS_BUCKET_NAME")
 if not bucket:
     results.append({"check":"worker S3 configuration","status":"failed","error_code":"missing_bucket"})
 else:
-    with closing(boto3.client("s3",config=config,region_name=region)) as s3:
+    with closing(client("s3",config=config,region_name=region)) as s3:
         if not s3.meta.endpoint_url.endswith(".amazonaws.com"):
             raise RuntimeError("cloud audit requires an actual AWS S3 endpoint")
         prefix="sources/cloud-readiness-"+uuid.uuid4().hex+"/"
@@ -51,7 +52,7 @@ else:
             return {"bucket":bucket,"count":len(page.get("Uploads",[]))}
         check("s3:ListBucket",objects)
         check("s3:ListBucketMultipartUploads",multipart)
-with closing(boto3.client("sqs",config=config,region_name=region)) as sqs:
+with closing(client("sqs",config=config,region_name=region)) as sqs:
     for stage in ("TRANSFORM","INDEX"):
         url=os.environ.get("PUFFERFS_SQS_"+stage+"_QUEUE_URL")
         if not url:
@@ -69,15 +70,16 @@ raise SystemExit(0 if all(item["status"]=="passed" for item in results) else 1)
 
 
 def main():
-    app = modal.App("pufferfs-worker-audit-" + uuid.uuid4().hex[:12])
-    image = modal.Image.debian_slim(python_version="3.12").pip_install("boto3>=1.34")
+    app = modal.App("pufferfs-worker-audit")
+    image = (modal.Image.debian_slim(python_version="3.12").pip_install("boto3>=1.34")
+             .add_local_file(Path(__file__).resolve().parents[2] / "modal/aws_clients.py", "/root/aws_clients.py", copy=True))
     secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"))
     with modal.enable_output(), app.run():
         # Setup errors print only their class, never a credentials-provider
         # traceback, URL or environment value from the remote worker secret.
         command = "import json\ntry:\n    exec(" + repr(PROBE) + ")\nexcept Exception as error:\n    print(json.dumps({'check':'probe setup','status':'failed','error_code':type(error).__name__}),flush=True)\n    raise SystemExit(1)"
         sandbox = modal.Sandbox.create("python", "-c", command, app=app, image=image,
-            secrets=[secret], timeout=180, cpu=0.25, memory=256)
+            secrets=[secret], timeout=180, cpu=0.25, memory=256, include_oidc_identity_token=True)
         try:
             print("Temporary worker-credential audit:", sandbox.object_id, flush=True)
             # The remote program emits only selected nonsecret fields and error

@@ -13,7 +13,7 @@ image = (
     .add_local_file("file_runtime.py", "/root/file_runtime.py", copy=True)
     .add_local_file("file_reconciliation.py", "/root/file_reconciliation.py", copy=True)
 )
-for module in ("root_cleanup", "index_cleanup", "index_client", "index_routing", "source_io", "embedding_cleanup", "artifact_cleanup", "source_cleanup"):
+for module in ("aws_clients", "root_cleanup", "index_cleanup", "index_client", "index_routing", "source_io", "embedding_cleanup", "artifact_cleanup", "source_cleanup"):
     image = image.add_local_file(f"{module}.py", f"/root/{module}.py", copy=True)
 secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"))
 
@@ -22,7 +22,7 @@ secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "puffer
               max_containers=1, schedule=modal.Period(minutes=1))
 def reconcile():
     from contextlib import closing
-    import boto3
+    from aws_clients import client
     from botocore.config import Config
     from file_reconciliation import reconcile_file_work
     from index_cleanup import cleanup_index
@@ -33,11 +33,11 @@ def reconcile():
     from index_client import SCHEMA, turbopuffer_client
 
     # Bounded network operations; the next schedule repairs an interrupted send.
-    sqs = boto3.client("sqs", config=Config(connect_timeout=10, read_timeout=20,
+    sqs = client("sqs", config=Config(connect_timeout=10, read_timeout=20,
                                           retries={"mode": "standard", "total_max_attempts": 2}))
     try:
         result = reconcile_file_work(sqs)
-        with closing(boto3.client("s3", config=Config(connect_timeout=10, read_timeout=20,
+        with closing(client("s3", config=Config(connect_timeout=10, read_timeout=20,
                                                       retries={"total_max_attempts": 2}))) as s3:
             with turbopuffer_client(timeout=20, max_retries=0) as tp:
                 def apply(namespace, mutation, vector_disabled):

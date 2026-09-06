@@ -11,10 +11,10 @@ app = modal.App("pufferfs-index-cpu")
               timeout=3600, max_containers=32)
 @modal.fastapi_endpoint(method="POST", label="pufferfs-file-index-cpu")
 def index(item: dict):
-    import boto3
+    from aws_clients import client
     from index_worker import index_file, turbopuffer_client
     from role_auth import require_work_request
 
     work, token = require_work_request(item)
     with turbopuffer_client() as tp:
-        return index_file(work, token, None, boto3.client("s3"), os.environ["AWS_BUCKET_NAME"], tp, cpu_only=True)
+        return index_file(work, token, None, client("s3"), os.environ["AWS_BUCKET_NAME"], tp, cpu_only=True)

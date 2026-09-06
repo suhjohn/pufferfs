@@ -12,7 +12,7 @@ app = modal.App(os.getenv("PUFFERFS_COLLECTOR_APP_NAME", "pufferfs-batch-collect
 @app.function(image=cpu_image, secrets=[worker_secret], cpu=2, memory=4096,
               timeout=900, max_containers=1, schedule=modal.Period(minutes=1))
 def collect():
-    import boto3
+    from aws_clients import client as aws_client
     from google import genai
 
     from batch_collector import assemble_extraction, collect_batch
@@ -22,7 +22,7 @@ def collect():
     from provider_refresh import refresh_batch_inputs
     from provider_cleanup import cleanup_provider_files
 
-    s3, sqs = boto3.client("s3"), boto3.client("sqs")
+    s3, sqs = aws_client("s3"), aws_client("sqs")
     bucket = os.environ["AWS_BUCKET_NAME"]
     # No implicit SDK replay of a potentially accepted paid create. Explicit
     # reconciliation owns retries; reads can safely retry on the next schedule.

@@ -1,9 +1,10 @@
 # Production Deployment
 
-This repository uses three deployment surfaces:
+This repository uses four deployment surfaces:
 
 - GitHub Actions for CI, release, and manual component deployments.
 - Pulumi for AWS infrastructure, backend image builds, and ECS task definitions.
+- Modal for independently deployed transformation, collection, indexing, query and reconciliation roles.
 - S3 + CloudFront for the static web app and installer script.
 
 This checkout contains only per-file processing. Before upgrading an older
@@ -11,8 +12,9 @@ fleet, stop/drain legacy writers and queues, audit historical recapture and
 publication coverage, apply migrations, and deploy matching CLI/API/consumer
 and Modal roles. There is no mixed-generation read fallback.
 
-Deploy `transform_app.py`, `collector_app.py`, `index_cpu_app.py`,
-`index_gpu_app.py`, `query_app.py`, and `reconciliation_app.py` independently.
+The backend/all workflow deploys `transform_app.py`, `collector_app.py`,
+`index_cpu_app.py`, `index_gpu_app.py`, `query_app.py`, and
+`reconciliation_app.py` as separate apps after the API applies migrations.
 The query embedder receives only endpoint authentication. Keep any existing
 endpoint alive until every caller has switched; deleted source code does not
 stop an already deployed application.
@@ -133,6 +135,9 @@ DATABASE_URL
 JWT_SECRET
 TURBOPUFFER_API_KEY
 MODAL_SECRET_KEY
+MODAL_TOKEN_ID
+MODAL_TOKEN_SECRET
+GEMINI_API_KEY
 GOOGLE_CLIENT_SECRET
 ```
 
@@ -157,6 +162,8 @@ Set these variables on each deploy environment:
 
 ```text
 PROJECT_NAME=pufferfs
+MODAL_WORKSPACE_ID=<workspace-id>
+MODAL_ENVIRONMENT=main
 FRONTEND_URL=https://pufferfs.com
 COOKIE_DOMAIN=.pufferfs.com
 API_DOMAIN=api.pufferfs.com
@@ -208,18 +215,23 @@ MODAL_FILE_CPU_INDEX_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
 ```
 
-Create the worker secret named by `PUFFERFS_WORKER_SECRET_NAME` with
-`DATABASE_URL`, `GEMINI_API_KEY`, `TURBOPUFFER_API_KEY`, object-store credentials,
-`AWS_BUCKET_NAME`, `AWS_REGION` and both SQS queue URLs. Create the endpoint-auth
-secret named by `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` with
+The workflow creates/updates `pufferfs-workers` with the database/provider
+configuration, artifact bucket, queue URLs and `PUFFERFS_AWS_ROLE_ARN` from
+Pulumi outputs. Workers exchange their Modal identity for refreshable AWS role
+credentials. The role trusts the configured workspace/environment and named
+worker apps; its policy covers the artifact bucket and sending to the two work
+queues. Pulumi creates the Modal OIDC provider unless
+`MODAL_OIDC_PROVIDER_ARN` selects an existing account-wide provider.
+
+The workflow also updates `pufferfs-endpoint-auth` with
 `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, matching the API/consumer
-`MODAL_SECRET_KEY`. The query deployment uses the endpoint-auth secret.
+`MODAL_SECRET_KEY`. The query deployment uses this secret.
 
 Optional CLI release variables:
 
 ```text
-PUFFERFS_CLI_LATEST_VERSION=0.6.6
-PUFFERFS_CLI_MIN_VERSION=0.2.0
+PUFFERFS_CLI_LATEST_VERSION=0.7.0
+PUFFERFS_CLI_MIN_VERSION=0.7.0
 PUFFERFS_CLI_DOWNLOAD_BASE_URL=https://pufferfs.com/releases
 ```
 

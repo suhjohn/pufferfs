@@ -22,6 +22,7 @@ def main():
     if not key:
         raise RuntimeError("MODAL_SECRET_KEY must match the configured Modal endpoint-auth secret")
     os.environ["PUFFERFS_QUERY_APP_NAME"] = "pufferfs-query-validation-" + uuid.uuid4().hex[:12]
+    os.environ["PUFFERFS_QUERY_ENDPOINT_LABEL"] = os.environ["PUFFERFS_QUERY_APP_NAME"]
     os.environ["PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS"] = "0"
     os.environ["PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS"] = "1"
     os.environ["PUFFERFS_EMBEDDING_DEVICE"] = "cuda"

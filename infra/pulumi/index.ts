@@ -462,6 +462,43 @@ const taskRole = new aws.iam.Role(name("ecs-task-role"), {
   tags,
 });
 
+const modalWorkspaceId = requireNonBlank("modalWorkspaceId");
+const modalEnvironment = requireNonBlank("modalEnvironment");
+const modalProviderArn = cfg.get("modalOidcProviderArn") ?? new aws.iam.OpenIdConnectProvider(name("modal-oidc"), {
+  url: "https://oidc.modal.com",
+  clientIdLists: ["oidc.modal.com"],
+  tags,
+}).arn;
+const modalRole = new aws.iam.Role(name("modal-worker-role"), {
+  assumeRolePolicy: pulumi.output(modalProviderArn).apply(arn => JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [{
+      Effect: "Allow",
+      Principal: { Federated: arn },
+      Action: "sts:AssumeRoleWithWebIdentity",
+      Condition: {
+        StringEquals: { "oidc.modal.com:aud": "oidc.modal.com" },
+        StringLike: { "oidc.modal.com:sub": [
+          "pufferfs-transform", "pufferfs-batch-collector", "pufferfs-index-cpu",
+          "pufferfs-index-gpu", "pufferfs-reconciliation", "pufferfs-worker-audit",
+        ].map(app => `modal:workspace_id:${modalWorkspaceId}:environment_name:${modalEnvironment}:app_name:${app}:function_name:*:container_id:*`) },
+      },
+    }],
+  })),
+  tags,
+});
+new aws.iam.RolePolicy(name("modal-worker-policy"), {
+  role: modalRole.id,
+  policy: pulumi.all([bucket.arn, ...syncQueues.map(({ queue }) => queue.arn)])
+    .apply(([bucketArn, ...queueArns]) => JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts", "s3:ListBucket", "s3:ListBucketMultipartUploads"], Resource: [bucketArn, `${bucketArn}/*`] },
+        { Effect: "Allow", Action: ["sqs:SendMessage", "sqs:GetQueueAttributes"], Resource: queueArns },
+      ],
+    })),
+});
+
 new aws.iam.RolePolicy(name("ecs-task-policy"), {
   role: taskRole.id,
   policy: pulumi
@@ -935,6 +972,8 @@ export const inviteEmailIdentityNameOutput = transactionalEmailIdentityNameOutpu
 export const inviteEmailIdentityVerificationStatus = transactionalEmailIdentityVerificationStatus;
 export const inviteEmailDkimValidationRecords = transactionalEmailDkimValidationRecords;
 export const artifactBucket = bucket.bucket;
+export const modalWorkerRoleArn = modalRole.arn;
+export const modalOidcProvider = modalProviderArn;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;
 export const syncQueueUrls = Object.fromEntries(syncQueues.map(({ stage, queue }) => [stage, queue.url]));

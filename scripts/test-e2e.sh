@@ -41,7 +41,7 @@ runner_started=1
 failed_tick=0
 for ((attempt=0; attempt<45; attempt++)); do
   if "${compose[@]}" logs --no-color --tail=100 reconciler |
-      rg 'reconciler scheduled invocation failed:' >/dev/null; then
+      grep -F 'reconciler scheduled invocation failed:' >/dev/null; then
     failed_tick=1
     break
   fi
@@ -83,7 +83,7 @@ fi
 "${compose[@]}" up -d --no-deps transform-consumer
 "${compose[@]}" run --rm --no-deps e2e malformed-transformed
 if ! "${compose[@]}" logs --no-color transform-consumer |
-    rg 'not valid job JSON; left unacknowledged \(receive batch size=3\)' >/dev/null; then
+    grep -F 'not valid job JSON; left unacknowledged (receive batch size=3)' >/dev/null; then
   echo "Malformed delivery scenario did not exercise a mixed three-message receive batch." >&2
   exit 1
 fi

@@ -7,7 +7,7 @@ index_image = (modal.Image.debian_slim(python_version="3.12")
                .apt_install("ca-certificates")
                .pip_install_from_requirements("requirements-index.txt")
                .env({"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"}))
-for module in ("source_io", "extraction", "file_runtime", "nomic_model", "embedding_artifacts", "index_mutations", "index_routing", "index_client", "index_prepare", "index_publish", "index_worker", "role_auth"):
+for module in ("aws_clients", "source_io", "extraction", "file_runtime", "nomic_model", "embedding_artifacts", "index_mutations", "index_routing", "index_client", "index_prepare", "index_publish", "index_worker", "role_auth"):
     index_image = index_image.add_local_file(f"{module}.py", f"/root/{module}.py", copy=True)
 # Modal imports the deployment module again inside the remote container. Its
 # top-level build-helper import and requirements file must also be present.

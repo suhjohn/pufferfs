@@ -11,6 +11,7 @@ cpu_image = (
     # Binary libpq's OpenSSL defaults need not match the base image's paths.
     # Keep sslrootcert=system / verify-full using the installed trust store.
     .env({"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"})
+    .add_local_file("aws_clients.py", "/root/aws_clients.py", copy=True)
     .add_local_file("source_io.py", "/root/source_io.py", copy=True)
     .add_local_file("extraction.py", "/root/extraction.py", copy=True)
     .add_local_file("spreadsheet_extract.py", "/root/spreadsheet_extract.py", copy=True)

@@ -31,7 +31,7 @@ class Indexer:
 
     @modal.fastapi_endpoint(method="POST", label=os.getenv("PUFFERFS_INDEX_GPU_ENDPOINT_LABEL", "pufferfs-file-index-gpu"))
     def index(self, item: dict):
-        import boto3
+        from aws_clients import client
         from index_worker import index_file
         from role_auth import require_work_request
         work, token = require_work_request(item)
@@ -40,4 +40,4 @@ class Indexer:
             return self.model.encode(["search_document: " + text for text in texts],
                 normalize_embeddings=True, show_progress_bar=False, batch_size=64, device=self.device).tolist()
 
-        return index_file(work, token, encode, boto3.client("s3"), os.environ["AWS_BUCKET_NAME"], self.tp)
+        return index_file(work, token, encode, client("s3"), os.environ["AWS_BUCKET_NAME"], self.tp)

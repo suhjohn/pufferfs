@@ -61,6 +61,14 @@ jobs:
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
       MODAL_SECRET_KEY: ${{ secrets.MODAL_SECRET_KEY }}
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      MODAL_WORKSPACE_ID: ${{ vars.MODAL_WORKSPACE_ID }}
+      MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT }}
+      MODAL_OIDC_PROVIDER_ARN: ${{ vars.MODAL_OIDC_PROVIDER_ARN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TURBOPUFFER_REGION: ${{ vars.TURBOPUFFER_REGION }}
+      TURBOPUFFER_API_URL: ${{ vars.TURBOPUFFER_API_URL }}
       PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
       MODAL_QUERY_EMBED_ENDPOINT: ${{ vars.MODAL_QUERY_EMBED_ENDPOINT || secrets.MODAL_QUERY_EMBED_ENDPOINT }}
       MODAL_TRANSFORM_ENDPOINT: ${{ vars.MODAL_TRANSFORM_ENDPOINT || secrets.MODAL_TRANSFORM_ENDPOINT }}
@@ -119,6 +127,16 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Check worker deployment configuration
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        run: |
+          set -euo pipefail
+          : "${MODAL_TOKEN_ID:?Set MODAL_TOKEN_ID}"
+          : "${MODAL_TOKEN_SECRET:?Set MODAL_TOKEN_SECRET}"
+          : "${MODAL_WORKSPACE_ID:?Set MODAL_WORKSPACE_ID}"
+          : "${MODAL_ENVIRONMENT:?Set MODAL_ENVIRONMENT}"
+          : "${GEMINI_API_KEY:?Set GEMINI_API_KEY}"
+
       - name: Set up Go
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         uses: actions/setup-go@v6
@@ -175,6 +193,29 @@ jobs:
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
         run: pulumi up --yes --refresh
+
+      - name: Wait for API and consumers
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        run: |
+          set -euo pipefail
+          CLUSTER="$(pulumi stack output ecsClusterArn)"
+          API_SERVICE="$(pulumi stack output apiServiceArn)"
+          mapfile -t WORKERS < <(pulumi stack output workerServiceArns --json | jq -r '.[]')
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$API_SERVICE" "${WORKERS[@]}"
+
+      - name: Configure and deploy Modal roles
+        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
+        run: |
+          set -euo pipefail
+          : "${MODAL_TOKEN_ID:?Set MODAL_TOKEN_ID}"
+          : "${MODAL_TOKEN_SECRET:?Set MODAL_TOKEN_SECRET}"
+          python3 -m pip install 'modal>=1.1.2,<2'
+          python3 scripts/deploy/configure-modal.py
+          cd modal
+          for role in transform_app index_cpu_app index_gpu_app query_app collector_app reconciliation_app; do
+            python3 -m modal deploy "${role}.py" --env "$MODAL_ENVIRONMENT"
+          done
 
       - name: Build frontend
         if: ${{ inputs.component == 'frontend' || inputs.component == 'all' }}
