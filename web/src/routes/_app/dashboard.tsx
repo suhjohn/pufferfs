@@ -68,7 +68,6 @@ function Dashboard() {
       const deletedRoot = roots?.find((root) => root.id === rootId);
       capture("root_deleted", {
         root_scope: deletedRoot?.scope,
-        had_visible_generation: Boolean(deletedRoot?.visible_generation_id),
       });
       queryClient.invalidateQueries({ queryKey: ["roots"] });
       queryClient.invalidateQueries({ queryKey: ["root-sync-summaries"] });
@@ -77,7 +76,7 @@ function Dashboard() {
 
   function confirmDeleteRoot(root: Root) {
     const ok = window.confirm(
-      `Delete root "${root.name}"?\n\nThis removes indexed content and stored sync artifacts for the root. Sync job history is retained for accounting.`,
+      `Delete root "${root.name}"?\n\nThis removes the root's indexed content and schedules cleanup of retained source and processing artifacts.`,
     );
     if (ok) deleteRootMutation.mutate(root.id);
   }
@@ -88,18 +87,9 @@ function Dashboard() {
     rootSyncsQuery.data ??
     roots?.map((root) => ({
       root,
-      latestJob: undefined,
+      status: "loading", indexed: 0, total: 0,
     })) ??
     [];
-  const recentSyncs = rootSummaries
-    .filter((summary) => summary.latestJob)
-    .sort((a, b) => {
-      const aStarted = a.latestJob?.started_at ?? "";
-      const bStarted = b.latestJob?.started_at ?? "";
-      return bStarted.localeCompare(aStarted);
-    })
-    .slice(0, 5);
-
   useEffect(() => {
     if (trackedView.current || !roots || !keysQuery.data) return;
     trackedView.current = true;
@@ -240,7 +230,7 @@ pufferfs init --api-key ${newKey}`}</pre>
         <div className="section-heading">
           <div>
             <h2>roots</h2>
-            <p>Folders that have been synced into a committed search index.</p>
+            <p>Folders captured for asynchronous per-file indexing.</p>
           </div>
         </div>
         {isPending && <p className="muted">loading</p>}
@@ -253,18 +243,18 @@ pufferfs init --api-key ${newKey}`}</pre>
             <div className="data-row data-row-head root-data-row">
               <span>name</span>
               <span>access</span>
-              <span>last synced</span>
+              <span>indexed files</span>
               <span>status</span>
               <span />
             </div>
-            {rootSummaries.map(({ root, latestJob }) => (
+            {rootSummaries.map(({ root, status, indexed, total }) => (
               <div key={root.id} className="data-row root-data-row">
                 <strong>{root.name}</strong>
                 <span className="tag">{formatAccess(root)}</span>
                 <span className="muted">
-                  {formatDateTime(latestJob?.finished_at ?? latestJob?.started_at)}
+                  {formatProgress(indexed, total)}
                 </span>
-                <span className="status-text">{rootStatus(root.visible_generation_id, latestJob?.status)}</span>
+                <span className="status-text">{status}</span>
                 <button
                   className="btn btn-sm btn-danger"
                   disabled={deleteRootMutation.isPending}
@@ -281,40 +271,6 @@ pufferfs init --api-key ${newKey}`}</pre>
         )}
       </section>
 
-      <section className="console-section" aria-label="recent syncs">
-        <div className="section-heading">
-          <div>
-            <h2>recent syncs</h2>
-            <p>Latest sync activity across your roots.</p>
-          </div>
-        </div>
-        {rootSyncsQuery.isPending && roots && roots.length > 0 && (
-          <p className="muted">loading</p>
-        )}
-        {recentSyncs.length === 0 && !rootSyncsQuery.isPending && (
-          <div className="empty-state">no syncs yet</div>
-        )}
-        {recentSyncs.length > 0 && (
-          <div className="data-list">
-            <div className="data-row data-row-head sync-data-row">
-              <span>root</span>
-              <span>status</span>
-              <span>progress</span>
-              <span>started</span>
-            </div>
-            {recentSyncs.map(({ root, latestJob }) => (
-              <div key={latestJob?.id ?? root.id} className="data-row sync-data-row">
-                <strong>{root.name}</strong>
-                <span className="status-text">{latestJob?.status ?? "unknown"}</span>
-                <span className="muted">
-                  {formatProgress(latestJob?.processed, latestJob?.total_files)}
-                </span>
-                <span className="muted">{formatDateTime(latestJob?.started_at)}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
     </main>
   );
 }
@@ -327,12 +283,6 @@ const API_KEY_SCOPES = [
   { value: "api_keys:write", label: "write keys" },
   { value: "org:admin", label: "manage org" },
 ];
-
-function rootStatus(hasVisibleGeneration: string, latestStatus?: string) {
-  if (latestStatus && latestStatus !== "completed") return latestStatus;
-  if (hasVisibleGeneration) return "synced";
-  return latestStatus ?? "not synced";
-}
 
 function formatProgress(processed?: number, total?: number) {
   if (!total) return "0/0";

@@ -1,0 +1,227 @@
+name: pufferfs-e2e
+
+x-environment: &environment
+  DATABASE_URL: postgres://postgres:e2e-only@postgres:5432/pufferfs_e2e?sslmode=disable
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://aws:4566
+  AWS_ENDPOINT_URL_SQS: http://faults:8667
+  AWS_BUCKET_NAME: pufferfs-e2e
+  AWS_EC2_METADATA_DISABLED: 'true'
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+  PUFFERFS_SQS_TRANSFORM_QUEUE_URL: http://aws:4566/queue/us-east-1/000000000000/file-transform.fifo
+  PUFFERFS_SQS_INDEX_QUEUE_URL: http://aws:4566/queue/us-east-1/000000000000/file-index.fifo
+  PUFFERFS_TP_NAMESPACE_SHARDS: '2'
+  PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS: ${PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS:-2592000}
+  PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS: ${PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS:-2592000}
+  PUFFERFS_SOURCE_RETENTION_SECONDS: ${PUFFERFS_SOURCE_RETENTION_SECONDS:-2592000}
+  MODAL_TRANSFORM_ENDPOINT: http://transform:8080/
+  MODAL_FILE_CPU_INDEX_ENDPOINT: http://index-cpu:8080/
+  MODAL_FILE_INDEX_ENDPOINT: http://index-vector:8080/
+  MODAL_QUERY_EMBED_ENDPOINT: http://query:8080/
+  MODAL_SECRET_KEY: e2e-worker-only
+  PUFFERFS_MODAL_ENDPOINT_AUTH_KEY: e2e-worker-only
+  PUFFERFS_ADMIN_KEY: e2e-admin-only
+  JWT_SECRET: e2e-jwt-only-not-a-production-secret
+  ENABLE_EMAIL_LOGIN: 'false'
+  POSTHOG_ENABLED: 'false'
+  TURBOPUFFER_API_KEY: ${TURBOPUFFER_API_KEY:-}
+  # One resolved endpoint for Go and Python. Passing REGION as well makes the
+  # Python SDK reject a fixed URL, even when its region argument is omitted.
+  TURBOPUFFER_API_URL: ${TURBOPUFFER_API_URL:-https://${TURBOPUFFER_REGION:-gcp-us-central1}.turbopuffer.com}
+
+x-worker: &worker
+  image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-worker
+  build:
+    context: .
+    dockerfile: tests/e2e/Dockerfile
+    target: worker
+  environment: *environment
+  init: true
+  restart: 'no'
+  depends_on:
+    api-ready: {condition: service_completed_successfully}
+  healthcheck:
+    test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+    interval: 5s
+    timeout: 5s
+    retries: 24
+
+services:
+  faults:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: [-host, 0.0.0.0, -config, /config/faults.json]
+    volumes:
+      - ./tests/e2e/faults.json:/config/faults.json:ro
+    depends_on:
+      aws: {condition: service_healthy}
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: pufferfs_e2e
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: e2e-only
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U postgres -d pufferfs_e2e]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  aws:
+    # Last-generation community emulator, explicitly pinned. New LocalStack
+    # releases require a separately provisioned auth token; never pull latest.
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: s3,sqs
+      LOCALSTACK_HOST: aws:4566
+      SQS_ENDPOINT_STRATEGY: path
+      AWS_DEFAULT_REGION: us-east-1
+    healthcheck:
+      test: [CMD-SHELL, 'awslocal s3api list-buckets >/dev/null && awslocal sqs list-queues >/dev/null']
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  aws-init:
+    <<: *worker
+    environment:
+      <<: *environment
+      AWS_ENDPOINT_URL_SQS: http://aws:4566
+    entrypoint: [python, /e2e/bootstrap.py]
+    healthcheck: {disable: true}
+    depends_on:
+      aws: {condition: service_healthy}
+
+  api:
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-go
+    build: .
+    environment:
+      <<: *environment
+      AWS_ENDPOINT_URL: http://faults:8666
+    depends_on:
+      postgres: {condition: service_healthy}
+      aws-init: {condition: service_completed_successfully}
+      faults: {condition: service_started}
+
+  api-ready:
+    <<: *worker
+    entrypoint: [python, /e2e/ready.py]
+    healthcheck: {disable: true}
+    depends_on:
+      api: {condition: service_started}
+
+  transform-consumer:
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-go
+    build: .
+    environment:
+      <<: *environment
+      PUFFERFS_PROCESS: worker
+      PUFFERFS_WORKER_STAGE: transform
+      PUFFERFS_WORKER_CONCURRENCY: '4'
+    depends_on:
+      transform: {condition: service_healthy}
+
+  index-consumer:
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-go
+    build: .
+    environment:
+      <<: *environment
+      PUFFERFS_PROCESS: worker
+      PUFFERFS_WORKER_STAGE: index
+      PUFFERFS_WORKER_CONCURRENCY: '4'
+    depends_on:
+      index-cpu: {condition: service_healthy}
+      index-vector: {condition: service_healthy}
+
+  transform:
+    <<: *worker
+    command: [transform]
+    environment:
+      <<: *environment
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  collector:
+    <<: *worker
+    command: [collector]
+    environment:
+      <<: *environment
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    healthcheck:
+      test: [CMD, python, -c, "import pathlib,time; assert time.time()-pathlib.Path('/tmp/role-heartbeat').stat().st_mtime < 1000"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+
+  index-cpu:
+    <<: *worker
+    command: [index-cpu]
+
+  index-vector:
+    <<: *worker
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-vector
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: vector
+    environment:
+      <<: *environment
+      PUFFERFS_EMBEDDING_DEVICE: cpu
+      OMP_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    command: [index-vector]
+
+  query:
+    <<: *worker
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-vector
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: vector
+    environment:
+      <<: *environment
+      PUFFERFS_EMBEDDING_DEVICE: cpu
+      OMP_NUM_THREADS: '2'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    command: [query]
+
+  reconciler:
+    <<: *worker
+    command: [reconciler]
+    healthcheck:
+      test: [CMD, python, -c, "import pathlib,time; assert time.time()-pathlib.Path('/tmp/role-heartbeat').stat().st_mtime < 240"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+
+  e2e:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: runner
+    profiles: [test]
+    environment:
+      <<: *environment
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      PUFFERFS_SERVER_URL: http://api:8080
+      # Inspect real queue state even while application delivery is cut off.
+      AWS_ENDPOINT_URL_SQS: http://aws:4566
+      PUFFERFS_E2E_TIMEOUT_SECONDS: ${PUFFERFS_E2E_TIMEOUT_SECONDS:-3600}
+    volumes:
+      - ./tests/e2e/artifacts:/artifacts
+      - e2e-state:/state
+      - e2e-cli:/root/.tpfs
+    depends_on:
+      transform-consumer: {condition: service_started}
+      index-consumer: {condition: service_started}
+      collector: {condition: service_started}
+      reconciler: {condition: service_started}
+      query: {condition: service_healthy}
+
+volumes:
+  e2e-state:
+  e2e-cli:

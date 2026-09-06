@@ -66,9 +66,8 @@ The usual flow is:
 4. Optionally keep the folder current with `sync --follow` or a background service.
 
 A root is the durable unit of sync and access control. The local folder remains
-the source of truth. PufferFS stores temporary uploaded copies during sync, then
-keeps extracted chunks, embeddings, state snapshots, and search index rows so it
-can answer queries.
+the source of truth. PufferFS retains captured originals, extracted chunks, embeddings and index rows.
+Files become searchable independently after processing.
 Deleting a root removes PufferFS artifacts and index metadata, not local source
 files.
 
@@ -103,7 +102,7 @@ The CLI also stores per-root local cache under:
 ~/.tpfs/roots/<root-id>/
 ```
 
-That cache includes root metadata, flat file state, and a Merkle tree snapshot.
+That cache includes root identity, per-file heads and bounded immutable capture spools.
 
 ## Syncing a Folder
 
@@ -146,81 +145,34 @@ Return machine-readable output:
 pufferfs sync ./workspace --json
 ```
 
-Start a sync job without waiting for it to commit:
+Capture returns after durable registration. Inspect or wait for indexing:
 
 ```sh
-pufferfs sync ./workspace --name workspace --background
-# --detach is an alias for --background
+pufferfs sync status --root workspace --json
+pufferfs sync wait --root workspace
+pufferfs sync wait --root /path/to/workspace --include "docs/**" --exclude "docs/archive/**"
 ```
 
-Inspect or wait for a sync job:
+The agent discovers files, captures stable bytes into immutable packs, uploads
+through signed URLs, then registers versions. Indexing continues asynchronously.
+Current captured/indexed heads are separate; unrelated files need not wait for
+one another. Subset sync leaves unselected files untouched. Append capture
+verifies the old prefix before reusing its remote extents; rewrites/truncations
+capture new bytes.
 
-```sh
-pufferfs sync status --root workspace
-pufferfs sync status --root workspace --job-id <sync-job-id> --json
-pufferfs sync jobs --root workspace
-pufferfs sync wait --root workspace --job-id <sync-job-id>
-```
+Pending uploads are journaled and resumed. `--force` reindexes unchanged files
+and, after an explicit version conflict, preserves the rejected spool while
+recapturing current local files. It does not merge concurrent edits. See
+[configuration](configuration.md) for exact conflict and retention behavior.
 
-Wait until selected local files are visible in the latest committed generation:
-
-```sh
-pufferfs sync wait --root /Users/me/workspace --include "docs/policy.md"
-pufferfs sync wait --root /Users/me/workspace --include "docs/**" --exclude "docs/archive/**"
-pufferfs sync wait --root workspace --include "docs/**" --json
-```
-
-What to expect:
-
-- The CLI discovers file metadata, then captures bytes for files that cannot be
-  proven unchanged from the committed local cache.
-- It builds the final state and Merkle tree from cached committed hashes and the
-  exact bytes accepted by the current sync generation.
-- If local cache is stale relative to the server, it fetches remote state and
-  diffs against that.
-- A file that changes while being captured does not fail the whole sync. A
-  complete captured version can commit and is marked for reconciliation; an
-  incomplete capture is deferred and its prior committed version stays visible.
-- This is generic regular-file handling and does not require copying the root to
-  a local snapshot directory. It does not claim an instantaneous filesystem-wide
-  snapshot when writers remain active.
-- Small non-empty files are packed into bundle objects, large files are
-  uploaded individually, and empty files need no source upload.
-- With `--root <path>` and no subset flags, the CLI syncs that folder as the
-  full root. If `--name` is omitted, the root name defaults to the directory
-  basename.
-- With `--include <glob>` and optional `--exclude <glob>`, the CLI syncs a
-  subset. Multiple includes are additive, excludes win, and selected changes are
-  patched into the current committed root state so unselected files stay visible
-  in existing roots.
-- With `--force`, the CLI uploads and reindexes the current files even when the
-  committed root state already has matching size/content hashes. For full-root
-  sync, all current files are treated as modified and deleted paths are closed.
-  For subset sync, only selected files are forced. `--force` is intended for
-  one-shot recovery and cannot be combined with `--follow`.
-- Uploaded source objects are temporary transport for the sync generation. They
-  are removed after the generation commits, is aborted, is rejected, fails, or
-  expires incomplete.
-- The server creates a sync job and a new generation.
-- The index is not visible to queries until the generation commits.
-- By default, the CLI polls async sync jobs until completion. With
-  `--background`/`--detach`, it prints the `sync_job_id` and exits; use
-  `pufferfs sync status`, `pufferfs sync jobs`, or `pufferfs sync wait` to
-  inspect completion.
-- `pufferfs sync wait --include ...` is different from job wait: it hashes the
-  current local files matching the same root-relative include/exclude semantics
-  as subset sync, fetches the latest committed root state, and returns only when
-  every selected local file has the same size and `sha256:` content hash in the
-  visible generation. This works with `sync --follow` and installed services
-  because it waits for committed state, not for a particular process.
-- If the server generation changed during sync, the CLI reloads state,
-  recomputes the diff, and retries.
+The agent does not produce an atomic snapshot of an actively changing root.
+Downstream computation always uses the captured bytes, never a later read of
+the live path. Root-generation jobs and background/detach flags are retired.
 
 ## What Gets Synced
 
 PufferFS decides which files to sync (and index) by evaluating a layered set of
-ignore rules. Anything matched by an ignore rule is excluded from the Merkle
-tree, the diff, the upload, and the search index.
+ignore rules. Anything matched by an ignore rule is excluded from capture, the diff, the upload, and the search index.
 
 Ignore matching combines server-managed policy and local CLI rules. Organization
 and user ignore policies are fetched from the server before scanning and are also
@@ -388,13 +340,10 @@ The sync model understands:
 - Added files.
 - Modified files.
 - Removed files.
-- Moved files.
-- Renamed files.
 - Unchanged files.
 
-Move and rename detection is content-hash based. For moved files, PufferFS can
-reuse existing indexed row metadata when safe, which avoids unnecessary
-re-chunking and re-embedding.
+Moves and renames are captured as a deletion at the old path and a new file
+at the destination. Unchanged content can reuse cached embeddings.
 
 ## Search
 
@@ -447,7 +396,7 @@ Search modes:
 
 What to expect:
 
-- Query results are filtered to the root's latest committed generation.
+- Query results are filtered to the root's published file versions.
 - In-progress sync data is not returned.
 - Results can include file path, absolute path, chunk index, file type, content,
   page number, image path, and score.
@@ -456,24 +405,14 @@ What to expect:
 
 ## File Type Behavior
 
-Text-like files can be chunked locally by the Go server. PDFs, Office files,
-presentations, images, structured files, and media files use Modal compute when
-configured. The full extraction and chunking process is documented in
-[File Ingestion and Chunking](file-ingestion-and-chunking.md).
+All files are transformed in the independent CPU worker. Text/code/JSONL use
+bounded byte-preserving line chunks; spreadsheets preserve cell addresses.
+PDF/Word/presentations always render temporary images and use Gemini Batch.
+Images use the same vision parsing; media uses temporary audio clips and
+best-effort Gemini diarization. Generated images/media are not stored in S3.
 
-Expected extraction behavior:
-
-- Code and config files are split into overlapping text chunks.
-- Markdown and text are split by headings and text boundaries where possible.
-- PDFs are rendered by page and sent through vision extraction by default.
-- Native PDF text is retained only as a no-vision fallback.
-- Word and PowerPoint files are converted to PDF first, then processed by page.
-- Images can be captioned or text-extracted when vision extraction is available.
-- Email, calendar, and contact files are parsed into searchable text records.
-- Audio and video are split into overlapping time windows and described for
-  semantic search.
-
-Page-based document results may include page numbers and image artifact paths.
+See [File Ingestion and Chunking](file-ingestion-and-chunking.md) for every
+supported extension, chunk contract and limitation.
 
 ## Continuous Sync
 
@@ -619,31 +558,14 @@ not know the source wording.
 
 ## Operational Expectations
 
-Sync jobs are generation-based:
+Capture acceptance is not indexing completion. Search/read expose only each
+file's published extraction; a replacement leaves its prior publication visible
+until the new index mutation finishes. Deletes publish tombstones.
 
-- A sync builds a new generation.
-- Turbopuffer rows may be written before commit.
-- Queries only see the latest visible generation.
-- Failed or partial generations are not exposed in normal query results.
-
-Queued deployments may use worker stages:
-
-- Chunk.
-- Embed.
-- Index.
-- Commit.
-- Cleanup.
-
-Without queued workers, the server can run the same pipeline in-process.
-
-Storage expectations:
-
-- Object storage is the data plane for temporary source transport, durable state
-  refs, sync artifacts, and page images.
-- PostgreSQL is the control plane plus small durable caches.
-- Turbopuffer is the search index.
-- Modal is the heavy compute layer for embeddings and document/image
-  extraction.
+SQS owns execution delivery and retries; Postgres records catalog/ownership and
+recovery state. S3 holds immutable sources and derived artifacts. The API never
+runs transformation or bulk indexing in-process. See the
+[deployment diagram](architecture-and-functionality.md).
 
 ## Troubleshooting
 
@@ -653,11 +575,11 @@ If sync finds no changes:
 - For subset sync, confirm `--include`/`--exclude` patterns are root-relative
   and match the paths you expect.
 - Check ignore rules.
-- Check whether the local cache already matches the visible generation.
+- Check whether the local files already match captured heads.
 
 If query returns no results:
 
-- Confirm the root was synced and the sync job completed.
+- Confirm the root was captured and `sync wait` completed.
 - Try `--mode hybrid`.
 - Remove overly narrow `--glob` filters.
 - Confirm the API key has query/read access.
@@ -676,10 +598,6 @@ If a sync fails repeatedly:
 - Run a normal `pufferfs sync` once to see the direct error.
 - Check upload size limits for very large files.
 - Check server-side Modal, Turbopuffer, object storage, and queue configuration.
-- If Modal embedding returns 500s for text/code chunks, verify the server is not
-  sending chunk metadata fields unsupported by the deployed Modal embed schema;
-  the server should preserve line metadata in index rows but omit it from the
-  embed request payload.
 - Check service logs if running as a background service.
 
 ## Upgrade Behavior
@@ -701,3 +619,18 @@ What to expect:
 - The archive checksum is verified.
 - The current binary is replaced.
 - Installed user services can be restarted after upgrade.
+
+## End-to-end tests
+
+Only Docker Compose end-to-end tests are maintained. The previous Go/Python/
+TypeScript unit and in-process integration suites have been retired.
+
+```sh
+# Real provider calls incur usage charges. Use dedicated test credentials.
+set -a; source .env; set +a
+bash scripts/test-e2e.sh
+```
+
+See [the E2E runbook](../tests/e2e/README.md) for deployment roles, scenarios,
+resource isolation, cleanup and explicit differences from production. Missing
+provider credentials fail the suite; they never select mocks or skip scenarios.

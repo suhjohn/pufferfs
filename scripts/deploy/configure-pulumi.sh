@@ -32,11 +32,12 @@ for key in \
   JWT_SECRET \
   TURBOPUFFER_API_KEY \
   MODAL_SECRET_KEY \
-  MODAL_CHUNK_ENDPOINT \
-  MODAL_EMBED_ENDPOINT \
-  MODAL_QUERY_EMBED_ENDPOINT \
-  MODAL_INDEX_SHARD_ENDPOINT
+  MODAL_QUERY_EMBED_ENDPOINT
 do
+  require_env "$key"
+done
+
+for key in MODAL_TRANSFORM_ENDPOINT MODAL_FILE_INDEX_ENDPOINT MODAL_FILE_CPU_INDEX_ENDPOINT; do
   require_env "$key"
 done
 
@@ -61,17 +62,16 @@ pulumi config set aws:region "$DEPLOY_REGION"
 pulumi config set pufferfs:projectName "${PROJECT_NAME:-pufferfs}"
 pulumi config set pufferfs:availabilityZones "$DEPLOY_AZS"
 pulumi config set pufferfs:imageTag "${IMAGE_TAG:-${GITHUB_SHA:-prod}}"
-pulumi config set pufferfs:queueBackend "${PUFFERFS_QUEUE_BACKEND:-sqs}"
 
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
 pulumi config set --secret pufferfs:modalSecretKey "$MODAL_SECRET_KEY"
 
-pulumi config set pufferfs:modalChunkEndpoint "$MODAL_CHUNK_ENDPOINT"
-pulumi config set pufferfs:modalEmbedEndpoint "$MODAL_EMBED_ENDPOINT"
 pulumi config set pufferfs:modalQueryEmbedEndpoint "$MODAL_QUERY_EMBED_ENDPOINT"
-pulumi config set pufferfs:modalIndexShardEndpoint "$MODAL_INDEX_SHARD_ENDPOINT"
+pulumi config set pufferfs:modalTransformEndpoint "$MODAL_TRANSFORM_ENDPOINT"
+pulumi config set pufferfs:modalFileIndexEndpoint "$MODAL_FILE_INDEX_ENDPOINT"
+pulumi config set pufferfs:modalFileCpuIndexEndpoint "$MODAL_FILE_CPU_INDEX_ENDPOINT"
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
 

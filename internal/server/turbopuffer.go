@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,92 +56,11 @@ func NewTPClient(apiKey, region string) *TPClient {
 	return c
 }
 
-// NewTPClientWithURL creates a TP client with a custom base URL (for testing).
-func NewTPClientWithURL(apiKey, baseURL string) *TPClient {
-	return &TPClient{
-		apiKey:       apiKey,
-		region:       "test",
-		httpClient:   &http.Client{Timeout: 120 * time.Second},
-		baseOverride: baseURL,
-	}
-}
-
 func (t *TPClient) baseURL() string {
 	if t.baseOverride != "" {
 		return t.baseOverride
 	}
 	return "https://api.turbopuffer.com"
-}
-
-// namespaceName returns the tp namespace for a root.
-func namespaceName(rootID string) string {
-	return "root-" + rootID
-}
-
-// UpsertRows writes documents to a namespace.
-func (t *TPClient) UpsertRows(ns string, rows []map[string]any, distanceMetric string) error {
-	body := map[string]any{
-		"upsert_rows": rows,
-		"schema": map[string]any{
-			"content": map[string]any{
-				"type":             "string",
-				"full_text_search": true,
-			},
-			"file_path":                 map[string]any{"type": "string"},
-			"chunk_index":               map[string]any{"type": "uint"},
-			"content_hash":              map[string]any{"type": "string"},
-			"file_hash":                 map[string]any{"type": "string"},
-			"file_type":                 map[string]any{"type": "string"},
-			"page_number":               map[string]any{"type": "uint"},
-			"image_path":                map[string]any{"type": "string"},
-			"line_start":                map[string]any{"type": "uint"},
-			"line_end":                  map[string]any{"type": "uint"},
-			"root_id":                   map[string]any{"type": "string"},
-			"generation_id":             map[string]any{"type": "string"},
-			"valid_from_generation":     map[string]any{"type": "string"},
-			"valid_from_generation_seq": map[string]any{"type": "uint"},
-			"valid_to_generation":       map[string]any{"type": "string"},
-			"valid_to_generation_seq":   map[string]any{"type": "uint"},
-		},
-	}
-	if strings.TrimSpace(distanceMetric) != "" {
-		body["distance_metric"] = distanceMetric
-	}
-	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	return err
-}
-
-// PatchRows updates attributes on existing documents without replacing vectors.
-func (t *TPClient) PatchRows(ns string, rows []map[string]any) error {
-	body := map[string]any{
-		"patch_rows": rows,
-	}
-	_, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	return err
-}
-
-// DeleteByFilter deletes documents that match a Turbopuffer filter.
-func (t *TPClient) DeleteByFilter(ns string, filters any, allowPartial bool) (bool, error) {
-	body := map[string]any{
-		"delete_by_filter": filters,
-	}
-	if allowPartial {
-		body["delete_by_filter_allow_partial"] = true
-	}
-	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	if err != nil {
-		if isTPNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-	var result struct {
-		RowsRemaining bool `json:"rows_remaining"`
-	}
-	if len(resp) > 0 {
-		_ = json.Unmarshal(resp, &result)
-	}
-	return result.RowsRemaining, nil
 }
 
 func (t *TPClient) DeleteNamespace(ns string) error {
@@ -181,54 +101,19 @@ func (t *TPClient) DeleteNamespace(ns string) error {
 	return lastErr
 }
 
-// PatchByFilter updates attributes on documents that match a Turbopuffer filter.
-func (t *TPClient) PatchByFilter(ns string, filters any, patch map[string]any, allowPartial bool) (bool, int, error) {
-	body := map[string]any{
-		"patch_by_filter": map[string]any{
-			"filters": filters,
-			"patch":   patch,
-		},
-	}
-	if allowPartial {
-		body["patch_by_filter_allow_partial"] = true
-	}
-	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s", ns), body)
-	if err != nil {
-		if isTPNotFound(err) {
-			return false, 0, nil
-		}
-		return false, 0, err
-	}
-	var result struct {
-		RowsRemaining bool `json:"rows_remaining"`
-		RowsAffected  int  `json:"rows_affected"`
-		RowsPatched   int  `json:"rows_patched"`
-		Count         int  `json:"count"`
-	}
-	if len(resp) > 0 {
-		_ = json.Unmarshal(resp, &result)
-	}
-	affected := result.RowsAffected
-	if affected == 0 {
-		affected = result.RowsPatched
-	}
-	if affected == 0 {
-		affected = result.Count
-	}
-	return result.RowsRemaining, affected, nil
+// TPQuery is the index's wire contract. Attribute inclusion and exclusion are
+// mutually exclusive; exclusion avoids fetching vectors and internal metadata.
+type TPQuery struct {
+	RankBy            any      `json:"rank_by"`
+	Limit             int      `json:"limit"`
+	Filters           any      `json:"filters,omitempty"`
+	IncludeAttributes []string `json:"include_attributes,omitempty"`
+	ExcludeAttributes []string `json:"exclude_attributes,omitempty"`
 }
 
 // Query performs a search query.
-func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeAttrs []string) ([]map[string]any, error) {
-	body := map[string]any{
-		"rank_by":            rankBy,
-		"limit":              limit,
-		"include_attributes": includeAttrs,
-	}
-	if filters != nil {
-		body["filters"] = filters
-	}
-	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
+func (t *TPClient) Query(ctx context.Context, ns string, query TPQuery) ([]map[string]any, error) {
+	resp, err := t.requestContext(ctx, "POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), query)
 	if err != nil {
 		if isTPNotFound(err) {
 			return nil, nil
@@ -246,11 +131,11 @@ func (t *TPClient) Query(ns string, rankBy any, limit int, filters any, includeA
 }
 
 // MultiQuery performs multiple queries (for hybrid search) via the /query endpoint.
-func (t *TPClient) MultiQuery(ns string, queries []map[string]any) ([][]map[string]any, error) {
+func (t *TPClient) MultiQuery(ctx context.Context, ns string, queries []TPQuery) ([][]map[string]any, error) {
 	body := map[string]any{
 		"queries": queries,
 	}
-	resp, err := t.request("POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
+	resp, err := t.requestContext(ctx, "POST", fmt.Sprintf("/v2/namespaces/%s/query", ns), body)
 	if err != nil {
 		if isTPNotFound(err) {
 			return make([][]map[string]any, len(queries)), nil
@@ -266,6 +151,9 @@ func (t *TPClient) MultiQuery(ns string, queries []map[string]any) ([][]map[stri
 	if err := json.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("parsing multi_query response: %w", err)
 	}
+	if len(result.Results) != len(queries) {
+		return nil, errors.New("index returned an incomplete multi-query response")
+	}
 
 	var allRows [][]map[string]any
 	for _, r := range result.Results {
@@ -274,7 +162,7 @@ func (t *TPClient) MultiQuery(ns string, queries []map[string]any) ([][]map[stri
 	return allRows, nil
 }
 
-func (t *TPClient) request(method, path string, body any) ([]byte, error) {
+func (t *TPClient) requestContext(ctx context.Context, method, path string, body any) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -283,7 +171,19 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 	url := t.baseURL() + path
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequest(method, url, bytes.NewReader(data))
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(data))
 		if err != nil {
 			return nil, err
 		}
@@ -293,14 +193,12 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
 		respBody, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if readErr != nil {
 			lastErr = readErr
-			time.Sleep(time.Duration(attempt+1) * time.Second)
 			continue
 		}
 
@@ -311,40 +209,11 @@ func (t *TPClient) request(method, path string, body any) ([]byte, error) {
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			return nil, lastErr
 		}
-		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
-	return nil, lastErr
-}
-
-// HybridSearch performs a hybrid BM25+vector search with reciprocal rank fusion.
-func (t *TPClient) HybridSearch(ns string, queryText string, queryVector []float64, topK int, filters any) ([]map[string]any, error) {
-	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
-
-	queries := []map[string]any{
-		{
-			"rank_by":            []any{"vector", "ANN", queryVector},
-			"limit":              topK,
-			"include_attributes": includeAttrs,
-		},
-		{
-			"rank_by":            []any{"content", "BM25", queryText},
-			"limit":              topK,
-			"include_attributes": includeAttrs,
-		},
-	}
-
-	if filters != nil {
-		for i := range queries {
-			queries[i]["filters"] = filters
-		}
-	}
-
-	resultSets, err := t.MultiQuery(ns, queries)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	return reciprocalRankFusion(resultSets, 60), nil
+	return nil, lastErr
 }
 
 // reciprocalRankFusion merges multiple ranked result lists.

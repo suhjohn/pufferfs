@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -92,31 +91,4 @@ func activeRootIndexNamespaces(namespaces []models.RootIndexNamespace) []models.
 		return active[i].ShardIndex < active[j].ShardIndex
 	})
 	return active
-}
-
-func queueIndexNamespaces(namespaces []models.RootIndexNamespace) []queue.IndexNamespace {
-	active := activeRootIndexNamespaces(namespaces)
-	out := make([]queue.IndexNamespace, 0, len(active))
-	for _, ns := range active {
-		out = append(out, queue.IndexNamespace{
-			Namespace:  ns.Namespace,
-			ShardIndex: ns.ShardIndex,
-			ShardCount: ns.ShardCount,
-		})
-	}
-	return out
-}
-
-func modelIndexNamespaces(namespaces []queue.IndexNamespace, orgID, rootID string) []models.RootIndexNamespace {
-	out := make([]models.RootIndexNamespace, 0, len(namespaces))
-	for _, ns := range namespaces {
-		out = append(out, models.RootIndexNamespace{
-			OrgID:      orgID,
-			RootID:     rootID,
-			Namespace:  ns.Namespace,
-			ShardIndex: ns.ShardIndex,
-			ShardCount: ns.ShardCount,
-		})
-	}
-	return out
 }

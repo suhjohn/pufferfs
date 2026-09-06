@@ -9,6 +9,61 @@ done over HTTP.
 
 ## Conventions
 
+### Processing protocol
+
+The server advertises sync protocol 2. Source packs and per-file registration
+are the only ingestion protocol. The retired upload, upload-bundle and
+root-generation sync/job endpoints return 404. Deploy a matching CLI, API and
+consumer release; never retry through a previous ingestion protocol.
+
+### Per-file multipart source packs
+
+These endpoints require root sync permission and `sync` or `write` scope. They
+do not use root generation IDs and send no source bytes through the API server.
+
+- `POST /roots/{id}/sources/multipart/init`: `{request_id, size}`. Persist the
+  UUID `request_id` before calling. Returns `{object_key, upload_id, part_size,
+  part_count, complete}`; identical retries reuse an active session. Size is
+  1..128 MiB, with 16 MiB parts. Reusing a request ID with another size is 409.
+  Resume checks S3 session status. A confirmed absent session **and** absent
+  completed object returns 409 with `code: source_multipart_expired`. Retain
+  the captured pack bytes and capture ID, durably assign a new upload request
+  UUID, and discard only the expired upload's key/ID/part acknowledgements.
+  A temporary status-check failure is 503; keep the existing upload identity.
+  If S3 completion succeeded but the API acknowledgement was lost, the original
+  frozen part list plus object identity/size can recover `complete: true`.
+- `POST /roots/{id}/sources/multipart/part`: `{object_key, part_number}`.
+  Returns `{url, headers, size}` for a direct PUT. Part numbers start at 1.
+  Retain the returned upload ETag locally. Call again to renew an expired URL
+  before completion starts; do not send API credentials to the signed URL.
+- `POST /roots/{id}/sources/multipart/complete`: `{object_key, parts}` where
+  each ordered part is `{part_number, etag}`. The API persists the exact list
+  before calling S3. Retry the identical list after a transient error. A changed
+  list is 409; once sealed, new part URL requests are rejected. Successful
+  completion returns `{object_key, status: "complete"}`.
+
+Only after completion may captured versions reference this object's extents.
+This API is available for migration development. The opt-in capture CLI uses
+it for new packs of at least 32 MiB and persists part acknowledgements locally.
+The infrastructure aborts incomplete S3 multipart uploads after one day. The
+capture CLI recovers from this using the retained immutable spool. API task
+credentials need `s3:ListMultipartUploadParts` as well as the existing upload,
+object-read and bucket-list permissions. Real AWS/IAM rollout validation remains
+required; the expiry/recovery path is exercised using Compose S3.
+
+### General
+
+`POST /roots/{id}/captured-proofs` accepts `{files: [{path, version_id,
+content_hash}]}` for 1..128 unique paths. It records the requesting user's hash
+proofs for existing current versions without uploading content or creating
+extraction/index work. Root sync permission and applicable path ACLs are required.
+Any stale/deleted version or hash mismatch rejects the entire batch with 409.
+Success returns `{status: "complete", files: <count>}`. Catalog entries from
+`GET /roots/{id}/captured-files` include `proof_current` for the requesting user.
+This preserves the existing client-reported hash contract, not a cryptographic
+proof-of-possession challenge. The opt-in capture CLI hashes uncached or
+unproven local files and uses this endpoint when their bytes match the catalog.
+
 - Base URL is your server URL, e.g. `https://api.example.com`.
 - All request and response bodies are JSON. Responses set
   `Content-Type: application/json`.
@@ -28,7 +83,7 @@ done over HTTP.
 | `401 Unauthorized` | Missing or invalid credentials. |
 | `403 Forbidden` | Authenticated but lacking the required scope or role. |
 | `404 Not Found` | Resource missing, or hidden because the caller cannot read it. |
-| `409 Conflict` | Stale sync base generation, sync already in progress, or a sync targets a root being deleted. |
+| `409 Conflict` | File version conflict, retired source identity, or a deleting root. |
 | `500 Internal Server Error` | Unexpected server-side failure. |
 | `503 Service Unavailable` | Readiness probe failed (database unreachable). |
 
@@ -351,63 +406,12 @@ Response `200`:
 }
 ```
 
-### `POST /roots/{id}/upload?path=<relpath>[&generation_id=<id>]`
-
-Upload a single source file's bytes (normally a large file). Requires `sync`/`write`
-and write-ACL on the path. Body is the raw file. **Max 10 GiB.** Current clients
-use this proxied path only below their direct-multipart threshold. With
-`generation_id`, stored as temporary transport at
-`syncs/<generationID>/sources/files/.capture-<captureID>/<path>`, using a unique
-server-generated capture ID for every request. Without `generation_id`, stored
-at legacy `files/<rootID>/<path>`. The response includes the object key plus
-the SHA-256 and length of the exact accepted body:
-`{"key":"...","content_hash":"sha256:...","size":123}`. The server rejects a
-body whose received length differs from `Content-Length` and deletes that
-partial object. For sufficiently large local text/code sources, the response
-also contains contiguous `source_ranges` with byte offsets, lengths, and global
-starting line numbers.
-
-### Direct multipart source upload
-
-Current clients use four authenticated control-plane calls for standalone files
-at least 64 MiB by default:
-
-1. `POST /roots/{id}/upload/multipart/init` with `generation_id`, `path`, and
-   `size` creates a generation-scoped upload and returns its key, upload ID,
-   part size/count, and text range target.
-2. `POST /roots/{id}/upload/multipart/part` returns a short-lived signed PUT URL
-   for one numbered part and exact content length.
-3. `POST /roots/{id}/upload/multipart/complete` supplies ordered part ETags,
-   the SHA-256, and any planned source ranges. The server completes the object
-   and verifies its stored byte length.
-4. `POST /roots/{id}/upload/multipart/abort` aborts an unfinished session.
-
-The CLI overlaps up to four independently retryable parts per file. At the
-default 16 MiB part size, a maximum-size object uses 640 parts. Abandoned
-sessions are also expired by the artifact bucket lifecycle rule.
-
-### `POST /roots/{id}/upload-bundle?bundle_id=<id>[&generation_id=<id>]`
-
-Upload a packed small-file bundle or a gzip state ref. Requires `sync`/`write`.
-Body is the raw bundle. **Max 1024 MiB.** With `generation_id`, stored as
-temporary transport at `syncs/<generationID>/sources/bundles/<bundleID>`.
-Without `generation_id`, stored at legacy `bundles/<rootID>/<bundleID>`.
-Response `{"key": "..."}`.
-
-All raw upload endpoints stream into bounded-memory multipart object-storage
-uploads. Known oversized bodies are rejected before reading; unknown-length
-bodies are capped while streaming. An oversized body returns `413`, and a body
-that remains idle during a read for two minutes returns `408`. Failed multipart
-uploads are aborted before the error response is returned.
-
 ### `GET /roots/{id}/state`
 
-Return the root's current committed file-state map
+Return the root's historical committed file-state map
 (`{ "<path>": { "size", "content_hash", "mtime" } }`). Requires read access.
-Used by the CLI to diff against the server when local cache is stale and by
-`pufferfs sync wait --include ...` to verify that selected local files are
-present in the latest visible generation with matching size and `sha256:`
-content hash.
+Retained for migration audits. Current file inventory and publication status
+come from `GET /roots/{id}/captured-files`.
 
 ### `POST /roots/{id}/read`
 
@@ -420,8 +424,7 @@ Request:
 ```json
 {
   "path": "docs/manual.pdf",
-  "pages": { "start": 10, "end": 12 },
-  "include_images": true
+  "pages": { "start": 10, "end": 12 }
 }
 ```
 
@@ -439,13 +442,13 @@ may include at most 1000 items.
 
 Behavior:
 
-- Page reads use indexed document chunks with `page_number` / `image_path`.
-- When `include_images` is true, page results include an authenticated
-  `image_url` for `GET /roots/{id}/assets`.
+- Page reads assemble all indexed chunks with the requested `page_number`.
+- Generated image downloads and `include_images` are no longer supported.
 - Line reads require chunks indexed with `line_start` / `line_end`; files synced
   before that metadata existed may need to be resynced.
-- ACL, visible-generation, and user-root content-proof filtering match query
-  behavior.
+- ACL and user-root content-proof filtering match query behavior. Reads use
+  the catalog's published extraction and return 404 for unpublished or deleted
+  files.
 
 Response:
 
@@ -460,206 +463,11 @@ Response:
       "page": 10,
       "page_number": 9,
       "chunk_index": 9,
-      "content": "...page text...",
-      "image_path": "chunks/<root>/docs/manual.pdf.9.jpg",
-      "image_url": "/roots/<root>/assets?key=chunks%2F..."
+      "content": "...page text..."
     }
   ]
 }
 ```
-
-### `GET /roots/{id}/assets?key=<storage-key>`
-
-Download a returned page/image asset. Requires scope `query` / `read`. The key
-must be an active indexed `image_path` under `chunks/<rootID>/`, and the caller
-must be allowed to read the row that references it.
-
-### `POST /roots/{id}/sync`
-
-Submit a sync. See [Sync](#sync) below.
-
-### `POST /roots/{id}/sync/init`
-
-Initialize a sync session. Creates a `SyncJob` and a building `SyncGeneration`
-server-side, returning IDs and a manifest prefix the client uses for subsequent
-artifact uploads. Requires scope `sync` / `write` and write access to the root.
-
-Request:
-
-```json
-{
-  "protocol_version": 1,
-  "base_generation_id": "<current-visible-generation-or-empty>",
-  "base_generation_seq": 7,
-  "total_files": 500
-}
-```
-
-Response `200`:
-
-```json
-{
-  "root_id": "...",
-  "sync_job_id": "...",
-  "generation_id": "...",
-  "generation_seq": 8,
-  "base_generation_id": "...",
-  "base_generation_seq": 7,
-  "manifest_prefix": "syncs/<generation_id>/manifests/"
-}
-```
-
-If `base_generation_id`/`seq` is stale, returns `409` with a sync conflict
-(same shape as [sync conflicts](#sync-conflicts)).
-
-### `POST /roots/{id}/sync/{generation_id}/upload`
-
-Upload a generation-scoped artifact. Requires scope `sync` / `write`. The
-artifact `kind` and `name` are specified as query parameters:
-
-```
-POST /roots/{id}/sync/{generation_id}/upload?kind=manifest&name=000000.jsonl
-POST /roots/{id}/sync/{generation_id}/upload?kind=proof&name=content-proof.json
-POST /roots/{id}/sync/{generation_id}/upload?kind=state&name=state.json.gz
-```
-
-Body is JSONL for manifests, JSON for proofs, and gzipped JSON for state.
-**Max 1024 MiB.** Returns `200` with the stored object key:
-
-```json
-{ "key": "syncs/<generation_id>/manifests/000000.jsonl" }
-```
-
-### `DELETE /roots/{id}/sync/{generation_id}`
-
-Abort an unsubmitted sync session. Marks the generation as `failed` and cleans
-up any artifacts already uploaded under `syncs/<generation_id>/`. Requires scope
-`sync` / `write`. Returns `200 {"status":"aborted"}`.
-
-Use this if the client encounters an upload error before calling
-`POST /roots/{id}/sync` to finalize.
-
-The server also deletes generation-scoped temporary transport/artifact objects
-when finalize is rejected, processing fails, an async job expires incomplete, or
-the generation commits successfully.
-
-### `GET /roots/{id}/sync/status[?job_id=<id>]`
-
-Return a sync job's status. Without `job_id`, returns the latest job for the
-root. Jobs that exceed the server sync timeout are transitioned to `failed`.
-Returns a `SyncJob` object. In-flight statuses include `queued`, `chunking`,
-`indexing`, and `committing`; terminal statuses are
-`completed` and `failed`.
-
-The CLI's filtered wait mode (`pufferfs sync wait --include <glob>`) combines
-this endpoint with `GET /roots/{id}/state`: it polls job status for progress and
-failure, but success is based on committed file state rather than an in-flight
-job phase.
-
-### `GET /roots/{id}/sync/jobs`
-
-Return up to the 20 most recent `SyncJob`s for the root. Requires read access.
-
----
-
-## Sync
-
-### `POST /roots/{id}/sync[?async=true]`
-
-Requires scope `sync` / `write`, write access to the root, and write-ACL on
-every changed path. Request body is a `SyncRequest`:
-
-```json
-{
-  "protocol_version": 1,
-  "generation_id": "<from-sync-init>",
-  "base_generation_id": "<id-or-empty>",
-  "base_generation_seq": 7,
-  "change_refs": ["syncs/<generation>/manifests/000000.jsonl", "..."],
-  "changes": [],
-  "state_ref": "states/<root>/<generation>.json.gz",
-  "content_proof": { "root_hash": "...", "file_hashes": {}, "dir_hashes": {} }
-}
-```
-
-When using the manifest-session flow (recommended for large trees):
-
-1. Call `POST /roots/{id}/sync/init` to get a `generation_id`.
-2. Upload manifest shards and state via `POST /roots/{id}/sync/{generation_id}/upload`.
-3. Submit the finalize request with `generation_id` and `change_refs` pointing to
-   the uploaded manifest shards. `changes` can be empty when `change_refs` is provided.
-
-For backward compatibility, inline `changes` without a `generation_id` still works
-for small syncs.
-
-The CLI's subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`)
-uses the same endpoint. It sends a small change set for selected files but still
-uploads a complete root `state_ref` produced by merging those selected changes
-into the current committed state. API clients must follow the same rule: never
-finalize a partial state map unless the intent is to remove every omitted path
-from the root's next visible generation.
-
-Rules:
-
-- `protocol_version` must equal the server's `SyncProtocolVersion` (`1`), else
-  `400` with `{"error","protocol_version","required_version"}`.
-- At least one of `state` (inline map) or `state_ref` (object key) is required.
-  Inline state is gzipped and persisted by the server as a state ref.
-- `source_key` values for uploaded content should reference
-  `syncs/<generation_id>/sources/files/.capture-<capture_id>/<path>` or
-  `syncs/<generation_id>/sources/bundles/<bundle_id>` for new clients. Legacy
-  generation-scoped file keys without a capture ID, `files/<root_id>/...`, and
-  `bundles/<root_id>/...` refs are still accepted.
-- Central org/user ignore policy is enforced during finalize. New content under
-  ignored paths returns `400`; removals for ignored paths are allowed so policy
-  changes can remove existing indexed rows.
-- `base_generation_id`/`seq` must match the root's current visible generation,
-  otherwise a [sync conflict](#sync-conflicts) is returned.
-- `changes[].status` is one of `ADDED`, `MODIFIED`, `REMOVED`, `MOVED`,
-  `RENAMED`, or `UNCHANGED`. For moves/renames, `old_path` is required.
-
-**Sync modes:**
-
-- Default (synchronous): runs the pipeline inline and returns `200` with a
-  `SyncResponse` only after the generation commits.
-- `?async=true`: returns `202 Accepted` immediately with the job/generation IDs;
-  poll `GET /roots/{id}/sync/status?job_id=...` until `status` is `completed`
-  or `failed`.
-
-Queries read only the latest committed visible generation. While an async sync
-job is still in flight, query results continue to come from the previous
-committed generation.
-
-`SyncResponse`:
-
-```json
-{
-  "root_id": "...", "sync_job_id": "...",
-  "generation_id": "...", "generation_seq": 8,
-  "chunks_added": 12, "chunks_removed": 3, "chunks_moved": 1, "files_processed": 9
-}
-```
-
-### Sync conflicts
-
-If the client's base generation is stale (someone else committed first), the
-server returns `409` with a `SyncConflictResponse`:
-
-```json
-{
-  "error": "stale sync base generation",
-  "client_base_generation_id": "...",
-  "client_base_generation_seq": 7,
-  "current_generation_id": "...",
-  "current_generation_seq": 9
-}
-```
-
-The expected client behavior is to reload remote state, recompute the diff
-against the current generation, and retry. A sync already in progress for the
-root also yields `409`.
-
----
 
 ## ACLs
 
@@ -675,6 +483,9 @@ them. All ACL routes require **admin role** plus the matching ACL scope.
 
 `permission` defaults to `none`; any other value is rejected with `400`.
 Response `201`: the `RootACL`.
+
+Targets accept `user:<id>`, `role:<role>` and `*`; historical bare user IDs
+remain supported. Prefixes are folders and normalized with a trailing slash.
 
 ### `GET /roots/{id}/acls`
 
@@ -709,17 +520,28 @@ Request (`QueryRequest`):
 
 Behavior:
 
-- Results are always constrained to the root's **visible (committed)
-  generation**. A root with no committed generation returns no rows. In-flight
-  or failed syncs are never exposed.
+- Captured files expose only their published extraction. Capturing or extracting
+  a new version leaves the previous publication searchable until the new
+  extraction is published.
+- Search validates candidate paths against the catalog and retries after excluding
+  obsolete/unpublished extractions. Each file's first observed publication is
+  pinned for that request; this is not an atomic whole-root snapshot. Single-file
+  reads likewise retain one file publication through pagination.
 - Sharded roots are queried across all active namespaces concurrently. Multi-root
-  queries repeat that process per root, then merge and truncate globally.
+  queries repeat that process per root, then merge and truncate globally. Both
+  hybrid rank lists are validated before rank fusion.
 - Denied ACL prefixes are filtered out post-query for each root.
 - For `user`-scoped roots, non-admin callers are additionally filtered through
   their stored content proof, so they only receive rows for files they can prove
   they possess.
 - Explicitly requested inaccessible roots return `404`. `all_roots` only selects
   roots the caller can access.
+- If publication validation exhausts its bounds, the response is `503` with code
+  `search_publication_busy` and `Retry-After: 1`, not a successful partial result.
+  Retry after indexing/cleanup progresses. Each root's index/database search has
+  a 30-second budget; its timeout returns `504`. These limits do not cover the
+  earlier query-embedding call or make a multi-root request a 30-second operation.
+- ACL lookup failures return an error rather than granting access.
 
 Response (`QueryResponse`):
 
@@ -738,15 +560,16 @@ Response (`QueryResponse`):
       "content": "...matched text...",
       "file_type": "pdf",
       "page_number": 3,
-      "image_path": "chunks/<root>/...png",
       "score": 0.0123
     }
   ]
 }
 ```
 
-`page_number` and `image_path` are present only for page/image-based results.
-`score` is the Turbopuffer distance (`$dist`); lower is closer for cosine.
+`page_number` is present for page-based results. Image storage paths are not returned.
+For a single ranking in one shard, `score` is the provider's `$dist` (lower for
+cosine distance, higher for BM25). Hybrid or cross-shard fusion uses reciprocal
+rank scores, where higher ranks first. Scores across these modes are not comparable.
 
 ---
 
@@ -827,28 +650,6 @@ Deletes return `409` while sync jobs are active and report
 }
 ```
 
-### FileChange (sync)
-
-```json
-{
-  "path": "string", "absolute_path": "string?",
-  "status": "ADDED|MODIFIED|REMOVED|MOVED|RENAMED|UNCHANGED",
-  "old_path": "string?", "content_hash": "string", "size": 0,
-  "source_key": "string?", "source_offset": 0, "source_length": 0
-}
-```
-
-### SyncJob
-
-```json
-{
-  "id": "string", "org_id": "string", "root_id": "string", "user_id": "string",
-  "status": "running|completed|failed", "total_files": 0, "processed": 0,
-  "errors": [ { "error": "..." } ],
-  "started_at": "RFC3339", "finished_at": "RFC3339?"
-}
-```
-
 ### RootACL
 
 ```json
@@ -861,15 +662,43 @@ Deletes return `409` while sync jobs are active and report
 
 ## Limits
 
-| Limit | Value | Source |
-| --- | --- | --- |
-| Single source object | 10 GiB | proxied or direct multipart source upload |
-| Multipart parts | 10,000 parts; non-final parts 5 MiB–5 GiB | S3 multipart protocol |
-| Bundle upload | 1024 MiB | `handleUploadBundle` |
-| Sync artifact upload | 1024 MiB | `handleSyncArtifactUpload` |
-| Upload body idle timeout | 2 min per blocking read | `streamingUploadBody` |
-| Default `top_k` | 10 | `handleQuery` |
-| Sync job timeout | 30 min (configurable via `PUFFERFS_SYNC_JOB_TIMEOUT`) | `syncJobTimeout` |
-| Namespace shards per root | 1 default, 256 max | `PUFFERFS_TP_NAMESPACE_SHARDS` |
+| Limit | Value |
+| --- | --- |
+| Registered files per capture | 128 |
+| Source pack | 1–128 MiB |
+| Catalog page | 1–1000 files; default 500 |
+| Capture request body | 4 MiB |
+| Read response content | 32 MiB; request smaller ranges above this |
+| Default query top_k | 10 |
+| Namespace shards per root | 1 default, 256 max |
 
-See [configuration.md](./configuration.md) for tunables.
+## Per-file capture catalog
+
+Add `processing=true` to include each file's latest registered extraction status.
+The optional `processing` object contains `extraction_id`, `revision`, `stage`,
+`status`, `attempt_count`, `acknowledged_batches`, and optional
+`mutation_batch_count`. States are `pending`, `running`, `waiting_provider`,
+`complete`, `failed`, `superseded`, `missing`, or `inconsistent`. `complete`
+requires that exact extraction to be published; matching captured/indexed file
+version IDs alone is insufficient when a newer extraction revision is pending.
+`missing`/`inconsistent` indicate incomplete catalog/publication metadata, not
+successful indexing. Raw worker errors, artifact bodies, and provider payloads
+are not exposed. These are live pages, not an atomic whole-root snapshot.
+
+The status option uses the same pagination, root sync permission, and path ACLs
+as ordinary catalog reads. It reads only Postgres. Omit the option (or use
+`processing=false`) for the cheaper capture-bootstrap metadata query.
+
+`GET /roots/{id}/captured-files?limit=500&cursor=<file-id>`
+
+Requires sync/write scope, root sync permission and existing path ACL access.
+Returns `files` and optional `next_cursor`. Limit is 1–1000; default 500. Each
+entry contains `file_id`, `path`, captured `version_id`/`sequence`,
+`indexed_version_id`, `content_hash`, `size`, `deleted` and
+`source_manifest_ref`. No source/chunk/vector bodies are returned.
+
+Continue while `next_cursor` is present, including when `files` is empty after
+ACL filtering. Pagination is a live catalog scan, not a root-wide snapshot;
+version registration must still send each file's `previous_version_id` to
+detect concurrent changes. Tombstones remain available for safe path recreation.
+Capture acceptance does not imply indexing completion.

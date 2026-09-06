@@ -19,10 +19,12 @@ config:
   pufferfs:adminKeyHash:
     secure: "optional-admin-key-sha256"
 
-  pufferfs:modalChunkEndpoint: "https://...chunk-file-endpoint.modal.run"
-  pufferfs:modalEmbedEndpoint: "https://...embed-chunks-endpoint.modal.run"
   pufferfs:modalQueryEmbedEndpoint: "https://...embed-query-endpoint.modal.run"
-  pufferfs:modalIndexShardEndpoint: "https://...index-shard-endpoint.modal.run"
+
+  # Required independently deployed worker endpoints; audit recapture before rollout.
+  pufferfs:modalTransformEndpoint: "https://...pufferfs-file-transform.modal.run"
+  pufferfs:modalFileIndexEndpoint: "https://...pufferfs-file-index-gpu.modal.run"
+  pufferfs:modalFileCpuIndexEndpoint: "https://...pufferfs-file-index-cpu.modal.run"
 
   # CLI release manifest advertised at GET /cli/version.
   pufferfs:cliLatestVersion: "0.6.6"

@@ -31,6 +31,7 @@ type StorageConfig struct {
 	Bucket          string `toml:"bucket"`
 	AccessKeyID     string `toml:"access_key_id"`
 	SecretAccessKey string `toml:"secret_access_key"`
+	SessionToken    string `toml:"session_token"`
 }
 
 // DefaultConfigDir returns ~/.tpfs.
@@ -113,5 +114,8 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("AWS_SECRET_ACCESS_KEY"); v != "" {
 		c.Storage.SecretAccessKey = v
+	}
+	if v := os.Getenv("AWS_SESSION_TOKEN"); v != "" {
+		c.Storage.SessionToken = v
 	}
 }

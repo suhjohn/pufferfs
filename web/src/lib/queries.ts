@@ -9,8 +9,6 @@ export interface Root {
   owner_user_id?: string;
   access?: string[];
   access_source?: string;
-  visible_generation_id: string;
-  visible_generation_seq: number;
   created_at: string;
   updated_at: string;
 }
@@ -51,22 +49,11 @@ export interface APIKey {
   expires_at?: string;
 }
 
-export interface SyncJob {
-  id: string;
-  org_id: string;
-  root_id: string;
-  user_id: string;
-  status: string;
-  total_files: number;
-  processed: number;
-  errors?: unknown;
-  started_at: string;
-  finished_at?: string;
-}
-
 export interface RootSyncSummary {
   root: Root;
-  latestJob?: SyncJob;
+  status: string;
+  indexed: number;
+  total: number;
 }
 
 // The Go API returns JSON `null` for empty slices, so every list query coalesces
@@ -79,23 +66,33 @@ export async function deleteRoot(rootId: string): Promise<void> {
   await api(`/roots/${rootId}`, { method: "DELETE" });
 }
 
-export async function fetchSyncJobs(rootId: string): Promise<SyncJob[]> {
-  return (await api<SyncJob[] | null>(`/roots/${rootId}/sync/jobs`)) ?? [];
-}
-
-export async function fetchRootSyncSummaries(
-  roots: Root[],
-): Promise<RootSyncSummary[]> {
-  const jobsByRoot = await Promise.all(
-    roots.map(async (root) => ({
-      root,
-      jobs: await fetchSyncJobs(root.id).catch(() => []),
-    })),
-  );
-
-  return jobsByRoot.map(({ root, jobs }) => ({
-    root,
-    latestJob: jobs[0],
+export async function fetchRootSyncSummaries(roots: Root[]): Promise<RootSyncSummary[]> {
+  return Promise.all(roots.map(async (root) => {
+    const summary: RootSyncSummary = { root, status: "not synced", indexed: 0, total: 0 };
+    if (!root.access?.includes("sync")) {
+      return { ...summary, status: "sync access required" };
+    }
+    try {
+      let cursor = "";
+      let failed = false;
+      do {
+        const page = await api<{
+          files: { processing?: { status: string } }[];
+          next_cursor?: string;
+        }>(`/roots/${encodeURIComponent(root.id)}/captured-files?processing=true&limit=1000&cursor=${encodeURIComponent(cursor)}`);
+        for (const file of page.files) {
+          summary.total++;
+          if (file.processing?.status === "complete") summary.indexed++;
+          if (file.processing?.status === "failed") failed = true;
+        }
+        cursor = page.next_cursor ?? "";
+      } while (cursor);
+      summary.status = failed ? "failed" : summary.total === 0 ? "not synced"
+        : summary.indexed === summary.total ? "indexed" : "processing";
+    } catch {
+      summary.status = "status unavailable";
+    }
+    return summary;
   }));
 }
 

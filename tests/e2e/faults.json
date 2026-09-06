@@ -1,0 +1,4 @@
+[
+  {"name":"source-upload","listen":"0.0.0.0:8666","upstream":"aws:4566","enabled":true},
+  {"name":"queue-delivery","listen":"0.0.0.0:8667","upstream":"aws:4566","enabled":true}
+]

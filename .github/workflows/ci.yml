@@ -3,55 +3,51 @@ name: ci
 on:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-
-      - name: Test Go packages
-        run: go test ./...
-
-      - name: Set up Node
-        uses: actions/setup-node@v6
+      - name: Build Go applications
+        run: go build ./...
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: |
             infra/pulumi/package-lock.json
             web/package-lock.json
-
       - name: Build Pulumi project
         working-directory: infra/pulumi
-        run: |
-          npm ci
-          npm run build
-
+        run: npm ci && npm run build
       - name: Build web app
         working-directory: web
-        run: |
-          npm ci
-          npm run build
-
+        run: npm ci && npm run build
       - name: Check GoReleaser config
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: v2.16.0
           args: check
+      - name: Check shell and Compose configuration
+        run: |
+          sh -n scripts/install.sh
+          bash -n scripts/test-e2e.sh
+          bash -n scripts/test-e2e-index-recovery.sh
+          bash -n scripts/test-e2e-media.sh
+          docker compose --env-file /dev/null -f compose.e2e.yml config --quiet
+          docker compose --env-file /dev/null -f compose.e2e.yml -f compose.e2e-index-recovery.yml config --quiet
 
-      - name: Check install script syntax
-        run: sh -n scripts/install.sh
+  e2e:
+    needs: build
+    uses: ./.github/workflows/e2e.yml
+    secrets: inherit

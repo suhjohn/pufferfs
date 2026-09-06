@@ -4,7 +4,10 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY pkg/ ./pkg/
+COPY migrations/ ./migrations/
 RUN CGO_ENABLED=0 GOOS=linux go build -o /pufferfs-server ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux go build -o /pufferfs-worker ./cmd/worker
 RUN CGO_ENABLED=0 GOOS=linux go build -o /pufferfs-runtime ./cmd/runtime

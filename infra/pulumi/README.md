@@ -5,11 +5,10 @@ This stack deploys PufferFS to AWS:
 - ECR repository and locally built app image.
 - VPC with public ALB subnets, private ECS subnets, and NAT egress.
 - ECS/Fargate API service behind an Application Load Balancer.
-- ECS/Fargate worker services for `chunk`, `index`, and `commit`.
+- ECS/Fargate consumer services for `transform` and `index`.
 - Isolated SQS FIFO queues and dead-letter queues for each worker stage.
 - CloudWatch alarms for queue age and dead-letter messages; set
   `pufferfs:alarmTopicArn` to route alarms to an SNS topic.
-- 3 private NATS JetStream nodes retained as a rollback backend.
 - S3 artifact bucket.
 - Secrets Manager entries for `DATABASE_URL`, `JWT_SECRET`,
   `TURBOPUFFER_API_KEY`, `MODAL_SECRET_KEY`, and optional
@@ -17,6 +16,24 @@ This stack deploys PufferFS to AWS:
 - CloudWatch logs.
 
 Postgres is not created here. Provide `pufferfs:databaseUrl` for the database you want the services to use.
+
+## Processing deployment
+
+Only the per-file/SQS topology exists. Each ECS consumer defaults to 16 concurrent
+jobs (maximum 64). Independent `sync-file-transform.fifo` and
+`sync-file-index.fifo` queues have DLQs and queue-age alarms. Their logical
+resource names preserve the implemented per-file deployment identity.
+
+Provide `modalTransformEndpoint`, `modalFileIndexEndpoint`,
+`modalFileCpuIndexEndpoint` and `modalQueryEmbedEndpoint`.
+Deploy the six Modal apps separately; this stack does not deploy them or
+provision their credentials. Postgres is metadata/recovery storage, not a queue.
+
+An upgrade from the old stack removes chunk/commit queues and services, NATS
+services, EFS and service-discovery resources. Drain/account for old work,
+audit source recapture, preserve needed backups and review the Pulumi preview
+before an approved deployment. Code retirement does not authorize applying
+these changes or deleting live cloud data.
 
 ## Requirements
 
@@ -213,8 +230,6 @@ aws s3 sync dist/client/ "s3://$(cd ../infra/pulumi && pulumi stack output webBu
 
 ## Notes
 
-- Production defaults to managed SQS via `pufferfs:queueBackend=sqs`. NATS is
-  private to the VPC and can be selected as a rollback with
-  `pufferfs:queueBackend=nats`.
+- Managed SQS is required for both processing stages.
 - The S3 bucket is managed by this stack. Set `pufferfs:forceDestroyBucket=true` only for throwaway environments.
 - The default topology includes one NAT Gateway. For a lower-cost dev stack, we can add a config flag to run tasks in public subnets instead.

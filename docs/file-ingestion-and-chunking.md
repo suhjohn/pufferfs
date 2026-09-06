@@ -1,261 +1,66 @@
-# File Ingestion and Chunking
-
-This document describes how PufferFS turns source files into searchable text
-chunks, page images, embeddings, and index rows.
-
-## Entry Points
-
-During sync, the Go sync pipeline classifies each changed file and chooses one
-of two chunking paths:
-
-- Local chunking for ordinary text/code files.
-- Modal chunking for formats that need conversion, parsing, OCR, vision, or
-  media processing.
-
-The main routing code is:
-
-- `internal/server/sync_pipeline.go`: calls local chunking or Modal chunking.
-- `internal/server/local_chunker.go`: local text/code chunking.
-- `modal/app.py`: Modal orchestration, document rendering, embedding, and API
-  endpoints.
-- `modal/chunkers.py`: format-specific extraction and chunking logic.
-
-Every output chunk has:
-
-- `id`: stable hash of `root_id:file_path` plus `chunk_index`.
-- `root_id`
-- `file_path`
-- `absolute_path`, when available.
-- `chunk_index`
-- `content`: the text that is embedded and searched.
-- `content_hash`
-- `file_type`
-- `page_number`, for page-based document chunks.
-- `image_path`, for rendered document pages and standalone images.
-
-## Format Detection
-
-The Go server detects rich formats before choosing local or Modal chunking:
-
-- Documents: `.pdf`, `.doc`, `.docx`, `.ppt`, `.pptx`
-- Images: `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`, `.bmp`
-- Email, calendar, contacts: `.eml`, `.msg`, `.vcf`, `.ics`
-- Audio: `.mp3`, `.wav`
-- Video: `.mp4`, `.mov`
-
-Unknown files return `auto`. Modal then has a broader extension map for code,
-configuration, Markdown, and plain text:
-
-- Code/config: Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C#,
-  Ruby, PHP, Swift, Kotlin, Scala, shell, Lua, Perl, R, SQL, HTML, CSS, SCSS,
-  YAML, TOML, JSON, XML, Proto, GraphQL, Terraform, HCL, Dockerfile, Makefile.
-- Text/docs: `.md`, `.rst`, `.txt`.
-- Unknown extensions fall back to text.
-
-Local chunking has its own code extension map. One important special case:
-`.svg` is locally chunkable as text when the server handles it locally, even
-though Modal classifies SVG as an image.
-
-## Document Files
-
-Supported document inputs:
-
-- PDF: `.pdf`
-- Word: `.doc`, `.docx`
-- PowerPoint: `.ppt`, `.pptx`
-
-Pipeline:
-
-1. DOC/DOCX and PPT/PPTX files are converted to PDF with headless LibreOffice.
-2. PDF pages are rendered directly to compressed JPEG images with `frpdf-renderer`.
-   Rendering defaults to
-   `PUFFERFS_MODAL_PAGE_IMAGE_DPI=160` and
-   `PUFFERFS_MODAL_PAGE_IMAGE_JPEG_QUALITY=75`.
-3. Native PDF text is extracted separately as the first text source when available.
-4. Rendered page JPEGs are uploaded to S3-compatible storage in parallel,
-   capped per chunking container by
-   `PUFFERFS_MODAL_PAGE_IMAGE_UPLOAD_CONCURRENCY`.
-5. Pages with no native text are submitted to the shared Modal
-   `page_image_to_text` function pool for LLM OCR. Pages with native PDF text
-   skip LLM OCR. Global OCR fan-out is capped by
-   `PUFFERFS_MODAL_OCR_MAX_CONTAINERS`, not by each document.
-   `PUFFERFS_VLLM_MODELS` uses `provider/model:weight` entries to split
-   traffic by quota capacity, for example Fireworks, OpenAI, and Gemini models
-   in one weighted pool. If Gemini OCR fails, including recitation blocks, OCR
-   retries that page with `openai/gpt-5.4-nano`.
-6. If no configured image provider key is available, PufferFS falls back to
-   native extracted text.
-7. The rendered page JPEG is uploaded to S3-compatible storage at:
-
-   ```text
-   chunks/<root_id>/<file_path>.<page_number>.jpg
-   ```
-
-Chunking rule:
-
-- One chunk per page.
-- `chunk_index` equals the zero-based page number.
-- `page_number` is set.
-- `image_path` points to the rendered page image.
-
-## Standalone Images
-
-Supported image inputs:
-
-- `.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`, `.bmp`
-
-Pipeline:
-
-1. The original image is uploaded to S3-compatible storage at:
-
-   ```text
-   chunks/<root_id>/<file_path>
-   ```
-
-2. Gemini vision extracts text from the image or describes visual content.
-3. If Gemini is unavailable or returns empty text, PufferFS stores a placeholder
-   like `[Image: path/to/file.png]`.
-
-Chunking rule:
-
-- One chunk per image.
-- `chunk_index` is `0`.
-- `image_path` points to the uploaded original image.
-
-## Audio and Video
-
-Supported media inputs:
-
-- Audio: `.mp3`, `.wav`
-- Video: `.mp4`, `.mov`
-
-Pipeline:
-
-1. ffprobe reads the duration.
-2. ffmpeg cuts the file into overlapping segments.
-3. Each segment is uploaded to Gemini as audio/video.
-4. Gemini returns a semantic description for retrieval. The prompt asks for
-   useful search-index text, not a verbatim transcript.
-5. The indexed content is prefixed with the segment time range.
-
-Chunking rule:
-
-- Window size: 6 minutes.
-- Overlap: 1 minute.
-- Effective stride: 5 minutes.
-- Content format:
-
-  ```text
-  [00:00-06:00] <segment description>
-  ```
-
-If Gemini is unavailable or all segment descriptions are empty, PufferFS emits
-one placeholder chunk such as `[Audio file: path/to/file.mp3]` or
-`[Video file: path/to/file.mp4]`.
-
-## Email, Calendar, and Contacts
-
-Supported structured inputs:
-
-- Email: `.eml`, `.msg`
-- Contacts: `.vcf`
-- Calendar/tasks: `.ics`
-
-Email pipeline:
-
-1. Extract headers: Subject, From, To, Cc, Date.
-2. Extract body text.
-3. Prefer `text/plain` parts.
-4. If only HTML is available, strip HTML to text.
-5. Ignore attachments.
-6. Prefix each chunk with the selected headers.
-
-Contact pipeline:
-
-1. Split VCF content into `BEGIN:VCARD` / `END:VCARD` records.
-2. Parse fields such as name, organization, title, email, phone, address, URL,
-   note, and categories.
-3. Convert each record into friendly text.
-
-Calendar pipeline:
-
-1. Split ICS content into `VEVENT` or `VTODO` records.
-2. Parse fields such as title, start, end, due date, location, description,
-   organizer, attendees, status, and URL.
-3. Convert each record into friendly text.
-
-Chunking rule:
-
-- Email bodies are split into roughly 2000-character chunks with overlap,
-  while repeating the header prelude in each chunk.
-- VCF/ICS records are packed into chunks up to roughly 2000 characters.
-- Oversized records are split with roughly 200 characters of overlap.
-
-## Code, Markdown, and Plain Text
-
-Modal code chunking:
-
-- 300 lines per chunk.
-- 50 lines of overlap.
-- Used for code/config file types known to Modal.
-
-Modal Markdown/text chunking:
-
-- Split by Markdown headings matching `^#{1,6}\s`.
-- Split oversized sections into 2000-character chunks.
-- 200 characters of overlap.
-
-Local Go chunking:
-
-- Used when a file can be handled without Modal.
-- Code chunks target 3000 characters with 1000 characters of overlap on line
-  boundaries.
-- Text/Markdown chunks target 2400 characters with 400 characters of overlap.
-- Text boundaries prefer paragraph breaks, then line breaks, then sentence
-  endings, then spaces.
-
-The local and Modal chunk sizes are not identical. The local path optimizes for
-avoiding Modal round trips for ordinary text/code, while Modal owns richer
-format extraction.
-
-Subset sync (`pufferfs sync --root <path> --include <glob> [--exclude <glob>]`)
-uses the same classification and chunking rules for the selected paths only. The
-CLI merges the selected changes into the current committed root state before
-finalize, so unselected files keep their existing indexed rows and generation
-visibility.
-
-## Embedding
-
-After extraction and chunking, PufferFS embeds each chunk's `content` with:
-
-```text
-nomic-ai/nomic-embed-text-v1.5
-```
-
-Chunk contents are embedded with a `search_document:` prefix. Query text is
-embedded separately with a `search_query:` prefix. Embeddings are normalized and
-stored as vectors for Turbopuffer hybrid/vector search.
-
-For queued vector syncs, Modal downloads each compressed chunk artifact with
-bounded retries, embeds at most 64 pending rows at a time in FP16, and writes
-rows directly to Turbopuffer in batches bounded by 512 rows and 8 MiB. Partial
-buffers flush at end of shard;
-there is no intermediate vector/index-row object in storage. The in-process
-fallback retains the embedding cache keyed by model version and content hash.
-
-## Search Index Rows
-
-Index rows include the chunk text, vector, path metadata, content hashes,
-file type, optional line metadata, optional page/image metadata, and generation
-validity metadata.
-Turbopuffer stores `content` with full-text search enabled and `vector` for ANN
-search.
-
-Queries can use:
-
-- Full-text search.
-- Vector search.
-- Hybrid search.
-
-Results include the original chunk metadata, so document/image results can
-refer back to page numbers and stored page images when those fields exist.
+# File ingestion and chunking
+
+For deployed roles and queue ownership, start with
+[architecture](architecture-and-functionality.md). Every format uses the same
+capture → transform → index lifecycle; there are no session-specific handlers
+or path/content recipe systems.
+
+## Transformation contracts
+
+| Input | Computation | Chunk location |
+| --- | --- | --- |
+| Plain text, code, JSONL/NDJSON | Stream UTF-8; group lines up to 6,000 bytes; split oversized lines at UTF-8 boundaries | Original byte and line offsets |
+| PDF | Render every page locally; Gemini 3.5 Flash-Lite Batch extracts Markdown from the image | Page number |
+| Word and presentations | Headless LibreOffice → temporary PDF → the same image parsing | Page/slide number |
+| Images | Decode/render individual frames/pages → Gemini Batch → Markdown | Frame/page number |
+| Spreadsheets | Parse sheet cells into bounded text chunks, retaining cell addresses | Sheet and cell/row metadata |
+| Email, calendar, contacts | Parse structured fields into text → bounded chunks | Format-specific metadata |
+| Audio and video | FFmpeg decodes the first audio track into temporary 16 kHz mono WAV clips → Gemini Batch transcription | Global start/end seconds; request-scoped speakers |
+
+Documents never bypass image parsing using a native text layer. Converted
+PDFs, rendered images and media clips are temporary local files, never S3
+artifacts. Original input bytes—including original images—remain in source packs.
+
+JSONL is ordinary text: no JSON projection, parsing/re-serialization or special
+session recognition. Concatenating text chunks reproduces the original UTF-8
+bytes, including whitespace and CRLF. Unknown extensions try this text path;
+invalid UTF-8 and binary data fail explicitly.
+
+Current media clips are 60 seconds. Persisted older extraction revisions retain
+their original clip boundaries for retries. Video indexes its audio, not visual
+frames. Silent video cannot produce a transcript. Gemini speaker diarization is
+best-effort: labels are scoped to one request, and distinct voices may merge.
+
+## Supported extensions
+
+- Documents: PDF; DOC, DOCX, DOCM, DOT, DOTX, DOTM, RTF, ODT, OTT, FODT.
+- Presentations: PPT, PPTX, PPTM, PPS, PPSX, PPSM, POT, POTX, POTM, ODP, OTP, FODP.
+- Spreadsheets: XLS, XLSX, XLSM, XLSB, XLT, XLTX, XLTM, ODS, OTS, FODS, CSV, TSV.
+- Images: PNG, JPG, JPEG, JFIF, WebP, GIF, BMP, TIFF, TIF, HEIC, HEIF, AVIF, SVG, APNG, JP2, JPX, J2K.
+- Audio: MP3, WAV, M4A, M4B, AAC, FLAC, OGG, OGA, Opus, AIF, AIFF, WMA, AMR.
+- Video: MP4, MOV, M4V, MKV, WebM, AVI, MPEG, MPG, WMV, FLV, 3GP, MTS, M2TS, MXF.
+- Structured: EML, MSG, VCF, ICS.
+- Text: UTF-8 text/code/configuration formats, JSON, JSONL, NDJSON, Markdown and logs.
+
+The format table in [extraction.py](../modal/extraction.py) is authoritative.
+Extension support does not promise every codec/container variant. Encrypted,
+corrupt, unsupported or undecodable files fail without manufacturing content.
+Office macros are not executed; spreadsheet values do not imply recalculation.
+
+## Durable outputs
+
+Each extraction stores compressed ordered JSONL chunks in S3:
+`chunk_index`, `content`, `content_hash`, and `location`.
+The collector validates provider results before publication. Missing or invalid
+results retry only the affected requests.
+
+The index worker reads chunks, reuses compatible cached vectors or runs Nomic,
+then persists replayable index mutation packs in S3. It applies those mutations
+to Turbopuffer and advances the file catalog only after all batches succeed.
+Postgres contains metadata and references, never vector bodies.
+
+Original source packs, chunks and vectors have independent safe retention:
+current published/captured versions and retry/append dependencies remain reachable.
+Root deletion and obsolete artifacts are cleaned by the scheduled reconciler.
+
+See [E2E evidence and limitations](../tests/e2e/README.md).

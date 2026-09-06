@@ -246,7 +246,7 @@ func resetFollowTimer(timer *time.Timer, pending *bool, delay time.Duration) {
 }
 
 func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions) (bool, error) {
-	result, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, true, os.Stdout)
+	result, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, os.Stdout)
 	if err == nil {
 		failures.Reset()
 		return result != nil && len(result.dirtyPaths) > 0, nil

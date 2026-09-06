@@ -1,0 +1,98 @@
+# Native preparation/API/consumers run in Compose; GPU index and query run on
+# real Modal. Postgres, S3 and SQS are isolated cloud resources provisioned by
+# tests/e2e/cloud_index.py. No emulator endpoints or production queues here.
+x-environment: &environment
+  DATABASE_URL: ${DATABASE_URL:?Isolated database required}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Scoped temporary credentials required}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Scoped temporary credentials required}
+  AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:?Scoped temporary credentials required}
+  AWS_REGION: ${AWS_REGION:?}
+  AWS_DEFAULT_REGION: ${AWS_REGION:?}
+  AWS_BUCKET_NAME: ${AWS_BUCKET_NAME:?Isolated bucket required}
+  AWS_EC2_METADATA_DISABLED: 'true'
+  SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+  PUFFERFS_SQS_TRANSFORM_QUEUE_URL: ${PUFFERFS_SQS_TRANSFORM_QUEUE_URL:?}
+  PUFFERFS_SQS_INDEX_QUEUE_URL: ${PUFFERFS_SQS_INDEX_QUEUE_URL:?}
+  PUFFERFS_TP_NAMESPACE_SHARDS: '2'
+  MODAL_TRANSFORM_ENDPOINT: http://transform:8080/
+  MODAL_FILE_CPU_INDEX_ENDPOINT: http://index-cpu:8080/
+  MODAL_FILE_INDEX_ENDPOINT: ${MODAL_FILE_INDEX_ENDPOINT:?}
+  MODAL_QUERY_EMBED_ENDPOINT: ${MODAL_QUERY_EMBED_ENDPOINT:?}
+  MODAL_SECRET_KEY: ${MODAL_SECRET_KEY:?}
+  PUFFERFS_MODAL_ENDPOINT_AUTH_KEY: ${MODAL_SECRET_KEY:?}
+  PUFFERFS_ADMIN_KEY: ${PUFFERFS_ADMIN_KEY:?}
+  JWT_SECRET: ${JWT_SECRET:?}
+  ENABLE_EMAIL_LOGIN: 'false'
+  POSTHOG_ENABLED: 'false'
+  TURBOPUFFER_API_KEY: ${TURBOPUFFER_API_KEY:?}
+  TURBOPUFFER_API_URL: ${TURBOPUFFER_API_URL:-https://gcp-us-central1.turbopuffer.com}
+
+x-worker: &worker
+  image: ${COMPOSE_PROJECT_NAME}-worker
+  build: {context: ., dockerfile: tests/e2e/Dockerfile, target: worker}
+  environment: *environment
+  init: true
+  depends_on:
+    api-ready: {condition: service_completed_successfully}
+
+services:
+  api:
+    image: ${COMPOSE_PROJECT_NAME}-go
+    build: .
+    environment: *environment
+  api-ready:
+    <<: *worker
+    entrypoint: [python, /e2e/ready.py, 'http://api:8080/healthz']
+    depends_on:
+      api: {condition: service_started}
+  transform:
+    <<: *worker
+    command: [transform]
+    environment:
+      <<: *environment
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+  index-cpu:
+    <<: *worker
+    command: [index-cpu]
+  reconciler:
+    <<: *worker
+    command: [reconciler]
+  transform-consumer:
+    image: ${COMPOSE_PROJECT_NAME}-go
+    environment:
+      <<: *environment
+      PUFFERFS_PROCESS: worker
+      PUFFERFS_WORKER_STAGE: transform
+      PUFFERFS_WORKER_CONCURRENCY: '2'
+    depends_on:
+      transform: {condition: service_healthy}
+  index-consumer:
+    image: ${COMPOSE_PROJECT_NAME}-go
+    environment:
+      <<: *environment
+      PUFFERFS_PROCESS: worker
+      PUFFERFS_WORKER_STAGE: index
+      PUFFERFS_WORKER_CONCURRENCY: '2'
+    depends_on:
+      api-ready: {condition: service_completed_successfully}
+  e2e:
+    build: {context: ., dockerfile: tests/e2e/Dockerfile, target: runner}
+    profiles: [test]
+    environment:
+      <<: *environment
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?}
+      PUFFERFS_SERVER_URL: http://api:8080
+      PUFFERFS_E2E_TIMEOUT_SECONDS: ${PUFFERFS_E2E_TIMEOUT_SECONDS:-1200}
+    volumes:
+      - ./tests/e2e/artifacts:/artifacts
+      - cloud-state:/state
+      - cloud-cli:/root/.tpfs
+
+volumes:
+  cloud-state:
+  cloud-cli:

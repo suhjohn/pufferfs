@@ -6,12 +6,98 @@ This repository uses three deployment surfaces:
 - Pulumi for AWS infrastructure, backend image builds, and ECS task definitions.
 - S3 + CloudFront for the static web app and installer script.
 
+This checkout contains only per-file processing. Before upgrading an older
+fleet, stop/drain legacy writers and queues, audit historical recapture and
+publication coverage, apply migrations, and deploy matching CLI/API/consumer
+and Modal roles. There is no mixed-generation read fallback.
+
+Deploy `transform_app.py`, `collector_app.py`, `index_cpu_app.py`,
+`index_gpu_app.py`, `query_app.py`, and `reconciliation_app.py` independently.
+The query embedder receives only endpoint authentication. Keep any existing
+endpoint alive until every caller has switched; deleted source code does not
+stop an already deployed application.
+
+Pulumi now removes the old chunk/commit queues and NATS/EFS/service-discovery
+resources on upgrade. Review its preview and retain recoverable data before an
+approved deployment. No production deployment was performed by code retirement.
+
+`python3 tests/e2e/cloud_query.py` starts a temporary, uniquely named Modal app
+with the actual query definition, exercises invalid credentials and concurrent
+synthetic HTTP queries, and stops the app on exit. It requires Modal credentials
+and `MODAL_SECRET_KEY` matching the configured endpoint-auth secret. It does not
+deploy, change the production API endpoint or ingest personal files.
+
+`uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_index.py`
+exercises actual AWS S3/SQS and independently running Modal bulk/query GPU apps
+with the production CLI/API/consumer processes in Docker Compose. It provisions
+a disposable database/login on the configured Postgres server (requires
+CREATE ROLE and CREATE DATABASE), an isolated bucket and FIFO queues, and
+temporary Modal secrets. The host needs IAM-user credentials capable of STS
+federation and resource provisioning; runtime workers receive only a dedicated
+database login and two-hour AWS credentials scoped to that run's bucket/queues.
+Set `AWS_REGION` explicitly. `DATABASE_URL` must retain `sslmode=verify-full`.
+If the database router needs a suffix on connection usernames, set
+`PUFFERFS_CLOUD_DB_LOGIN_SUFFIX` explicitly (for example `.BRANCH_ID` on
+PlanetScale). It is appended to the generated login, not the SQL role name;
+the script checks that login before provisioning AWS or Modal resources.
+No production app, endpoint, queue or IAM policy is replaced. The scenario checks
+multiple GPU embedding batches, durable vectors/mutations, vector/FTS/hybrid
+search, append-cache reuse and public multipart upload/resume/completion/cleanup.
+This does not prove the deployed ECS role's permissions or historical cutover.
+On cleanup failure, the script prints the location of a protected recovery file
+and retains resources needed for recovery; it does not drop an uncleaned catalog.
+
+Worker images set `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`. Binary
+libpq's bundled OpenSSL can otherwise miss the container trust store even when
+Python's TLS connections succeed. A read-only real-database check reproduced
+that failure and succeeded with the installed CA bundle, without disabling
+hostname/certificate verification. This follows PostgreSQL's documented
+[system trust-store configuration](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT).
+Use a deliberately configured CA bundle for private certificate authorities;
+do not work around trust failures by setting `sslmode=disable` or `require`.
+
+The bulk role also accepts `PUFFERFS_INDEX_GPU_APP_NAME`,
+`PUFFERFS_INDEX_GPU_ENDPOINT_LABEL` and `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS`.
+Defaults preserve the production names and 16-container limit; isolated cloud
+validation supplies unique names and a one-container limit. Each bulk container
+has two CPUs and 4 GiB RAM in addition to its configured GPU.
+
+Apply migrations through the API deployment before starting updated ingestion
+workers or reconciliation. The new embedding cache requires migration 037,
+obsolete-extraction cleanup requires 038, and source-pack reachability/ownership
+requires 039 plus the cascade-order fix in 040; query embedding does not depend on these tables. Audit unaccepted
+pre-039 uploads (which lack uploader identity) and finish legacy extent backfill
+before enabling pack retirement on existing catalogs. Review the ordinary
+30-day source/cache/artifact retention defaults before
+enabling the updated reconciler. Its external Modal principal needs S3 delete,
+listing and multipart-abort permissions for the documented artifact prefixes.
+An ECS task-role policy does not establish those permissions for Modal.
+The Compose suite verifies fresh-database builds; it does not by itself validate
+a populated production upgrade, AWS bucket versioning/physical erasure, or the
+external worker principal's effective IAM permissions. No rollout is implied by
+a successful local suite.
+
+`python3 scripts/deploy/audit-worker-cloud.py` checks STS identity, S3 object/
+multipart listing and configured SQS attributes from a temporary Modal CPU
+sandbox using `PUFFERFS_WORKER_SECRET_NAME` (default `pufferfs-workers`). It is
+a read-only deployment diagnostic, not a full E2E suite: it never reads source
+bodies, receives messages, creates queues or changes IAM. Missing secrets or
+queue configuration fail explicitly. Write/abort/delete permissions and the
+complete GPU index path still require a staging production-path run.
+
+The 2026-09-05 audit found the default worker secret missing in `main`. A
+separate diagnostic against the existing legacy secret confirmed S3 listings
+but found both new queue URL variables absent. Do not silently use the legacy
+secret as the new worker deployment configuration; provision the intended
+principal and queues explicitly. See the implementation ledger for exact evidence.
+
 ## Branch and PR Gates
 
 Enable branch protection on `main` and require the `ci` workflow before merge.
 The `ci` workflow runs on pull requests and pushes to `main`:
 
-- `go test ./...`
+- `go build ./...`
+- Docker Compose E2E against real model/search providers (review-gated `e2e` environment)
 - `npm ci && npm run build` in `infra/pulumi`
 - `npm ci && npm run build` in `web`
 - `goreleaser check`
@@ -19,7 +105,18 @@ The `ci` workflow runs on pull requests and pushes to `main`:
 
 ## GitHub Environments
 
-Create GitHub Environments named `staging` and `production`.
+Create GitHub Environments named `staging`, `production` and `e2e`. The `e2e`
+environment requires reviewers plus dedicated `GEMINI_API_KEY` and
+`TURBOPUFFER_API_KEY` secrets. Do not approve untrusted PR code for these secrets.
+
+With both provider credentials in the shell environment, run
+`python3 scripts/deploy/configure-e2e-secrets.py --repo OWNER/REPO` to configure
+the E2E environment. A newly created environment requires manual approval by
+the authenticated GitHub user (self-approval is allowed). Existing review rules
+are preserved; an existing environment without reviewers is rejected before
+uploading any secrets. Values travel over stdin, never command arguments/logs.
+This command neither dispatches nor approves a workflow. Credentials copied
+from `.env` are not independently issued CI-only provider keys.
 
 For `production`, enable required reviewers so deploys need approval before they
 can touch AWS.
@@ -46,12 +143,10 @@ PUFFERFS_ADMIN_KEY_HASH
 POSTHOG_KEY
 STRIPE_SECRET_KEY
 STRIPE_WEBHOOK_SECRET
-MODAL_CHUNK_ENDPOINT
-MODAL_EMBED_ENDPOINT
+MODAL_TRANSFORM_ENDPOINT
+MODAL_FILE_INDEX_ENDPOINT
+MODAL_FILE_CPU_INDEX_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
-MODAL_INDEX_SHARD_ENDPOINT
-MODAL_OFFICE_TO_PDF_ENDPOINT
-MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
 ```
 
 Modal endpoints may be stored as variables instead of secrets.
@@ -107,27 +202,18 @@ names remain accepted as aliases.
 Required Modal endpoint variables, unless stored as secrets:
 
 ```text
-MODAL_CHUNK_ENDPOINT
-MODAL_EMBED_ENDPOINT
+MODAL_TRANSFORM_ENDPOINT
+MODAL_FILE_INDEX_ENDPOINT
+MODAL_FILE_CPU_INDEX_ENDPOINT
 MODAL_QUERY_EMBED_ENDPOINT
-MODAL_INDEX_SHARD_ENDPOINT
 ```
 
-The public Modal conversion endpoints are optional for direct callers and are
-not required by the API server:
-
-```text
-MODAL_OFFICE_TO_PDF_ENDPOINT
-MODAL_PDF_TO_PAGE_IMAGES_ENDPOINT
-```
-
-Add `TURBOPUFFER_API_KEY` and the object-store/provider credentials to the Modal
-secret named by `PUFFERFS_MODAL_SECRET_NAME`. Create the separate Modal secret
-named by `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` with one entry:
-`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, set to the same value as the API server's
-`MODAL_SECRET_KEY`. The shared value authorizes shard indexing and direct calls
-to the conversion endpoints; the Turbopuffer key lets index shards write their
-bounded batches directly.
+Create the worker secret named by `PUFFERFS_WORKER_SECRET_NAME` with
+`DATABASE_URL`, `GEMINI_API_KEY`, `TURBOPUFFER_API_KEY`, object-store credentials,
+`AWS_BUCKET_NAME`, `AWS_REGION` and both SQS queue URLs. Create the endpoint-auth
+secret named by `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` with
+`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, matching the API/consumer
+`MODAL_SECRET_KEY`. The query deployment uses the endpoint-auth secret.
 
 Optional CLI release variables:
 
@@ -150,7 +236,8 @@ repo:suhjohn/pufferfs:environment:production
 
 The role needs permission to manage the resources in `infra/pulumi`, including
 ECR, ECS, ELB, CloudFront, S3, ACM, IAM role attachments, Secrets Manager,
-CloudWatch Logs, EFS, VPC resources, and service discovery.
+CloudWatch Logs, SQS and VPC resources. An upgrade also needs permission to
+retire the previous EFS and service-discovery resources.
 
 Store that role ARN as the environment secret `AWS_ROLE_ARN`.
 

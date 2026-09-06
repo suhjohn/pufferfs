@@ -12,20 +12,25 @@ PufferFS stores derived copies and metadata across four systems:
 
 | System | Holds | Plane |
 | --- | --- | --- |
-| Object storage (S3-compatible) | Temporary source transport copies, packed transport bundles, gzipped root state snapshots, sync artifacts, and rendered page/OCR images. | Data |
-| PostgreSQL | Orgs, users, API key hashes, roots, ACLs, sync jobs/generations, root state refs, embedding cache, content proofs, subscriptions. | Control |
-| Turbopuffer | Search index rows: extracted content, path metadata, optional line/page metadata, file/chunk hashes, file type, generation metadata, and embedding vectors. | Index |
-| Modal | Transient compute for chunking, OCR/vision extraction, and embeddings. | Compute |
+| Object storage (S3-compatible) | Immutable originals and source manifests, extracted text chunks, vector packs and replayable mutations | Data |
+| PostgreSQL | Tenants, credentials, permissions, file versions, extraction/work metadata, source extents, provider submissions and cleanup records | Control |
+| Turbopuffer | Searchable text, file/chunk/location metadata and optional vectors | Index |
+| Transformation/index/query workers | Temporary captured data, rendered images, audio clips and inference buffers | Compute |
+| Gemini Batch | Temporary image/audio inputs and parsing/transcription outputs | External provider |
 
-Object storage object layout (by prefix): `syncs/<generationID>/sources/...`
-for temporary source transport, legacy `files/<rootID>/...` and
-`bundles/<rootID>/...` transport for older clients, durable
-`states/<rootID>/...`, generation artifacts under `syncs/<generationID>/...`,
-and rendered/indexed media under `chunks/<rootID>/...`.
+Source and extraction keys are scoped by organization and root. Signed uploads
+authorize one immutable object, not a bucket or a tenant prefix. Multipart
+completion verifies upload identity and size. Registration checks uploader,
+capture, path permissions and exact reusable source extents under the root lock;
+knowledge of another file's packed-object key is insufficient.
 
-> **Implication for reviewers:** extracted document content and temporary source
-> bytes leave the local machine. Treat the server, its object store, Postgres,
-> Turbopuffer, and Modal as in-scope for any data-sensitivity assessment.
+Generated images and converted media never enter S3. Original images are
+ordinary retained input bytes. Gemini uploads have explicit cleanup tracking;
+a missing provider file is not reported as a confirmed deletion without evidence.
+
+Originals and derived data leave the device. Include S3, Postgres, worker
+hosting, Gemini and Turbopuffer in the data-sensitivity assessment. Current heads,
+retries and append dependencies prevent premature retention cleanup.
 
 ## Authentication
 
@@ -110,11 +115,10 @@ subtract from, not add to, the role/scope/root-grant baseline.
 ### 5. Content-proof filtering (user roots)
 
 For `user`-scoped roots, non-admin callers' query results are additionally
-filtered through a stored **content proof** (a Merkle map of file paths →
-hashes). A row is returned only if its `file_path`/`file_hash` appears in the
-caller's proof. This means that even with a shared or cloned index, a user only
-sees results for files they can prove they currently possess. Org roots
-intentionally skip this filter (results are shared by membership + ACL).
+filtered by per-file path/hash proof records. Missing, deleted or mismatched
+proofs do not fall back to old root-wide proofs. This is a client-reported hash
+check, not a cryptographic proof-of-possession challenge; all tenant/root/path
+authorization still applies. Org roots skip this additional hash filter.
 
 ## Secret-file handling
 
@@ -137,45 +141,37 @@ credentials.json  service-account*.json
 
 PufferFS also honors built-in ignores, server-managed org/user ignore policies,
 `.gitignore`, `.tpfsignore` (root), and `~/.tpfs/.tpfsignore` (global). Org/user
-policies are enforced by the server during sync finalize; local ignore files are
+policies are enforced by the server during capture registration; local ignore files are
 CLI-side filtering for the syncing machine.
 
 ## Query-result correctness and isolation
 
-- Every query is constrained to the root's **visible (committed) generation**.
-  If the visible generation cannot be resolved, the query **fails closed**
-  (returns an error) rather than serving unfiltered rows. A root with no
-  committed generation matches no rows, so in-flight or failed syncs are never
-  exposed.
-- Tenancy is enforced by org scoping on every root lookup
-  (`id.OrgID == root.OrgID`); cross-org reads are not possible through the normal
-  API.
-- Multi-root query applies the same visible-generation, ACL, and content-proof
-  filters independently to each selected root before globally merging results.
-- **Any new query path must reapply the visible-generation filter and the ACL /
-  content-proof filters** — these are the load-bearing isolation controls.
+Search validates ranked candidates against per-file catalog publications before
+returning results; rejected extraction identities are excluded and re-queried.
+Reads pin one publication across pagination. Pending/superseded mutations are
+not exposed. There is no root-generation or mixed-schema fallback.
+
+Tenant/root permissions, deny-prefix ACLs and user-root hash proofs still apply
+to every result, including multi-root retrieval. Permission or publication
+lookup failures fail closed.
 
 ## Data lifecycle and deletion
 
-- **Root deletion** (`DELETE /roots/{id}` or admin equivalent) removes the
-  root's Turbopuffer namespaces and all S3 objects under `files/`, `bundles/`,
-  `states/`, `chunks/`, and `syncs/` for its generations, plus the local
-  `~/.tpfs/roots/<id>/` cache. **It does not delete source files on the user's
-  machine.**
-- Root deletion atomically stops active sync jobs before cleanup. Queued and
-  late worker deliveries re-run root cleanup, preventing work that was already
-  in flight from restoring deleted objects or index namespaces. Organization
-  and user deletion remain blocked while their sync jobs are active.
-- Deletion does not imply deletion of already exported logs, provider billing
-  records, or vendor-side operational records unless those are covered by the
-  deployment's separate retention process.
-- Temporary source transport and sync artifacts are deleted when a generation
-  commits, is aborted, is rejected during finalize, fails during processing, or
-  expires as incomplete. Failed or partial generations never become visible to
-  queries.
-- The embedding cache is keyed by org + model version + content hash; bumping
-  `PUFFERFS_EMBEDDING_MODEL_VERSION` effectively invalidates stale cached
-  vectors.
+Root deletion marks the root unavailable and preserves cleanup targets before
+removing catalog rows. Late worker writes are handled by repeated scheduled
+cleanup of source/extraction/mutation prefixes and index namespaces. Historical
+prefixes remain on the cleanup list for upgrades. Local source files are never
+deleted by PufferFS root deletion.
+
+Original packs, derived artifacts and vector caches have separate retention
+policies. Current heads, append dependencies, retry state, active leases and
+provider submissions protect reachable data from premature cleanup.
+Postgres stores vector locators, not vector bodies.
+
+S3 versioning, backups, provider operational records and already-exported logs
+need their own retention policy; API deletion alone is not evidence of physical
+erasure from those systems. See [configuration](configuration.md) and
+[E2E limitations](../tests/e2e/README.md).
 
 ## Vulnerability disclosure
 
@@ -209,9 +205,9 @@ These are real, in-code limitations to account for in a deployment:
       leave it unset to disable admin routes entirely.
 - [ ] Restrict CORS origins to your known web app origin(s).
 - [ ] Issue API keys with explicit least-privilege scopes; rotate regularly.
-- [ ] Lock down the object store, Postgres, and Turbopuffer to the server's
-      network; they hold temporary source transport, extracted content, durable
-      state, and vectors.
+- [ ] Restrict object-store, Postgres and Turbopuffer access to authorized
+      API/worker roles and scoped signed uploads; they hold originals,
+      extracted content, catalog records and vectors.
 - [ ] Use ACL deny prefixes and ignore files for sensitive subtrees; do not rely
       on filename-based secret filtering alone.
 - [x] Harden OAuth state before exposing Google login publicly.

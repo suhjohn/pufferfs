@@ -12,6 +12,7 @@ dist/
 /vendor/
 coverage.out
 *.coverprofile
+/tests/e2e/artifacts/
 
 # Python
 __pycache__/

@@ -64,13 +64,11 @@ func main() {
 		log.Println("POSTHOG_ENABLED is set but POSTHOG_KEY is missing; analytics disabled")
 	}
 
-	if q, backend, err := queue.NewFromEnv(context.Background(), false); err != nil {
-		log.Fatalf("connecting to sync queue: %v", err)
-	} else if q != nil {
-		defer q.Close()
-		srv.SetQueue(q)
-		log.Printf("sync queue enabled: backend=%s", backend)
+	q, err := queue.NewFromEnv(context.Background())
+	if err != nil {
+		log.Fatalf("connecting to SQS: %v", err)
 	}
+	srv.SetQueue(q)
 
 	// JWT secret
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))

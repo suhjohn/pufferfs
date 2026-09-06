@@ -7,14 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -23,27 +21,15 @@ import (
 
 // Client wraps an S3 client with the configured bucket.
 type Client struct {
-	s3       *s3.Client
-	presign  *s3.PresignClient
-	uploader streamUploader
-	aborter  multipartAborter
-	bucket   string
+	s3      *s3.Client
+	presign *s3.PresignClient
+	bucket  string
 }
 
 type CompletedPart struct {
 	PartNumber int32
 	ETag       string
 }
-
-type streamUploader interface {
-	Upload(context.Context, *s3.PutObjectInput, ...func(*manager.Uploader)) (*manager.UploadOutput, error)
-}
-
-type multipartAborter interface {
-	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
-}
-
-const multipartAbortTimeout = 30 * time.Second
 
 // NewClient creates a new S3-compatible storage client.
 func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
@@ -64,7 +50,7 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 			credentials.NewStaticCredentialsProvider(
 				cfg.AccessKeyID,
 				cfg.SecretAccessKey,
-				"",
+				cfg.SessionToken,
 			),
 		))
 	}
@@ -80,24 +66,30 @@ func NewClient(cfg appconfig.StorageConfig) (*Client, error) {
 			o.UsePathStyle = true
 		}
 	})
-	uploader := newStreamUploader(client)
 
-	return &Client{s3: client, presign: s3.NewPresignClient(client), uploader: uploader, aborter: client, bucket: cfg.Bucket}, nil
+	return &Client{s3: client, presign: s3.NewPresignClient(client), bucket: cfg.Bucket}, nil
 }
 
-func (c *Client) CreateMultipartUpload(ctx context.Context, key, contentType string) (string, error) {
-	out, err := c.s3.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
-		Bucket:      &c.bucket,
-		Key:         &key,
-		ContentType: &contentType,
-	})
+// PresignImmutablePut signs a create-only upload. Reusing the URL cannot
+// overwrite a source pack after a version has started referencing it.
+func (c *Client) PresignImmutablePut(ctx context.Context, key string, size int64) (string, map[string][]string, error) {
+	result, err := c.presign.PresignPutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key),
+		ContentLength: aws.Int64(size), ContentType: aws.String("application/octet-stream"),
+		IfNoneMatch: aws.String("*"),
+	}, func(options *s3.PresignOptions) { options.Expires = 15 * time.Minute })
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	if out.UploadId == nil || *out.UploadId == "" {
-		return "", errors.New("object storage returned an empty multipart upload id")
+	return result.URL, result.SignedHeader, nil
+}
+
+func (c *Client) ObjectSize(ctx context.Context, key string) (int64, error) {
+	result, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(c.bucket), Key: aws.String(key)})
+	if err != nil {
+		return 0, err
 	}
-	return *out.UploadId, nil
+	return aws.ToInt64(result.ContentLength), nil
 }
 
 func (c *Client) PresignMultipartPart(ctx context.Context, key, uploadID string, partNumber int32, contentLength int64, expires time.Duration) (string, map[string][]string, error) {
@@ -119,51 +111,6 @@ func (c *Client) PresignMultipartPart(ctx context.Context, key, uploadID string,
 	return out.URL, out.SignedHeader, nil
 }
 
-func (c *Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, size int64, parts []CompletedPart) error {
-	completed := make([]types.CompletedPart, len(parts))
-	for i, part := range parts {
-		completed[i] = types.CompletedPart{PartNumber: &part.PartNumber, ETag: &part.ETag}
-	}
-	_, err := c.s3.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
-		Bucket:   &c.bucket,
-		Key:      &key,
-		UploadId: &uploadID,
-		MultipartUpload: &types.CompletedMultipartUpload{
-			Parts: completed,
-		},
-	})
-	if err != nil {
-		// Completion is idempotent from PufferFS's perspective. If S3 committed
-		// the object but its response was lost, a retry reports NoSuchUpload.
-		// This key is unique to the capture attempt, so matching size is enough
-		// to recognize that successful prior completion.
-		if matches, _, _ := c.objectHasSize(ctx, key, size); matches {
-			return nil
-		}
-		return err
-	}
-	matches, actual, err := c.objectHasSize(ctx, key, size)
-	if err != nil {
-		return err
-	}
-	if !matches {
-		_ = c.DeleteMany(ctx, []string{key})
-		return fmt.Errorf("completed multipart object size %d does not match expected size %d", actual, size)
-	}
-	return nil
-}
-
-func (c *Client) objectHasSize(ctx context.Context, key string, size int64) (bool, int64, error) {
-	out, err := c.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &c.bucket, Key: &key})
-	if err != nil {
-		return false, -1, err
-	}
-	if out.ContentLength == nil {
-		return false, -1, errors.New("object storage returned no content length")
-	}
-	return *out.ContentLength == size, *out.ContentLength, nil
-}
-
 func (c *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
 	_, err := c.s3.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   &c.bucket,
@@ -173,53 +120,11 @@ func (c *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string)
 	return err
 }
 
-func newStreamUploader(client manager.UploadAPIClient, options ...func(*manager.Uploader)) *manager.Uploader {
-	baseOptions := []func(*manager.Uploader){func(u *manager.Uploader) {
-		// Keep the checksum behavior consistent with the S3 client. This also
-		// avoids requiring optional checksum support from S3-compatible stores.
-		u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-		// Bound per-request buffering and let UploadStream abort explicitly so
-		// cleanup can use a context that survives client disconnection.
-		u.Concurrency = 2
-		u.LeavePartsOnError = true
-	}}
-	return manager.NewUploader(client, append(baseOptions, options...)...)
-}
-
 // Upload puts an object into S3.
 func (c *Client) Upload(ctx context.Context, key string, data []byte, contentType string) error {
-	return c.UploadStream(ctx, key, bytes.NewReader(data), contentType)
-}
-
-func (c *Client) UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error {
-	_, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
-		Bucket:      &c.bucket,
-		Key:         &key,
-		Body:        body,
-		ContentType: &contentType,
+	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &c.bucket, Key: &key, Body: bytes.NewReader(data), ContentType: &contentType,
 	})
-	if err == nil {
-		return nil
-	}
-
-	var multipartFailure manager.MultiUploadFailure
-	if !errors.As(err, &multipartFailure) || multipartFailure.UploadID() == "" || c.aborter == nil {
-		return err
-	}
-
-	// Request cancellation is a common upload failure mode, but using the
-	// canceled request context for cleanup would leave orphaned multipart
-	// parts. Preserve context values while giving the abort a short deadline.
-	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartAbortTimeout)
-	defer cancel()
-	_, abortErr := c.aborter.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
-		Bucket:   &c.bucket,
-		Key:      &key,
-		UploadId: aws.String(multipartFailure.UploadID()),
-	})
-	if abortErr != nil {
-		return errors.Join(err, fmt.Errorf("aborting failed multipart upload: %w", abortErr))
-	}
 	return err
 }
 
@@ -234,24 +139,6 @@ func (c *Client) Download(ctx context.Context, key string) ([]byte, error) {
 }
 
 // Open streams an object, optionally limited to a byte range.
-func (c *Client) Open(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {
-	if offset < 0 || length < 0 {
-		return nil, fmt.Errorf("invalid object range offset=%d length=%d", offset, length)
-	}
-	input := &s3.GetObjectInput{Bucket: &c.bucket, Key: &key}
-	if length > 0 {
-		if offset > math.MaxInt64-length+1 {
-			return nil, fmt.Errorf("invalid object range offset=%d length=%d", offset, length)
-		}
-		rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
-		input.Range = &rangeHeader
-	}
-	resp, err := c.s3.GetObject(ctx, input)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
-}
 
 // DeleteMany removes objects from S3 in one batch.
 func (c *Client) DeleteMany(ctx context.Context, keys []string) error {

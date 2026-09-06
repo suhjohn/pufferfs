@@ -6,8 +6,8 @@ PufferFS is a filesystem sync and search service for agent workflows. Sync a
 local folder into a hosted hybrid index, then query it from the CLI, web
 console, scripts, or agents.
 
-It is built around roots: named filesystem snapshots with access control,
-generation tracking, and hybrid BM25/vector retrieval.
+It is built around roots: named collections of versioned files with access control,
+independent publication, and hybrid BM25/vector retrieval.
 
 Try it at [pufferfs.com](https://pufferfs.com).
 
@@ -62,16 +62,17 @@ pufferfs sync --root /Users/me/handbook --force
 pufferfs sync --root /Users/me/handbook --include "policies/**" --force
 ```
 
-Query the latest committed generation:
+Wait for indexing, then query published files:
 
 ```sh
+pufferfs sync wait --root handbook
 pufferfs query "paid time off" --root handbook --top-k 2
 ```
 
 Read a known file slice:
 
 ```sh
-pufferfs read docs/policy.pdf --root handbook --pages 10:12 --output-dir ./pages
+pufferfs read docs/policy.pdf --root handbook --pages 10:12
 pufferfs read src/main.go --root repo --lines 200:400
 ```
 
@@ -89,13 +90,12 @@ pufferfs service start handbook
 pufferfs service status handbook
 ```
 
-Useful root and job commands:
+Useful root and status commands:
 
 ```sh
-pufferfs sync ./handbook --name handbook --background
+pufferfs sync ./handbook --name handbook
 pufferfs sync status --root handbook
-pufferfs sync jobs --root handbook
-pufferfs sync wait --root handbook --job-id <sync-job-id>
+pufferfs sync wait --root handbook
 pufferfs sync wait --root /Users/me/handbook --include "policies/**" --exclude "policies/archive/**"
 pufferfs root current
 pufferfs root delete --yes
@@ -106,13 +106,12 @@ pufferfs root delete handbook --yes
 
 PufferFS depends on a few external systems:
 
-- PostgreSQL for users, organizations, roots, jobs, and metadata.
-- S3-compatible object storage for temporary source transport, durable state
-  snapshots, rendered file artifacts, and sync artifacts.
+- PostgreSQL for tenants, permissions, versioned file catalogs and recovery metadata.
+- S3 for immutable originals, text chunks, vector packs and replayable mutations.
 - Turbopuffer for hybrid search namespaces.
-- Modal for chunking, embeddings, OCR/image processing, and direct vector-shard indexing.
-- Amazon SQS FIFO (production) or NATS JetStream (self-hosted) for the optional
-  queued sync pipeline.
+- Separate Modal transformation, collector, index, query and reconciliation apps.
+- Two required SQS FIFO queues, with independent transform/index consumers and DLQs.
+- Gemini 3.5 Flash-Lite Batch for document/image parsing and media transcription.
 - Email-code and Google OAuth for hosted web login.
 - AWS SES for transactional login-code and invite email.
 - Stripe for optional billing.
@@ -127,7 +126,7 @@ Use PufferFS in one of two ways:
   [pufferfs.com](https://pufferfs.com). Install the CLI, run `pufferfs init`,
   and sync/query roots without operating the backend.
 - **Self-hosted**: run the Go API server with PostgreSQL, S3-compatible object
-  storage, Turbopuffer, Modal endpoints, and optional queue workers. The web
+  storage, Turbopuffer, Modal endpoints, and both SQS consumers. The web
   console, installer, and workers can be deployed alongside the API when needed.
 
 Self-hosted production setup is documented in
@@ -138,10 +137,10 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 
 - `cmd/pufferfs`: CLI for sync, query, root management, services, and upgrades.
 - `cmd/server`: API server.
-- `cmd/worker`: queued sync stage worker.
-- `internal/server`: handlers, DB access, sync pipeline, Modal, Turbopuffer,
+- `cmd/worker`: SQS transform/index consumer.
+- `internal/server`: handlers, DB access, capture/catalog, Modal, Turbopuffer,
   billing, and cleanup.
-- `modal`: Python Modal app and file chunkers.
+- `modal`: independently deployed processing roles.
 - `web`: web console and docs site.
 - `infra/pulumi`: AWS production infrastructure.
 
@@ -149,13 +148,12 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 
 | Type | Strategy |
 | --- | --- |
-| Code | Line-based chunks |
-| Markdown / text | Section-based chunks |
-| PDF | Page rendering and Gemini vision extraction |
-| DOCX / PPTX | Convert to PDF, then page rendering and Gemini vision extraction |
-| Images | Captioning/OCR pipeline |
-| Email / calendar / contacts | Structured text extraction |
-| Audio / video | Overlapping time-window descriptions |
+| Text/code/JSONL | Bounded byte-preserving line chunks |
+| PDF, Word, presentations | Local page images → Gemini Batch Markdown |
+| Spreadsheets | Sheet/cell-preserving extraction |
+| Images | Frame/page images → Gemini Batch Markdown |
+| Email/calendar/contacts | Structured text extraction |
+| Audio/video | Temporary audio clips → Gemini Batch transcript; best-effort speaker labels |
 
 See [File Ingestion and Chunking](docs/file-ingestion-and-chunking.md) for the
 full format, extraction, and chunking process.

@@ -2,11 +2,9 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
+	"io/fs"
 	"os"
 	"strings"
 	"time"
@@ -15,27 +13,19 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	// pgx stdlib adapter for goose
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/migrations"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
 // DB wraps the Postgres connection pool.
 type DB struct {
 	pool *pgxpool.Pool
-}
-
-type SyncGeneration struct {
-	ID                string
-	OrgID             string
-	RootID            string
-	SyncJobID         string
-	BaseGenerationID  string
-	Seq               int64
-	BaseGenerationSeq int64
 }
 
 type RootStateRecord struct {
@@ -58,8 +48,6 @@ type EmailLoginChallenge struct {
 	ConsumedAt     *time.Time
 }
 
-var errSyncInProgress = errors.New("sync already in progress for root")
-var errStaleSyncBase = errors.New("sync base generation is stale")
 var errRootDeleting = errors.New("root is being deleted")
 
 // NewDB creates a connection pool and runs migrations.
@@ -83,331 +71,25 @@ func (db *DB) Close() {
 }
 
 func (db *DB) runMigrations(databaseURL string) error {
-	migrationsDir := os.Getenv("MIGRATIONS_DIR")
-	if migrationsDir == "" {
-		migrationsDir = "migrations"
+	var schema fs.FS = migrations.Files
+	if dir := os.Getenv("MIGRATIONS_DIR"); dir != "" {
+		schema = os.DirFS(dir)
 	}
-
-	// Check if migrations directory exists; fall back to inline if not
-	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
-		return db.migrateFallback()
-	}
-
 	gooseDB, err := goose.OpenDBWithDriver("pgx", databaseURL)
 	if err != nil {
 		return fmt.Errorf("goose open: %w", err)
 	}
 	defer gooseDB.Close()
-
-	if err := goose.Up(gooseDB, migrationsDir); err != nil {
-		return fmt.Errorf("goose up: %w", err)
+	locker, err := lock.NewPostgresSessionLocker()
+	if err != nil {
+		return err
 	}
-	return nil
-}
-
-// migrateFallback runs inline SQL migrations when goose files aren't available.
-func (db *DB) migrateFallback() error {
-	_, err := db.pool.Exec(context.Background(), `
-		CREATE TABLE IF NOT EXISTS organizations (
-			id         TEXT PRIMARY KEY,
-			name       TEXT NOT NULL,
-			slug       TEXT NOT NULL UNIQUE,
-			external_id TEXT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		ALTER TABLE organizations ADD COLUMN IF NOT EXISTS external_id TEXT;
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_organizations_external_id ON organizations(external_id) WHERE external_id IS NOT NULL;
-
-		CREATE TABLE IF NOT EXISTS users (
-			id          TEXT PRIMARY KEY,
-			email       TEXT NOT NULL UNIQUE,
-			name        TEXT NOT NULL DEFAULT '',
-			avatar_url  TEXT NOT NULL DEFAULT '',
-			provider    TEXT NOT NULL DEFAULT 'google',
-			provider_id TEXT NOT NULL DEFAULT '',
-			external_id TEXT,
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		ALTER TABLE users ADD COLUMN IF NOT EXISTS external_id TEXT;
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_users_external_id ON users(external_id) WHERE external_id IS NOT NULL;
-
-		CREATE TABLE IF NOT EXISTS user_identities (
-			id             TEXT PRIMARY KEY,
-			user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			provider       TEXT NOT NULL,
-			provider_id    TEXT NOT NULL DEFAULT '',
-			email          TEXT NOT NULL,
-			email_verified BOOLEAN NOT NULL DEFAULT TRUE,
-			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_id
-			ON user_identities(provider, provider_id)
-			WHERE provider_id <> '';
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_email
-			ON user_identities(provider, email)
-			WHERE provider_id = '';
-		CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id);
-
-		CREATE TABLE IF NOT EXISTS email_login_challenges (
-			id               TEXT PRIMARY KEY,
-			email            TEXT NOT NULL,
-			code_hash        TEXT NOT NULL,
-			flow             TEXT NOT NULL DEFAULT 'web',
-			cli_redirect_uri TEXT NOT NULL DEFAULT '',
-			attempts         INT NOT NULL DEFAULT 0,
-			max_attempts     INT NOT NULL DEFAULT 5,
-			request_ip_hash  TEXT NOT NULL DEFAULT '',
-			user_agent_hash  TEXT NOT NULL DEFAULT '',
-			created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			expires_at       TIMESTAMPTZ NOT NULL,
-			consumed_at      TIMESTAMPTZ
-		);
-		CREATE INDEX IF NOT EXISTS idx_email_login_challenges_email_created
-			ON email_login_challenges(email, created_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_email_login_challenges_expires
-			ON email_login_challenges(expires_at);
-
-		CREATE TABLE IF NOT EXISTS org_members (
-			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			role      TEXT NOT NULL DEFAULT 'viewer',
-			joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, user_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS groups (
-			id          TEXT PRIMARY KEY,
-			org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			name        TEXT NOT NULL,
-			external_id TEXT NOT NULL DEFAULT '',
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE(org_id, name)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_org_external
-			ON groups(org_id, external_id)
-			WHERE external_id <> '';
-
-		CREATE TABLE IF NOT EXISTS group_members (
-			org_id    TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			group_id  TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-			user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, group_id, user_id)
-		);
-		CREATE INDEX IF NOT EXISTS idx_group_members_user
-			ON group_members(org_id, user_id);
-
-		CREATE TABLE IF NOT EXISTS org_invites (
-			id                 TEXT PRIMARY KEY,
-			org_id             TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			email              TEXT NOT NULL,
-			role               TEXT NOT NULL DEFAULT 'viewer',
-			invited_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_org_invites_org_email ON org_invites(org_id, email);
-		CREATE INDEX IF NOT EXISTS idx_org_invites_email ON org_invites(email);
-
-		CREATE TABLE IF NOT EXISTS org_ignore_policies (
-			org_id             TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
-			patterns           TEXT NOT NULL DEFAULT '',
-			updated_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-			updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-
-		CREATE TABLE IF NOT EXISTS user_ignore_policies (
-			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			patterns   TEXT NOT NULL DEFAULT '',
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, user_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS api_keys (
-			id         TEXT PRIMARY KEY,
-			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			key_hash   TEXT NOT NULL UNIQUE,
-			name       TEXT NOT NULL DEFAULT '',
-			scopes     TEXT[] NOT NULL DEFAULT '{}',
-			expires_at TIMESTAMPTZ,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-
-			CREATE TABLE IF NOT EXISTS roots (
-				id          TEXT PRIMARY KEY,
-				org_id      TEXT REFERENCES organizations(id) ON DELETE CASCADE,
-			name        TEXT NOT NULL,
-			source_path TEXT NOT NULL,
-			vector_disabled BOOLEAN NOT NULL DEFAULT FALSE,
-			scope       TEXT NOT NULL DEFAULT 'org',
-			owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-			visible_generation_id TEXT NOT NULL DEFAULT '',
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		ALTER TABLE roots ADD COLUMN IF NOT EXISTS vector_disabled BOOLEAN NOT NULL DEFAULT FALSE;
-		ALTER TABLE roots ADD COLUMN IF NOT EXISTS visible_generation_id TEXT NOT NULL DEFAULT '';
-		ALTER TABLE roots ADD COLUMN IF NOT EXISTS scope TEXT NOT NULL DEFAULT 'org';
-		ALTER TABLE roots ADD COLUMN IF NOT EXISTS owner_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
-		ALTER TABLE roots ADD COLUMN IF NOT EXISTS deleting_at TIMESTAMPTZ;
-		CREATE INDEX IF NOT EXISTS idx_roots_owner ON roots(owner_user_id) WHERE owner_user_id IS NOT NULL;
-
-			CREATE TABLE IF NOT EXISTS root_index_namespaces (
-				id          TEXT PRIMARY KEY,
-				org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-				root_id     TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-				namespace   TEXT NOT NULL UNIQUE,
-				shard_index INT NOT NULL,
-				shard_count INT NOT NULL,
-				created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-				retired_at  TIMESTAMPTZ,
-				UNIQUE(root_id, shard_index)
-			);
-			CREATE INDEX IF NOT EXISTS idx_root_index_namespaces_root ON root_index_namespaces(root_id, shard_index);
-			CREATE INDEX IF NOT EXISTS idx_root_index_namespaces_org ON root_index_namespaces(org_id);
-			INSERT INTO root_index_namespaces (id, org_id, root_id, namespace, shard_index, shard_count)
-			SELECT
-				'rin_' || substr(md5(r.org_id || ':' || r.id || ':0'), 1, 24),
-				r.org_id,
-				r.id,
-				'org-' || r.org_id || '-root-' || r.id,
-				0,
-				1
-			FROM roots r
-			WHERE r.org_id IS NOT NULL
-			ON CONFLICT (root_id, shard_index) DO NOTHING;
-
-			CREATE TABLE IF NOT EXISTS root_states (
-			root_id    TEXT PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
-			state      JSONB NOT NULL DEFAULT '{}',
-			state_ref  TEXT NOT NULL DEFAULT '',
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-		ALTER TABLE root_states ADD COLUMN IF NOT EXISTS state_ref TEXT NOT NULL DEFAULT '';
-
-		CREATE TABLE IF NOT EXISTS embedding_cache (
-			org_id        TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			model_version TEXT NOT NULL DEFAULT '',
-			content_hash  TEXT NOT NULL,
-			embedding     BYTEA NOT NULL,
-			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, model_version, content_hash)
-		);
-		ALTER TABLE embedding_cache ADD COLUMN IF NOT EXISTS model_version TEXT NOT NULL DEFAULT '';
-		DO $$
-		BEGIN
-			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'embedding_cache_pkey')
-				AND NOT EXISTS (
-					SELECT 1 FROM pg_constraint c
-					JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
-					WHERE c.conname = 'embedding_cache_pkey' AND a.attname = 'model_version'
-				) THEN
-				ALTER TABLE embedding_cache DROP CONSTRAINT embedding_cache_pkey;
-				ALTER TABLE embedding_cache ADD PRIMARY KEY (org_id, model_version, content_hash);
-			END IF;
-		END $$;
-
-		CREATE TABLE IF NOT EXISTS root_acls (
-			id          TEXT PRIMARY KEY,
-			org_id      TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			root_id     TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-			path_prefix TEXT NOT NULL DEFAULT '/',
-			grant_to    TEXT NOT NULL,
-			permission  TEXT NOT NULL DEFAULT 'read',
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-
-		CREATE TABLE IF NOT EXISTS root_grants (
-			id             TEXT PRIMARY KEY,
-			org_id         TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			root_id        TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-			principal_type TEXT NOT NULL,
-			principal_id   TEXT NOT NULL,
-			permissions    TEXT[] NOT NULL DEFAULT '{}',
-			created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			UNIQUE(root_id, principal_type, principal_id)
-		);
-		CREATE INDEX IF NOT EXISTS idx_root_grants_org_principal
-			ON root_grants(org_id, principal_type, principal_id);
-		CREATE INDEX IF NOT EXISTS idx_root_grants_root
-			ON root_grants(root_id);
-
-		CREATE TABLE IF NOT EXISTS sync_jobs (
-			id           TEXT PRIMARY KEY,
-			org_id       TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			root_id      TEXT REFERENCES roots(id) ON DELETE SET NULL,
-			user_id      TEXT NOT NULL REFERENCES users(id),
-			status       TEXT NOT NULL DEFAULT 'pending',
-			total_files  INT NOT NULL DEFAULT 0,
-			processed    INT NOT NULL DEFAULT 0,
-			errors       JSONB NOT NULL DEFAULT '[]',
-			started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			finished_at  TIMESTAMPTZ
-		);
-		ALTER TABLE sync_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-		ALTER TABLE sync_jobs ALTER COLUMN root_id DROP NOT NULL;
-		DO $$
-		BEGIN
-			IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sync_jobs_root_id_fkey') THEN
-				ALTER TABLE sync_jobs DROP CONSTRAINT sync_jobs_root_id_fkey;
-			END IF;
-			ALTER TABLE sync_jobs
-				ADD CONSTRAINT sync_jobs_root_id_fkey
-				FOREIGN KEY (root_id) REFERENCES roots(id) ON DELETE SET NULL;
-		END $$;
-		CREATE TABLE IF NOT EXISTS sync_job_shards (
-			job_id          TEXT NOT NULL REFERENCES sync_jobs(id) ON DELETE CASCADE,
-			stage           TEXT NOT NULL,
-			shard_index     INT NOT NULL,
-			status          TEXT NOT NULL DEFAULT 'completed',
-			files_processed INT NOT NULL DEFAULT 0,
-			started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			finished_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (job_id, stage, shard_index)
-		);
-		CREATE INDEX IF NOT EXISTS idx_sync_job_shards_job_stage_status ON sync_job_shards(job_id, stage, status);
-
-		CREATE TABLE IF NOT EXISTS sync_generations (
-			id                 TEXT PRIMARY KEY,
-			org_id             TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			root_id            TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-			sync_job_id        TEXT REFERENCES sync_jobs(id) ON DELETE SET NULL,
-			base_generation_id TEXT NOT NULL DEFAULT '',
-			seq                BIGSERIAL,
-			base_generation_seq BIGINT NOT NULL DEFAULT 0,
-			status             TEXT NOT NULL DEFAULT 'building',
-			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			visible_at         TIMESTAMPTZ
-		);
-		ALTER TABLE sync_generations ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
-		ALTER TABLE sync_generations ADD COLUMN IF NOT EXISTS base_generation_seq BIGINT NOT NULL DEFAULT 0;
-		CREATE UNIQUE INDEX IF NOT EXISTS sync_generations_seq_idx ON sync_generations(seq);
-
-		CREATE TABLE IF NOT EXISTS content_proofs (
-			org_id     TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
-			user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			root_id    TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
-			root_hash  TEXT NOT NULL DEFAULT '',
-			proof      JSONB NOT NULL DEFAULT '{}',
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (org_id, user_id, root_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS subscriptions (
-			org_id                 TEXT PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
-			stripe_customer_id     TEXT NOT NULL DEFAULT '',
-			stripe_subscription_id TEXT NOT NULL DEFAULT '',
-			plan                   TEXT NOT NULL DEFAULT 'free',
-			status                 TEXT NOT NULL DEFAULT 'none',
-			current_period_end     TIMESTAMPTZ,
-			updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		);
-	`)
+	provider, err := goose.NewProvider(goose.DialectPostgres, gooseDB, schema,
+		goose.WithSessionLocker(locker))
+	if err != nil {
+		return fmt.Errorf("migration provider: %w", err)
+	}
+	_, err = provider.Up(context.Background())
 	return err
 }
 
@@ -915,16 +597,16 @@ func (db *DB) CreateAPIKey(ctx context.Context, orgID, userID, name string, scop
 
 // ResolveAPIKey looks up an API key by its hash and returns the associated identity.
 func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity, error) {
-	var orgID, userID, role string
+	var keyID, orgID, userID, role string
 	var scopes []string
 	err := db.pool.QueryRow(ctx,
-		`SELECT ak.org_id, ak.user_id, om.role, ak.scopes
+		`SELECT ak.id, ak.org_id, ak.user_id, om.role, ak.scopes
 		 FROM api_keys ak
 		 JOIN org_members om ON om.org_id = ak.org_id AND om.user_id = ak.user_id
 		 WHERE ak.key_hash = $1
 		   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`,
 		keyHash,
-	).Scan(&orgID, &userID, &role, &scopes)
+	).Scan(&keyID, &orgID, &userID, &role, &scopes)
 	if err != nil {
 		return nil, err
 	}
@@ -933,11 +615,12 @@ func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity
 	_ = db.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
 
 	return &auth.Identity{
-		UserID: userID,
-		OrgID:  orgID,
-		Role:   auth.Role(role),
-		Email:  email,
-		Scopes: scopes,
+		UserID:   userID,
+		OrgID:    orgID,
+		Role:     auth.Role(role),
+		Email:    email,
+		Scopes:   scopes,
+		APIKeyID: keyID,
 	}, nil
 }
 
@@ -1530,7 +1213,8 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 
 // PrepareRootDeletion makes deletion terminal before remote cleanup starts.
 // The root row stays present so a failed cleanup can be retried, while the
-// deleting marker prevents a concurrent sync from creating another generation.
+// deleting marker prevents concurrent capture registration. Historical jobs
+// are cancelled as an upgrade safeguard; this runtime creates none.
 func (db *DB) PrepareRootDeletion(ctx context.Context, orgID, rootID string) (int, error) {
 	tx, err := db.pool.Begin(ctx)
 	if err != nil {
@@ -1638,6 +1322,41 @@ func (db *DB) RootPermissions(ctx context.Context, root *models.RootMetadata, us
 	if root == nil {
 		return nil, "", nil
 	}
+	rows, err := db.pool.Query(ctx,
+		`SELECT principal_type, permissions
+		 FROM root_grants rg
+		 WHERE rg.org_id = $1 AND rg.root_id = $2
+		   AND (
+		     (rg.principal_type = 'org' AND rg.principal_id = $1)
+		     OR (rg.principal_type = 'user' AND rg.principal_id = $3)
+		     OR (rg.principal_type = 'group' AND EXISTS (
+		       SELECT 1 FROM group_members gm
+		       WHERE gm.org_id = rg.org_id
+		         AND gm.group_id = rg.principal_id
+		         AND gm.user_id = $3
+		     ))
+		   )`,
+		root.OrgID, root.ID, userID,
+	)
+	if err != nil {
+		return nil, "", err
+	}
+	defer rows.Close()
+	grants, err := pgx.CollectRows(rows, pgx.RowToStructByPos[rootGrantPermissions])
+	if err != nil {
+		return nil, "", err
+	}
+	permissions, source := effectiveRootPermissions(root, userID, role, grants)
+	return permissions, source, nil
+}
+
+type rootGrantPermissions struct {
+	PrincipalType string
+	Permissions   []string
+}
+
+// Permission policy is shared by ordinary reads and locked capture snapshots.
+func effectiveRootPermissions(root *models.RootMetadata, userID string, role auth.Role, grants []rootGrantPermissions) ([]string, string) {
 	permissions := map[string]bool{}
 	source := ""
 	add := func(nextSource string, perms ...string) {
@@ -1670,39 +1389,10 @@ func (db *DB) RootPermissions(ctx context.Context, root *models.RootMetadata, us
 		}
 	}
 
-	rows, err := db.pool.Query(ctx,
-		`SELECT principal_type, permissions
-		 FROM root_grants rg
-		 WHERE rg.org_id = $1 AND rg.root_id = $2
-		   AND (
-		     (rg.principal_type = 'org' AND rg.principal_id = $1)
-		     OR (rg.principal_type = 'user' AND rg.principal_id = $3)
-		     OR (rg.principal_type = 'group' AND EXISTS (
-		       SELECT 1 FROM group_members gm
-		       WHERE gm.org_id = rg.org_id
-		         AND gm.group_id = rg.principal_id
-		         AND gm.user_id = $3
-		     ))
-		   )`,
-		root.OrgID, root.ID, userID,
-	)
-	if err != nil {
-		return nil, "", err
+	for _, grant := range grants {
+		add(grant.PrincipalType, grant.Permissions...)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var principalType string
-		var grantPerms []string
-		if err := rows.Scan(&principalType, &grantPerms); err != nil {
-			return nil, "", err
-		}
-		add(principalType, grantPerms...)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", err
-	}
-	return sortedRootPermissions(permissions), source, nil
+	return sortedRootPermissions(permissions), source
 }
 
 func addRootPermission(permissions map[string]bool, permission string) {
@@ -1955,39 +1645,6 @@ func (db *DB) ListSyncGenerationIDs(ctx context.Context, orgID, rootID string) (
 	return ids, rows.Err()
 }
 
-// SaveState persists the filesystem state for a root.
-func (db *DB) SaveState(ctx context.Context, rootID string, state map[string]models.FileState) error {
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO root_states (root_id, state, state_ref, updated_at)
-		 VALUES ($1, $2, '', NOW())
-		 ON CONFLICT (root_id) DO UPDATE SET state = $2, state_ref = '', updated_at = NOW()`,
-		rootID, state,
-	)
-	return err
-}
-
-func (db *DB) SaveStateRef(ctx context.Context, rootID, stateRef string) error {
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO root_states (root_id, state, state_ref, updated_at)
-		 VALUES ($1, '{}'::jsonb, $2, NOW())
-		 ON CONFLICT (root_id) DO UPDATE SET state = '{}'::jsonb, state_ref = $2, updated_at = NOW()`,
-		rootID, stateRef,
-	)
-	return err
-}
-
-// LoadState retrieves the filesystem state for a root.
-func (db *DB) LoadState(ctx context.Context, rootID string) (map[string]models.FileState, error) {
-	record, err := db.LoadStateRecord(ctx, rootID)
-	if err != nil {
-		return nil, err
-	}
-	if record.State == nil {
-		return make(map[string]models.FileState), nil
-	}
-	return record.State, nil
-}
-
 func (db *DB) LoadStateRecord(ctx context.Context, rootID string) (*RootStateRecord, error) {
 	var state map[string]models.FileState
 	var stateRef string
@@ -2000,399 +1657,6 @@ func (db *DB) LoadStateRecord(ctx context.Context, rootID string) (*RootStateRec
 	return &RootStateRecord{State: state, Ref: stateRef}, nil
 }
 
-// UpdateRootTimestamp updates the updated_at on a root.
-func (db *DB) UpdateRootTimestamp(ctx context.Context, rootID string) error {
-	_, err := db.pool.Exec(ctx,
-		`UPDATE roots SET updated_at = NOW() WHERE id = $1`, rootID,
-	)
-	return err
-}
-
-func (db *DB) GetVisibleGeneration(ctx context.Context, rootID string) (string, error) {
-	var generationID string
-	err := db.pool.QueryRow(ctx,
-		`SELECT visible_generation_id FROM roots WHERE id = $1`, rootID,
-	).Scan(&generationID)
-	return generationID, err
-}
-
-func (db *DB) GetGenerationSeq(ctx context.Context, generationID string) (int64, error) {
-	if generationID == "" {
-		return 0, nil
-	}
-	var seq int64
-	err := db.pool.QueryRow(ctx,
-		`SELECT seq FROM sync_generations WHERE id = $1`, generationID,
-	).Scan(&seq)
-	return seq, err
-}
-
-func (db *DB) GetVisibleGenerationSeq(ctx context.Context, rootID string) (int64, error) {
-	visibleID, err := db.GetVisibleGeneration(ctx, rootID)
-	if err != nil || visibleID == "" {
-		return 0, err
-	}
-	return db.GetGenerationSeq(ctx, visibleID)
-}
-
-func (db *DB) CreateSyncGeneration(ctx context.Context, orgID, rootID, syncJobID, clientBaseGenerationID string, clientBaseGenerationSeq int64) (*SyncGeneration, error) {
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	var baseGenerationID string
-	var deletingAt *time.Time
-	err = tx.QueryRow(ctx,
-		`SELECT visible_generation_id, deleting_at FROM roots WHERE id = $1 FOR UPDATE`, rootID,
-	).Scan(&baseGenerationID, &deletingAt)
-	if err != nil {
-		return nil, err
-	}
-	if deletingAt != nil {
-		return nil, errRootDeleting
-	}
-
-	staleCutoff := time.Now().Add(-syncJobTimeout())
-	if _, err := tx.Exec(ctx,
-		`UPDATE sync_generations g
-		 SET status = 'failed'
-		 WHERE g.root_id = $1 AND g.status = 'building'
-		   AND COALESCE((SELECT j.status IN ('completed', 'failed') OR j.updated_at < $2
-		                   FROM sync_jobs j WHERE j.id = g.sync_job_id), g.created_at < $2)`,
-		rootID, staleCutoff,
-	); err != nil {
-		return nil, err
-	}
-
-	var buildingID string
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM sync_generations
-		 WHERE root_id = $1 AND status = 'building'
-		 LIMIT 1`,
-		rootID,
-	).Scan(&buildingID)
-	if err == nil {
-		return nil, errSyncInProgress
-	}
-	if err != pgx.ErrNoRows {
-		return nil, err
-	}
-
-	var baseSeq int64
-	if baseGenerationID != "" {
-		err = tx.QueryRow(ctx,
-			`SELECT seq FROM sync_generations WHERE id = $1`, baseGenerationID,
-		).Scan(&baseSeq)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := validateSyncBase(clientBaseGenerationID, clientBaseGenerationSeq, baseGenerationID, baseSeq); err != nil {
-		return nil, err
-	}
-
-	generationID := uuid.New().String()
-	var seq int64
-	err = tx.QueryRow(ctx,
-		`INSERT INTO sync_generations (id, org_id, root_id, sync_job_id, base_generation_id, base_generation_seq, status)
-		 VALUES ($1, $2, $3, $4, $5, $6, 'building')
-		 RETURNING seq`,
-		generationID, orgID, rootID, syncJobID, baseGenerationID, baseSeq,
-	).Scan(&seq)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return &SyncGeneration{
-		ID:                generationID,
-		OrgID:             orgID,
-		RootID:            rootID,
-		SyncJobID:         syncJobID,
-		BaseGenerationID:  baseGenerationID,
-		Seq:               seq,
-		BaseGenerationSeq: baseSeq,
-	}, nil
-}
-
-func (db *DB) GetSyncGeneration(ctx context.Context, orgID, rootID, generationID string) (*SyncGeneration, error) {
-	var generation SyncGeneration
-	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, root_id, COALESCE(sync_job_id, ''), COALESCE(base_generation_id, ''), seq, base_generation_seq
-		 FROM sync_generations
-		 WHERE id = $1 AND org_id = $2 AND root_id = $3 AND status = 'building'`,
-		generationID, orgID, rootID,
-	).Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.SyncJobID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq)
-	if err != nil {
-		return nil, err
-	}
-	return &generation, nil
-}
-
-func (db *DB) GetSyncGenerationForJob(ctx context.Context, orgID, rootID, jobID string) (*SyncGeneration, error) {
-	var generation SyncGeneration
-	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, root_id, COALESCE(sync_job_id, ''), COALESCE(base_generation_id, ''), seq, base_generation_seq
-		 FROM sync_generations
-		 WHERE org_id = $1 AND root_id = $2 AND sync_job_id = $3
-		 ORDER BY seq DESC
-		 LIMIT 1`,
-		orgID, rootID, jobID,
-	).Scan(&generation.ID, &generation.OrgID, &generation.RootID, &generation.SyncJobID, &generation.BaseGenerationID, &generation.Seq, &generation.BaseGenerationSeq)
-	if err != nil {
-		return nil, err
-	}
-	return &generation, nil
-}
-
-func validateSyncBase(clientBaseGenerationID string, clientBaseGenerationSeq int64, visibleGenerationID string, visibleGenerationSeq int64) error {
-	if clientBaseGenerationID != visibleGenerationID {
-		return fmt.Errorf("%w: client base generation %q does not match visible generation %q", errStaleSyncBase, clientBaseGenerationID, visibleGenerationID)
-	}
-	if clientBaseGenerationSeq != 0 && clientBaseGenerationSeq != visibleGenerationSeq {
-		return fmt.Errorf("%w: client base generation seq %d does not match visible generation seq %d", errStaleSyncBase, clientBaseGenerationSeq, visibleGenerationSeq)
-	}
-	return nil
-}
-
-func (db *DB) CommitSyncGeneration(ctx context.Context, generation *SyncGeneration, state map[string]models.FileState, stateRef string) error {
-	if generation == nil {
-		return fmt.Errorf("sync generation is required")
-	}
-	var stateJSON []byte
-	var err error
-	if stateRef == "" {
-		stateJSON, err = json.Marshal(state)
-		if err != nil {
-			return err
-		}
-	}
-
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx,
-		`UPDATE roots
-		 SET visible_generation_id = $1, updated_at = NOW()
-		 WHERE id = $2 AND visible_generation_id = $3`,
-		generation.ID, generation.RootID, generation.BaseGenerationID,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("root visible generation changed while sync was running")
-	}
-
-	if stateRef != "" {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO root_states (root_id, state, state_ref, updated_at)
-			 VALUES ($1, '{}'::jsonb, $2, NOW())
-			 ON CONFLICT (root_id) DO UPDATE SET state = '{}'::jsonb, state_ref = $2, updated_at = NOW()`,
-			generation.RootID, stateRef,
-		); err != nil {
-			return err
-		}
-	} else {
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO root_states (root_id, state, state_ref, updated_at)
-			 VALUES ($1, $2::jsonb, '', NOW())
-			 ON CONFLICT (root_id) DO UPDATE SET state = $2::jsonb, state_ref = '', updated_at = NOW()`,
-			generation.RootID, string(stateJSON),
-		); err != nil {
-			return err
-		}
-	}
-
-	tag, err = tx.Exec(ctx,
-		`UPDATE sync_generations
-		 SET status = 'visible', visible_at = NOW()
-		 WHERE id = $1 AND status = 'building'`,
-		generation.ID,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("sync generation %s is no longer building", generation.ID)
-	}
-
-	return tx.Commit(ctx)
-}
-
-func (db *DB) MarkSyncGenerationFailed(ctx context.Context, generationID string) error {
-	if generationID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_generations SET status = 'failed' WHERE id = $1 AND status = 'building'`,
-		generationID,
-	)
-	return err
-}
-
-func (db *DB) MarkSyncGenerationFailedForJob(ctx context.Context, jobID string) error {
-	if jobID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_generations SET status = 'failed' WHERE sync_job_id = $1 AND status = 'building'`,
-		jobID,
-	)
-	return err
-}
-
-func (db *DB) MarkSyncGenerationCleanupPending(ctx context.Context, generationID string) error {
-	if generationID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_generations SET status = 'failed'
-		 WHERE id = $1 AND status IN ('failed', 'cleaning', 'superseded')`,
-		generationID,
-	)
-	return err
-}
-
-func (db *DB) MarkSyncGenerationCleaning(ctx context.Context, generationID string) error {
-	if generationID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_generations SET status = 'cleaning' WHERE id = $1 AND status = 'failed'`,
-		generationID,
-	)
-	return err
-}
-
-func (db *DB) MarkSyncGenerationCleaned(ctx context.Context, generationID string) error {
-	if generationID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_generations SET status = 'superseded' WHERE id = $1 AND status = 'cleaning'`,
-		generationID,
-	)
-	return err
-}
-
-func (db *DB) ListFailedSyncGenerationIDs(ctx context.Context, orgID, rootID string) ([]string, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT id FROM sync_generations
-		 WHERE org_id = $1 AND root_id = $2 AND status IN ('failed', 'cleaning')
-		 ORDER BY created_at`,
-		orgID, rootID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-func (db *DB) GetSyncGenerationStatus(ctx context.Context, generationID string) (string, error) {
-	var status string
-	err := db.pool.QueryRow(ctx,
-		`SELECT status FROM sync_generations WHERE id = $1`,
-		generationID,
-	).Scan(&status)
-	return status, err
-}
-
-// ---------------------------------------------------------------------------
-// Embedding Cache
-// ---------------------------------------------------------------------------
-
-// GetCachedEmbeddings looks up cached embeddings by content hash within an org,
-// scoped to a specific embedding model version so vectors are never reused
-// across model versions.
-func (db *DB) GetCachedEmbeddings(ctx context.Context, orgID, modelVersion string, hashes []string) (map[string][]float64, error) {
-	hashes = uniqueStrings(hashes)
-	result := make(map[string][]float64)
-	if len(hashes) == 0 {
-		return result, nil
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT content_hash, embedding FROM embedding_cache WHERE org_id = $1 AND model_version = $2 AND content_hash = ANY($3)`,
-		orgID, modelVersion, hashes,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var hash string
-		var embBytes []byte
-		if err := rows.Scan(&hash, &embBytes); err != nil {
-			return nil, err
-		}
-		emb, err := decodeEmbedding(embBytes)
-		if err != nil {
-			return nil, fmt.Errorf("decoding embedding for %s: %w", hash, err)
-		}
-		result[hash] = emb
-	}
-	return result, rows.Err()
-}
-
-func uniqueStrings(values []string) []string {
-	seen := make(map[string]bool, len(values))
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		out = append(out, value)
-	}
-	return out
-}
-
-// SaveCachedEmbeddings stores one pipeline batch in the embedding cache.
-func (db *DB) SaveCachedEmbeddings(ctx context.Context, orgID, modelVersion string, entries map[string][]float64) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	var sb strings.Builder
-	sb.WriteString(`INSERT INTO embedding_cache (org_id, model_version, content_hash, embedding, created_at) VALUES `)
-	args := make([]any, 0, len(entries)*2+2)
-	args = append(args, orgID, modelVersion) // $1 = org_id, $2 = model_version
-	i := 0
-	for hash, emb := range entries {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		p := i*2 + 3 // value placeholders start at $3 ($1=org_id, $2=model_version)
-		fmt.Fprintf(&sb, "($1, $2, $%d, $%d, NOW())", p, p+1)
-		args = append(args, hash, encodeEmbedding(emb))
-		i++
-	}
-	sb.WriteString(` ON CONFLICT (org_id, model_version, content_hash) DO NOTHING`)
-
-	_, err := db.pool.Exec(ctx, sb.String(), args...)
-	return err
-}
-
-// ---------------------------------------------------------------------------
-// ACLs
-// ---------------------------------------------------------------------------
-
-// CreateACL creates a folder-level ACL entry.
 func (db *DB) CreateACL(ctx context.Context, orgID, rootID, pathPrefix, grantTo, permission string) (*models.RootACL, error) {
 	acl := &models.RootACL{
 		ID:         uuid.New().String(),
@@ -2403,26 +1667,43 @@ func (db *DB) CreateACL(ctx context.Context, orgID, rootID, pathPrefix, grantTo,
 		Permission: permission,
 		CreatedAt:  time.Now(),
 	}
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO root_acls (id, org_id, root_id, path_prefix, grant_to, permission, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+	// Serialize deny insertion with per-file capture acceptance, not its slow
+	// source upload. A deny committed before capture takes the lock is observed.
+	tag, err := db.pool.Exec(ctx,
+		`WITH capture_root AS MATERIALIZED (
+		 SELECT id FROM roots WHERE id=$3 AND org_id=$2 AND deleting_at IS NULL FOR UPDATE)
+		 INSERT INTO root_acls (id, org_id, root_id, path_prefix, grant_to, permission, created_at)
+		 SELECT $1, $2, $3, $4, $5, $6, $7 FROM capture_root`,
 		acl.ID, acl.OrgID, acl.RootID, acl.PathPrefix, acl.GrantTo, acl.Permission, acl.CreatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
+	if tag.RowsAffected() != 1 {
+		return nil, pgx.ErrNoRows
+	}
 	return acl, nil
 }
 
+type aclQueryer interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 // GetACLsForUser returns all ACL entries that apply to a user for a root.
-// Matches both direct user grants and role-based grants.
+// Matches documented user/role/wildcard targets and historical bare user IDs.
 func (db *DB) GetACLsForUser(ctx context.Context, orgID, rootID, userID string, role auth.Role) ([]models.RootACL, error) {
+	return getACLsForUser(ctx, db.pool, orgID, rootID, userID, role)
+}
+
+func getACLsForUser(ctx context.Context, queryer aclQueryer, orgID, rootID, userID string, role auth.Role) ([]models.RootACL, error) {
 	grantTargets := []string{
 		userID,
+		"user:" + userID,
 		"role:" + string(role),
+		"*",
 	}
 
-	rows, err := db.pool.Query(ctx,
+	rows, err := queryer.Query(ctx,
 		`SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at
 		 FROM root_acls
 		 WHERE org_id = $1 AND root_id = $2 AND grant_to = ANY($3)
@@ -2442,7 +1723,7 @@ func (db *DB) GetACLsForUser(ctx context.Context, orgID, rootID, userID string, 
 		}
 		acls = append(acls, a)
 	}
-	return acls, nil
+	return acls, rows.Err()
 }
 
 // ListACLs returns all ACLs for a root.
@@ -2476,321 +1757,6 @@ func (db *DB) DeleteACL(ctx context.Context, orgID, aclID string) error {
 	return err
 }
 
-// ---------------------------------------------------------------------------
-// Sync Jobs
-// ---------------------------------------------------------------------------
-
-// CreateSyncJob creates a new sync job record.
-func (db *DB) CreateSyncJob(ctx context.Context, orgID, rootID, userID string, totalFiles int) (*models.SyncJob, error) {
-	job := &models.SyncJob{
-		ID:         uuid.New().String(),
-		OrgID:      orgID,
-		RootID:     rootID,
-		UserID:     userID,
-		Status:     "pending",
-		TotalFiles: totalFiles,
-		Processed:  0,
-		StartedAt:  time.Now(),
-	}
-	job.UpdatedAt = job.StartedAt
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO sync_jobs (id, org_id, root_id, user_id, status, total_files, processed, started_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)`,
-		job.ID, job.OrgID, job.RootID, job.UserID, job.Status, job.TotalFiles, job.Processed, job.StartedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return job, nil
-}
-
-// UpdateSyncJobStatus updates only the phase/status of a sync job.
-func (db *DB) UpdateSyncJobStatus(ctx context.Context, jobID, status string) error {
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET status = $1, updated_at = NOW()
-		 WHERE id = $2
-		   AND status NOT IN ('completed', 'failed')
-		   AND array_position(ARRAY['pending','queued','chunking','embedding','indexing','upserting','committing'], status)
-		       < array_position(ARRAY['pending','queued','chunking','embedding','indexing','upserting','committing'], $1)`,
-		status, jobID,
-	)
-	return err
-}
-
-// UpdateSyncJobTotalFiles replaces the discovery-time estimate with the
-// authoritative change count supplied when a manifest session is finalized.
-func (db *DB) UpdateSyncJobTotalFiles(ctx context.Context, jobID string, totalFiles int) error {
-	if jobID == "" {
-		return nil
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET total_files = $1, updated_at = NOW()
-		 WHERE id = $2 AND status NOT IN ('completed', 'failed')`,
-		totalFiles, jobID,
-	)
-	return err
-}
-
-// TouchSyncJob persists liveness for a worker that is still processing a
-// potentially long-running shard.
-func (db *DB) TouchSyncJob(ctx context.Context, jobID string) error {
-	if jobID == "" {
-		return nil
-	}
-	tag, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs SET updated_at = NOW()
-		 WHERE id = $1 AND status NOT IN ('completed', 'failed')`,
-		jobID,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return pgx.ErrNoRows
-	}
-	return nil
-}
-
-// ExpireSyncJob marks a job failed only if its lease is still stale. The
-// updated_at predicate prevents a watchdog read from racing with a concurrent
-// upload or worker heartbeat and failing a job that has renewed since.
-func (db *DB) ExpireSyncJob(ctx context.Context, jobID string, staleBefore time.Time, errors []map[string]string) (bool, error) {
-	if errors == nil {
-		errors = []map[string]string{}
-	}
-	tag, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs
-		 SET status = 'failed', finished_at = NOW(), updated_at = NOW(), errors = $2
-		 WHERE id = $1
-		   AND status NOT IN ('completed', 'failed')
-		   AND updated_at < $3`,
-		jobID, errors, staleBefore,
-	)
-	if err != nil {
-		return false, err
-	}
-	return tag.RowsAffected() == 1, nil
-}
-
-// RecordSyncJobShard stores idempotent progress and returns the completed shard
-// count and current generation status in the same progress round trip.
-func (db *DB) RecordSyncJobShard(ctx context.Context, jobID, stage string, shardIndex, filesProcessed int) (int, string, error) {
-	if _, err := db.pool.Exec(ctx,
-		`INSERT INTO sync_job_shards (job_id, stage, shard_index, status, files_processed, finished_at)
-		 VALUES ($1, $2, $3, 'completed', $4, NOW())
-		 ON CONFLICT (job_id, stage, shard_index) DO NOTHING`,
-		jobID, stage, shardIndex, filesProcessed,
-	); err != nil {
-		return 0, "", err
-	}
-	var completed int
-	var generationStatus string
-	err := db.pool.QueryRow(ctx,
-		`UPDATE sync_jobs
-		 SET processed = CASE WHEN $2 = 'index' THEN COALESCE((
-				SELECT SUM(files_processed) FROM sync_job_shards
-				WHERE job_id = $1 AND stage = $2 AND status = 'completed'
-			), 0) ELSE processed END,
-			 updated_at = NOW()
-		 WHERE id = $1
-		 RETURNING
-		   (SELECT COUNT(*) FROM sync_job_shards WHERE job_id = $1 AND stage = $2 AND status = 'completed'),
-		   COALESCE((SELECT status FROM sync_generations WHERE sync_job_id = $1 ORDER BY seq DESC LIMIT 1), '')`,
-		jobID, stage,
-	).Scan(&completed, &generationStatus)
-	return completed, generationStatus, err
-}
-
-func (db *DB) CountCompletedSyncJobShards(ctx context.Context, jobID, stage string) (int, error) {
-	var count int
-	err := db.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM sync_job_shards
-		 WHERE job_id = $1 AND stage = $2 AND status = 'completed'`,
-		jobID, stage,
-	).Scan(&count)
-	return count, err
-}
-
-// CompleteSyncJob marks a sync job as completed or failed.
-func (db *DB) CompleteSyncJob(ctx context.Context, jobID, status string, errors []map[string]string) error {
-	if errors == nil {
-		errors = []map[string]string{}
-	}
-	_, err := db.pool.Exec(ctx,
-		`UPDATE sync_jobs
-		 SET status = $1, finished_at = NOW(), updated_at = NOW(), errors = $2
-		 WHERE id = $3 AND status NOT IN ('completed', 'failed')`,
-		status, errors, jobID,
-	)
-	return err
-}
-
-// GetSyncJob retrieves a sync job by ID.
-func (db *DB) GetSyncJob(ctx context.Context, orgID, jobID string) (*models.SyncJob, error) {
-	job := &models.SyncJob{}
-	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
-		        errors, started_at, updated_at, finished_at
-		 FROM sync_jobs WHERE id = $1 AND org_id = $2`, jobID, orgID,
-	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Chunked, &job.Embedded, &job.Indexed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
-	if err != nil {
-		return nil, err
-	}
-	return job, nil
-}
-
-// ListSyncJobs lists recent sync jobs for a root.
-func (db *DB) ListSyncJobs(ctx context.Context, orgID, rootID string, limit int) ([]models.SyncJob, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
-		        errors, started_at, updated_at, finished_at
-		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
-		 ORDER BY started_at DESC LIMIT $3`,
-		orgID, rootID, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var jobs []models.SyncJob
-	for rows.Next() {
-		var j models.SyncJob
-		if err := rows.Scan(&j.ID, &j.OrgID, &j.RootID, &j.UserID, &j.Status, &j.TotalFiles,
-			&j.Processed, &j.Chunked, &j.Embedded, &j.Indexed, &j.Errors, &j.StartedAt, &j.UpdatedAt, &j.FinishedAt); err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, j)
-	}
-	return jobs, nil
-}
-
-// GetLatestSyncJob gets the most recent sync job for a root.
-func (db *DB) GetLatestSyncJob(ctx context.Context, orgID, rootID string) (*models.SyncJob, error) {
-	job := &models.SyncJob{}
-	err := db.pool.QueryRow(ctx,
-		`SELECT id, org_id, COALESCE(root_id, ''), user_id, status, total_files, processed,
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'chunk' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'embed' AND status = 'completed'), 0),
-		        COALESCE((SELECT SUM(files_processed) FROM sync_job_shards WHERE job_id = sync_jobs.id AND stage = 'index' AND status = 'completed'), 0),
-		        errors, started_at, updated_at, finished_at
-		 FROM sync_jobs WHERE org_id = $1 AND root_id = $2
-		 ORDER BY started_at DESC LIMIT 1`,
-		orgID, rootID,
-	).Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status, &job.TotalFiles,
-		&job.Processed, &job.Chunked, &job.Embedded, &job.Indexed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt)
-	if err != nil {
-		return nil, err
-	}
-	return job, nil
-}
-
-// ListSyncJobsForReconciliation returns stale active jobs and jobs whose failed
-// generation still needs cleanup.
-func (db *DB) ListSyncJobsForReconciliation(ctx context.Context, staleBefore time.Time, limit int) ([]models.SyncJob, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT j.id, j.org_id, COALESCE(j.root_id, ''), j.user_id, j.status,
-		        j.total_files, j.processed, j.errors, j.started_at, j.updated_at, j.finished_at
-		 FROM sync_jobs j
-		 WHERE j.status <> 'completed'
-		   AND ((j.status <> 'failed' AND j.updated_at < $1)
-		     OR EXISTS (
-		       SELECT 1 FROM sync_generations g
-			       WHERE g.sync_job_id = j.id
-			         AND (g.status IN ('failed', 'cleaning') OR (j.status = 'failed' AND g.status = 'visible'))
-		     ))
-		 ORDER BY j.updated_at ASC
-		 LIMIT $2`,
-		staleBefore, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	jobs := make([]models.SyncJob, 0)
-	for rows.Next() {
-		var job models.SyncJob
-		if err := rows.Scan(&job.ID, &job.OrgID, &job.RootID, &job.UserID, &job.Status,
-			&job.TotalFiles, &job.Processed, &job.Errors, &job.StartedAt, &job.UpdatedAt, &job.FinishedAt); err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, job)
-	}
-	return jobs, rows.Err()
-}
-
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
-
-// Ping checks the database connection.
 func (db *DB) Ping(ctx context.Context) error {
 	return db.pool.Ping(ctx)
-}
-
-// ---------------------------------------------------------------------------
-// Content Proofs
-// ---------------------------------------------------------------------------
-
-// UpsertContentProof stores or updates a content proof for a user+root pair.
-func (db *DB) UpsertContentProof(ctx context.Context, orgID, userID, rootID, rootHash string, proof []byte) error {
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO content_proofs (org_id, user_id, root_id, root_hash, proof, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, NOW())
-		 ON CONFLICT (org_id, user_id, root_id)
-		 DO UPDATE SET root_hash = EXCLUDED.root_hash, proof = EXCLUDED.proof, updated_at = NOW()`,
-		orgID, userID, rootID, rootHash, proof,
-	)
-	return err
-}
-
-// GetContentProof retrieves the content proof for a user+root pair.
-func (db *DB) GetContentProof(ctx context.Context, orgID, userID, rootID string) ([]byte, string, error) {
-	var proof []byte
-	var rootHash string
-	err := db.pool.QueryRow(ctx,
-		`SELECT proof, root_hash FROM content_proofs
-		 WHERE org_id = $1 AND user_id = $2 AND root_id = $3`,
-		orgID, userID, rootID,
-	).Scan(&proof, &rootHash)
-	if err != nil {
-		return nil, "", err
-	}
-	return proof, rootHash, nil
-}
-
-// ---------------------------------------------------------------------------
-// Encoding helpers
-// ---------------------------------------------------------------------------
-
-func encodeEmbedding(emb []float64) []byte {
-	buf := make([]byte, len(emb)*8)
-	for i, v := range emb {
-		binary.LittleEndian.PutUint64(buf[i*8:], math.Float64bits(v))
-	}
-	return buf
-}
-
-func decodeEmbedding(buf []byte) ([]float64, error) {
-	if len(buf)%8 != 0 {
-		return nil, fmt.Errorf("invalid embedding bytes length: %d", len(buf))
-	}
-	emb := make([]float64, len(buf)/8)
-	for i := range emb {
-		emb[i] = math.Float64frombits(binary.LittleEndian.Uint64(buf[i*8:]))
-	}
-	return emb, nil
 }

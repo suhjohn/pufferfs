@@ -146,7 +146,7 @@ pufferfs sync ./handbook --name handbook --dry-run`}</pre>
               <pre className="code-pane solo">{`# sync a directory and wait for commit
 pufferfs sync ./handbook --name handbook
 
-# query the latest committed generation
+# query published file versions
 pufferfs query "paid time off" --root handbook --top-k 2
 
 # keep it current with a supervised background service

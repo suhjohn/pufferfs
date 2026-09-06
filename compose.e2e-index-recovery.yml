@@ -1,0 +1,27 @@
+# Optional network-fault topology. API queries still hit real Turbopuffer
+# directly; only index-worker writes pass through the controlled relay.
+services:
+  index-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: worker
+    entrypoint: [python, /e2e/index_relay.py]
+    environment:
+      E2E_TURBOPUFFER_UPSTREAM: ${TURBOPUFFER_API_URL:-https://${TURBOPUFFER_REGION:-gcp-us-central1}.turbopuffer.com}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  index-cpu:
+    environment:
+      TURBOPUFFER_API_URL: http://index-relay:8080
+    depends_on:
+      index-relay: {condition: service_healthy}
+  index-vector:
+    environment:
+      TURBOPUFFER_API_URL: http://index-relay:8080
+    depends_on:
+      index-relay: {condition: service_healthy}

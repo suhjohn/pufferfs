@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"time"
 
@@ -25,15 +26,8 @@ const (
 	queueOperationTimeout = 30 * time.Second
 )
 
-type sqsClient interface {
-	SendMessageBatch(context.Context, *sqs.SendMessageBatchInput, ...func(*sqs.Options)) (*sqs.SendMessageBatchOutput, error)
-	ReceiveMessage(context.Context, *sqs.ReceiveMessageInput, ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
-	DeleteMessage(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
-	ChangeMessageVisibility(context.Context, *sqs.ChangeMessageVisibilityInput, ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
-}
-
 type SQSQueue struct {
-	client    sqsClient
+	client    *sqs.Client
 	queueURLs map[string]string
 }
 
@@ -42,12 +36,13 @@ type sqsReceipt struct {
 	receiptHandle string
 }
 
-func NewSQSQueue(client sqsClient, queueURLs map[string]string) (*SQSQueue, error) {
+func NewSQSQueue(client *sqs.Client, queueURLs map[string]string) (*SQSQueue, error) {
 	if client == nil {
 		return nil, errors.New("SQS client is required")
 	}
-	urls := make(map[string]string, len(allStages()))
-	for _, stage := range allStages() {
+	stages := []string{StageTransform, StageIndex}
+	urls := make(map[string]string, len(stages))
+	for _, stage := range stages {
 		url := queueURLs[stage]
 		if url == "" {
 			return nil, fmt.Errorf("SQS queue URL is required for stage %q", stage)
@@ -84,8 +79,8 @@ func (q *SQSQueue) Enqueue(ctx context.Context, stage string, msgs ...JobMessage
 		return nil
 	}
 	for _, msg := range msgs {
-		if msg.JobID == "" {
-			return errors.New("queue job_id is required")
+		if msg.JobID == "" || msg.WorkID == "" {
+			return errors.New("queue job_id and work_id are required")
 		}
 		msg.Stage = stage
 		body, marshalErr := json.Marshal(msg)
@@ -145,17 +140,16 @@ func (q *SQSQueue) Pull(ctx context.Context, stage string, batchSize int, timeou
 		var job JobMessage
 		if err := json.Unmarshal([]byte(aws.ToString(message.Body)), &job); err != nil {
 			// Leave malformed messages unacked so SQS moves them to the stage DLQ
-			// after the configured receive limit, preserving evidence for repair.
-			return nil, fmt.Errorf("decoding SQS job message: %w", err)
-		}
-		attempts, _ := strconv.Atoi(message.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
-		if attempts < 1 {
-			attempts = 1
+			// after the receive limit. Still return the valid jobs from this batch:
+			// discarding them would strand their receipts until visibility expires.
+			// Log identity only; a malformed body can contain sensitive data.
+			log.Printf("SQS %s message %s is not valid job JSON; left unacknowledged (receive batch size=%d)",
+				stage, aws.ToString(message.MessageId), len(output.Messages))
+			continue
 		}
 		messages = append(messages, ReceivedMessage{
-			Job:      job,
-			Attempts: attempts,
-			receipt:  sqsReceipt{queueURL: queueURL, receiptHandle: aws.ToString(message.ReceiptHandle)},
+			Job:     job,
+			receipt: sqsReceipt{queueURL: queueURL, receiptHandle: aws.ToString(message.ReceiptHandle)},
 		})
 	}
 	return messages, nil
@@ -175,10 +169,6 @@ func (q *SQSQueue) Ack(msg ReceivedMessage) error {
 	return err
 }
 
-func (q *SQSQueue) Nak(msg ReceivedMessage) error {
-	return q.changeVisibility(msg, 0)
-}
-
 func (q *SQSQueue) NakWithDelay(msg ReceivedMessage, delay time.Duration) error {
 	if delay < 0 {
 		delay = 0
@@ -194,23 +184,6 @@ func (q *SQSQueue) InProgress(msg ReceivedMessage) error {
 	return q.changeVisibility(msg, int32(defaultSQSVisibility/time.Second))
 }
 
-func (q *SQSQueue) Close() {}
-
-func (q *SQSQueue) changeVisibility(msg ReceivedMessage, seconds int32) error {
-	receipt, err := getSQSReceipt(msg)
-	if err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), queueOperationTimeout)
-	defer cancel()
-	_, err = q.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
-		QueueUrl:          aws.String(receipt.queueURL),
-		ReceiptHandle:     aws.String(receipt.receiptHandle),
-		VisibilityTimeout: seconds,
-	})
-	return err
-}
-
 func (q *SQSQueue) queueURL(stage string) (string, error) {
 	url := q.queueURLs[stage]
 	if url == "" {
@@ -220,8 +193,8 @@ func (q *SQSQueue) queueURL(stage string) (string, error) {
 }
 
 func getSQSReceipt(msg ReceivedMessage) (sqsReceipt, error) {
-	receipt, ok := msg.receipt.(sqsReceipt)
-	if !ok || receipt.queueURL == "" || receipt.receiptHandle == "" {
+	receipt := msg.receipt
+	if receipt.queueURL == "" || receipt.receiptHandle == "" {
 		return sqsReceipt{}, errors.New("queue message does not contain an SQS receipt")
 	}
 	return receipt, nil
@@ -237,15 +210,23 @@ func sqsStableID(parts ...string) string {
 }
 
 func sqsMessageGroupID(stage string, msg JobMessage) string {
-	// Commit mutates the visible root pointer and must remain root-ordered.
-	// Data stages are independent by generation/shard; grouping them by root
-	// silently reduces every stage to one in-flight job.
-	if stage == StageCommit {
-		return sqsStableID(msg.OrgID, msg.RootID, stage)
+	if stage == StageIndex {
+		// Serialize deliveries per file; workers also enforce version order.
+		return sqsStableID(msg.OrgID, msg.RootID, msg.FileID, stage)
 	}
-	return sqsStableID(msg.OrgID, msg.RootID, msg.GenerationID, stage, strconv.Itoa(msg.ShardIndex))
+	return sqsStableID(msg.OrgID, msg.RootID, msg.WorkID, stage)
 }
-
-func allStages() []string {
-	return []string{StageChunk, StageIndex, StageCommit}
+func (q *SQSQueue) changeVisibility(msg ReceivedMessage, seconds int32) error {
+	receipt, err := getSQSReceipt(msg)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), queueOperationTimeout)
+	defer cancel()
+	_, err = q.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(receipt.queueURL),
+		ReceiptHandle:     aws.String(receipt.receiptHandle),
+		VisibilityTimeout: seconds,
+	})
+	return err
 }

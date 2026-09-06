@@ -1,49 +1,39 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
-	"github.com/pufferfs/pufferfs/internal/diff"
 	"github.com/pufferfs/pufferfs/internal/ignore"
-	"github.com/pufferfs/pufferfs/internal/merkle"
 	"github.com/pufferfs/pufferfs/pkg/models"
 	"github.com/spf13/cobra"
 )
 
 func syncCmd() *cobra.Command {
 	var (
-		dryRun     bool
-		name       string
-		rootID     string
-		rootPath   string
-		includes   []string
-		excludes   []string
-		scope      string
-		noVector   bool
-		force      bool
-		follow     bool
-		jsonOut    bool
-		background bool
-		detach     bool
-		options    followOptions
+		dryRun   bool
+		name     string
+		rootID   string
+		rootPath string
+		includes []string
+		excludes []string
+		scope    string
+		noVector bool
+		force    bool
+		follow   bool
+		jsonOut  bool
+		options  followOptions
 	)
 
 	cmd := &cobra.Command{
@@ -52,13 +42,13 @@ func syncCmd() *cobra.Command {
 		Long: strings.TrimSpace(`Sync a directory to PufferFs.
 
 By default, sync scans PATH, --root, or the current directory, computes a root
-diff, uploads changed file content, and commits a new root generation. If
+and captures changed bytes into immutable source packs, then registers file versions.
+Indexing is asynchronous; use 'sync wait' to wait for searchable results. If
 --name is omitted, the root name defaults to the directory basename.
 
 Use --include to sync only files matching one or more root-relative glob
 patterns. Multiple --include flags are combined as OR, and --exclude always
-wins. In subset mode, PufferFS uploads only selected file bytes but still commits
-a complete merged root state so unselected files in existing roots stay visible.`),
+wins. Only selected files are updated; unselected files stay visible.`),
 		Example: strings.TrimSpace(`  pufferfs sync ./handbook --name handbook
   pufferfs sync --root /Users/me/handbook
   pufferfs sync --root /Users/me/handbook --include 'docs/**' --include README.md
@@ -94,23 +84,17 @@ a complete merged root state so unselected files in existing roots stay visible.
 				if force {
 					return fmt.Errorf("--follow cannot be combined with --force")
 				}
-				if background || detach {
-					return fmt.Errorf("--background/--detach cannot be combined with --follow")
-				}
 				if cfg.Server.URL == "" {
 					return fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 				}
 				return runFollow(cfg, absDir, name, rootID, noVector, options)
-			}
-			if dryRun && (background || detach) {
-				return fmt.Errorf("--background/--detach cannot be combined with --dry-run")
 			}
 			if subsetMode {
 				log := syncLogWriter(jsonOut)
 				result, err := runSyncSubset(cfg, absDir, syncSubsetSpec{
 					Includes: includes,
 					Excludes: excludes,
-				}, name, rootID, scope, noVector, force, dryRun, !background && !detach, log)
+				}, name, rootID, scope, noVector, force, dryRun, log)
 				if err != nil {
 					return err
 				}
@@ -120,7 +104,7 @@ a complete merged root state so unselected files in existing roots stay visible.
 				return nil
 			}
 			log := syncLogWriter(jsonOut)
-			result, err := runSync(cfg, absDir, name, rootID, scope, noVector, force, dryRun, !background && !detach, log)
+			result, err := runSync(cfg, absDir, name, rootID, scope, noVector, force, dryRun, log)
 			if err != nil {
 				return err
 			}
@@ -134,8 +118,6 @@ a complete merged root state so unselected files in existing roots stay visible.
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be synced without syncing")
 	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Continuously sync when files change")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print sync result as JSON")
-	cmd.Flags().BoolVar(&background, "background", false, "Start sync and return immediately with a sync job ID")
-	cmd.Flags().BoolVar(&detach, "detach", false, "Alias for --background")
 	cmd.Flags().StringVarP(&name, "name", "n", "", "Name alias for this root")
 	cmd.Flags().StringVar(&rootID, "id", "", "Root ID to re-attach to")
 	cmd.Flags().StringVar(&rootPath, "root", "", "Root path to sync")
@@ -143,9 +125,9 @@ a complete merged root state so unselected files in existing roots stay visible.
 	cmd.Flags().StringArrayVar(&excludes, "exclude", nil, "Skip files matching this root-relative glob; can be repeated")
 	cmd.Flags().StringVar(&scope, "scope", "org", "Root scope to create when missing: org or user")
 	cmd.Flags().BoolVar(&noVector, "no-vector", false, "Create the root without vector search support")
-	cmd.Flags().BoolVar(&force, "force", false, "Force re-sync and reindex even when local files match the committed root state")
+	cmd.Flags().BoolVar(&force, "force", false, "Force reindex and retain rejected conflicting captures before recapturing current files")
 	addFollowFlags(cmd, &options)
-	cmd.AddCommand(syncStatusCmd(), syncJobsCmd(), syncWaitCmd())
+	cmd.AddCommand(syncStatusCmd(), syncWaitCmd(), syncAuditCmd())
 
 	return cmd
 }
@@ -176,24 +158,19 @@ func resolveSyncDirectoryArg(args []string, rootPath string, onlyMode bool) (str
 }
 
 type syncCommandResult struct {
-	Status         string              `json:"status"`
-	RootID         string              `json:"root_id,omitempty"`
-	RootName       string              `json:"root_name,omitempty"`
-	SourcePath     string              `json:"source_path,omitempty"`
-	DryRun         bool                `json:"dry_run,omitempty"`
-	Changes        int                 `json:"changes"`
-	Stats          *models.DiffStats   `json:"stats,omitempty"`
-	FileChanges    []models.FileChange `json:"file_changes,omitempty"`
-	Ignored        []string            `json:"ignored_patterns,omitempty"`
-	Secrets        []string            `json:"secrets,omitempty"`
-	SyncJobID      string              `json:"sync_job_id,omitempty"`
-	GenerationID   string              `json:"generation_id,omitempty"`
-	GenerationSeq  int64               `json:"generation_seq,omitempty"`
-	ChunksAdded    int                 `json:"chunks_added,omitempty"`
-	ChunksRemoved  int                 `json:"chunks_removed,omitempty"`
-	ChunksMoved    int                 `json:"chunks_moved,omitempty"`
-	FilesProcessed int                 `json:"files_processed,omitempty"`
-	dirtyPaths     []string
+	Status            string              `json:"status"`
+	RootID            string              `json:"root_id,omitempty"`
+	RootName          string              `json:"root_name,omitempty"`
+	SourcePath        string              `json:"source_path,omitempty"`
+	DryRun            bool                `json:"dry_run,omitempty"`
+	Changes           int                 `json:"changes"`
+	Stats             *models.DiffStats   `json:"stats,omitempty"`
+	FileChanges       []models.FileChange `json:"file_changes,omitempty"`
+	Ignored           []string            `json:"ignored_patterns,omitempty"`
+	Secrets           []string            `json:"secrets,omitempty"`
+	FilesProcessed    int                 `json:"files_processed,omitempty"`
+	ConflictsRetained int                 `json:"conflicts_retained,omitempty"`
+	dirtyPaths        []string
 }
 
 func syncLogWriter(jsonOutput bool) io.Writer {
@@ -206,14 +183,13 @@ func syncLogWriter(jsonOutput bool) io.Writer {
 func syncStatusCmd() *cobra.Command {
 	var (
 		rootRef  string
-		jobID    string
 		jsonOut  bool
 		watch    bool
 		interval time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "status [root-id-or-name]",
-		Short: "Show sync job status",
+		Short: "Show sync processing status",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := appconfig.Load()
@@ -223,71 +199,40 @@ func syncStatusCmd() *cobra.Command {
 			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
 			if err != nil {
 				return err
+			}
+			read := func(ctx context.Context) (*captureStatusReport, error) {
+				return readCaptureStatus(ctx, client, rootID, nil)
+			}
+			emit := func(result *captureStatusReport) error {
+				if jsonOut {
+					return writePrettyJSON(os.Stdout, result)
+				}
+				return printCaptureStatus(os.Stdout, result)
 			}
 			if watch {
-				return watchSyncStatus(client, rootID, jobID, interval, jsonOut)
+				ctx, cancel := context.WithTimeout(cmd.Context(), syncPollTimeout())
+				defer cancel()
+				_, err := pollCaptureStatus(ctx, interval, read, emit)
+				return err
 			}
-			job, raw, err := getSyncJob(client, rootID, jobID)
+			result, err := read(cmd.Context())
 			if err != nil {
 				return err
 			}
-			if jsonOut {
-				return writeRawJSONLine(os.Stdout, raw)
-			}
-			printSyncJob(os.Stdout, job)
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
-	cmd.Flags().StringVar(&jobID, "job-id", "", "Specific sync job ID (defaults to latest)")
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print raw sync job JSON")
-	cmd.Flags().BoolVar(&watch, "watch", false, "Poll until the sync job completes or fails")
-	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval for --watch")
-	return cmd
-}
+			return emit(result)
 
-func syncJobsCmd() *cobra.Command {
-	var (
-		rootRef string
-		jsonOut bool
-	)
-	cmd := &cobra.Command{
-		Use:   "jobs [root-id-or-name]",
-		Short: "List recent sync jobs for a root",
-		Args:  cobra.MaximumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := appconfig.Load()
-			if err != nil {
-				return fmt.Errorf("loading config: %w", err)
-			}
-			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
-			if err != nil {
-				return err
-			}
-			raw, err := client.get(fmt.Sprintf("/roots/%s/sync/jobs", url.PathEscape(rootID)))
-			if err != nil {
-				return fmt.Errorf("listing sync jobs: %w", err)
-			}
-			if jsonOut {
-				return writeRawJSONLine(os.Stdout, raw)
-			}
-			var jobs []models.SyncJob
-			if err := json.Unmarshal(raw, &jobs); err != nil {
-				return fmt.Errorf("parsing sync jobs: %w", err)
-			}
-			printSyncJobs(os.Stdout, jobs)
-			return nil
 		},
 	}
 	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print raw sync jobs JSON")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print per-file processing status JSON")
+	cmd.Flags().BoolVar(&watch, "watch", false, "Poll until indexing completes or processing fails")
+	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval for --watch")
 	return cmd
 }
 
 func syncWaitCmd() *cobra.Command {
 	var (
 		rootRef  string
-		jobID    string
 		jsonOut  bool
 		interval time.Duration
 		timeout  time.Duration
@@ -296,46 +241,34 @@ func syncWaitCmd() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "wait [root-id-or-name]",
-		Short: "Wait for a sync job or selected committed files",
+		Short: "Wait for indexing or selected synced files",
 		Long: strings.TrimSpace(`Wait for sync completion.
 
-With no --include or --exclude filters, this waits for the latest or specified
-sync job to complete. With filters, it repeatedly hashes matching local files
-and waits until the latest committed root state contains those exact file
-versions. Filters use the same root-relative glob semantics as subset sync:
-multiple --include flags are additive, and --exclude wins.`),
+This waits for the latest registered extraction of each captured file to be published. Filters compare matching local file hashes
+with those captured versions. Unrelated files do not block a filtered wait.
+There is no root job ID or server-side commit barrier.`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := appconfig.Load()
 			if err != nil {
 				return fmt.Errorf("loading config: %w", err)
 			}
-			if len(includes) > 0 || len(excludes) > 0 {
-				result, err := waitForCommittedSelection(cfg, rootRef, args, syncSubsetSpec{Includes: includes, Excludes: excludes}, jobID, interval, timeout, !jsonOut)
-				if jsonOut && result != nil {
-					if writeErr := writePrettyJSON(os.Stdout, result); writeErr != nil {
-						return writeErr
-					}
+			var emit func(*captureStatusReport) error
+			if !jsonOut {
+				emit = func(result *captureStatusReport) error { return printCaptureStatus(os.Stdout, result) }
+			}
+			result, err := waitForCapturedSelection(cmd.Context(), cfg, rootRef, args,
+				syncSubsetSpec{Includes: includes, Excludes: excludes}, interval, timeout, emit)
+			if jsonOut && result != nil {
+				if writeErr := writePrettyJSON(os.Stdout, result); writeErr != nil {
+					return writeErr
 				}
-				return err
 			}
-			client, rootID, err := syncCommandClientAndRoot(cfg, rootRef, args)
-			if err != nil {
-				return err
-			}
-			job, err := waitForSyncJob(client, rootID, jobID, interval, !jsonOut)
-			if err != nil {
-				return err
-			}
-			if jsonOut {
-				return writePrettyJSON(os.Stdout, job)
-			}
-			return nil
+			return err
 		},
 	}
 	cmd.Flags().StringVar(&rootRef, "root", "", "Root ID or name (defaults to the root for the current directory)")
-	cmd.Flags().StringVar(&jobID, "job-id", "", "Specific sync job ID (defaults to latest)")
-	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print final sync job JSON")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "Print final processing status JSON")
 	cmd.Flags().DurationVar(&interval, "interval", 2*time.Second, "Polling interval")
 	cmd.Flags().DurationVar(&timeout, "timeout", 0, "Maximum time to wait (defaults to PUFFERFS_SYNC_POLL_TIMEOUT or 35m)")
 	cmd.Flags().StringArrayVar(&includes, "include", nil, "Wait for files matching this root-relative glob; can be repeated")
@@ -370,169 +303,6 @@ func syncCommandClientAndRoot(cfg *appconfig.Config, rootRef string, args []stri
 		rootID = resolvedID
 	}
 	return client, rootID, nil
-}
-
-func getSyncJob(client *apiClient, rootID, jobID string) (*models.SyncJob, []byte, error) {
-	path := fmt.Sprintf("/roots/%s/sync/status", url.PathEscape(rootID))
-	if jobID != "" {
-		path += "?job_id=" + url.QueryEscape(jobID)
-	}
-	raw, err := client.get(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("getting sync status: %w", err)
-	}
-	var job models.SyncJob
-	if err := json.Unmarshal(raw, &job); err != nil {
-		return nil, nil, fmt.Errorf("parsing sync status: %w", err)
-	}
-	return &job, raw, nil
-}
-
-func watchSyncStatus(client *apiClient, rootID, jobID string, interval time.Duration, jsonOut bool) error {
-	deadline := time.Now().Add(syncPollTimeout())
-	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out waiting for sync job status")
-		}
-		job, raw, err := getSyncJob(client, rootID, jobID)
-		if err != nil {
-			return err
-		}
-		if jsonOut {
-			if err := writeRawJSONLine(os.Stdout, raw); err != nil {
-				return err
-			}
-		} else {
-			printSyncJob(os.Stdout, job)
-		}
-		if syncJobTerminal(job.Status) {
-			if job.Status == "failed" {
-				return fmt.Errorf("sync job failed: %s", string(job.Errors))
-			}
-			return nil
-		}
-		time.Sleep(normalizeSyncPollInterval(interval))
-	}
-}
-
-func waitForSyncJob(client *apiClient, rootID, jobID string, interval time.Duration, logProgress bool) (*models.SyncJob, error) {
-	deadline := time.Now().Add(syncPollTimeout())
-	for {
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for sync job")
-		}
-		job, _, err := getSyncJob(client, rootID, jobID)
-		if err != nil {
-			return nil, err
-		}
-		switch job.Status {
-		case "completed":
-			if logProgress {
-				fmt.Fprintf(os.Stdout, "Sync job %s completed (%d/%d files).\n", job.ID, job.Processed, job.TotalFiles)
-			}
-			return job, nil
-		case "failed":
-			return job, fmt.Errorf("sync job failed: %s", string(job.Errors))
-		default:
-			if logProgress {
-				printSyncProgress(os.Stdout, job)
-			}
-			time.Sleep(normalizeSyncPollInterval(interval))
-		}
-	}
-}
-
-type syncSelectionWaitResult struct {
-	Status               string               `json:"status"`
-	RootID               string               `json:"root_id"`
-	RootName             string               `json:"root_name,omitempty"`
-	SourcePath           string               `json:"source_path"`
-	VisibleGenerationID  string               `json:"visible_generation_id,omitempty"`
-	VisibleGenerationSeq int64                `json:"visible_generation_seq,omitempty"`
-	Matched              int                  `json:"matched"`
-	Total                int                  `json:"total"`
-	Missing              []string             `json:"missing,omitempty"`
-	Stale                []syncSelectionStale `json:"stale,omitempty"`
-	LatestJob            *models.SyncJob      `json:"latest_job,omitempty"`
-	Includes             []string             `json:"include,omitempty"`
-	Excludes             []string             `json:"exclude,omitempty"`
-}
-
-type syncSelectionStale struct {
-	Path     string `json:"path"`
-	Expected string `json:"expected"`
-	Actual   string `json:"actual,omitempty"`
-}
-
-func waitForCommittedSelection(cfg *appconfig.Config, rootRef string, args []string, spec syncSubsetSpec, jobID string, interval, timeout time.Duration, logProgress bool) (*syncSelectionWaitResult, error) {
-	if cfg.Server.URL == "" {
-		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
-	}
-	client := newAPIClient(cfg)
-	root, err := resolveSyncWaitRoot(client, rootRef, args)
-	if err != nil {
-		return nil, err
-	}
-	compiled, err := compileSyncSubsetSpec(root.CanonicalSourcePath, spec)
-	if err != nil {
-		return nil, err
-	}
-	policy, err := fetchSyncPolicy(client, false)
-	if err != nil {
-		return nil, err
-	}
-
-	if timeout <= 0 {
-		timeout = syncPollTimeout()
-	}
-	interval = normalizeSyncPollInterval(interval)
-	deadline := time.Now().Add(timeout)
-	var last *syncSelectionWaitResult
-	for {
-		localState, err := selectedLocalState(root.CanonicalSourcePath, compiled, policy)
-		if err != nil {
-			return last, err
-		}
-		remoteRoot, err := loadRemoteRoot(client, root.ID)
-		if err != nil {
-			return last, fmt.Errorf("loading remote root metadata: %w", err)
-		}
-		remoteState, err := loadRemoteState(client, root.ID)
-		if err != nil {
-			return last, fmt.Errorf("loading remote state: %w", err)
-		}
-		latestJob, jobErr := getOptionalSyncJob(client, root.ID, jobID)
-		if jobErr != nil {
-			return last, jobErr
-		}
-		result := compareCommittedSelection(remoteRoot, root.CanonicalSourcePath, localState, remoteState, latestJob, spec)
-		last = result
-		if result.Status == "synced" {
-			if logProgress {
-				fmt.Fprintf(os.Stdout, "All selected files are synced (%d/%d).\n", result.Matched, result.Total)
-			}
-			return result, nil
-		}
-		if result.Status == "empty" {
-			return result, fmt.Errorf("no local files matched the selected sync filters")
-		}
-		if latestJob != nil && latestJob.Status == "failed" {
-			result.Status = "failed"
-			return result, fmt.Errorf("sync job failed: %s", string(latestJob.Errors))
-		}
-		if jobID != "" && latestJob != nil && latestJob.Status == "completed" {
-			result.Status = "unsynced"
-			return result, fmt.Errorf("sync job %s completed but selected files are not committed (%d/%d matched)", jobID, result.Matched, result.Total)
-		}
-		if time.Now().After(deadline) {
-			result.Status = "timeout"
-			return result, fmt.Errorf("timed out waiting for selected files to sync (%d/%d matched)", result.Matched, result.Total)
-		}
-		if logProgress {
-			printSelectionWaitProgress(os.Stdout, result)
-		}
-		time.Sleep(interval)
-	}
 }
 
 func resolveSyncWaitRoot(client *apiClient, rootRef string, args []string) (*syncOnlyRoot, error) {
@@ -620,103 +390,6 @@ func selectedLocalState(rootPath string, spec compiledSyncSubsetSpec, policy ign
 	return state, nil
 }
 
-func getOptionalSyncJob(client *apiClient, rootID, jobID string) (*models.SyncJob, error) {
-	job, _, err := getSyncJob(client, rootID, jobID)
-	if err == nil {
-		return job, nil
-	}
-	if jobID != "" {
-		return nil, err
-	}
-	var apiErr *apiError
-	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	return nil, err
-}
-
-func compareCommittedSelection(root *models.RootMetadata, sourcePath string, localState, remoteState map[string]models.FileState, latestJob *models.SyncJob, spec syncSubsetSpec) *syncSelectionWaitResult {
-	result := &syncSelectionWaitResult{
-		Status:               "pending",
-		RootID:               root.ID,
-		RootName:             root.Name,
-		SourcePath:           sourcePath,
-		VisibleGenerationID:  root.VisibleGenerationID,
-		VisibleGenerationSeq: root.VisibleGenerationSeq,
-		Total:                len(localState),
-		LatestJob:            latestJob,
-		Includes:             dedupeStrings(spec.Includes),
-		Excludes:             dedupeStrings(spec.Excludes),
-	}
-	if len(localState) == 0 {
-		result.Status = "empty"
-		return result
-	}
-	paths := make([]string, 0, len(localState))
-	for relPath := range localState {
-		paths = append(paths, relPath)
-	}
-	sort.Strings(paths)
-	for _, relPath := range paths {
-		local := localState[relPath]
-		remote, ok := remoteState[relPath]
-		if !ok {
-			result.Missing = append(result.Missing, relPath)
-			continue
-		}
-		if remote.ContentHash != local.ContentHash || remote.Size != local.Size {
-			result.Stale = append(result.Stale, syncSelectionStale{
-				Path:     relPath,
-				Expected: local.ContentHash,
-				Actual:   remote.ContentHash,
-			})
-			continue
-		}
-		result.Matched++
-	}
-	if result.Matched == result.Total {
-		result.Status = "synced"
-	}
-	return result
-}
-
-func printSelectionWaitProgress(w io.Writer, result *syncSelectionWaitResult) {
-	if result == nil {
-		return
-	}
-	jobStatus := "no active sync job"
-	if result.LatestJob != nil {
-		jobStatus = fmt.Sprintf("latest job: %s (%d/%d files)", result.LatestJob.Status, result.LatestJob.Processed, result.LatestJob.TotalFiles)
-	}
-	fmt.Fprintf(w, "Waiting for selected files to sync: %d/%d matched; %s\n", result.Matched, result.Total, jobStatus)
-	if len(result.Missing) > 0 {
-		fmt.Fprintf(w, "missing: %s\n", strings.Join(limitStrings(result.Missing, 5), ", "))
-	}
-	if len(result.Stale) > 0 {
-		paths := make([]string, 0, min(len(result.Stale), 5))
-		for i, stale := range result.Stale {
-			if i >= 5 {
-				break
-			}
-			paths = append(paths, stale.Path)
-		}
-		fmt.Fprintf(w, "stale: %s\n", strings.Join(paths, ", "))
-	}
-}
-
-func limitStrings(values []string, limit int) []string {
-	if len(values) <= limit {
-		return values
-	}
-	out := append([]string{}, values[:limit]...)
-	out = append(out, fmt.Sprintf("...+%d more", len(values)-limit))
-	return out
-}
-
-func syncJobTerminal(status string) bool {
-	return status == "completed" || status == "failed"
-}
-
 func normalizeSyncPollInterval(interval time.Duration) time.Duration {
 	if interval < 100*time.Millisecond {
 		return 2 * time.Second
@@ -724,227 +397,8 @@ func normalizeSyncPollInterval(interval time.Duration) time.Duration {
 	return interval
 }
 
-func printSyncJob(w io.Writer, job *models.SyncJob) {
-	fmt.Fprintf(w, "sync_job_id: %s\n", job.ID)
-	fmt.Fprintf(w, "root_id: %s\n", job.RootID)
-	fmt.Fprintf(w, "status: %s\n", job.Status)
-	fmt.Fprintf(w, "progress: %d/%d files\n", syncJobCurrentProgress(job), job.TotalFiles)
-	fmt.Fprintf(w, "stages: chunked=%d indexed=%d\n", job.Chunked, job.Indexed)
-	fmt.Fprintf(w, "started_at: %s\n", job.StartedAt.Format(time.RFC3339))
-	if job.FinishedAt != nil {
-		fmt.Fprintf(w, "finished_at: %s\n", job.FinishedAt.Format(time.RFC3339))
-	}
-	if len(job.Errors) > 0 && string(job.Errors) != "null" {
-		fmt.Fprintf(w, "errors: %s\n", string(job.Errors))
-	}
-}
-
-func syncJobCurrentProgress(job *models.SyncJob) int {
-	if job.Status == "chunking" {
-		return job.Chunked
-	}
-	return max(job.Processed, job.Indexed)
-}
-
-func printSyncProgress(w io.Writer, job *models.SyncJob) {
-	fmt.Fprintf(w, "Sync status: %s (%d/%d files; chunked=%d indexed=%d)\n",
-		job.Status, syncJobCurrentProgress(job), job.TotalFiles, job.Chunked, job.Indexed)
-}
-
-func printSyncJobs(w io.Writer, jobs []models.SyncJob) {
-	if len(jobs) == 0 {
-		fmt.Fprintln(w, "No sync jobs found.")
-		return
-	}
-	for i := range jobs {
-		if i > 0 {
-			fmt.Fprintln(w)
-		}
-		printSyncJob(w, &jobs[i])
-	}
-}
-
-func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
-	if log == nil {
-		log = os.Stdout
-	}
-	// Default name to directory basename
-	if name == "" {
-		name = filepath.Base(dir)
-	}
-
-	var (
-		client     *apiClient
-		localMeta  *rootMeta
-		remoteRoot *models.RootMetadata
-	)
-	if rootID == "" {
-		if meta, err := findLocalRootMeta(name, dir); err == nil {
-			rootID = meta.ID
-			localMeta = meta
-		} else if !dryRun {
-			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, noVector, log)
-			if err != nil {
-				return nil, err
-			}
-			rootID = resolvedRoot.ID
-			remoteRoot = resolvedRoot
-		}
-	} else if meta, err := loadRootMeta(rootID); err == nil {
-		localMeta = meta
-	}
-	if !dryRun && cfg.Server.URL != "" && rootID != "" && remoteRoot == nil {
-		if client == nil {
-			client = newAPIClient(cfg)
-		}
-		var err error
-		remoteRoot, err = loadRemoteRoot(client, rootID)
-		if err != nil {
-			return nil, fmt.Errorf("loading remote root metadata: %w", err)
-		}
-		if err := validateNoVectorRoot(remoteRoot, noVector); err != nil {
-			return nil, err
-		}
-	}
-	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
-	useLocalCache := localCacheMatchesRemote(localMeta, remoteRoot)
-	var hashCache map[string]models.FileState
-	if useLocalCache && rootID != "" {
-		hashCache, _ = loadLocalState(rootID)
-	}
-
-	policy := ignore.PolicyPatternSet{}
-	if cfg.Server.URL != "" && rootID != "" {
-		if client == nil {
-			client = newAPIClient(cfg)
-		}
-		effectivePolicy, err := fetchEffectiveIgnorePolicy(client)
-		if err != nil {
-			if !dryRun {
-				return nil, fmt.Errorf("loading ignore policy: %w", err)
-			}
-			fmt.Fprintf(log, "Warning: could not load server ignore policy: %v\n", err)
-		} else {
-			policy.OrgPatterns = effectivePolicy.OrgPatterns
-			policy.UserPatterns = effectivePolicy.UserPatterns
-		}
-	}
-	if !dryRun {
-		var baseState map[string]models.FileState
-		if useLocalCache && baseGenerationID != "" && localMeta != nil && localMeta.GenerationID == baseGenerationID && hashCache != nil {
-			baseState = hashCache
-		} else {
-			var loadErr error
-			baseState, loadErr = loadRemoteState(client, rootID)
-			if loadErr != nil {
-				return nil, fmt.Errorf("loading remote state: %w", loadErr)
-			}
-		}
-		return runCapturedSyncWithConflictRetry(captureSyncInput{
-			Config:            cfg,
-			Client:            client,
-			Dir:               dir,
-			Name:              name,
-			RootID:            rootID,
-			BaseGenerationID:  baseGenerationID,
-			BaseGenerationSeq: baseGenerationSeq,
-			BaseState:         baseState,
-			HashCache:         hashCache,
-			Policy:            policy,
-			Force:             force,
-			WaitForCompletion: waitForCompletion,
-			Log:               log,
-		})
-	}
-
-	// Build Merkle tree (parallel file hashing)
-	matcher := ignore.NewMatcherWithPolicy(dir, policy)
-	fmt.Fprintf(log, "Building Merkle tree for %s...\n", dir)
-	start := time.Now()
-	currentTree, err := merkle.BuildTreeWithStateCache(dir, matcher, hashCache)
-	if err != nil {
-		return nil, fmt.Errorf("building Merkle tree: %w", err)
-	}
-	fmt.Fprintf(log, "Merkle tree built in %s (root hash: %s)\n", time.Since(start).Round(time.Millisecond), currentTree.Root.Hash[:20]+"...")
-
-	// Extract flat state for backward compatibility with server
-	currentState := currentTree.ToFileStateMap()
-
-	if !useLocalCache {
-		fmt.Fprintln(log, "Remote generation changed; diffing against remote state.")
-		previousState, err := loadRemoteState(client, rootID)
-		if err != nil {
-			return nil, fmt.Errorf("loading remote state: %w", err)
-		}
-		result := diff.Compute(previousState, currentState)
-		if force {
-			result = forcedSyncDiff(previousState, currentState)
-		}
-		if countChanges(result) == 0 {
-			if force {
-				fmt.Fprintln(log, "No files to force sync.")
-			} else {
-				fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
-			}
-			if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, baseGenerationID, baseGenerationSeq); err != nil {
-				return nil, err
-			}
-			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
-		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
-	}
-
-	if force {
-		previousState := hashCache
-		if previousState == nil {
-			previousState, _ = loadLocalState(rootID)
-		}
-		if previousState == nil && rootID != "" && !dryRun && cfg.Server.URL != "" {
-			previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
-		}
-		result := forcedSyncDiff(previousState, currentState)
-		if countChanges(result) == 0 {
-			fmt.Fprintln(log, "No files to force sync.")
-			return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
-		}
-		return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
-	}
-
-	// Load previous tree — try local first, then fall back to flat state
-	var prevTree *merkle.Tree
-	prevTree, err = loadLocalTree(rootID)
-	if err != nil {
-		// Fall back to flat state for backward compatibility
-		var previousState map[string]models.FileState
-		previousState, err = loadLocalState(rootID)
-		if err != nil {
-			if rootID != "" && !dryRun && cfg.Server.URL != "" {
-				previousState, _ = loadRemoteState(newAPIClient(cfg), rootID)
-			}
-		}
-		if previousState != nil {
-			// Use flat diff as fallback
-			result := diff.Compute(previousState, currentState)
-			return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
-		}
-		// No previous state at all — everything is new
-		prevTree = &merkle.Tree{Root: &merkle.Node{IsDir: true, Children: map[string]*merkle.Node{}}}
-	}
-
-	// Merkle tree-based diff — only walks changed branches
-	if prevTree.Root.Hash == currentTree.Root.Hash {
-		fmt.Fprintln(log, "No changes detected (Merkle root hash matches).")
-		return unchangedSyncResult(rootID, name, dir, baseGenerationID, baseGenerationSeq), nil
-	}
-
-	treeChanges := merkle.Diff(prevTree, currentTree)
-	fmt.Fprintf(log, "Merkle diff found %d changed files (skipped unchanged subtrees)\n", len(treeChanges))
-
-	// Convert Merkle changes to DiffResult for compatibility
-	result := merkleChangesToDiffResult(treeChanges)
-
-	return runSyncWithConflictRetry(cfg, dir, name, rootID, rootScope, noVector, force, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
+func runSync(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, force, dryRun bool, log io.Writer) (*syncCommandResult, error) {
+	return runSyncSubset(cfg, dir, syncSubsetSpec{}, name, rootID, rootScope, noVector, force, dryRun, log)
 }
 
 type syncOnlyRoot struct {
@@ -962,186 +416,59 @@ type compiledSyncSubsetSpec struct {
 	excludeGlobs []string
 }
 
-func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
-	if log == nil {
-		log = os.Stdout
-	}
-	rootPath = filepath.Clean(rootPath)
-	canonicalRoot, err := canonicalLocalPath(rootPath)
+func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, noVector, force, dryRun bool, log io.Writer) (*syncCommandResult, error) {
+	canonical, err := canonicalLocalPath(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolving sync root: %w", err)
 	}
 	if name == "" {
-		name = filepath.Base(canonicalRoot)
+		name = filepath.Base(canonical)
 	}
-	if cfg.Server.URL == "" && !dryRun {
+	if dryRun {
+		return runFileCapturePreview(context.Background(), cfg, canonical, name, rootID, spec, noVector, force, log)
+	}
+	if cfg.Server.URL == "" {
 		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
 	}
-
-	var (
-		client     *apiClient
-		localMeta  *rootMeta
-		remoteRoot *models.RootMetadata
-	)
+	if log == nil {
+		log = os.Stdout
+	}
+	client := newAPIClient(cfg)
 	if rootID == "" {
-		if meta, err := findLocalRootMeta(name, rootPath); err == nil {
+		if meta, err := findLocalRootMeta(name, canonical); err == nil {
 			rootID = meta.ID
-			localMeta = meta
-		} else if meta, err := findLocalRootMeta(name, canonicalRoot); err == nil {
-			rootID = meta.ID
-			localMeta = meta
-		} else if !dryRun {
-			client = newAPIClient(cfg)
-			resolvedRoot, err := resolveOrCreateRoot(client, name, rootPath, rootScope, noVector, log)
+		} else {
+			root, err := resolveOrCreateRoot(client, name, canonical, rootScope, noVector, log)
 			if err != nil {
 				return nil, err
 			}
-			rootID = resolvedRoot.ID
-			remoteRoot = resolvedRoot
-		}
-	} else if meta, err := loadRootMeta(rootID); err == nil {
-		localMeta = meta
-	}
-	if !dryRun && cfg.Server.URL != "" && rootID != "" && remoteRoot == nil {
-		if client == nil {
-			client = newAPIClient(cfg)
-		}
-		remoteRoot, err = loadRemoteRoot(client, rootID)
-		if err != nil {
-			return nil, fmt.Errorf("loading remote root metadata: %w", err)
-		}
-		if err := validateNoVectorRoot(remoteRoot, noVector); err != nil {
-			return nil, err
+			rootID = root.ID
 		}
 	}
-
-	baseGenerationID, baseGenerationSeq := syncBaseFromMeta(localMeta, remoteRoot)
-	root := &syncOnlyRoot{
-		RootMetadata: models.RootMetadata{
-			ID:                   rootID,
-			Name:                 name,
-			SourcePath:           rootPath,
-			Scope:                rootScope,
-			VisibleGenerationID:  baseGenerationID,
-			VisibleGenerationSeq: baseGenerationSeq,
-		},
-		CanonicalSourcePath: canonicalRoot,
+	root, err := loadRemoteRoot(client, rootID)
+	if err != nil {
+		return nil, fmt.Errorf("loading remote root metadata: %w", err)
 	}
-	if remoteRoot != nil {
-		root.RootMetadata = *remoteRoot
-		root.CanonicalSourcePath = canonicalRoot
-		if name == "" {
-			name = remoteRoot.Name
-		}
+	if err := validateNoVectorRoot(root, noVector); err != nil {
+		return nil, err
 	}
-
-	if client == nil && cfg.Server.URL != "" {
-		client = newAPIClient(cfg)
-	}
-	policy, err := fetchSyncPolicy(client, dryRun)
+	policy, err := fetchSyncPolicy(client, false)
 	if err != nil {
 		return nil, err
 	}
-	compiled, err := compileSyncSubsetSpec(canonicalRoot, spec)
+	compiled, err := compileSyncSubsetSpec(canonical, spec)
 	if err != nil {
 		return nil, err
 	}
-
-	result, err := runSyncSubsetOnce(cfg, client, root, compiled, policy, force, dryRun, waitForCompletion, log)
-	var conflict *syncConflictError
-	if !errors.As(err, &conflict) {
+	input := captureSyncInput{Client: client, Dir: canonical, Name: root.Name, RootID: rootID, Policy: policy, Select: compiled.matches, Force: force, Log: log}
+	result, err := runFileCaptureSync(context.Background(), input, fileCaptureCacheDir(input))
+	if err != nil {
 		return result, err
 	}
-	if dryRun {
-		return nil, err
+	if err := saveRootMeta(rootID, root.Name, canonical); err != nil {
+		return result, fmt.Errorf("saving local root identity after capture: %w", err)
 	}
-
-	fmt.Fprintln(log, "Remote generation changed during sync; reconciling selected files against latest remote state.")
-	latestRoot, loadErr := loadRemoteRoot(client, root.ID)
-	if loadErr != nil {
-		return nil, fmt.Errorf("loading remote root metadata after sync conflict: %w", loadErr)
-	}
-	root.RootMetadata = *latestRoot
-	return runSyncSubsetOnce(cfg, client, root, compiled, policy, force, dryRun, waitForCompletion, log)
-}
-
-func runSyncSubsetOnce(cfg *appconfig.Config, client *apiClient, root *syncOnlyRoot, spec compiledSyncSubsetSpec, policy ignore.PolicyPatternSet, force, dryRun, waitForCompletion bool, log io.Writer) (*syncCommandResult, error) {
-	baseState, err := loadSyncSubsetBaseState(client, root)
-	if err != nil {
-		return nil, err
-	}
-	if !dryRun {
-		var hashCache map[string]models.FileState
-		if localMeta, err := loadRootMeta(root.ID); root.VisibleGenerationID != "" && err == nil && localCacheMatchesRemote(localMeta, &root.RootMetadata) {
-			if canonicalMetaPath, err := canonicalLocalPath(localMeta.SourcePath); err == nil && canonicalMetaPath == root.CanonicalSourcePath {
-				hashCache, _ = loadLocalState(root.ID)
-			}
-		}
-		return runCapturedSyncOnce(captureSyncInput{
-			Config:            cfg,
-			Client:            client,
-			Dir:               root.CanonicalSourcePath,
-			Name:              root.Name,
-			RootID:            root.ID,
-			BaseGenerationID:  root.VisibleGenerationID,
-			BaseGenerationSeq: root.VisibleGenerationSeq,
-			BaseState:         baseState,
-			HashCache:         hashCache,
-			Policy:            policy,
-			Select:            spec.matches,
-			Force:             force,
-			WaitForCompletion: waitForCompletion,
-			Log:               log,
-		})
-	}
-	matcher := ignore.NewMatcherWithPolicy(root.CanonicalSourcePath, policy)
-	diffResult, mergedState, err := buildSyncSubsetDiff(root.CanonicalSourcePath, spec, baseState, matcher, force)
-	if err != nil {
-		return nil, err
-	}
-	if countChanges(diffResult) == 0 {
-		if force {
-			fmt.Fprintln(log, "No selected files to force sync.")
-		} else {
-			fmt.Fprintln(log, "No changes detected for selected files.")
-		}
-		return unchangedSyncResult(root.ID, root.Name, root.CanonicalSourcePath, root.VisibleGenerationID, root.VisibleGenerationSeq), nil
-	}
-
-	currentTree, err := merkle.BuildTreeFromState(root.CanonicalSourcePath, mergedState)
-	if err != nil {
-		return nil, fmt.Errorf("building merged root tree: %w", err)
-	}
-	syncResult, err := runSyncWithResult(cfg, root.CanonicalSourcePath, root.Name, root.ID, root.Scope, root.VectorDisabled, dryRun, waitForCompletion, diffResult, mergedState, currentTree, root.VisibleGenerationID, root.VisibleGenerationSeq, policy, log)
-	if syncResult != nil {
-		syncResult.FileChanges = filterChanges(diffResult)
-		stats := diffResult.Stats
-		if dryRun {
-			syncResult.Stats = &stats
-		}
-	}
-	return syncResult, err
-}
-
-func loadSyncSubsetBaseState(client *apiClient, root *syncOnlyRoot) (map[string]models.FileState, error) {
-	if root == nil || root.ID == "" {
-		return map[string]models.FileState{}, nil
-	}
-	if localMeta, err := loadRootMeta(root.ID); root.VisibleGenerationID != "" && err == nil && localCacheMatchesRemote(localMeta, &root.RootMetadata) {
-		if canonicalMetaPath, err := canonicalLocalPath(localMeta.SourcePath); err == nil && canonicalMetaPath == root.CanonicalSourcePath {
-			if state, err := loadLocalState(root.ID); err == nil {
-				return state, nil
-			}
-		}
-	}
-	if client == nil {
-		return map[string]models.FileState{}, nil
-	}
-	state, err := loadRemoteState(client, root.ID)
-	if err != nil {
-		return nil, fmt.Errorf("loading remote state: %w", err)
-	}
-	return state, nil
+	return result, nil
 }
 
 func fetchSyncPolicy(client *apiClient, dryRun bool) (ignore.PolicyPatternSet, error) {
@@ -1297,170 +624,6 @@ func canonicalLocalPath(path string) (string, error) {
 	return abs, nil
 }
 
-func buildSyncSubsetDiff(rootPath string, spec compiledSyncSubsetSpec, baseState map[string]models.FileState, matcher *ignore.Matcher, force bool) (models.DiffResult, map[string]models.FileState, error) {
-	merged := make(map[string]models.FileState, len(baseState))
-	for path, state := range baseState {
-		merged[path] = state
-	}
-
-	current := make(map[string]models.FileState)
-	selected := make(map[string]bool)
-	rootPath = filepath.Clean(rootPath)
-
-	err := filepath.WalkDir(rootPath, func(absPath string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		relPath, err := filepath.Rel(rootPath, absPath)
-		if err != nil {
-			return err
-		}
-		if relPath == "." {
-			return nil
-		}
-		relPath = filepath.ToSlash(relPath)
-
-		if matcher != nil && matcher.ShouldIgnore(relPath, entry.IsDir()) {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if !spec.matches(relPath) {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", relPath, err)
-		}
-		state, err := fileStateForPath(absPath, info)
-		if err != nil {
-			return fmt.Errorf("hash %s: %w", relPath, err)
-		}
-		selected[relPath] = true
-		current[relPath] = state
-		return nil
-	})
-	if err != nil {
-		return models.DiffResult{}, nil, err
-	}
-
-	for relPath := range baseState {
-		if spec.matches(relPath) {
-			selected[relPath] = true
-		}
-	}
-
-	result := models.DiffResult{}
-	paths := make([]string, 0, len(selected))
-	for relPath := range selected {
-		paths = append(paths, relPath)
-	}
-	sort.Strings(paths)
-
-	for _, relPath := range paths {
-		currentState, hasCurrent := current[relPath]
-		base, hadBase := baseState[relPath]
-		switch {
-		case !hasCurrent && hadBase:
-			delete(merged, relPath)
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusRemoved,
-				ContentHash: base.ContentHash,
-				Size:        base.Size,
-			})
-			result.Stats.Removed++
-		case hasCurrent && !hadBase:
-			merged[relPath] = currentState
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusAdded,
-				ContentHash: currentState.ContentHash,
-				Size:        currentState.Size,
-			})
-			result.Stats.Added++
-		case hasCurrent && (base.ContentHash != currentState.ContentHash || base.Size != currentState.Size):
-			merged[relPath] = currentState
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusModified,
-				ContentHash: currentState.ContentHash,
-				Size:        currentState.Size,
-			})
-			result.Stats.Modified++
-		case hasCurrent && force:
-			merged[relPath] = currentState
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusModified,
-				ContentHash: currentState.ContentHash,
-				Size:        currentState.Size,
-			})
-			result.Stats.Modified++
-		case hasCurrent:
-			merged[relPath] = base
-			result.Stats.Unchanged++
-		}
-	}
-
-	return result, merged, nil
-}
-
-func forcedSyncDiff(previousState, currentState map[string]models.FileState) models.DiffResult {
-	result := models.DiffResult{}
-	seen := make(map[string]bool, len(previousState)+len(currentState))
-	paths := make([]string, 0, len(previousState)+len(currentState))
-	for relPath := range previousState {
-		if !seen[relPath] {
-			seen[relPath] = true
-			paths = append(paths, relPath)
-		}
-	}
-	for relPath := range currentState {
-		if !seen[relPath] {
-			seen[relPath] = true
-			paths = append(paths, relPath)
-		}
-	}
-	sort.Strings(paths)
-
-	for _, relPath := range paths {
-		current, hasCurrent := currentState[relPath]
-		previous, hadPrevious := previousState[relPath]
-		switch {
-		case hasCurrent && hadPrevious:
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusModified,
-				ContentHash: current.ContentHash,
-				Size:        current.Size,
-			})
-			result.Stats.Modified++
-		case hasCurrent:
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusAdded,
-				ContentHash: current.ContentHash,
-				Size:        current.Size,
-			})
-			result.Stats.Added++
-		case hadPrevious:
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        relPath,
-				Status:      models.StatusRemoved,
-				ContentHash: previous.ContentHash,
-				Size:        previous.Size,
-			})
-			result.Stats.Removed++
-		}
-	}
-	return result
-}
-
 func (spec compiledSyncSubsetSpec) matches(relPath string) bool {
 	relPath = path.Clean(filepath.ToSlash(relPath))
 	included := len(spec.includeGlobs) == 0
@@ -1588,209 +751,6 @@ func fileStateForPath(path string, info os.FileInfo) (models.FileState, error) {
 }
 
 // runSyncWithResult executes the sync with a pre-computed DiffResult.
-func runSyncWithResult(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
-	var err error
-
-	// Detect secrets
-	secrets := diff.DetectSecrets(currentState)
-
-	if dryRun {
-		fmt.Fprint(log, diff.FormatDryRun(result, currentState, ignoredPatterns(policy), secrets))
-		return dryRunSyncResult(rootID, name, dir, result, policy, secrets), nil
-	}
-
-	// Need a server connection for actual sync
-	if cfg.Server.URL == "" {
-		return nil, fmt.Errorf("server URL not configured; run 'pufferfs init' first")
-	}
-
-	client := newAPIClient(cfg)
-
-	// Get or create root
-	if rootID == "" {
-		resolvedRoot, err := resolveOrCreateRoot(client, name, dir, rootScope, noVector, log)
-		if err != nil {
-			return nil, err
-		}
-		rootID = resolvedRoot.ID
-		baseGenerationID = resolvedRoot.VisibleGenerationID
-		baseGenerationSeq = resolvedRoot.VisibleGenerationSeq
-	}
-
-	// Upload changed files to S3 via the server
-	changeCount := countChanges(result)
-	fmt.Fprintf(log, "Syncing %d changes to root %s...\n", changeCount, rootID)
-
-	syncInit, err := initSyncSession(client, rootID, baseGenerationID, baseGenerationSeq, changeCount)
-	if err != nil {
-		if conflict, ok := syncConflictFromError(err); ok {
-			return nil, conflict
-		}
-		return nil, fmt.Errorf("initializing sync session: %w", err)
-	}
-	syncSubmitted := false
-	defer func() {
-		if !syncSubmitted {
-			_ = abortSyncSession(client, rootID, syncInit.GenerationID)
-		}
-	}()
-	heartbeat := startSyncSessionHeartbeat(client, rootID, syncInit.GenerationID, log)
-	defer heartbeat.Stop()
-	baseGenerationID = syncInit.BaseGenerationID
-	baseGenerationSeq = syncInit.BaseGenerationSeq
-
-	changes := withAbsolutePaths(dir, filterChanges(result))
-	for _, change := range changes {
-		if change.Status == models.StatusAdded || change.Status == models.StatusModified {
-			return nil, fmt.Errorf("precomputed sync cannot submit %s without an authoritative capture", change.Path)
-		}
-	}
-	// Build content proof from Merkle tree
-	proof := currentTree.BuildContentProof()
-	contentProof := &models.ContentProofData{
-		FileHashes: proof.FileHashes,
-		DirHashes:  proof.DirHashes,
-		RootHash:   proof.RootHash,
-	}
-	metadataRefs, err := uploadSyncMetadata(client, rootID, syncInit.GenerationID, changes, contentProof, currentState)
-	if err != nil {
-		return nil, err
-	}
-
-	syncReq := models.SyncRequest{
-		ProtocolVersion:   models.SyncProtocolVersion,
-		RootID:            rootID,
-		GenerationID:      syncInit.GenerationID,
-		BaseGenerationID:  baseGenerationID,
-		BaseGenerationSeq: baseGenerationSeq,
-		ChangeRefs:        metadataRefs.ChangeRefs,
-		StateRef:          metadataRefs.StateRef,
-		ContentProofRef:   metadataRefs.ContentProofRef,
-	}
-
-	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync?async=true", rootID), syncReq)
-	heartbeat.Stop()
-	if err != nil {
-		if conflict, ok := syncConflictFromError(err); ok {
-			return nil, conflict
-		}
-		return nil, fmt.Errorf("sync request: %w", err)
-	}
-	syncSubmitted = true
-
-	var syncResp models.SyncResponse
-	if err := json.Unmarshal(respBody, &syncResp); err != nil {
-		return nil, fmt.Errorf("parsing sync response: %w", err)
-	}
-	if syncResp.RootID == "" {
-		syncResp.RootID = rootID
-	}
-	var completedJob *models.SyncJob
-	if syncResp.SyncJobID != "" && waitForCompletion {
-		completedJob, err = pollSyncJob(client, rootID, syncResp.SyncJobID, log)
-		if err != nil {
-			return nil, err
-		}
-		syncResp.FilesProcessed = completedJob.Processed
-	}
-
-	saveLocalSyncCacheWarnings(rootID, name, dir, currentState, currentTree, syncResp.GenerationID, syncResp.GenerationSeq)
-
-	if !waitForCompletion {
-		fmt.Fprintf(log, "Sync job %s started for root %s. Check status with: pufferfs sync status --root %s --job-id %s\n",
-			syncResp.SyncJobID, rootID, rootID, syncResp.SyncJobID)
-		return backgroundSyncResult(name, dir, changeCount, syncResp), nil
-	}
-
-	if completedJob != nil {
-		fmt.Fprintf(log, "Sync complete: %d/%d files processed\n", completedJob.Processed, completedJob.TotalFiles)
-	} else {
-		fmt.Fprintf(log, "Sync complete: %d files processed, %d chunks added, %d removed, %d moved\n",
-			syncResp.FilesProcessed, syncResp.ChunksAdded, syncResp.ChunksRemoved, syncResp.ChunksMoved)
-	}
-
-	return completedSyncResult(name, dir, changeCount, syncResp), nil
-}
-
-type syncConflictError struct {
-	models.SyncConflictResponse
-}
-
-func (e *syncConflictError) Error() string {
-	return fmt.Sprintf("remote generation changed from %q/%d to %q/%d", e.ClientBaseGenerationID, e.ClientBaseGenerationSeq, e.CurrentGenerationID, e.CurrentGenerationSeq)
-}
-
-func syncConflictFromError(err error) (*syncConflictError, bool) {
-	var apiErr *apiError
-	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusConflict {
-		return nil, false
-	}
-	var raw map[string]json.RawMessage
-	if json.Unmarshal(apiErr.Body, &raw) != nil {
-		return nil, false
-	}
-	if _, ok := raw["current_generation_id"]; !ok {
-		return nil, false
-	}
-	var resp models.SyncConflictResponse
-	if json.Unmarshal(apiErr.Body, &resp) != nil || resp.Error == "" {
-		return nil, false
-	}
-	return &syncConflictError{SyncConflictResponse: resp}, true
-}
-
-func runSyncWithConflictRetry(cfg *appconfig.Config, dir, name, rootID, rootScope string, noVector, force, dryRun, waitForCompletion bool, result models.DiffResult, currentState map[string]models.FileState, currentTree *merkle.Tree, baseGenerationID string, baseGenerationSeq int64, policy ignore.PolicyPatternSet, log io.Writer) (*syncCommandResult, error) {
-	syncResult, err := runSyncWithResult(cfg, dir, name, rootID, rootScope, noVector, dryRun, waitForCompletion, result, currentState, currentTree, baseGenerationID, baseGenerationSeq, policy, log)
-	var conflict *syncConflictError
-	if !errors.As(err, &conflict) {
-		return syncResult, err
-	}
-	if dryRun {
-		return nil, err
-	}
-
-	fmt.Fprintln(log, "Remote generation changed during sync; reconciling against latest remote state.")
-	client := newAPIClient(cfg)
-	previousState, loadErr := loadRemoteState(client, rootID)
-	if loadErr != nil {
-		return nil, fmt.Errorf("loading remote state after sync conflict: %w", loadErr)
-	}
-	reconciled := diff.Compute(previousState, currentState)
-	if force {
-		reconciled = forcedSyncDiff(previousState, currentState)
-	}
-	if countChanges(reconciled) == 0 {
-		fmt.Fprintln(log, "No changes detected (remote state matches local filesystem).")
-		if err := saveLocalSyncCache(rootID, name, dir, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq); err != nil {
-			return nil, err
-		}
-		return unchangedSyncResult(rootID, name, dir, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq), nil
-	}
-	return runSyncWithResult(cfg, dir, name, rootID, rootScope, noVector, dryRun, waitForCompletion, reconciled, currentState, currentTree, conflict.CurrentGenerationID, conflict.CurrentGenerationSeq, policy, log)
-}
-
-func pollSyncJob(client *apiClient, rootID, jobID string, log io.Writer) (*models.SyncJob, error) {
-	fmt.Fprintf(log, "Sync job %s started; polling until committed...\n", jobID)
-	for {
-		body, err := client.get(fmt.Sprintf("/roots/%s/sync/status?job_id=%s", rootID, url.QueryEscape(jobID)))
-		if err != nil {
-			return nil, fmt.Errorf("polling sync job: %w", err)
-		}
-		var job models.SyncJob
-		if err := json.Unmarshal(body, &job); err != nil {
-			return nil, fmt.Errorf("parsing sync job status: %w", err)
-		}
-		switch job.Status {
-		case "completed":
-			return &job, nil
-		case "failed":
-			return &job, fmt.Errorf("sync job failed: %s", string(job.Errors))
-		default:
-			printSyncProgress(log, &job)
-			time.Sleep(2 * time.Second)
-		}
-	}
-}
 
 func syncPollTimeout() time.Duration {
 	const defaultTimeout = 35 * time.Minute
@@ -1803,18 +763,6 @@ func syncPollTimeout() time.Duration {
 		return defaultTimeout
 	}
 	return timeout
-}
-
-func unchangedSyncResult(rootID, name, dir, generationID string, generationSeq int64) *syncCommandResult {
-	return &syncCommandResult{
-		Status:        "unchanged",
-		RootID:        rootID,
-		RootName:      name,
-		SourcePath:    dir,
-		Changes:       0,
-		GenerationID:  generationID,
-		GenerationSeq: generationSeq,
-	}
 }
 
 func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, policy ignore.PolicyPatternSet, secrets []string) *syncCommandResult {
@@ -1831,126 +779,6 @@ func dryRunSyncResult(rootID, name, dir string, result models.DiffResult, policy
 		Ignored:     ignoredPatterns(policy),
 		Secrets:     secrets,
 	}
-}
-
-func completedSyncResult(name, dir string, changes int, resp models.SyncResponse) *syncCommandResult {
-	return &syncCommandResult{
-		Status:         "synced",
-		RootID:         resp.RootID,
-		RootName:       name,
-		SourcePath:     dir,
-		Changes:        changes,
-		SyncJobID:      resp.SyncJobID,
-		GenerationID:   resp.GenerationID,
-		GenerationSeq:  resp.GenerationSeq,
-		ChunksAdded:    resp.ChunksAdded,
-		ChunksRemoved:  resp.ChunksRemoved,
-		ChunksMoved:    resp.ChunksMoved,
-		FilesProcessed: resp.FilesProcessed,
-	}
-}
-
-func backgroundSyncResult(name, dir string, changes int, resp models.SyncResponse) *syncCommandResult {
-	return &syncCommandResult{
-		Status:        "started",
-		RootID:        resp.RootID,
-		RootName:      name,
-		SourcePath:    dir,
-		Changes:       changes,
-		SyncJobID:     resp.SyncJobID,
-		GenerationID:  resp.GenerationID,
-		GenerationSeq: resp.GenerationSeq,
-	}
-}
-
-// merkleChangesToDiffResult converts Merkle tree changes to the existing DiffResult format.
-// Includes move detection by matching removed→added files with the same content hash.
-func merkleChangesToDiffResult(changes []merkle.DiffChange) models.DiffResult {
-	result := models.DiffResult{}
-
-	// Separate added and removed for move detection
-	var added, removed []merkle.DiffChange
-	for _, c := range changes {
-		switch c.Type {
-		case "added":
-			added = append(added, c)
-		case "removed":
-			removed = append(removed, c)
-		case "modified":
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        c.Path,
-				Status:      models.StatusModified,
-				ContentHash: c.ContentHash,
-				Size:        c.Size,
-			})
-			result.Stats.Modified++
-		}
-	}
-
-	removedByHash := make(map[string][]int, len(removed))
-	for i, change := range removed {
-		removedByHash[change.ContentHash] = append(removedByHash[change.ContentHash], i)
-	}
-	usedRemoved := make([]bool, len(removed))
-	usedAdded := make([]bool, len(added))
-	maxMoveBytes := moveReuseMaxBytes()
-	for ai, a := range added {
-		matches := removedByHash[a.ContentHash]
-		if len(matches) == 0 || a.Size > maxMoveBytes {
-			continue
-		}
-		ri := matches[len(matches)-1]
-		removedByHash[a.ContentHash] = matches[:len(matches)-1]
-		usedRemoved[ri] = true
-		usedAdded[ai] = true
-		result.Changes = append(result.Changes, models.FileChange{
-			Path:        a.Path,
-			Status:      models.StatusMoved,
-			OldPath:     removed[ri].Path,
-			ContentHash: a.ContentHash,
-			Size:        a.Size,
-		})
-		result.Stats.Moved++
-	}
-
-	for ri, r := range removed {
-		if !usedRemoved[ri] {
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        r.Path,
-				Status:      models.StatusRemoved,
-				ContentHash: r.ContentHash,
-				Size:        r.Size,
-			})
-			result.Stats.Removed++
-		}
-	}
-
-	for ai, a := range added {
-		if !usedAdded[ai] {
-			result.Changes = append(result.Changes, models.FileChange{
-				Path:        a.Path,
-				Status:      models.StatusAdded,
-				ContentHash: a.ContentHash,
-				Size:        a.Size,
-			})
-			result.Stats.Added++
-		}
-	}
-
-	return result
-}
-
-func moveReuseMaxBytes() int64 {
-	const defaultBytes = 64 << 20
-	raw := os.Getenv("PUFFERFS_MOVE_REUSE_MAX_BYTES")
-	if raw == "" {
-		return defaultBytes
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return defaultBytes
-	}
-	return value
 }
 
 func resolveOrCreateRoot(client *apiClient, name, sourcePath, rootScope string, noVector bool, log io.Writer) (*models.RootMetadata, error) {
@@ -2004,11 +832,9 @@ func validateNoVectorRoot(root *models.RootMetadata, noVector bool) error {
 }
 
 type rootMeta struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	SourcePath    string `json:"source_path"`
-	GenerationID  string `json:"generation_id"`
-	GenerationSeq int64  `json:"generation_seq"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	SourcePath string `json:"source_path"`
 }
 
 func findLocalRootMeta(name, sourcePath string) (*rootMeta, error) {
@@ -2039,270 +865,6 @@ const (
 	maxUploadConcurrency     = 16
 )
 
-type boundedUploadGroup struct {
-	slots chan struct{}
-	wg    sync.WaitGroup
-
-	mu       sync.Mutex
-	firstErr error
-}
-
-func newBoundedUploadGroup(limit int) *boundedUploadGroup {
-	if limit < 1 {
-		limit = 1
-	}
-	return &boundedUploadGroup{slots: make(chan struct{}, limit)}
-}
-
-func (g *boundedUploadGroup) Go(upload func() error) bool {
-	if g.Err() != nil {
-		return false
-	}
-	g.slots <- struct{}{}
-	if g.Err() != nil {
-		<-g.slots
-		return false
-	}
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		defer func() { <-g.slots }()
-		g.record(upload())
-	}()
-	return true
-}
-
-func (g *boundedUploadGroup) Fail(err error) {
-	g.record(err)
-}
-
-func (g *boundedUploadGroup) Wait() error {
-	g.wg.Wait()
-	return g.Err()
-}
-
-func (g *boundedUploadGroup) Err() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.firstErr
-}
-
-func (g *boundedUploadGroup) record(err error) {
-	if err == nil {
-		return
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.firstErr == nil {
-		g.firstErr = err
-	}
-}
-
-func initSyncSession(client *apiClient, rootID, baseGenerationID string, baseGenerationSeq int64, totalFiles int) (*models.SyncInitResponse, error) {
-	req := models.SyncInitRequest{
-		ProtocolVersion:   models.SyncProtocolVersion,
-		BaseGenerationID:  baseGenerationID,
-		BaseGenerationSeq: baseGenerationSeq,
-		TotalFiles:        totalFiles,
-	}
-	respBody, err := client.post(fmt.Sprintf("/roots/%s/sync/init", rootID), req)
-	if err != nil {
-		return nil, err
-	}
-	var resp models.SyncInitResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return nil, err
-	}
-	if resp.GenerationID == "" || resp.SyncJobID == "" {
-		return nil, fmt.Errorf("sync init response missing generation or job id")
-	}
-	return &resp, nil
-}
-
-func uploadSyncArtifact(client *apiClient, rootID, generationID, kind, name string, data []byte, contentType string) (string, error) {
-	return uploadSyncArtifactReader(client, rootID, generationID, kind, name, bytes.NewReader(data), contentType)
-}
-
-func uploadSyncArtifactReader(client *apiClient, rootID, generationID, kind, name string, body io.Reader, contentType string) (string, error) {
-	path := fmt.Sprintf("/roots/%s/sync/%s/upload?kind=%s&name=%s", rootID, generationID, url.QueryEscape(kind), url.QueryEscape(name))
-	respBody, err := client.postStream(path, body, contentType)
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return "", err
-	}
-	return resp.Key, nil
-}
-
-func abortSyncSession(client *apiClient, rootID, generationID string) error {
-	if client == nil || rootID == "" || generationID == "" {
-		return nil
-	}
-	_, err := client.delete(fmt.Sprintf("/roots/%s/sync/%s", rootID, generationID))
-	return err
-}
-
-type syncMetadataRefs struct {
-	ChangeRefs      []string
-	ContentProofRef string
-	StateRef        string
-}
-
-func uploadSyncMetadata(client *apiClient, rootID, generationID string, changes []models.FileChange, proof *models.ContentProofData, state map[string]models.FileState) (syncMetadataRefs, error) {
-	manifestSize := uploadManifestMaxFiles()
-	shardCount := (len(changes) + manifestSize - 1) / manifestSize
-	refs := syncMetadataRefs{ChangeRefs: make([]string, shardCount)}
-	uploads := newBoundedUploadGroup(uploadConcurrency())
-	for shardIndex, start := 0, 0; start < len(changes); shardIndex, start = shardIndex+1, start+manifestSize {
-		end := min(start+manifestSize, len(changes))
-		ordinal := shardIndex
-		shard := changes[start:end]
-		if !uploads.Go(func() error {
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			for _, change := range shard {
-				if err := enc.Encode(change); err != nil {
-					return fmt.Errorf("encoding change shard %d: %w", ordinal, err)
-				}
-			}
-			key, err := uploadSyncArtifact(client, rootID, generationID, "manifest", fmt.Sprintf("%06d.jsonl", ordinal), buf.Bytes(), "application/x-ndjson")
-			if err != nil {
-				return fmt.Errorf("uploading change shard %d: %w", ordinal, err)
-			}
-			refs.ChangeRefs[ordinal] = key
-			return nil
-		}) {
-			break
-		}
-	}
-
-	if uploads.Err() == nil {
-		uploads.Go(func() error {
-			key, err := uploadContentProof(client, rootID, generationID, proof)
-			if err != nil {
-				return fmt.Errorf("uploading content proof: %w", err)
-			}
-			refs.ContentProofRef = key
-			return nil
-		})
-	}
-	if uploads.Err() == nil {
-		uploads.Go(func() error {
-			key, err := uploadRootState(client, rootID, generationID, state)
-			if err != nil {
-				return fmt.Errorf("uploading root state: %w", err)
-			}
-			refs.StateRef = key
-			return nil
-		})
-	}
-	if err := uploads.Wait(); err != nil {
-		return syncMetadataRefs{}, err
-	}
-	return refs, nil
-}
-
-func uploadContentProof(client *apiClient, rootID, generationID string, proof *models.ContentProofData) (string, error) {
-	if proof == nil {
-		return "", nil
-	}
-	data, err := json.Marshal(proof)
-	if err != nil {
-		return "", err
-	}
-	return uploadSyncArtifact(client, rootID, generationID, "proof", "content-proof.json", data, "application/json")
-}
-
-func uploadBundle(client *apiClient, rootID, generationID, bundleID string, data []byte, contentType string) (string, error) {
-	path := fmt.Sprintf("/roots/%s/upload-bundle?generation_id=%s&bundle_id=%s", rootID, url.QueryEscape(generationID), url.QueryEscape(bundleID))
-	respBody, err := client.postRaw(path, data, contentType)
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		Key string `json:"key"`
-	}
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return "", err
-	}
-	return resp.Key, nil
-}
-
-func uploadRootState(client *apiClient, rootID, generationID string, state map[string]models.FileState) (string, error) {
-	reader, writer := io.Pipe()
-	encoded := make(chan error, 1)
-	go func() {
-		gz := gzip.NewWriter(writer)
-		err := json.NewEncoder(gz).Encode(state)
-		if closeErr := gz.Close(); err == nil {
-			err = closeErr
-		}
-		_ = writer.CloseWithError(err)
-		encoded <- err
-	}()
-	key, uploadErr := uploadSyncArtifactReader(client, rootID, generationID, "state", "state.json.gz", reader, "application/gzip")
-	_ = reader.CloseWithError(uploadErr)
-	encodeErr := <-encoded
-	if uploadErr != nil {
-		return "", uploadErr
-	}
-	if encodeErr != nil {
-		return "", encodeErr
-	}
-	return key, nil
-}
-
-func uploadBundleSmallFileLimit() int64 {
-	const defaultBytes = 8 << 20
-	value, _ := strconv.ParseInt(os.Getenv("PUFFERFS_UPLOAD_BUNDLE_SMALL_FILE_BYTES"), 10, 64)
-	if value < 1 {
-		return defaultBytes
-	}
-	return value
-}
-
-func uploadBundleMaxBytes() int64 {
-	const defaultBytes = 15 << 20
-	value, _ := strconv.ParseInt(os.Getenv("PUFFERFS_UPLOAD_BUNDLE_MAX_BYTES"), 10, 64)
-	if value < 1 {
-		return defaultBytes
-	}
-	return min(value, int64(defaultBytes))
-}
-
-func uploadConcurrency() int {
-	value, _ := strconv.Atoi(os.Getenv("PUFFERFS_UPLOAD_CONCURRENCY"))
-	if value < 1 {
-		return defaultUploadConcurrency
-	}
-	return min(value, maxUploadConcurrency)
-}
-
-func uploadManifestMaxFiles() int {
-	const defaultFiles = 5000
-	value, _ := strconv.Atoi(os.Getenv("PUFFERFS_UPLOAD_MANIFEST_MAX_FILES"))
-	if value < 1 {
-		return defaultFiles
-	}
-	return min(value, defaultFiles)
-}
-
-func loadRemoteState(client *apiClient, rootID string) (map[string]models.FileState, error) {
-	respBody, err := client.get(fmt.Sprintf("/roots/%s/state", rootID))
-	if err != nil {
-		return nil, err
-	}
-	var state map[string]models.FileState
-	if err := json.Unmarshal(respBody, &state); err != nil {
-		return nil, err
-	}
-	return state, nil
-}
-
 func loadRemoteRoot(client *apiClient, rootID string) (*models.RootMetadata, error) {
 	respBody, err := client.get(fmt.Sprintf("/roots/%s", rootID))
 	if err != nil {
@@ -2313,85 +875,6 @@ func loadRemoteRoot(client *apiClient, rootID string) (*models.RootMetadata, err
 		return nil, err
 	}
 	return &root, nil
-}
-
-func syncBaseFromMeta(localMeta *rootMeta, remoteRoot *models.RootMetadata) (string, int64) {
-	if remoteRoot != nil {
-		return remoteRoot.VisibleGenerationID, remoteRoot.VisibleGenerationSeq
-	}
-	if localMeta != nil {
-		return localMeta.GenerationID, localMeta.GenerationSeq
-	}
-	return "", 0
-}
-
-func localCacheMatchesRemote(localMeta *rootMeta, remoteRoot *models.RootMetadata) bool {
-	if remoteRoot == nil {
-		return true
-	}
-	if remoteRoot.VisibleGenerationID == "" {
-		return true
-	}
-	if localMeta == nil {
-		return false
-	}
-	if localMeta.GenerationID != remoteRoot.VisibleGenerationID {
-		return false
-	}
-	if localMeta.GenerationSeq != 0 && localMeta.GenerationSeq != remoteRoot.VisibleGenerationSeq {
-		return false
-	}
-	return true
-}
-
-func loadLocalTree(rootID string) (*merkle.Tree, error) {
-	if rootID == "" {
-		return nil, fmt.Errorf("no root ID")
-	}
-	path := filepath.Join(appconfig.RootDir(rootID), "tree.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var tree merkle.Tree
-	return &tree, json.Unmarshal(data, &tree)
-}
-
-func saveLocalTree(rootID string, tree *merkle.Tree) error {
-	dir := appconfig.RootDir(rootID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	data, err := json.Marshal(tree)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "tree.json"), data, 0o600)
-}
-
-func loadLocalState(rootID string) (map[string]models.FileState, error) {
-	if rootID == "" {
-		return nil, fmt.Errorf("no root ID")
-	}
-	path := filepath.Join(appconfig.RootDir(rootID), "state.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var state map[string]models.FileState
-	return state, json.Unmarshal(data, &state)
-}
-
-func saveLocalState(rootID string, state map[string]models.FileState) error {
-	dir := appconfig.RootDir(rootID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "state.json"), data, 0o600)
 }
 
 func loadRootMeta(rootID string) (*rootMeta, error) {
@@ -2412,48 +895,21 @@ func loadRootMeta(rootID string) (*rootMeta, error) {
 	return &meta, nil
 }
 
-func saveRootMeta(rootID, name, sourcePath, generationID string, generationSeq int64) error {
+func saveRootMeta(rootID, name, sourcePath string) error {
 	dir := appconfig.RootDir(rootID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	meta := rootMeta{
-		ID:            rootID,
-		Name:          name,
-		SourcePath:    sourcePath,
-		GenerationID:  generationID,
-		GenerationSeq: generationSeq,
+		ID:         rootID,
+		Name:       name,
+		SourcePath: sourcePath,
 	}
 	data, err := json.Marshal(meta)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, "meta.json"), data, 0o600)
-}
-
-func saveLocalSyncCache(rootID, name, dir string, currentState map[string]models.FileState, currentTree *merkle.Tree, generationID string, generationSeq int64) error {
-	if err := saveLocalTree(rootID, currentTree); err != nil {
-		return fmt.Errorf("saving Merkle tree: %w", err)
-	}
-	if err := saveLocalState(rootID, currentState); err != nil {
-		return fmt.Errorf("saving local state: %w", err)
-	}
-	if err := saveRootMeta(rootID, name, dir, generationID, generationSeq); err != nil {
-		return fmt.Errorf("saving root meta: %w", err)
-	}
-	return nil
-}
-
-func saveLocalSyncCacheWarnings(rootID, name, dir string, currentState map[string]models.FileState, currentTree *merkle.Tree, generationID string, generationSeq int64) {
-	if err := saveLocalTree(rootID, currentTree); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save Merkle tree: %v\n", err)
-	}
-	if err := saveLocalState(rootID, currentState); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save local state: %v\n", err)
-	}
-	if err := saveRootMeta(rootID, name, dir, generationID, generationSeq); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to save root meta: %v\n", err)
-	}
 }
 
 func filterChanges(result models.DiffResult) []models.FileChange {
@@ -2464,15 +920,6 @@ func filterChanges(result models.DiffResult) []models.FileChange {
 		}
 	}
 	return changes
-}
-
-func withAbsolutePaths(rootDir string, changes []models.FileChange) []models.FileChange {
-	out := make([]models.FileChange, len(changes))
-	for i, change := range changes {
-		out[i] = change
-		out[i].AbsolutePath = filepath.Join(rootDir, filepath.FromSlash(change.Path))
-	}
-	return out
 }
 
 func countChanges(result models.DiffResult) int {

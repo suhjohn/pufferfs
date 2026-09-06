@@ -16,7 +16,7 @@ import (
 )
 
 func main() {
-	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageChunk), "sync stage to run: chunk, index, commit")
+	stage := flag.String("stage", getenv("PUFFERFS_WORKER_STAGE", queue.StageTransform), "consumer role: transform or index")
 	concurrency := flag.Int("concurrency", getenvInt("PUFFERFS_WORKER_CONCURRENCY", 4), "maximum jobs processed concurrently")
 	flag.Parse()
 
@@ -38,23 +38,22 @@ func main() {
 	modalClient := server.NewModalClient()
 	tpClient := server.NewTPClient(cfg.Turbopuffer.APIKey, cfg.Turbopuffer.Region)
 
-	q, backend, err := queue.NewFromEnv(context.Background(), true)
+	q, err := queue.NewFromEnv(context.Background())
 	if err != nil {
 		log.Fatalf("connecting to sync queue: %v", err)
 	}
-	defer q.Close()
 
 	srv := server.New(db, s3Client, modalClient, tpClient)
-	worker := server.NewSyncDispatcher(srv, q, *stage, *concurrency)
 
+	consumer, err := server.NewFileConsumer(srv, q, *stage, *concurrency)
+	if err != nil {
+		log.Fatal(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if *stage == queue.StageCommit {
-		go srv.RunSyncJobWatchdog(ctx)
-	}
-	log.Printf("pufferfs worker running stage=%s concurrency=%d queue=%s", *stage, *concurrency, backend)
-	if err := worker.Run(ctx); err != nil && err != context.Canceled {
-		log.Fatalf("worker stopped: %v", err)
+	log.Printf("file consumer running stage=%s concurrency=%d", *stage, *concurrency)
+	if err := consumer.Run(ctx); err != nil && err != context.Canceled {
+		log.Fatal(err)
 	}
 }
 

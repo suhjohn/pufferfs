@@ -90,9 +90,6 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob string, rootIDs []str
 	if !allRoots && len(resolvedRootIDs) == 0 {
 		return fmt.Errorf("at least one root is required")
 	}
-	if !jsonOutput && len(resolvedRootIDs) == 1 {
-		warnIfSyncRunning(client, resolvedRootIDs[0])
-	}
 
 	req := models.QueryRequest{
 		Query:    queryText,
@@ -125,15 +122,6 @@ func runQuery(cfg *appconfig.Config, queryText, mode, glob string, rootIDs []str
 
 	writeQueryResults(os.Stdout, resp)
 	return nil
-}
-
-func warnIfSyncRunning(client *apiClient, rootID string) {
-	job, _, err := getSyncJob(client, rootID, "")
-	if err != nil || syncJobTerminal(job.Status) {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "warning: latest sync job %s is still %s (%d/%d files); querying the previous committed generation\n",
-		job.ID, job.Status, job.Processed, job.TotalFiles)
 }
 
 func writeQueryResults(w io.Writer, resp models.QueryResponse) {

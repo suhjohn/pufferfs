@@ -1,0 +1,25 @@
+# Test-only network topology. The SDK's documented base URL setting routes
+# actual provider calls through a relay; responses and paid jobs remain real.
+services:
+  provider-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: worker
+    entrypoint: [python, /e2e/provider_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  transform:
+    environment:
+      GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
+    depends_on:
+      provider-relay: {condition: service_healthy}
+  collector:
+    environment:
+      GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
+    depends_on:
+      provider-relay: {condition: service_healthy}

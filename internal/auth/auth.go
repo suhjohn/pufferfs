@@ -30,6 +30,9 @@ type Identity struct {
 	Role   Role
 	Email  string
 	Scopes []string
+	// APIKeyID identifies the credential for transactional revocation checks.
+	// Empty for JWT identities; never contains the raw key or its hash.
+	APIKeyID string
 }
 
 type contextKey string

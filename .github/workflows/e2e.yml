@@ -1,0 +1,48 @@
+name: production-path-e2e
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - suite: corpus
+            script: scripts/test-e2e.sh
+          - suite: index-recovery
+            script: scripts/test-e2e-index-recovery.sh
+          - suite: retention-security
+            script: scripts/test-e2e-retention.sh
+          - suite: provider-recovery
+            script: scripts/test-e2e-provider-recovery.sh
+          - suite: media
+            script: scripts/test-e2e-media.sh
+          - suite: format-variants
+            script: scripts/test-e2e-formats.sh
+    # Configure required reviewers on this environment. Never expose paid
+    # provider keys to unreviewed PR code or use pull_request_target for this.
+    environment: e2e
+    timeout-minutes: 120
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Production-role Docker Compose end-to-end suite (${{ matrix.suite }})
+        run: bash "${{ matrix.script }}"
+      - name: Retain sanitized end-to-end results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-e2e-${{ matrix.suite }}
+          path: tests/e2e/artifacts/
+          if-no-files-found: warn
+          retention-days: 7

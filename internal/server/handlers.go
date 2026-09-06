@@ -10,40 +10,26 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
-	"github.com/pufferfs/pufferfs/internal/ignore"
 	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
-type objectStore interface {
-	Upload(ctx context.Context, key string, data []byte, contentType string) error
-	UploadStream(ctx context.Context, key string, body io.Reader, contentType string) error
-	Download(ctx context.Context, key string) ([]byte, error)
-	Open(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error)
-	DeleteMany(ctx context.Context, keys []string) error
-	DeletePrefix(ctx context.Context, prefix string) (int, error)
-}
-
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
 	db          *DB
-	s3          objectStore
+	s3          *storage.Client
 	modal       *ModalClient
 	tp          *TPClient
-	queue       queue.Queue
+	queue       *queue.SQSQueue
 	billing     *StripeClient
 	emails      TransactionalEmailSender
 	jwtSecret   []byte
@@ -57,10 +43,6 @@ type Server struct {
 
 // New creates a new Server with all dependencies.
 func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
-	return NewWithStore(db, s3, modal, tp)
-}
-
-func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Server {
 	s := &Server{
 		db:         db,
 		s3:         s3,
@@ -74,9 +56,8 @@ func NewWithStore(db *DB, s3 objectStore, modal *ModalClient, tp *TPClient) *Ser
 	return s
 }
 
-// SetQueue enables the durable queued sync path. Without a queue the server
-// keeps using the legacy in-process sync pipeline.
-func (s *Server) SetQueue(q queue.Queue) {
+// SetQueue connects source registration to SQS delivery.
+func (s *Server) SetQueue(q *queue.SQSQueue) {
 	s.queue = q
 }
 
@@ -175,22 +156,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /roots", s.handleListRoots)
 	s.mux.HandleFunc("GET /roots/{id}", s.handleGetRoot)
 	s.mux.HandleFunc("DELETE /roots/{id}", s.handleDeleteRoot)
-	s.mux.HandleFunc("POST /roots/{id}/upload", s.handleUpload)
-	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/init", s.handleMultipartSourceInit)
-	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/part", s.handleMultipartSourcePart)
-	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/complete", s.handleMultipartSourceComplete)
-	s.mux.HandleFunc("POST /roots/{id}/upload/multipart/abort", s.handleMultipartSourceAbort)
-	s.mux.HandleFunc("POST /roots/{id}/upload-bundle", s.handleUploadBundle)
-	s.mux.HandleFunc("POST /roots/{id}/sync", s.handleSync)
-	s.mux.HandleFunc("POST /roots/{id}/sync/init", s.handleSyncInit)
-	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/heartbeat", s.handleSyncHeartbeat)
-	s.mux.HandleFunc("POST /roots/{id}/sync/{generation_id}/upload", s.handleSyncArtifactUpload)
-	s.mux.HandleFunc("DELETE /roots/{id}/sync/{generation_id}", s.handleSyncAbort)
+	s.mux.HandleFunc("POST /roots/{id}/sources/init", s.handleSourcePackInit)
+	s.mux.HandleFunc("POST /roots/{id}/sources/complete", s.handleSourcePackComplete)
+	s.mux.HandleFunc("POST /roots/{id}/sources/multipart/init", s.handleCaptureMultipartInit)
+	s.mux.HandleFunc("POST /roots/{id}/sources/multipart/part", s.handleCaptureMultipartPart)
+	s.mux.HandleFunc("POST /roots/{id}/sources/multipart/complete", s.handleCaptureMultipartComplete)
+	s.mux.HandleFunc("POST /roots/{id}/versions", s.handleRegisterFileVersions)
+	s.mux.HandleFunc("GET /roots/{id}/captured-files", s.handleListCapturedFiles)
+	s.mux.HandleFunc("POST /roots/{id}/captured-proofs", s.handleCapturedProofs)
 	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
 	s.mux.HandleFunc("POST /roots/{id}/read", s.handleReadFile)
-	s.mux.HandleFunc("GET /roots/{id}/assets", s.handleGetRootAsset)
-	s.mux.HandleFunc("GET /roots/{id}/sync/status", s.handleSyncStatus)
-	s.mux.HandleFunc("GET /roots/{id}/sync/jobs", s.handleListSyncJobs)
 
 	// ACLs
 	s.mux.HandleFunc("POST /roots/{id}/acls", s.handleCreateACL)
@@ -364,6 +339,8 @@ func normalizeExplicitAPIKeyScopes(scopes []string) ([]string, error) {
 		"root:delete":    {},
 		"api_keys:read":  {},
 		"api_keys:write": {},
+		"acl:read":       {},
+		"acl:write":      {},
 		"org:admin":      {},
 		"read":           {},
 		"write":          {},
@@ -1466,6 +1443,9 @@ func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID str
 	}
 
 	prefixes := []string{
+		fmt.Sprintf("sources/%s/%s/", orgID, rootID),
+		fmt.Sprintf("extractions/%s/%s/", orgID, rootID),
+		fmt.Sprintf("mutations/%s/%s/", orgID, rootID),
 		fmt.Sprintf("files/%s/", rootID),
 		fmt.Sprintf("bundles/%s/", rootID),
 		fmt.Sprintf("states/%s/", rootID),
@@ -1488,366 +1468,6 @@ func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID str
 		result.S3ObjectsDeleted += count
 	}
 	return result, cleanupErr
-}
-
-func (s *Server) finishGenerationUpload(ctx context.Context, generation *SyncGeneration) error {
-	if generation == nil || generation.SyncJobID == "" {
-		return nil
-	}
-	return s.db.TouchSyncJob(ctx, generation.SyncJobID)
-}
-
-func writeGenerationUploadLookupError(w http.ResponseWriter, err error) {
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
-		return
-	}
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "refreshing sync generation: " + err.Error()})
-}
-
-func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-
-	rootID := r.PathValue("id")
-	filePath := r.URL.Query().Get("path")
-	if filePath == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path query param required"})
-		return
-	}
-	filePath, err := cleanFilePath(filePath)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	// Check write ACL for this path
-	if !s.checkWriteACL(r.Context(), id, rootID, filePath) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "no write permission for this path"})
-		return
-	}
-
-	if !prepareStreamingUpload(w, r, maxSourceUploadBytes) {
-		return
-	}
-
-	generationID := strings.TrimSpace(r.URL.Query().Get("generation_id"))
-	s3Key := fmt.Sprintf("files/%s/%s", rootID, filePath)
-	var generation *SyncGeneration
-	if generationID != "" {
-		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
-		if err != nil {
-			writeGenerationUploadLookupError(w, err)
-			return
-		}
-		// Each request gets an immutable object key. A client may retry after the
-		// server stored the body but its response was lost; sharing a key between
-		// attempts would let a late request overwrite the bytes described by a
-		// successful response.
-		s3Key = syncSourceCaptureFileKey(generationID, uuid.NewString(), filePath)
-	}
-	capture, err := uploadCapturedSource(r.Context(), s.s3, s3Key, filePath, r.Body, r.ContentLength)
-	if err != nil {
-		if errors.Is(err, errUploadLengthMismatch) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			return
-		}
-		writeUploadFailure(w, r, err)
-		return
-	}
-	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
-		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, capture)
-}
-
-var errUploadLengthMismatch = errors.New("upload body length changed while streaming")
-
-type byteCounter struct {
-	n int64
-}
-
-func (c *byteCounter) Write(p []byte) (int, error) {
-	c.n += int64(len(p))
-	return len(p), nil
-}
-
-func (s *Server) handleUploadBundle(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-
-	rootID := r.PathValue("id")
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	bundleID := strings.TrimSpace(r.URL.Query().Get("bundle_id"))
-	if bundleID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bundle_id query param required"})
-		return
-	}
-	bundleID = safeObjectName(bundleID)
-	if bundleID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid bundle_id"})
-		return
-	}
-
-	const maxUploadSize = 1024 << 20
-	if !prepareStreamingUpload(w, r, maxUploadSize) {
-		return
-	}
-
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	generationID := strings.TrimSpace(r.URL.Query().Get("generation_id"))
-	s3Key := fmt.Sprintf("bundles/%s/%s", rootID, bundleID)
-	var generation *SyncGeneration
-	if generationID != "" {
-		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
-		if err != nil {
-			writeGenerationUploadLookupError(w, err)
-			return
-		}
-		s3Key = syncSourceBundleKey(generationID, bundleID)
-	}
-	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
-		writeUploadFailure(w, r, err)
-		return
-	}
-	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
-		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
-}
-
-func safeObjectName(name string) string {
-	var b strings.Builder
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '-' || r == '_' || r == '.':
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
-const uploadIdleTimeout = 2 * time.Minute
-
-var errUploadBodyTimeout = errors.New("upload body timed out")
-
-func prepareStreamingUpload(w http.ResponseWriter, r *http.Request, maxBytes int64) bool {
-	if r.ContentLength > maxBytes {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
-			"error": fmt.Sprintf("upload exceeds %d byte limit", maxBytes),
-		})
-		return false
-	}
-
-	// Replace the server's whole-request deadlines with a per-read idle deadline
-	// for this size-bounded body. Active uploads can run as long as needed, but
-	// a client that stalls while the server is reading still releases its
-	// connection and multipart resources.
-	controller := http.NewResponseController(w)
-	_ = controller.SetReadDeadline(time.Time{})
-	_ = controller.SetWriteDeadline(time.Time{})
-	r.Body = &streamingUploadBody{
-		ReadCloser: http.MaxBytesReader(w, r.Body, maxBytes),
-		controller: controller,
-	}
-	return true
-}
-
-type streamingUploadBody struct {
-	io.ReadCloser
-	controller *http.ResponseController
-}
-
-func (b *streamingUploadBody) Read(p []byte) (int, error) {
-	_ = b.controller.SetReadDeadline(time.Now().Add(uploadIdleTimeout))
-	n, err := b.ReadCloser.Read(p)
-	_ = b.controller.SetReadDeadline(time.Time{})
-	if err != nil {
-		var timeoutErr interface{ Timeout() bool }
-		if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
-			return n, fmt.Errorf("%w: %v", errUploadBodyTimeout, err)
-		}
-	}
-	return n, err
-}
-
-func writeUploadFailure(w http.ResponseWriter, r *http.Request, err error) {
-	if r.Context().Err() != nil {
-		// The requester has gone away. UploadStream has already attempted to
-		// abort any multipart upload, and there is no client left to answer.
-		return
-	}
-	var maxBytesErr *http.MaxBytesError
-	if errors.As(err, &maxBytesErr) {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "upload exceeds maximum allowed size"})
-		return
-	}
-	if errors.Is(err, errUploadBodyTimeout) {
-		writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "upload body timed out"})
-		return
-	}
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed: " + err.Error()})
-}
-
-func (s *Server) handleSyncHeartbeat(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	generationID := r.PathValue("generation_id")
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
-	if err != nil {
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
-}
-
-func (s *Server) handleSyncArtifactUpload(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	generationID := r.PathValue("generation_id")
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
-	if err != nil {
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
-	name := safeObjectName(strings.TrimSpace(r.URL.Query().Get("name")))
-	if name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name query param required"})
-		return
-	}
-	var s3Key string
-	switch kind {
-	case "manifest":
-		s3Key = fmt.Sprintf("syncs/%s/manifests/%s", generationID, name)
-	case "proof":
-		s3Key = fmt.Sprintf("syncs/%s/proofs/%s", generationID, name)
-	case "state":
-		s3Key = stateObjectKey(rootID, generationID)
-	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "kind must be manifest, proof, or state"})
-		return
-	}
-	const maxUploadSize = 1024 << 20
-	if !prepareStreamingUpload(w, r, maxUploadSize) {
-		return
-	}
-	contentType := r.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	if err := s.s3.UploadStream(r.Context(), s3Key, r.Body, contentType); err != nil {
-		writeUploadFailure(w, r, err)
-		return
-	}
-	if err := s.finishGenerationUpload(r.Context(), generation); err != nil {
-		_ = s.s3.DeleteMany(context.WithoutCancel(r.Context()), []string{s3Key})
-		writeGenerationUploadLookupError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"key": s3Key})
-}
-
-func (s *Server) handleSyncAbort(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	generationID := r.PathValue("generation_id")
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-	generation, err := s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, generationID)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
-		return
-	}
-	_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
-	if generation.SyncJobID != "" {
-		_ = s.db.CompleteSyncJob(r.Context(), generation.SyncJobID, "failed", []map[string]string{{"error": "sync aborted"}})
-	}
-	if err := s.cleanupFailedGeneration(r.Context(), id.OrgID, rootID, generation.ID, s.syncRequestForCleanup(r.Context(), generation.ID)); err != nil {
-		log.Printf("warning: failed aborted generation cleanup for root %s generation %s: %v", rootID, generation.ID, err)
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "aborted"})
 }
 
 func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
@@ -1875,630 +1495,6 @@ func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, state)
 }
-
-func (s *Server) handleSyncInit(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-
-	rootID := r.PathValue("id")
-	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-	if r.Body == nil || r.ContentLength == 0 {
-		writeJSON(w, http.StatusOK, map[string]bool{"can_reuse": false})
-		return
-	}
-
-	var req models.SyncInitRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	if req.ProtocolVersion != models.SyncProtocolVersion {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":            fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion),
-			"protocol_version": req.ProtocolVersion,
-			"required_version": models.SyncProtocolVersion,
-		})
-		return
-	}
-	if err := validateSyncBase(req.BaseGenerationID, req.BaseGenerationSeq, root.VisibleGenerationID, root.VisibleGenerationSeq); err != nil {
-		writeSyncConflict(w, err, &models.SyncRequest{BaseGenerationID: req.BaseGenerationID, BaseGenerationSeq: req.BaseGenerationSeq}, root.VisibleGenerationID, root.VisibleGenerationSeq)
-		return
-	}
-	job, err := s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, req.TotalFiles)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync job: " + err.Error()})
-		return
-	}
-	generation, err := s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, req.BaseGenerationID, req.BaseGenerationSeq)
-	if err != nil {
-		_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		if errors.Is(err, errStaleSyncBase) {
-			if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
-				writeSyncConflict(w, err, &models.SyncRequest{BaseGenerationID: req.BaseGenerationID, BaseGenerationSeq: req.BaseGenerationSeq}, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
-				return
-			}
-		}
-		status := http.StatusInternalServerError
-		if errors.Is(err, errSyncInProgress) || errors.Is(err, errRootDeleting) {
-			status = http.StatusConflict
-		}
-		writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
-		return
-	}
-	s.captureSyncStarted(r.Context(), id, root, &models.SyncRequest{
-		BaseGenerationID:  req.BaseGenerationID,
-		BaseGenerationSeq: req.BaseGenerationSeq,
-		ProtocolVersion:   req.ProtocolVersion,
-	}, job, req.TotalFiles)
-	writeJSON(w, http.StatusOK, models.SyncInitResponse{
-		RootID:            rootID,
-		SyncJobID:         job.ID,
-		GenerationID:      generation.ID,
-		GenerationSeq:     generation.Seq,
-		BaseGenerationID:  generation.BaseGenerationID,
-		BaseGenerationSeq: generation.BaseGenerationSeq,
-		ManifestPrefix:    fmt.Sprintf("syncs/%s/manifests/", generation.ID),
-	})
-}
-
-func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "sync", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "sync scope required"})
-		return
-	}
-
-	rootID := r.PathValue("id")
-
-	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionSync)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	var req models.SyncRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	req.RootID = rootID
-	req.DisableVector = root.VectorDisabled
-	if req.ProtocolVersion != models.SyncProtocolVersion {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion))
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error":            fmt.Sprintf("unsupported sync protocol_version %d", req.ProtocolVersion),
-			"protocol_version": req.ProtocolVersion,
-			"required_version": models.SyncProtocolVersion,
-		})
-		return
-	}
-	if err := normalizeSyncRequest(&req); err != nil {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if req.State == nil && req.StateRef == "" {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, "state or state_ref is required")
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "state or state_ref is required"})
-		return
-	}
-	if len(req.Changes) == 0 && len(req.ChangeRefs) == 0 {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, "changes or change_refs is required")
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "changes or change_refs is required"})
-		return
-	}
-	if err := s.validateSyncChanges(r.Context(), id, rootID, &req); err != nil {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if err := validateSyncBase(req.BaseGenerationID, req.BaseGenerationSeq, root.VisibleGenerationID, root.VisibleGenerationSeq); err != nil {
-		s.cleanupRejectedSyncRequest(r.Context(), id.OrgID, rootID, &req, err.Error())
-		writeSyncConflict(w, err, &req, root.VisibleGenerationID, root.VisibleGenerationSeq)
-		return
-	}
-
-	// Count actionable files
-	actionableFiles := 0
-	for _, c := range req.Changes {
-		if c.Status != models.StatusUnchanged {
-			actionableFiles++
-		}
-	}
-	var job *models.SyncJob
-	var generation *SyncGeneration
-	if req.GenerationID != "" {
-		generation, err = s.db.GetSyncGeneration(r.Context(), id.OrgID, rootID, req.GenerationID)
-		if err != nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync generation not found"})
-			return
-		}
-		if generation.SyncJobID != "" {
-			job, err = s.db.GetSyncJob(r.Context(), id.OrgID, generation.SyncJobID)
-			if err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "loading sync job: " + err.Error()})
-				return
-			}
-		}
-	} else {
-		job, err = s.db.CreateSyncJob(r.Context(), id.OrgID, rootID, id.UserID, actionableFiles)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating sync job: " + err.Error()})
-			return
-		}
-		generation, err = s.db.CreateSyncGeneration(r.Context(), id.OrgID, rootID, job.ID, req.BaseGenerationID, req.BaseGenerationSeq)
-		if err != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
-			if errors.Is(err, errStaleSyncBase) {
-				if currentRoot, rootErr := s.db.GetRoot(r.Context(), id.OrgID, rootID); rootErr == nil {
-					writeSyncConflict(w, err, &req, currentRoot.VisibleGenerationID, currentRoot.VisibleGenerationSeq)
-					return
-				}
-			}
-			status := http.StatusInternalServerError
-			if errors.Is(err, errSyncInProgress) || errors.Is(err, errRootDeleting) {
-				status = http.StatusConflict
-			}
-			writeJSON(w, status, map[string]string{"error": "creating sync generation: " + err.Error()})
-			return
-		}
-		s.captureSyncStarted(r.Context(), id, root, &req, job, actionableFiles)
-	}
-	if err := s.ensureSyncStateRef(r.Context(), rootID, generation.ID, &req); err != nil {
-		_ = s.db.MarkSyncGenerationFailed(r.Context(), generation.ID)
-		if job != nil {
-			_ = s.db.CompleteSyncJob(r.Context(), job.ID, "failed", []map[string]string{{"error": err.Error()}})
-		}
-		if cleanupErr := s.cleanupFailedGeneration(r.Context(), id.OrgID, rootID, generation.ID, &req); cleanupErr != nil {
-			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-		}
-		s.captureSyncFailed(r.Context(), id.OrgID, id.UserID, root, &req, job, "prepare_state")
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing sync state: " + err.Error()})
-		return
-	}
-	if r.URL.Query().Get("async") == "true" {
-		go func(req models.SyncRequest, generation *SyncGeneration, job *models.SyncJob) {
-			ctx, cancel := context.WithTimeout(context.Background(), syncJobTimeout())
-			defer cancel()
-			if _, err := s.runSyncJob(ctx, id.OrgID, id.UserID, rootID, generation, &req, job); err != nil {
-				log.Printf("async sync error for root %s: %v", rootID, err)
-			}
-		}(req, generation, job)
-		writeJSON(w, http.StatusAccepted, models.SyncResponse{RootID: rootID, SyncJobID: generation.SyncJobID, GenerationID: generation.ID, GenerationSeq: generation.Seq})
-		return
-	}
-
-	resp, err := s.runSyncJob(r.Context(), id.OrgID, id.UserID, rootID, generation, &req, job)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) cleanupRejectedSyncRequest(ctx context.Context, orgID, rootID string, req *models.SyncRequest, reason string) {
-	if req == nil || strings.TrimSpace(req.GenerationID) == "" {
-		return
-	}
-	generation, err := s.db.GetSyncGeneration(ctx, orgID, rootID, strings.TrimSpace(req.GenerationID))
-	if err != nil {
-		return
-	}
-	_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-	if generation.SyncJobID != "" {
-		_ = s.db.CompleteSyncJob(ctx, generation.SyncJobID, "failed", []map[string]string{{"error": reason}})
-	}
-	if cleanupErr := s.cleanupFailedGeneration(ctx, orgID, rootID, generation.ID, s.syncRequestForCleanup(ctx, generation.ID)); cleanupErr != nil {
-		log.Printf("warning: failed rejected generation cleanup for root %s generation %s: %v", rootID, generation.ID, cleanupErr)
-	}
-}
-
-func (s *Server) validateSyncChanges(ctx context.Context, id *auth.Identity, rootID string, req *models.SyncRequest) error {
-	policy, err := s.db.GetEffectiveIgnorePolicy(ctx, id.OrgID, id.UserID)
-	if err != nil {
-		return fmt.Errorf("loading ignore policy: %w", err)
-	}
-	var matcher *ignore.Matcher
-	if strings.TrimSpace(policy.OrgPatterns) != "" || strings.TrimSpace(policy.UserPatterns) != "" {
-		matcher = ignore.NewPolicyMatcher(ignore.PolicyPatternSet{OrgPatterns: policy.OrgPatterns, UserPatterns: policy.UserPatterns})
-	}
-	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil {
-		return fmt.Errorf("loading write ACLs: %w", err)
-	}
-	if matcher == nil && len(acls) == 0 {
-		return nil
-	}
-	check := func(change models.FileChange, ref string) error {
-		if ref != "" {
-			if err := normalizeSyncChange(req.RootID, req.GenerationID, &change); err != nil {
-				return fmt.Errorf("%s: %w", ref, err)
-			}
-		}
-		if matcher != nil && change.Status != models.StatusRemoved && matcher.ShouldIgnore(change.Path, false) {
-			return fmt.Errorf("path %q is ignored by org/user policy", change.Path)
-		}
-		if len(acls) == 0 {
-			return nil
-		}
-		if (change.Status == models.StatusMoved || change.Status == models.StatusRenamed) && !checkPermission(acls, change.OldPath, "write") {
-			return fmt.Errorf("no write permission for %s", change.OldPath)
-		}
-		if !checkPermission(acls, change.Path, "write") {
-			return fmt.Errorf("no write permission for %s", change.Path)
-		}
-		return nil
-	}
-	for _, change := range req.Changes {
-		if err := check(change, ""); err != nil {
-			return err
-		}
-	}
-	for _, ref := range req.ChangeRefs {
-		if err := eachJSONL(ctx, s.s3, ref, func(change models.FileChange) error { return check(change, ref) }); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeSyncConflict(w http.ResponseWriter, err error, req *models.SyncRequest, currentGenerationID string, currentGenerationSeq int64) {
-	var clientBaseGenerationID string
-	var clientBaseGenerationSeq int64
-	if req != nil {
-		clientBaseGenerationID = req.BaseGenerationID
-		clientBaseGenerationSeq = req.BaseGenerationSeq
-	}
-	writeJSON(w, http.StatusConflict, models.SyncConflictResponse{
-		Error:                   err.Error(),
-		ClientBaseGenerationID:  clientBaseGenerationID,
-		ClientBaseGenerationSeq: clientBaseGenerationSeq,
-		CurrentGenerationID:     currentGenerationID,
-		CurrentGenerationSeq:    currentGenerationSeq,
-	})
-}
-
-func (s *Server) runSyncJob(ctx context.Context, orgID, userID, rootID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	root, _ := s.db.GetRoot(ctx, orgID, rootID)
-	fail := func(stage string, cause error) (*models.SyncResponse, error) {
-		_ = s.db.MarkSyncGenerationFailed(ctx, generation.ID)
-		if job != nil {
-			_ = s.db.CompleteSyncJob(ctx, job.ID, "failed", []map[string]string{{"error": cause.Error()}})
-		}
-		if err := s.cleanupFailedGeneration(ctx, orgID, rootID, generation.ID, req); err != nil {
-			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", rootID, generation.ID, err)
-		}
-		s.captureSyncFailed(ctx, orgID, userID, root, req, job, stage)
-		return nil, cause
-	}
-
-	resp, err := s.runSyncPipeline(ctx, orgID, userID, generation, req, job)
-	if err != nil {
-		log.Printf("sync error for root %s: %v", rootID, err)
-		return fail("pipeline", err)
-	}
-	if s.queue != nil {
-		return resp, nil
-	}
-
-	if err := s.cleanupFailedGenerations(ctx, orgID, rootID); err != nil {
-		return fail("cleanup", fmt.Errorf("cleaning failed generations: %w", err))
-	}
-	if err := s.storeSyncContentProof(ctx, orgID, userID, rootID, req); err != nil {
-		return fail("content_proof", fmt.Errorf("storing content proof: %w", err))
-	}
-
-	if job != nil {
-		_ = s.db.UpdateSyncJobStatus(ctx, job.ID, "committing")
-	}
-	if err := s.db.CommitSyncGeneration(ctx, generation, req.State, req.StateRef); err != nil {
-		return fail("commit", fmt.Errorf("committing generation: %w", err))
-	}
-	if job != nil {
-		if err := s.db.CompleteSyncJob(ctx, job.ID, "completed", nil); err != nil {
-			log.Printf("error completing sync job %s: %v", job.ID, err)
-		}
-		resp.SyncJobID = job.ID
-	}
-	s.captureSyncCompleted(ctx, orgID, userID, root, req, job, resp)
-	if err := s.cleanupTerminalSyncObjects(ctx, rootID, generation.ID, req, false); err != nil {
-		log.Printf("warning: failed committed sync object cleanup for root %s generation %s: %v", rootID, generation.ID, err)
-	}
-	return resp, nil
-}
-
-func (s *Server) runSyncPipeline(ctx context.Context, orgID, userID string, generation *SyncGeneration, req *models.SyncRequest, job *models.SyncJob) (*models.SyncResponse, error) {
-	jobID := ""
-	if job != nil {
-		jobID = job.ID
-	}
-	if s.queue != nil {
-		return s.enqueueSync(ctx, orgID, userID, generation, req, jobID)
-	}
-	return s.processSync(ctx, orgID, generation, req, jobID)
-}
-
-func (s *Server) storeSyncContentProof(ctx context.Context, orgID, userID, rootID string, req *models.SyncRequest) error {
-	if req == nil {
-		return nil
-	}
-	proof := req.ContentProof
-	var proofBytes []byte
-	if proof != nil {
-		proofBytes, _ = json.Marshal(proof)
-	} else if req.ContentProofRef != "" {
-		data, err := s.s3.Download(ctx, req.ContentProofRef)
-		if err != nil {
-			return fmt.Errorf("downloading %s: %w", req.ContentProofRef, err)
-		}
-		var parsed models.ContentProofData
-		if err := json.Unmarshal(data, &parsed); err != nil {
-			return fmt.Errorf("parsing %s: %w", req.ContentProofRef, err)
-		}
-		proof = &parsed
-		proofBytes = data
-	}
-	if proof == nil {
-		return nil
-	}
-	return s.db.UpsertContentProof(ctx, orgID, userID, rootID, proof.RootHash, proofBytes)
-}
-
-// ---------------------------------------------------------------------------
-// Sync status
-// ---------------------------------------------------------------------------
-
-func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "query", "sync", "read", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	if _, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead); err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	var (
-		job *models.SyncJob
-		err error
-	)
-	if jobID := r.URL.Query().Get("job_id"); jobID != "" {
-		job, err = s.db.GetSyncJob(r.Context(), id.OrgID, jobID)
-	} else {
-		job, err = s.db.GetLatestSyncJob(r.Context(), id.OrgID, rootID)
-	}
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no sync jobs found"})
-		return
-	}
-	if job.RootID != rootID {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sync job not found"})
-		return
-	}
-	job = s.failExpiredSyncJob(r.Context(), job)
-	writeJSON(w, http.StatusOK, job)
-}
-
-func (s *Server) failExpiredSyncJob(ctx context.Context, job *models.SyncJob) *models.SyncJob {
-	if job == nil || job.Status == "completed" || job.Status == "failed" {
-		return job
-	}
-	timeout := syncJobTimeout()
-	staleBefore := time.Now().Add(-timeout)
-	if !syncJobLastProgress(job).Before(staleBefore) {
-		return job
-	}
-
-	message := fmt.Sprintf("sync job expired after %s without progress", timeout)
-	errors := []map[string]string{{"error": message}}
-	expired, err := s.db.ExpireSyncJob(ctx, job.ID, staleBefore, errors)
-	if err != nil {
-		log.Printf("warning: failed to expire sync job %s: %v", job.ID, err)
-		return job
-	}
-	if !expired {
-		if current, loadErr := s.db.GetSyncJob(ctx, job.OrgID, job.ID); loadErr == nil {
-			return current
-		}
-		return job
-	}
-	return s.finishFailedSyncJob(ctx, job, errors)
-}
-
-func (s *Server) failSyncJob(ctx context.Context, job *models.SyncJob, message string) *models.SyncJob {
-	if job == nil || job.Status == "completed" {
-		return job
-	}
-	errors := []map[string]string{{"error": message}}
-	if job.Status != "failed" {
-		if err := s.db.CompleteSyncJob(ctx, job.ID, "failed", errors); err != nil {
-			log.Printf("warning: failed to reconcile sync job %s: %v", job.ID, err)
-			return job
-		}
-	}
-	return s.finishFailedSyncJob(ctx, job, errors)
-}
-
-func (s *Server) finishFailedSyncJob(ctx context.Context, job *models.SyncJob, errors []map[string]string) *models.SyncJob {
-	if err := s.db.MarkSyncGenerationFailedForJob(ctx, job.ID); err != nil {
-		log.Printf("warning: failed to reconcile sync generation for job %s: %v", job.ID, err)
-	}
-	if generation, err := s.db.GetSyncGenerationForJob(ctx, job.OrgID, job.RootID, job.ID); err == nil {
-		req := s.syncRequestForCleanup(ctx, generation.ID)
-		if cleanupErr := s.cleanupFailedGeneration(ctx, job.OrgID, job.RootID, generation.ID, req); cleanupErr != nil {
-			log.Printf("warning: failed generation cleanup for root %s generation %s: %v", job.RootID, generation.ID, cleanupErr)
-		}
-	} else {
-		log.Printf("warning: failed to load expired sync generation for job %s: %v", job.ID, err)
-	}
-	errBytes, _ := json.Marshal(errors)
-	now := time.Now()
-	job.Status = "failed"
-	job.Errors = errBytes
-	job.UpdatedAt = now
-	job.FinishedAt = &now
-	return job
-}
-
-func syncJobLastProgress(job *models.SyncJob) time.Time {
-	if job != nil && !job.UpdatedAt.IsZero() {
-		return job.UpdatedAt
-	}
-	if job != nil {
-		return job.StartedAt
-	}
-	return time.Time{}
-}
-
-// ReconcileSyncJobs resolves jobs that can no longer complete without relying
-// on a status-page read to trigger cleanup.
-func (s *Server) ReconcileSyncJobs(ctx context.Context) (int, error) {
-	timeout := syncJobTimeout()
-	jobs, err := s.db.ListSyncJobsForReconciliation(ctx, time.Now().Add(-timeout), 100)
-	if err != nil {
-		return 0, err
-	}
-	reconciled := 0
-	for i := range jobs {
-		if generation, generationErr := s.db.GetSyncGenerationForJob(ctx, jobs[i].OrgID, jobs[i].RootID, jobs[i].ID); generationErr == nil {
-			if status, statusErr := s.db.GetSyncGenerationStatus(ctx, generation.ID); statusErr == nil {
-				switch status {
-				case "visible":
-					if err := s.db.CompleteSyncJob(ctx, jobs[i].ID, "completed", nil); err != nil {
-						return reconciled, err
-					}
-					reconciled++
-					continue
-				case "failed", "cleaning":
-					if failed := s.failSyncJob(ctx, &jobs[i], "sync generation failed before the job reached a terminal state"); failed != nil && failed.Status == "failed" {
-						reconciled++
-					}
-					continue
-				}
-			}
-		}
-		if expired := s.failExpiredSyncJob(ctx, &jobs[i]); expired != nil && expired.Status == "failed" {
-			reconciled++
-		}
-	}
-	return reconciled, nil
-}
-
-// RunSyncJobWatchdog periodically reconciles stalled jobs. It is intended to
-// run in the singleton commit worker.
-func (s *Server) RunSyncJobWatchdog(ctx context.Context) {
-	interval := syncJobWatchdogInterval()
-	reconcile := func() {
-		count, err := s.ReconcileSyncJobs(ctx)
-		if err != nil {
-			if ctx.Err() == nil {
-				log.Printf("sync job watchdog: %v", err)
-			}
-			return
-		}
-		if count > 0 {
-			log.Printf("sync job watchdog reconciled %d jobs", count)
-		}
-	}
-	reconcile()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			reconcile()
-		}
-	}
-}
-
-func syncJobWatchdogInterval() time.Duration {
-	const defaultInterval = time.Minute
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_JOB_WATCHDOG_INTERVAL"))
-	if raw == "" {
-		return defaultInterval
-	}
-	interval, err := time.ParseDuration(raw)
-	if err != nil || interval < time.Second {
-		return defaultInterval
-	}
-	return interval
-}
-
-func syncJobHeartbeatInterval() time.Duration {
-	interval := 2 * time.Minute
-	if timeoutInterval := syncJobTimeout() / 3; timeoutInterval < interval {
-		interval = timeoutInterval
-	}
-	if interval < 100*time.Millisecond {
-		return 100 * time.Millisecond
-	}
-	return interval
-}
-
-func syncJobTimeout() time.Duration {
-	const defaultTimeout = 30 * time.Minute
-	raw := strings.TrimSpace(os.Getenv("PUFFERFS_SYNC_JOB_TIMEOUT"))
-	if raw == "" {
-		return defaultTimeout
-	}
-	timeout, err := time.ParseDuration(raw)
-	if err != nil || timeout < time.Second {
-		return defaultTimeout
-	}
-	return timeout
-}
-
-func (s *Server) handleListSyncJobs(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "query", "sync", "read", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	jobs, err := s.db.ListSyncJobs(r.Context(), id.OrgID, rootID, 20)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, jobs)
-}
-
-// ---------------------------------------------------------------------------
-// Ignore policies
-// ---------------------------------------------------------------------------
 
 func (s *Server) handleGetEffectiveIgnorePolicy(w http.ResponseWriter, r *http.Request) {
 	id := auth.IdentityFromContext(r.Context())
@@ -2761,7 +1757,12 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "exactly one of pages or lines is required"})
 		return
 	}
-	if !s.checkReadACL(r.Context(), id, rootID, req.Path) {
+	allowed, err := s.checkReadACL(r.Context(), id, rootID, req.Path)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if !allowed {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
@@ -2769,7 +1770,13 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	if req.Pages != nil {
 		resp, err := s.readFilePages(r.Context(), id, root, &req, r)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			status := http.StatusBadRequest
+			if errors.Is(err, errFilePermissionsUnavailable) {
+				status = http.StatusInternalServerError
+			} else if errors.Is(err, errQueryRootNotFound) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -2777,58 +1784,16 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.readFileLines(r.Context(), id, root, &req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		status := http.StatusBadRequest
+		if errors.Is(err, errFilePermissionsUnavailable) {
+			status = http.StatusInternalServerError
+		} else if errors.Is(err, errQueryRootNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-func (s *Server) handleGetRootAsset(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "query", "read") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-	root, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-	key := strings.TrimSpace(r.URL.Query().Get("key"))
-	if key == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key query param required"})
-		return
-	}
-	if !strings.HasPrefix(key, fmt.Sprintf("chunks/%s/", rootID)) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
-		return
-	}
-	rows, err := s.readRows(r.Context(), root, []any{"image_path", "Eq", key}, 10, []string{"file_path", "file_hash", "image_path"})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	rows = filterDeniedQueryRows(rows, s.buildACLFilter(r.Context(), id, root.ID))
-	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		rows = s.filterByContentProof(r.Context(), id.OrgID, id.UserID, root.ID, rows)
-	}
-	if len(rows) == 0 {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
-		return
-	}
-	data, err := s.s3.Download(r.Context(), key)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "asset not found"})
-		return
-	}
-	w.Header().Set("Content-Type", http.DetectContentType(data))
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	_, _ = w.Write(data)
 }
 
 func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest, r *http.Request) (models.ReadFileResponse, error) {
@@ -2845,13 +1810,20 @@ func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *mod
 		pageFilters = append(pageFilters, []any{"page_number", "Gt", startPage - 1})
 	}
 	filters := []any{"And", pageFilters}
-	rows, err := s.readRows(ctx, root, filters, req.Pages.End-req.Pages.Start+1, readIncludeAttrs())
+	rows, err := s.readFileRows(ctx, root, req.Path, filters)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
-	rows = s.filterReadRows(ctx, id, root, rows)
+	rows, err = s.filterReadRows(ctx, id, root, rows)
+	if err != nil {
+		return models.ReadFileResponse{}, err
+	}
 	sort.SliceStable(rows, func(i, j int) bool {
-		return intFromAny(rows[i]["page_number"], 0) < intFromAny(rows[j]["page_number"], 0)
+		pi, pj := intFromAny(rows[i]["page_number"], 0), intFromAny(rows[j]["page_number"], 0)
+		if pi != pj {
+			return pi < pj
+		}
+		return intFromAny(rows[i]["chunk_index"], 0) < intFromAny(rows[j]["chunk_index"], 0)
 	})
 	resp := models.ReadFileResponse{
 		RootID:   root.ID,
@@ -2868,6 +1840,10 @@ func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *mod
 		if resp.AbsolutePath == "" {
 			resp.AbsolutePath = strVal(row, "absolute_path")
 		}
+		if len(resp.Pages) > 0 && resp.Pages[len(resp.Pages)-1].PageNumber == pageNumber {
+			resp.Pages[len(resp.Pages)-1].Content += strVal(row, "content")
+			continue
+		}
 		page := models.ReadPageResult{
 			Page:         pageNumber + 1,
 			PageNumber:   pageNumber,
@@ -2875,13 +1851,6 @@ func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *mod
 			Content:      strVal(row, "content"),
 			AbsolutePath: strVal(row, "absolute_path"),
 			FileType:     strVal(row, "file_type"),
-		}
-		if imagePath := strVal(row, "image_path"); imagePath != "" {
-			page.ImagePath = &imagePath
-			if req.IncludeImages {
-				imageURL := rootAssetURL(r, root.ID, imagePath)
-				page.ImageURL = &imageURL
-			}
 		}
 		resp.Pages = append(resp.Pages, page)
 	}
@@ -2897,21 +1866,31 @@ func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *mod
 		[]any{"line_end", "Gt", req.Lines.Start - 1},
 		[]any{"line_start", "Lte", req.Lines.End},
 	}}
-	rows, err := s.readRows(ctx, root, filters, 1000, readIncludeAttrs())
+	rows, err := s.readFileRows(ctx, root, req.Path, filters)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
-	rows = s.filterReadRows(ctx, id, root, rows)
+	rows, err = s.filterReadRows(ctx, id, root, rows)
+	if err != nil {
+		return models.ReadFileResponse{}, err
+	}
 	if len(rows) == 0 {
-		metadataRows, metaErr := s.readRows(ctx, root, []any{"file_path", "Eq", req.Path}, 1000, readIncludeAttrs())
+		metadataRows, metaErr := s.readFileMetadataRows(ctx, root, req.Path)
 		if metaErr != nil {
 			return models.ReadFileResponse{}, fmt.Errorf("line range %d:%d unavailable for %s; could not inspect indexed file metadata: %w", req.Lines.Start, req.Lines.End, req.Path, metaErr)
 		}
-		metadataRows = s.filterReadRows(ctx, id, root, metadataRows)
+		metadataRows, metaErr = s.filterReadRows(ctx, id, root, metadataRows)
+		if metaErr != nil {
+			return models.ReadFileResponse{}, metaErr
+		}
 		return models.ReadFileResponse{}, readLineRangeUnavailableError(req.Path, req.Lines, metadataRows)
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
-		return intFromAny(rows[i]["line_start"], 0) < intFromAny(rows[j]["line_start"], 0)
+		li, lj := intFromAny(rows[i]["line_start"], 0), intFromAny(rows[j]["line_start"], 0)
+		if li != lj {
+			return li < lj
+		}
+		return intFromAny(rows[i]["chunk_index"], 0) < intFromAny(rows[j]["chunk_index"], 0)
 	})
 
 	byLine := make(map[int]string)
@@ -2940,7 +1919,9 @@ func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *mod
 			if lineNumber < req.Lines.Start || lineNumber > req.Lines.End {
 				continue
 			}
-			if _, exists := byLine[lineNumber]; !exists {
+			if strVal(row, "extraction_id") != "" {
+				byLine[lineNumber] += strings.TrimSuffix(line, "\n")
+			} else if _, exists := byLine[lineNumber]; !exists {
 				byLine[lineNumber] = strings.TrimSuffix(line, "\n")
 			}
 		}
@@ -3019,27 +2000,36 @@ func readLineRangeUnavailableError(filePath string, requested *models.ReadRange,
 	return fmt.Errorf("line ranges unavailable for %s; indexed chunks do not include line metadata; resync this file or root and retry --lines", filePath)
 }
 
-func (s *Server) readRows(ctx context.Context, root *models.RootMetadata, filters any, limit int, includeAttrs []string) ([]map[string]any, error) {
+func (s *Server) readFileMetadataRows(ctx context.Context, root *models.RootMetadata, path string) ([]map[string]any, error) {
 	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, root.OrgID, root.ID)
 	if err != nil {
 		return nil, fmt.Errorf("listing root index namespaces: %w", err)
 	}
-	visibleSeq, err := s.db.GetVisibleGenerationSeq(ctx, root.ID)
-	if err != nil {
-		return nil, fmt.Errorf("resolving visible generation: %w", err)
+	if len(activeRootIndexNamespaces(indexNamespaces)) == 0 {
+		return nil, nil
 	}
-	combinedFilters := []any{filters, activeGenerationFilter(visibleSeq)}
-	return queryRootIndexNamespaces(indexNamespaces, limit, func(namespace string) ([]map[string]any, error) {
-		return s.tp.Query(namespace, []any{"file_path", "asc"}, limit, tpAndFilter(combinedFilters), includeAttrs)
-	})
+	ns, err := rootIndexNamespaceForPath(indexNamespaces, path)
+	if err != nil {
+		return nil, err
+	}
+	visibility, err := s.catalogVisibilitySnapshot(ctx, root.OrgID, root.ID, path)
+	if err != nil {
+		return nil, fmt.Errorf("resolving file publication: %w", err)
+	}
+	return s.tp.Query(ctx, ns.Namespace, TPQuery{RankBy: []any{"chunk_index", "asc"}, Limit: 1000,
+		Filters: tpAndFilter([]any{[]any{"file_path", "Eq", path}, visibility}), ExcludeAttributes: readExcludedAttrs()})
 }
 
-func (s *Server) filterReadRows(ctx context.Context, id *auth.Identity, root *models.RootMetadata, rows []map[string]any) []map[string]any {
-	rows = filterDeniedQueryRows(rows, s.buildACLFilter(ctx, id, root.ID))
+func (s *Server) filterReadRows(ctx context.Context, id *auth.Identity, root *models.RootMetadata, rows []map[string]any) ([]map[string]any, error) {
+	denied, err := s.buildACLFilter(ctx, id, root.ID)
+	if err != nil {
+		return nil, err
+	}
+	rows = filterDeniedQueryRows(rows, denied)
 	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
 		rows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, rows)
 	}
-	return rows
+	return rows, nil
 }
 
 func validateReadRange(r *models.ReadRange) error {
@@ -3055,23 +2045,31 @@ func validateReadRange(r *models.ReadRange) error {
 	return nil
 }
 
-func readIncludeAttrs() []string {
-	return []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
-}
-
-func rootAssetURL(r *http.Request, rootID, key string) string {
-	return fmt.Sprintf("/roots/%s/assets?key=%s", url.PathEscape(rootID), url.QueryEscape(key))
+func readExcludedAttrs() []string {
+	// Missing excluded fields are ignored by Turbopuffer, unlike missing included
+	// fields. Preserve extraction_id for split-line reads, but never transfer
+	// vectors or internal artifact/generation metadata for read/search results.
+	return []string{
+		"vector", "image_path", "generation_id", "valid_from_generation", "valid_from_generation_seq",
+		"valid_to_generation", "valid_to_generation_seq", "root_id", "file_id", "version_id",
+		"version_sequence", "extraction_sequence", "source_manifest_ref", "location_json",
+	}
 }
 
 // ---------------------------------------------------------------------------
 // ACL helpers
 // ---------------------------------------------------------------------------
 
+var errFilePermissionsUnavailable = errors.New("file permissions unavailable")
+
 // checkWriteACL checks if a user has write permission for a path in a root.
 // If no ACLs are configured for the root, all org editors+ have access.
 func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil || len(acls) == 0 {
+	if err != nil {
+		return false
+	}
+	if len(acls) == 0 {
 		_, ok, rootErr := s.rootForPermission(ctx, id, rootID, models.RootPermissionSync)
 		return rootErr == nil && ok
 	}
@@ -3080,21 +2078,20 @@ func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, f
 }
 
 // checkReadACL checks if a user has read permission for a path in a root.
-func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
+func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, filePath string) (bool, error) {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil || len(acls) == 0 {
-		return true // No ACLs → all org members can read
+	if err != nil {
+		return false, errFilePermissionsUnavailable
 	}
-
-	return checkPermission(acls, filePath, "read")
+	return checkPermission(acls, filePath, "read"), nil
 }
 
-// buildACLFilter returns Turbopuffer filter conditions based on user's ACLs.
-// Returns nil if no filtering is needed (user has full access).
-func (s *Server) buildACLFilter(ctx context.Context, id *auth.Identity, rootID string) []string {
+// buildACLFilter returns denied literal path prefixes for post-filtering.
+// An empty successful result means unrestricted; a lookup error never does.
+func (s *Server) buildACLFilter(ctx context.Context, id *auth.Identity, rootID string) ([]string, error) {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil || len(acls) == 0 {
-		return nil // No ACLs → full access
+	if err != nil {
+		return nil, errFilePermissionsUnavailable
 	}
 
 	// Collect denied path prefixes
@@ -3104,7 +2101,7 @@ func (s *Server) buildACLFilter(ctx context.Context, id *auth.Identity, rootID s
 			denied = append(denied, acl.PathPrefix)
 		}
 	}
-	return denied
+	return denied, nil
 }
 
 // checkPermission evaluates ACLs for a specific path and permission.
@@ -3121,97 +2118,8 @@ func checkPermission(acls []models.RootACL, filePath, _ string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Content proof filtering (Phase 3)
+// Historical root inventory (read-only migration audit)
 // ---------------------------------------------------------------------------
-
-// filterByContentProof removes query results for files the user doesn't have locally.
-// This provides zero-trust search: even with a shared/cloned index, users only see
-// results for files they can prove they possess (via Merkle tree hashes).
-func (s *Server) filterByContentProof(ctx context.Context, orgID, userID, rootID string, rows []map[string]any) []map[string]any {
-	proofBytes, _, err := s.db.GetContentProof(ctx, orgID, userID, rootID)
-	if err != nil {
-		return nil
-	}
-
-	var proof models.ContentProofData
-	if err := json.Unmarshal(proofBytes, &proof); err != nil {
-		return nil
-	}
-
-	var filtered []map[string]any
-	for _, row := range rows {
-		fp := strVal(row, "file_path")
-		fileHash := strVal(row, "file_hash")
-		if fp == "" {
-			continue
-		}
-		if proofHash, ok := proof.FileHashes[fp]; ok && proofHash == fileHash {
-			filtered = append(filtered, row)
-		}
-	}
-	return filtered
-}
-
-// ---------------------------------------------------------------------------
-// Sync processing
-// ---------------------------------------------------------------------------
-
-type pendingEmbedding struct {
-	chunk       map[string]any
-	rows        []map[string]any
-	contentHash string
-}
-
-type syncSourceCache struct {
-	s3   objectStore
-	key  string
-	data []byte
-}
-
-func stateObjectKey(rootID, generationID string) string {
-	return fmt.Sprintf("states/%s/%s.json.gz", rootID, safeObjectName(generationID))
-}
-
-func (s *Server) ensureSyncStateRef(ctx context.Context, rootID, generationID string, req *models.SyncRequest) error {
-	if req == nil {
-		return nil
-	}
-	if req.StateRef != "" {
-		if generationID == "" || !strings.HasPrefix(req.StateRef, fmt.Sprintf("syncs/%s/state/", generationID)) {
-			return nil
-		}
-		data, err := s.s3.Download(ctx, req.StateRef)
-		if err != nil {
-			return fmt.Errorf("downloading sync state object %s: %w", req.StateRef, err)
-		}
-		key := stateObjectKey(rootID, generationID)
-		if err := s.s3.Upload(ctx, key, data, "application/gzip"); err != nil {
-			return fmt.Errorf("uploading root state object %s: %w", key, err)
-		}
-		req.StateRef = key
-		return nil
-	}
-	if req.State == nil {
-		return nil
-	}
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(gz).Encode(req.State); err != nil {
-		_ = gz.Close()
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		return err
-	}
-	data := buf.Bytes()
-	key := stateObjectKey(rootID, generationID)
-	if err := s.s3.Upload(ctx, key, data, "application/gzip"); err != nil {
-		return fmt.Errorf("uploading root state object %s: %w", key, err)
-	}
-	req.StateRef = key
-	req.State = nil
-	return nil
-}
 
 func (s *Server) loadRootState(ctx context.Context, rootID string) (map[string]models.FileState, error) {
 	record, err := s.db.LoadStateRecord(ctx, rootID)
@@ -3260,104 +2168,6 @@ func decodeRootState(ref string, data []byte) (map[string]models.FileState, erro
 	return state, nil
 }
 
-func (c *syncSourceCache) read(ctx context.Context, key string, offset, length int64) ([]byte, error) {
-	if key == "" {
-		return nil, fmt.Errorf("empty source key")
-	}
-	if !isSourceBundleKey(key) {
-		body, err := c.s3.Open(ctx, key, offset, length)
-		if err != nil {
-			return nil, err
-		}
-		defer body.Close()
-		return io.ReadAll(body)
-	}
-	if key != c.key {
-		data, err := c.s3.Download(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		c.key, c.data = key, data
-	}
-	data := c.data
-	if length == 0 {
-		return data, nil
-	}
-	end := offset + length
-	if offset < 0 || end < offset || end > int64(len(data)) {
-		return nil, fmt.Errorf("invalid range offset=%d length=%d object_bytes=%d", offset, length, len(data))
-	}
-	return data[offset:end], nil
-}
-
-func (s *Server) resolvePendingEmbeddings(ctx context.Context, orgID string, pending []pendingEmbedding) error {
-	chunks := make([]map[string]any, len(pending))
-	for i, item := range pending {
-		chunks[i] = item.chunk
-	}
-	embedStart := time.Now()
-	resp, err := s.modal.EmbedChunks(chunks)
-	if err != nil {
-		return fmt.Errorf("embedding sync chunks: %w", err)
-	}
-	embedResults := resp.Results
-	if len(embedResults) != len(pending) {
-		return fmt.Errorf("embedding sync chunks: got %d results for %d chunks", len(embedResults), len(pending))
-	}
-	log.Printf("timing stage=modal_embed_global chunks=%d elapsed=%s", len(chunks), time.Since(embedStart))
-
-	cacheEntries := make(map[string][]float64)
-	for i, result := range embedResults {
-		embedding, ok := result["embedding"].([]any)
-		if !ok {
-			return fmt.Errorf("embedding result %d missing embedding vector", i)
-		}
-		for _, row := range pending[i].rows {
-			row["vector"] = embedding
-		}
-		hash := pending[i].contentHash
-		if hash == "" {
-			chunk, _ := result["chunk"].(map[string]any)
-			hash, _ = chunk["content_hash"].(string)
-		}
-		if hash == "" {
-			continue
-		}
-		embFloat := make([]float64, len(embedding))
-		for j, value := range embedding {
-			if f, ok := value.(float64); ok {
-				embFloat[j] = f
-			}
-		}
-		cacheEntries[hash] = embFloat
-	}
-
-	cacheSaveStart := time.Now()
-	if err := s.db.SaveCachedEmbeddings(ctx, orgID, s.modal.EmbeddingModelVersion(), cacheEntries); err != nil {
-		log.Printf("warning: failed to save embedding cache: %v", err)
-	}
-	log.Printf("timing stage=embedding_cache_save_global entries=%d elapsed=%s", len(cacheEntries), time.Since(cacheSaveStart))
-	return nil
-}
-
-func tpWriteBatchSize() int {
-	const defaultRows = 512
-	rows, _ := strconv.Atoi(os.Getenv("PUFFERFS_TP_WRITE_BATCH_ROWS"))
-	if rows < 1 {
-		return defaultRows
-	}
-	return min(rows, defaultRows)
-}
-
-func tpWriteBatchMaxBytes() int {
-	const defaultBytes = 8 << 20
-	bytes, _ := strconv.Atoi(os.Getenv("PUFFERFS_TP_WRITE_BATCH_BYTES"))
-	if bytes < 1 {
-		return defaultBytes
-	}
-	return min(bytes, defaultBytes)
-}
-
 func filteredQueryLimit(topK int) int {
 	if topK < 1 {
 		topK = 10
@@ -3375,28 +2185,6 @@ func filteredQueryLimit(topK int) int {
 // tpNamespace returns the Turbopuffer namespace for a root, scoped to an org.
 func tpNamespace(orgID, rootID string) string {
 	return fmt.Sprintf("org-%s-root-%s", orgID, rootID)
-}
-
-func modalChunkPayload(row map[string]any) map[string]any {
-	chunk := map[string]any{
-		"id":           row["id"],
-		"content":      row["content"],
-		"file_path":    row["file_path"],
-		"chunk_index":  row["chunk_index"],
-		"content_hash": row["content_hash"],
-		"file_type":    row["file_type"],
-		"root_id":      row["root_id"],
-	}
-	if absolutePath, ok := row["absolute_path"]; ok && absolutePath != nil {
-		chunk["absolute_path"] = absolutePath
-	}
-	if pageNumber, ok := row["page_number"]; ok && pageNumber != nil {
-		chunk["page_number"] = pageNumber
-	}
-	if imagePath, ok := row["image_path"]; ok && imagePath != nil {
-		chunk["image_path"] = imagePath
-	}
-	return chunk
 }
 
 // ---------------------------------------------------------------------------
@@ -3503,6 +2291,19 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, root := range selection.roots {
 		rootResults, stats, err := s.queryOneRoot(r.Context(), id, &req, root, embedding, queryLimit)
 		if err != nil {
+			if errors.Is(err, errQueryRootNotFound) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+				return
+			}
+			if errors.Is(err, errSearchPublicationBusy) {
+				w.Header().Set("Retry-After", "1")
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "search_publication_busy", "error": errSearchPublicationBusy.Error()})
+				return
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "index search timed out"})
+				return
+			}
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -3609,6 +2410,8 @@ type queryRootStats struct {
 }
 
 func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *models.QueryRequest, root models.RootMetadata, embedding []float64, queryLimit int) ([]models.QueryResult, queryRootStats, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, id.OrgID, root.ID)
 	if err != nil {
 		return nil, queryRootStats{}, fmt.Errorf("listing root index namespaces: %w", err)
@@ -3619,53 +2422,57 @@ func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *model
 		return nil, stats, nil
 	}
 
-	includeAttrs := []string{"content", "file_path", "absolute_path", "chunk_index", "content_hash", "file_hash", "file_type", "page_number", "image_path", "line_start", "line_end", "generation_id", "valid_from_generation", "valid_from_generation_seq", "valid_to_generation", "valid_to_generation_seq"}
-
-	var filters []any
-	if req.Glob != "" {
-		filters = append(filters, []any{"file_path", "Glob", req.Glob})
-	}
-	visibleSeq, err := s.db.GetVisibleGenerationSeq(ctx, root.ID)
-	if err != nil {
-		return nil, stats, fmt.Errorf("resolving visible generation: %w", err)
-	}
-	filters = append(filters, activeGenerationFilter(visibleSeq))
-
-	var rows []map[string]any
+	fts, ann := []any{"content", "BM25", req.Query}, []any{"vector", "ANN", embedding}
+	var rankings []any
 	switch req.Mode {
 	case "fts":
-		rankBy := []any{"content", "BM25", req.Query}
-		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
-		})
+		rankings = []any{fts}
 	case "vector":
 		if root.VectorDisabled {
 			return nil, stats, fmt.Errorf("root %s has vector search disabled", root.ID)
 		}
-		rankBy := []any{"vector", "ANN", embedding}
-		rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-			return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
-		})
+		rankings = []any{ann}
 	case "hybrid":
+		rankings = []any{ann, fts}
 		if root.VectorDisabled {
-			rankBy := []any{"content", "BM25", req.Query}
-			rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-				return s.tp.Query(namespace, rankBy, queryLimit, tpAndFilter(filters), includeAttrs)
-			})
-		} else {
-			rows, err = queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-				return s.tp.HybridSearch(namespace, req.Query, embedding, queryLimit, tpAndFilter(filters))
-			})
+			rankings = []any{fts}
 		}
 	default:
 		return nil, stats, fmt.Errorf("mode must be fts, vector, or hybrid")
 	}
+	rows, err := queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
+		sets, err := s.queryPublishedRows(ctx, root.OrgID, root.ID, func(visibility any) ([][]map[string]any, error) {
+			filters := []any{visibility}
+			if req.Glob != "" {
+				filters = append(filters, []any{"file_path", "Glob", req.Glob})
+			}
+			queries := make([]TPQuery, len(rankings))
+			for i, rank := range rankings {
+				queries[i] = TPQuery{RankBy: rank, Limit: queryLimit, Filters: tpAndFilter(filters), ExcludeAttributes: readExcludedAttrs()}
+			}
+			if len(queries) == 1 {
+				rows, err := s.tp.Query(ctx, namespace, queries[0])
+				return [][]map[string]any{rows}, err
+			}
+			return s.tp.MultiQuery(ctx, namespace, queries)
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(sets) == 1 {
+			return sets[0], nil
+		}
+		return reciprocalRankFusion(sets, 60), nil
+	})
 	if err != nil {
 		return nil, stats, err
 	}
 	stats.rawResultCount = len(rows)
 
-	deniedPrefixes := s.buildACLFilter(ctx, id, root.ID)
+	deniedPrefixes, err := s.buildACLFilter(ctx, id, root.ID)
+	if err != nil {
+		return nil, stats, err
+	}
 	filteredRows := filterDeniedQueryRows(rows, deniedPrefixes)
 	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
 		filteredRows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, filteredRows)
@@ -3718,11 +2525,6 @@ func queryResultsFromRows(root models.RootMetadata, rows []map[string]any) []mod
 			if f, ok := pn.(float64); ok {
 				n := int(f)
 				results[i].PageNumber = &n
-			}
-		}
-		if ip, ok := row["image_path"]; ok && ip != nil {
-			if s, ok := ip.(string); ok {
-				results[i].ImagePath = &s
 			}
 		}
 	}
@@ -3895,34 +2697,6 @@ func (s *Server) rootForPermission(ctx context.Context, id *auth.Identity, rootI
 	root.Access = perms
 	root.AccessSource = source
 	return root, rootPermissionAllowed(perms, permission), nil
-}
-
-func detectFileType(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".pdf":
-		return "pdf"
-	case ".docx", ".doc":
-		return "docx"
-	case ".pptx", ".ppt":
-		return "pptx"
-	case ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp":
-		return "image"
-	case ".eml":
-		return "eml"
-	case ".msg":
-		return "msg"
-	case ".vcf":
-		return "vcf"
-	case ".ics":
-		return "ics"
-	case ".mp3", ".wav":
-		return "audio"
-	case ".mp4", ".mov":
-		return "video"
-	default:
-		return "auto"
-	}
 }
 
 func tpAndFilter(filters []any) any {

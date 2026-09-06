@@ -24,4 +24,5 @@ dist
 **/*.pyo
 **/*.test
 coverage.out
+tests/e2e/artifacts
 *.coverprofile

@@ -62,10 +62,10 @@ jobs:
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
       MODAL_SECRET_KEY: ${{ secrets.MODAL_SECRET_KEY }}
       PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
-      MODAL_CHUNK_ENDPOINT: ${{ vars.MODAL_CHUNK_ENDPOINT || secrets.MODAL_CHUNK_ENDPOINT }}
-      MODAL_EMBED_ENDPOINT: ${{ vars.MODAL_EMBED_ENDPOINT || secrets.MODAL_EMBED_ENDPOINT }}
       MODAL_QUERY_EMBED_ENDPOINT: ${{ vars.MODAL_QUERY_EMBED_ENDPOINT || secrets.MODAL_QUERY_EMBED_ENDPOINT }}
-      MODAL_INDEX_SHARD_ENDPOINT: ${{ vars.MODAL_INDEX_SHARD_ENDPOINT || secrets.MODAL_INDEX_SHARD_ENDPOINT }}
+      MODAL_TRANSFORM_ENDPOINT: ${{ vars.MODAL_TRANSFORM_ENDPOINT || secrets.MODAL_TRANSFORM_ENDPOINT }}
+      MODAL_FILE_INDEX_ENDPOINT: ${{ vars.MODAL_FILE_INDEX_ENDPOINT || secrets.MODAL_FILE_INDEX_ENDPOINT }}
+      MODAL_FILE_CPU_INDEX_ENDPOINT: ${{ vars.MODAL_FILE_CPU_INDEX_ENDPOINT || secrets.MODAL_FILE_CPU_INDEX_ENDPOINT }}
       FRONTEND_URL: ${{ vars.FRONTEND_URL }}
       COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
       API_DOMAIN: ${{ vars.API_DOMAIN }}
@@ -170,73 +170,6 @@ jobs:
         run: |
           npm run build
           pulumi preview --diff --refresh
-
-      - name: Retire legacy us-east-1 service discovery services
-        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
-        run: |
-          set -euo pipefail
-          LEGACY_REGION="us-east-1"
-          NAMESPACE_NAME="${PROJECT_NAME}-${PULUMI_STACK}.local"
-          NAMESPACE_ID="$(aws servicediscovery list-namespaces \
-            --region "$LEGACY_REGION" \
-            --filters Name=NAME,Values="$NAMESPACE_NAME",Condition=EQ Name=TYPE,Values=DNS_PRIVATE,Condition=EQ \
-            --query 'Namespaces[0].Id' \
-            --output text 2>/dev/null || true)"
-
-          if [ -z "$NAMESPACE_ID" ] || [ "$NAMESPACE_ID" = "None" ]; then
-            echo "No legacy Cloud Map namespace found in ${LEGACY_REGION}: ${NAMESPACE_NAME}"
-            exit 0
-          fi
-
-          echo "Retiring legacy Cloud Map services in ${LEGACY_REGION}/${NAMESPACE_ID}"
-          SERVICE_IDS="$(aws servicediscovery list-services \
-            --region "$LEGACY_REGION" \
-            --filters Name=NAMESPACE_ID,Values="$NAMESPACE_ID",Condition=EQ \
-            --query 'Services[].Id' \
-            --output text)"
-
-          for SERVICE_ID in $SERVICE_IDS; do
-            INSTANCE_IDS="$(aws servicediscovery list-instances \
-              --region "$LEGACY_REGION" \
-              --service-id "$SERVICE_ID" \
-              --query 'Instances[].Id' \
-              --output text)"
-
-            for INSTANCE_ID in $INSTANCE_IDS; do
-              OPERATION_ID="$(aws servicediscovery deregister-instance \
-                --region "$LEGACY_REGION" \
-                --service-id "$SERVICE_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --query 'OperationId' \
-                --output text || true)"
-              if [ -n "$OPERATION_ID" ] && [ "$OPERATION_ID" != "None" ]; then
-                for _ in $(seq 1 30); do
-                  STATUS="$(aws servicediscovery get-operation \
-                    --region "$LEGACY_REGION" \
-                    --operation-id "$OPERATION_ID" \
-                    --query 'Operation.Status' \
-                    --output text)"
-                  [ "$STATUS" = "SUCCESS" ] && break
-                  if [ "$STATUS" = "FAIL" ]; then
-                    aws servicediscovery get-operation --region "$LEGACY_REGION" --operation-id "$OPERATION_ID"
-                    exit 1
-                  fi
-                  sleep 2
-                done
-              fi
-            done
-
-            for ATTEMPT in $(seq 1 30); do
-              if aws servicediscovery delete-service --region "$LEGACY_REGION" --id "$SERVICE_ID"; then
-                break
-              fi
-              if [ "$ATTEMPT" -eq 30 ]; then
-                echo "Could not delete legacy Cloud Map service: $SERVICE_ID" >&2
-                exit 1
-              fi
-              sleep 2
-            done
-          done
 
       - name: Deploy backend and infrastructure
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}

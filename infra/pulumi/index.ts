@@ -2,6 +2,7 @@ import * as aws from "@pulumi/aws";
 import * as docker from "@pulumi/docker";
 import * as pulumi from "@pulumi/pulumi";
 
+
 const cfg = new pulumi.Config();
 const requireNonBlank = (key: string): string => {
   const value = cfg.require(key).trim();
@@ -32,17 +33,18 @@ const enableBilling = cfg.getBoolean("enableBilling") ?? false;
 const frontendUrl = cfg.get("frontendUrl");
 const posthogEnabled = cfg.getBoolean("posthogEnabled") ?? false;
 const posthogHost = cfg.get("posthogHost");
-const queueBackend = cfg.get("queueBackend") ?? "sqs";
-if (queueBackend !== "sqs" && queueBackend !== "nats") {
-  throw new Error('pufferfs:queueBackend must be either "sqs" or "nats"');
-}
+// SQS is the only execution queue; queues contain per-file references.
+const processing = {
+  queuePrefix: "file-",
+  workers: { transform: 16, index: 16 },
+  endpoints: {
+    MODAL_TRANSFORM_ENDPOINT: "modalTransformEndpoint",
+    MODAL_FILE_INDEX_ENDPOINT: "modalFileIndexEndpoint",
+    MODAL_FILE_CPU_INDEX_ENDPOINT: "modalFileCpuIndexEndpoint",
+    MODAL_QUERY_EMBED_ENDPOINT: "modalQueryEmbedEndpoint",
+  },
+};
 const alarmTopicArn = cfg.get("alarmTopicArn");
-const natsImage = cfg.get("natsImage") ?? "nats:2.12.2-alpine";
-const natsClusterName = cfg.get("natsClusterName") ?? "pufferfs";
-const natsNodes = ["nats-1", "nats-2", "nats-3"] as const;
-const natsDnsZone = `${project}-${stack}.local`;
-const natsRoutes = natsNodes.map((node) => `nats://${node}.${natsDnsZone}:6222`).join(",");
-const natsURL = natsNodes.map((node) => `nats://${node}.${natsDnsZone}:4222`).join(",");
 
 const tags = {
   Project: project,
@@ -213,6 +215,21 @@ new aws.s3.BucketPublicAccessBlock(name("artifacts-public-access"), {
   restrictPublicBuckets: true,
 });
 
+new aws.s3.BucketPolicy(name("artifacts-transport-policy"), {
+  bucket: bucket.id,
+  policy: bucket.arn.apply((arn) => JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [{
+      Sid: "DenyInsecureTransport",
+      Effect: "Deny",
+      Principal: "*",
+      Action: "s3:*",
+      Resource: [arn, `${arn}/*`],
+      Condition: { Bool: { "aws:SecureTransport": "false", "aws:PrincipalIsAWSService": "false" } },
+    }],
+  })),
+});
+
 new aws.s3.BucketServerSideEncryptionConfigurationV2(name("artifacts-encryption"), {
   bucket: bucket.id,
   rules: [
@@ -364,10 +381,11 @@ const logGroup = new aws.cloudwatch.LogGroup(name("logs"), {
 // Each pipeline stage gets an independent FIFO queue so a wedged indexing
 // workload cannot consume chunking capacity. Data shards use
 // independent groups for concurrency; commits use one group per root.
-const syncStages = ["chunk", "index", "commit"] as const;
+const syncStages = Object.keys(processing.workers);
 const syncQueues = syncStages.map((stage) => {
-  const dlq = new aws.sqs.Queue(name(`${stage}-dlq`), {
-    name: `${name(`sync-${stage}-dlq`)}.fifo`,
+  const queueStage = `${processing.queuePrefix}${stage}`;
+  const dlq = new aws.sqs.Queue(name(`${queueStage}-dlq`), {
+    name: `${name(`sync-${queueStage}-dlq`)}.fifo`,
     fifoQueue: true,
     messageRetentionSeconds: 14 * 24 * 60 * 60,
     tags,
@@ -375,10 +393,13 @@ const syncQueues = syncStages.map((stage) => {
   // Commit-not-ready is normal while large roots finish their final shards;
   // retain those retries through the 30-minute watchdog window.
   const maxReceiveCount = stage === "commit" ? 400 : 5;
-  const queue = new aws.sqs.Queue(name(`${stage}-queue`), {
-    name: `${name(`sync-${stage}`)}.fifo`,
+  const queue = new aws.sqs.Queue(name(`${queueStage}-queue`), {
+    name: `${name(`sync-${queueStage}`)}.fifo`,
     fifoQueue: true,
     contentBasedDeduplication: false,
+    // Independent message groups allow concurrent file processing.
+    deduplicationScope: "messageGroup",
+    fifoThroughputLimit: "perMessageGroupId",
     visibilityTimeoutSeconds: 5 * 60,
     receiveWaitTimeSeconds: 20,
     messageRetentionSeconds: 14 * 24 * 60 * 60,
@@ -449,7 +470,7 @@ new aws.iam.RolePolicy(name("ecs-task-policy"), {
       const statements: Record<string, unknown>[] = [
         {
           Effect: "Allow",
-          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListBucket"],
+          Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts", "s3:ListBucket", "s3:ListBucketMultipartUploads"],
           Resource: [bucketArn, `${bucketArn}/*`],
         },
         {
@@ -545,119 +566,6 @@ const appSg = new aws.ec2.SecurityGroup(name("app-sg"), {
   tags: { ...tags, Name: name("app-sg") },
 });
 
-const natsSg = new aws.ec2.SecurityGroup(name("nats-sg"), {
-  vpcId: vpc.id,
-  ingress: [
-    {
-      protocol: "tcp",
-      fromPort: 4222,
-      toPort: 4222,
-      securityGroups: [appSg.id],
-    },
-    {
-      protocol: "tcp",
-      fromPort: 6222,
-      toPort: 6222,
-      self: true,
-    },
-    {
-      protocol: "tcp",
-      fromPort: 2049,
-      toPort: 2049,
-      securityGroups: [appSg.id],
-    },
-    {
-      protocol: "tcp",
-      fromPort: 2049,
-      toPort: 2049,
-      self: true,
-    },
-  ],
-  egress: [
-    {
-      protocol: "-1",
-      fromPort: 0,
-      toPort: 0,
-      cidrBlocks: ["0.0.0.0/0"],
-    },
-  ],
-  tags: { ...tags, Name: name("nats-sg") },
-});
-
-const fileSystem = new aws.efs.FileSystem(name("nats-efs"), {
-  encrypted: true,
-  tags,
-});
-
-const mountTargets = privateSubnets.map((subnet, i) =>
-  new aws.efs.MountTarget(name(`nats-efs-mt-${i + 1}`), {
-    fileSystemId: fileSystem.id,
-    subnetId: subnet.id,
-    securityGroups: [natsSg.id],
-  }),
-);
-
-const natsAccessPoints = natsNodes.map(
-  (node) =>
-    new aws.efs.AccessPoint(name(`${node}-ap`), {
-      fileSystemId: fileSystem.id,
-      posixUser: {
-        uid: 1000,
-        gid: 1000,
-      },
-      rootDirectory: {
-        path: `/${node}`,
-        creationInfo: {
-          ownerUid: 1000,
-          ownerGid: 1000,
-          permissions: "700",
-        },
-      },
-      tags: { ...tags, Name: name(`${node}-ap`) },
-    }),
-);
-
-new aws.iam.RolePolicy(name("ecs-efs-client-policy"), {
-  role: taskRole.id,
-  policy: pulumi
-    .all([fileSystem.arn, natsAccessPoints.map((ap) => ap.arn)])
-    .apply(([fileSystemArn, accessPointArns]) =>
-      JSON.stringify({
-        Version: "2012-10-17",
-        Statement: [
-          {
-            Effect: "Allow",
-            Action: [
-              "elasticfilesystem:ClientMount",
-              "elasticfilesystem:ClientWrite",
-              "elasticfilesystem:DescribeMountTargets",
-            ],
-            Resource: [fileSystemArn, ...accessPointArns],
-          },
-        ],
-      }),
-    ),
-});
-
-const namespace = new aws.servicediscovery.PrivateDnsNamespace(name("service-discovery"), {
-  name: natsDnsZone,
-  vpc: vpc.id,
-  tags,
-});
-
-const natsDiscoveryServices = natsNodes.map(
-  (node) =>
-    new aws.servicediscovery.Service(name(`${node}-discovery`), {
-      name: node,
-      dnsConfig: {
-        namespaceId: namespace.id,
-        dnsRecords: [{ ttl: 10, type: "A" }],
-        routingPolicy: "MULTIVALUE",
-      },
-      tags,
-    }),
-);
-
 const secretValues: Record<string, pulumi.Input<string>> = {
   DATABASE_URL: cfg.requireSecret("databaseUrl"),
   JWT_SECRET: cfg.requireSecret("jwtSecret"),
@@ -703,13 +611,7 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
   { name: "AWS_REGION", value: deployRegion },
   { name: "AWS_ENDPOINT_URL", value: "" },
-  { name: "NATS_URL", value: natsURL },
-  { name: "PUFFERFS_QUEUE_REPLICAS", value: natsNodes.length.toString() },
-  { name: "PUFFERFS_QUEUE_BACKEND", value: queueBackend },
-  { name: "MODAL_CHUNK_ENDPOINT", value: requireNonBlank("modalChunkEndpoint") },
-  { name: "MODAL_EMBED_ENDPOINT", value: requireNonBlank("modalEmbedEndpoint") },
-  { name: "MODAL_QUERY_EMBED_ENDPOINT", value: requireNonBlank("modalQueryEmbedEndpoint") },
-  { name: "MODAL_INDEX_SHARD_ENDPOINT", value: requireNonBlank("modalIndexShardEndpoint") },
+  ...Object.entries(processing.endpoints).map(([name, key]) => ({ name, value: requireNonBlank(key) })),
   { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
@@ -951,17 +853,14 @@ const apiService = new aws.ecs.Service(name("api"), {
   tags,
 });
 
-const workerDefaults: Record<string, number> = {
-  chunk: 16,
-  index: 64,
-  commit: 2,
-};
-
-const workerServices = Object.entries(workerDefaults).map(([stage, defaultConcurrency]) => {
+const workerServices = Object.entries(processing.workers).map(([stage, defaultConcurrency]) => {
   const serviceName = `worker-${stage}`;
   const concurrency =
     cfg.getNumber(`worker${stage[0].toUpperCase()}${stage.slice(1)}Concurrency`) ??
     defaultConcurrency;
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 64) {
+    throw new Error(`invalid ${serviceName} concurrency: ${concurrency}`);
+  }
   const task = appTaskDefinition(`${serviceName}-task`, serviceName, [
     { name: "PUFFERFS_PROCESS", value: "worker" },
     { name: "PUFFERFS_WORKER_STAGE", value: stage },
@@ -981,107 +880,6 @@ const workerServices = Object.entries(workerDefaults).map(([stage, defaultConcur
     },
     tags,
   });
-});
-
-const natsServices: aws.ecs.Service[] = [];
-natsNodes.forEach((node, i) => {
-  const task = new aws.ecs.TaskDefinition(name(`${node}-task`), {
-    family: name(`${node}-task`),
-    requiresCompatibilities: ["FARGATE"],
-    networkMode: "awsvpc",
-    cpu: "512",
-    memory: "1024",
-    executionRoleArn: executionRole.arn,
-    taskRoleArn: taskRole.arn,
-    volumes: [
-      {
-        name: "nats-data",
-        efsVolumeConfiguration: {
-          fileSystemId: fileSystem.id,
-          transitEncryption: "ENABLED",
-          authorizationConfig: {
-            accessPointId: natsAccessPoints[i].id,
-            iam: "ENABLED",
-          },
-        },
-      },
-    ],
-    containerDefinitions: JSON.stringify([
-      {
-        name: node,
-        image: natsImage,
-        essential: true,
-        command: [
-          "-js",
-          "-sd",
-          "/data",
-          "--server_name",
-          node,
-          "--cluster_name",
-          natsClusterName,
-          "-p",
-          "4222",
-          "-m",
-          "8222",
-          "-cluster",
-          "nats://0.0.0.0:6222",
-          "-routes",
-          natsRoutes,
-        ],
-        portMappings: [
-          { containerPort: 4222, protocol: "tcp" },
-          { containerPort: 6222, protocol: "tcp" },
-          { containerPort: 8222, protocol: "tcp" },
-        ],
-        mountPoints: [{ sourceVolume: "nats-data", containerPath: "/data" }],
-        healthCheck: {
-          command: [
-            "CMD-SHELL",
-            "wget -q -O /dev/null 'http://127.0.0.1:8222/healthz?js-enabled-only=true' || exit 1",
-          ],
-          interval: 10,
-          timeout: 5,
-          retries: 6,
-          startPeriod: 20,
-        },
-        stopTimeout: 120,
-        logConfiguration: logConfig(node),
-      },
-    ]),
-    tags,
-  });
-
-  const dependencies: pulumi.Resource[] = [...mountTargets, natsDiscoveryServices[i]];
-  if (i > 0) {
-    dependencies.push(natsServices[i - 1]);
-  }
-  const service = new aws.ecs.Service(
-    name(node),
-    {
-      cluster: cluster.arn,
-      taskDefinition: task.arn,
-      desiredCount: 1,
-      launchType: "FARGATE",
-      waitForSteadyState: true,
-      deploymentMinimumHealthyPercent: 0,
-      deploymentMaximumPercent: 100,
-      // Each NATS node is intentionally pinned to one subnet/AZ. ECS AZ
-      // rebalancing requires >100% surge capacity, which would start a second
-      // task against the same JetStream store and duplicate the server name.
-      availabilityZoneRebalancing: "DISABLED",
-      networkConfiguration: {
-        subnets: [privateSubnets[i % privateSubnets.length].id],
-        securityGroups: [natsSg.id],
-        assignPublicIp: false,
-      },
-      serviceRegistries: {
-        registryArn: natsDiscoveryServices[i].arn,
-      },
-      tags,
-    },
-    { dependsOn: dependencies },
-  );
-  natsServices.push(service);
 });
 
 // Maps an ACM cert's DNS validation option to the CNAME you add in Cloudflare.
@@ -1139,10 +937,7 @@ export const inviteEmailDkimValidationRecords = transactionalEmailDkimValidation
 export const artifactBucket = bucket.bucket;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;
-export const natsUrl = natsURL;
-export const syncQueueBackend = queueBackend;
 export const syncQueueUrls = Object.fromEntries(syncQueues.map(({ stage, queue }) => [stage, queue.url]));
 export const syncDeadLetterQueueUrls = Object.fromEntries(syncQueues.map(({ stage, dlq }) => [stage, dlq.url]));
 export const apiServiceArn = apiService.id;
 export const workerServiceArns = workerServices.map((service) => service.id);
-export const natsServiceArns = natsServices.map((service) => service.id);

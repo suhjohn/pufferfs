@@ -100,14 +100,13 @@ func writeRootList(w io.Writer, roots []models.RootMetadata) {
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tID\tSCOPE\tACCESS\tGENERATION\tSOURCE_PATH")
+	fmt.Fprintln(tw, "NAME\tID\tSCOPE\tACCESS\tSOURCE_PATH")
 	for _, root := range roots {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			root.Name,
 			root.ID,
 			root.Scope,
 			formatRootAccess(root.Access),
-			formatGeneration(root.VisibleGenerationID, root.VisibleGenerationSeq),
 			root.SourcePath,
 		)
 	}
@@ -125,17 +124,6 @@ func writeRootMeta(w io.Writer, meta *rootMeta) {
 	writeKV(w, "id", meta.ID)
 	writeKV(w, "name", meta.Name)
 	writeKV(w, "source_path", meta.SourcePath)
-	writeKV(w, "generation", formatGeneration(meta.GenerationID, meta.GenerationSeq))
-}
-
-func formatGeneration(id string, seq int64) string {
-	if id == "" {
-		return "-"
-	}
-	if seq == 0 {
-		return id
-	}
-	return fmt.Sprintf("%s/%d", id, seq)
 }
 
 func rootDeleteCmd() *cobra.Command {
