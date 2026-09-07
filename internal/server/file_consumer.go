@@ -166,20 +166,8 @@ func (c *FileConsumer) Process(ctx context.Context, msg queue.JobMessage) error 
 		case <-time.After(15 * time.Second):
 		}
 	}
-	if err != nil {
-		return err
-	}
-	err = c.server.db.pool.QueryRow(ctx, `SELECT status FROM file_work WHERE id=$1`, msg.WorkID).Scan(&status)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !fileWorkDurable(status, c.stage) {
-		return fmt.Errorf("Modal returned before durable %s completion: %s", c.stage, status)
-	}
-	return nil
+	// The RPC client validates the worker's durable status before succeeding.
+	return err
 }
 
 func fileWorkDurable(status, stage string) bool {

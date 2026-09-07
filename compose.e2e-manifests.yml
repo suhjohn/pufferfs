@@ -1,0 +1,19 @@
+services:
+  manifest-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/manifest_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  faults:
+    volumes:
+      - ./tests/e2e/manifest-faults.json:/config/faults.json:ro
+    depends_on:
+      manifest-relay: {condition: service_healthy}
+  transform:
+    environment:
+      AWS_ENDPOINT_URL: http://manifest-relay:8080
+    depends_on:
+      manifest-relay: {condition: service_healthy}

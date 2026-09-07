@@ -111,6 +111,7 @@ variables. Group by concern below.
 | Variable | Meaning | Default / notes |
 | --- | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. | **Required.** |
+| `PUFFERFS_WORKER_DB_MAX_CONNS` | Maximum PostgreSQL connections per Python worker process; 2–16, with no reserved minimum. Idle connections expire after one minute. | `2` |
 | `PUFFERFS_DB_MAX_CONNS` | Maximum PostgreSQL connections per Go API/consumer process; 1–64. Idle connections expire after one minute. | `4` |
 | `PORT` | HTTP listen port. | server default |
 | `LISTEN_ADDR` | Full listen address (overrides `PORT` when set). | — |
@@ -173,6 +174,8 @@ Source capture tuning uses plain integer byte values:
 | `MODAL_SECRET_KEY` | API/consumer caller authentication |
 | `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` | Modal auth secret; default `pufferfs-endpoint-auth` |
 | `PUFFERFS_WORKER_SECRET_NAME` | Modal worker credentials; default `pufferfs-workers` |
+| `PUFFERFS_MODAL_WORKER_CLOUD` | Optional deployment-time cloud for transformation and bulk GPU workers (for example `aws`); combine with region to keep workers near database/object storage. Unset uses Modal placement. |
+| `PUFFERFS_MODAL_WORKER_REGION` | Optional deployment-time placement for transformation and bulk GPU workers; unset uses Modal placement. Choose near database/object storage. |
 | `PUFFERFS_MODAL_EMBED_GPU` | Bulk GPU; default L4 |
 | `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | Bulk pool limit; default 16 |
 | `PUFFERFS_MODAL_QUERY_EMBED_GPU` | Query GPU; default L4 |
@@ -186,7 +189,7 @@ secret containing `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, equal to the caller's
 `MODAL_SECRET_KEY`.
 
 Pinned Nomic model/code revisions live in `modal/nomic_model.py`. Workers
-persist vector bodies in S3; Postgres stores locators. Documents/media use
+persist vector bodies in S3; Postgres stores bounded pack directories. Documents/media use
 Gemini 3.5 Flash-Lite Batch without provider roulette or native-PDF-text bypass.
 
 ### Transactional email (AWS SES, optional)
@@ -335,69 +338,6 @@ limit explicitly for larger files/batches. Cleanup does not erase originals in
 S3 and never treats an upload error as acceptance. Head metadata scales with
 tracked paths; the limit is not a cap on all CLI disk usage.
 
-### Historical recapture audit
-
-Catalog-only `sync status` cannot detect a historical file that has never been
-registered in the new catalog. Before retiring the old index, run this read-only
-audit on the source host against a prepared **non-production validation**
-deployment with per-file processing enabled:
-
-```bash
-pufferfs sync audit ROOT_ID --source /path/to/root --json
-```
-
-Use the actual root ID and a credential with legacy-state read access and sync
-access to the entire root. The command reads the old `/state` inventory and the
-paginated captured catalog, then hashes their union of paths locally using
-bounded reads. It neither trusts local hash caches nor writes proofs. The source
-directory must be explicit; it is not taken from a remote path. Historical paths
-remain in the audit even when current ignore rules exclude them from sync.
-
-- `needs_capture`: local bytes have no captured version or differ from it.
-- `missing_original`: the legacy inventory names a path with neither a captured
-  version nor an available local original. Restore it or resolve its intended
-  deletion explicitly; the audit does not authorize or register a deletion.
-- `missing_source_reference`: the catalog has no usable source metadata. This
-  is a repair requirement, not a claim that an S3 object was checked.
-- `pending`, `running`, `waiting_provider`, `failed`, etc.: capture exists, but
-  its latest extraction is not successfully published.
-- `complete` / `deleted`: the observed catalog reports publication of the
-  current captured version, including an explicit deletion when applicable.
-
-The report includes every audited path, whether its local bytes still match the
-legacy hash, the observed legacy generation, and `source_storage_verified:
-false`. A changed legacy hash is informational: capturing the current filesystem
-does not recover an older version whose original bytes no longer exist.
-Only `catalog_covered` exits successfully; incomplete and empty inventories exit
-nonzero. JSON remains parseable on an incomplete result; the error goes to stderr.
-Missing/unreadable inventory, an advancing legacy generation, unsafe local paths,
-nonregular files and detected changes while hashing fail the audit. `--timeout`
-(default 15 minutes) and cancellation apply to requests and local hashing.
-
-Recapture uses the existing sync command, not a second uploader:
-
-```bash
-pufferfs sync /path/to/root --id ROOT_ID --dry-run
-pufferfs sync /path/to/root --id ROOT_ID
-pufferfs sync wait ROOT_ID
-pufferfs sync audit ROOT_ID --source /path/to/root --json
-```
-
-Review the preview and effective ignore rules first. Normal sync may register
-deletions for **already-captured** paths absent locally and resumes pending
-journals before scanning. It does not synthesize tombstones for legacy-only
-paths. Matching legacy hashes do not suppress initial capture: those paths still
-need immutable source packs and per-file registration. A repeated accepted sync
-reuses its local heads; it does not recapture merely because indexing is pending.
-
-This audit is one migration check, **not a cutover gate on its own**. It does not
-scan local paths absent from both inventories, download or hash S3 objects,
-inspect actual index rows/search results, recover already-lost legacy inventory,
-or bypass path ACLs. Catalog pages and local reads are not an atomic root snapshot;
-pause writers and repeat validation for a cutover. Full source-storage integrity,
-read/search authorization, live worker/provider delivery, and production rollout
-still require independent verification and normal deployment approval.
-
 ### Retained source-storage verification
 
 `modal/source_verify.py` supplies the separate source-integrity check. It is an
@@ -418,8 +358,9 @@ alternative to the application ACL/content-proof checks for end users.
 
 The command enumerates **all retained file versions** under the root, including
 superseded versions and originals retained behind file-deletion tombstones. It
-checks each content-addressed manifest against its stored bytes and its catalog
-hash/size, verifies extent ownership and completed upload metadata, then hashes
+reads packed `.jsonl` record locators. It
+checks each manifest against its stored bytes (an exact range and record checksum
+for packed manifests) and its catalog hash/size, verifies extent ownership and completed upload metadata, then hashes
 the reconstructed source to EOF. Tombstones are reported without source reads.
 Missing manifests/packs, wrong bytes, invalid metadata and failed reads prevent
 a successful summary. It does not silently repair, recapture or delete anything.
@@ -451,8 +392,7 @@ immutable versions, not an atomic snapshot spanning Postgres and S3. It proves
 that the checked source bytes were readable during the run, not that objects
 cannot subsequently be deleted. It does not verify extraction chunks, vectors,
 mutation artifacts, index rows, or historical paths absent from the per-file
-catalog; use the preceding local audit for that last coverage check. Neither
-command alone authorizes production cutover or legacy deletion.
+catalog. It does not convert data from previous ingestion formats.
 
 Transformation and expired-provider-input refresh now use the same catalog-bound
 manifest reader: the manifest reference must belong to its root and match its
@@ -465,9 +405,8 @@ is no longer sufficient evidence that it represents the requested file version.
 The scheduled `pufferfs-reconciliation` deployment now requires `AWS_BUCKET_NAME`,
 S3 read/write access to cleanup mutation artifacts, and `TURBOPUFFER_API_KEY`
 in addition to its existing database/SQS configuration. It shares the index
-worker's `TURBOPUFFER_REGION` / optional `TURBOPUFFER_API_URL` settings. Apply
-migrations through 034 before deploying the updated worker roles. Drain old
-workers before this rollout: they do not enforce extraction-revision ordering.
+worker's `TURBOPUFFER_REGION` / optional `TURBOPUFFER_API_URL` settings. The
+API and worker roles must run the same current schema and artifact contracts.
 
 For Python workers, use either a region with the default/`{region}`-templated
 provider URL, or a fixed `TURBOPUFFER_API_URL` with `TURBOPUFFER_REGION` unset.
@@ -491,14 +430,13 @@ after five minutes. Backlog can extend these intervals. The role retains its
 sweep. At the budget, it stops starting index requests, waits for started requests
 and checkpoints their successes; provider timeouts still bound individual network
 operations. No new queue or always-running service is introduced.
-Historical rows without revision order and
-namespace remapping cleanup remain cutover gaps. This does not delete source
+This does not delete source
 packs, extracted chunks, vectors, or local capture spools for live roots.
 
 ### Root deletion recovery and retained sources
 
 Migration 034 records permanent root-deletion targets in Postgres before root
-or organization cascades discard their namespace/generation identities. It also
+or organization cascades discard their namespace identities. It also
 records targets when a root is marked `deleting_at`, so an interrupted delete
 remains recoverable. These are maintenance tombstones, not the SQS work queue.
 Root IDs and organization ownership are immutable; deleted IDs cannot be reused.
@@ -509,7 +447,7 @@ per invocation, with a separate 30-second soft budget. Index deletion records
 are packed once in `maintenance/root-deletions/` in S3 and reused on retries.
 Each index delete filters the recorded namespace by the deleted `root_id`, never
 deleting another root's rows even if the namespace was subsequently remapped.
-Sources, extraction outputs, mutations and legacy root/generation prefixes are
+Sources, extraction outputs and mutation prefixes are
 cleared in pages of up to 1,000 objects, followed by up to ten multipart aborts.
 Checks between requests stop further work after the soft deadline; the existing
 180-second deployment timeout remains the hard limit.
@@ -523,7 +461,7 @@ that API call to be retried; the sweeper handles external artifacts, not API
 response replay or final metadata deletion.
 
 The Modal reconciliation AWS principal additionally needs `s3:DeleteObject` and
-`s3:AbortMultipartUpload` on those exact root/generation prefixes,
+`s3:AbortMultipartUpload` on those exact root prefixes,
 `s3:ListBucket` and `s3:ListBucketMultipartUploads` on the bucket, and S3 get/put
 access to `maintenance/root-deletions/`. Pulumi does not provision the external
 Modal principal; its credentials/policy must be verified separately before
@@ -567,17 +505,10 @@ the same captured bytes. Existing presigned upload URLs remain capabilities
 until their recorded expiry; this fence does not revoke a URL already issued or
 claim instantaneous revocation of unrelated read requests.
 
-Legacy manifests are backfilled in bounded scheduled passes. Pack GC fails
-closed for any root with unknown version extents; corrupt/missing manifests
-remain visible as backfill failures. Legacy uploads lack uploader identity:
-existing authorized same-file ranges remain reusable after backfill. Unaccepted
-pre-migration uploads require re-upload from the retained local spool using the
-new CLI; knowledge of an old key alone never authorizes a new binding.
-Fresh-schema source-GC assertions passed, including real upload expiry and
-pending-spool recovery. The initial root-cleanup failure passed after the 040
-API migration. A latest-code full rerun, populated pre-039 upgrade, paused-reader
-and real AWS permission validation are still required. Explicit root deletion
-continues to erase that root's current objects and abandoned multipart uploads.
+Capture registration writes source extents in the same transaction as each
+version. There is no extent backfill, incomplete-catalog state, or old-manifest
+reader. Explicit root deletion erases that root's current objects and abandoned
+multipart uploads.
 
 Migration 038 tracks retired extraction artifacts. The scheduled reconciler
 uses `PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS` (default 30 days, minimum 60
@@ -592,9 +523,12 @@ artifacts. Each pass handles at most five extractions, one object page and ten
 multipart uploads per prefix, with a 15-second loop budget (individual network
 timeouts may extend it). Partial/error passes retry after five minutes;
 successful tombstones repeat daily for late writes. Metadata remains for audit,
-and root deletion takes over cleanup if the catalog is removed. The fresh
-Compose retention suite passed before migration 039; race coverage with paused work/retries and
-populated-database migration remain verification gates.
+and root deletion takes over cleanup if the catalog is removed.
+
+Migration 041 replaces the old embedding cache tables with bounded hash
+directories on `embedding_packs`, up to 512 vectors per immutable S3 object.
+It does not convert old vector locators. Cache misses are re-encoded normally.
+See [current schema and compatibility removal](fresh-schema-audit.md).
 
 Migration 037 tracks organization-shared embedding-cache packs independently of
 tenant rows. The scheduled reconciler retires at most 100 cold packs per pass,
@@ -613,32 +547,36 @@ new permissions for clients. The pre-039 Compose retention suite passed cache
 reuse, actual scheduled expiry, preserved search/mutations, and re-encoding after
 eviction. It does not yet verify deletion races with paused cache readers/writers.
 
-Migration 035 tracks temporary
-Google upload IDs separately from root/request rows. The collector releases exact
-tracked page/clip and batch-input uploads after all active transform work,
-batches and unfinished requests release them. For a deleted root it first
-cancels the provider job and waits for terminal status. An acknowledged delete
-or provider 404 sets `deleted_at`; a 403 never does. Migration 036 records the
-provider's returned `expirationTime` as `expires_at`, falling back conservatively
-to 48 hours after registration for uploaded Files without that metadata. Retries
-never extend this deadline. After it passes, bounded maintenance sets the
-separate `expired_at` and stops pointless delete retries without removing any
-source or batch recovery mappings. This records the provider retention deadline,
-not independently verified physical erasure. The [Files reference](https://ai.google.dev/api/files#File)
-defines the returned expiry timestamp; [uploaded Files retention](https://ai.google.dev/gemini-api/docs/files#delete-uploaded-files)
-is distinct from Google's six-week generated batch-result retention. Generated
-results are not registered as deletable uploads: deleting their batch did not
-make result bytes unavailable in the real-provider diagnostic. Unrecorded upload
-responses still require orphan/expiry handling. These provider cleanup paths
-are implemented. The complete lost-response/partial-retry real-provider E2E
-passed; the elapsed-expiry check remains a verification gate.
-No full physical-erasure
-claim is made for them. Roots hard-deleted before migration 034 have no retained
-cleanup identity and need separate historical reconciliation.
+Migration 045 replaces the provider ledger without an emptiness gate, data
+conversion, or rolling compatibility path. The resulting schema keeps one `provider_batches`
+row per contiguous range of at most 64 inputs and removes the three per-input
+provider tables. Input mappings, result/retry state and upload cleanup outcomes
+live in immutable, checksummed S3 manifests under `maintenance/provider/`.
+Workers require S3 GetObject/PutObject access to that prefix. It deliberately
+survives root prefix erasure so external upload cleanup can finish afterward.
 
-Migration 032 assigns immutable extraction registration sequences. Since the
-historical order was not recorded, it conservatively ranks each already-published
-extraction above its pre-migration alternatives. To replace that result, register
-a genuinely new extraction revision; replaying an old registration cannot
-promote its priority. Existing mutation artifacts lacking `extraction_sequence`
-can still replay, but same-version cleanup deliberately retains those rows.
+`PUFFERFS_PROVIDER_UPLOAD_CONCURRENCY` controls outstanding uploads within one
+transformation worker (default 4, range 1–16). It does not change the 64-input
+batch size or the number of worker containers. `PUFFERFS_COLLECTOR_WORKERS`
+is set when deploying the collector application (default 1, range 1–16). It
+controls both the maximum concurrent collector containers and the invocations
+started by the minute dispatcher. Collectors independently claim renewable leases. Each alternates provider collection, extraction assembly
+and cleanup during a nominal 50-second work window; a long operation may extend
+the invocation, within its 900-second timeout.
+
+Uncommitted preparation batches retry as a whole. Unrecorded temporary uploads
+may expire; committed manifests retain their exact upload IDs and returned
+expiry timestamps. Cleanup writes one S3 checkpoint for up to 65 uploads and
+one Postgres pointer update. An acknowledged deletion or provider 404 records
+`deleted_at` inside the checkpoint. A 403 does not prove deletion. Passing the
+recorded retention deadline records a distinct `expired_at`; no physical-erasure
+claim is implied. Generated batch-result files remain provider-managed.
+See [batch manifests, recovery, topology and bounded-call accounting](provider-batch-manifests.md).
+
+Extraction registration assigns immutable sequences. Index artifacts must carry
+their exact extraction sequence. Retry replays the complete mutation artifact;
+there is no partial-checkpoint or missing-sequence compatibility path.
+
+Migration 046 removes the retired generation-sync tables and root metadata,
+and limits deletion targets to the current namespace/source/artifact contracts.
+`sync audit` and the historical `/roots/{id}/state` endpoint are removed.

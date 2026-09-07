@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
@@ -27,11 +28,6 @@ import (
 // DB wraps the Postgres connection pool.
 type DB struct {
 	pool *pgxpool.Pool
-}
-
-type RootStateRecord struct {
-	State map[string]models.FileState
-	Ref   string
 }
 
 type EmailLoginChallenge struct {
@@ -191,23 +187,6 @@ func (db *DB) ProvisionOrganization(ctx context.Context, id, name, slug, externa
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
-}
-
-// UpsertUser is retained for older OAuth call sites. New providers should call
-// CompleteLogin so identity, invite, and org resolution remain provider-neutral.
-func (db *DB) UpsertUser(ctx context.Context, info auth.UserInfo, provider string) (userID, orgID string, role auth.Role, err error) {
-	login, err := db.CompleteLogin(ctx, auth.VerifiedIdentity{
-		Provider:      provider,
-		ProviderID:    info.ID,
-		Email:         info.Email,
-		Name:          info.Name,
-		AvatarURL:     info.Picture,
-		EmailVerified: true,
-	})
-	if err != nil {
-		return "", "", "", err
-	}
-	return login.UserID, login.OrgID, login.Role, nil
 }
 
 // CompleteLogin resolves a verified provider identity into a PufferFS user,
@@ -407,12 +386,9 @@ func (db *DB) acceptPendingOrgInvite(ctx context.Context, userID, email string) 
 		return "", "", false, err
 	}
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO org_members (org_id, user_id, role)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-		orgID, userID, rawRole,
-	); err != nil {
+	// An invitation can add membership, but cannot overwrite an existing role.
+	if err := tx.QueryRow(ctx, `SELECT role FROM change_org_member($1,'','',$2,$3,'join')`,
+		orgID, userID, rawRole).Scan(&rawRole); err != nil {
 		return "", "", false, err
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM org_invites WHERE id = $1`, inviteID); err != nil {
@@ -593,41 +569,57 @@ func (db *DB) ProvisionUser(ctx context.Context, id, email, name, avatarURL, pro
 // API Keys
 // ---------------------------------------------------------------------------
 
-// CreateAPIKey creates a new API key for a user in an org.
-func (db *DB) CreateAPIKey(ctx context.Context, orgID, userID, name string, scopes []string) (rawKey string, err error) {
-	id := uuid.New().String()
+// CreateAPIKey checks membership and the authorizing credential in the same
+// statement snapshot as the insert, after the complete request body has arrived.
+// A blank authorizingKeyID denotes a verified session or platform provisioning.
+func (db *DB) CreateAPIKey(ctx context.Context, orgID, userID, name string, scopes []string, authorizingKeyID string) (rawKey string, err error) {
 	rawKey = "pfs_" + uuid.New().String()
-	keyHash := auth.HashAPIKey(rawKey)
-
-	_, err = db.pool.Exec(ctx,
-		`INSERT INTO api_keys (id, org_id, user_id, key_hash, name, scopes, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-		id, orgID, userID, keyHash, name, scopes,
-	)
+	tag, err := db.pool.Exec(ctx, `INSERT INTO api_keys (id,org_id,user_id,key_hash,name,scopes)
+		SELECT $1,member.org_id,member.user_id,$4,$5,$6 FROM org_members member
+		WHERE member.org_id=$2 AND member.user_id=$3
+		AND ($7='' OR EXISTS (SELECT 1 FROM api_keys ak
+			WHERE ak.id=$7 AND ak.org_id=member.org_id AND ak.user_id=member.user_id
+			AND (ak.expires_at IS NULL OR ak.expires_at>clock_timestamp())
+			AND (cardinality(ak.scopes)=0 OR ak.scopes && ARRAY['api_keys:write','admin','write','*'])))`,
+		uuid.New().String(), orgID, userID, auth.HashAPIKey(rawKey), name, scopes, authorizingKeyID)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			return "", pgx.ErrNoRows // The org/user was deleted during insertion.
+		}
 		return "", err
+	}
+	if tag.RowsAffected() == 0 {
+		return "", pgx.ErrNoRows
 	}
 	return rawKey, nil
 }
 
+// ResolveSession trusts the signature's user/org identity, not its old role.
+func (db *DB) ResolveSession(ctx context.Context, userID, orgID string) (*auth.Identity, error) {
+	id := &auth.Identity{UserID: userID, OrgID: orgID}
+	err := db.pool.QueryRow(ctx, `SELECT om.role,u.email FROM org_members om
+		JOIN users u ON u.id=om.user_id WHERE om.user_id=$1 AND om.org_id=$2`,
+		userID, orgID).Scan(&id.Role, &id.Email)
+	return id, err
+}
+
 // ResolveAPIKey looks up an API key by its hash and returns the associated identity.
 func (db *DB) ResolveAPIKey(ctx context.Context, keyHash string) (*auth.Identity, error) {
-	var keyID, orgID, userID, role string
+	var keyID, orgID, userID, role, email string
 	var scopes []string
 	err := db.pool.QueryRow(ctx,
-		`SELECT ak.id, ak.org_id, ak.user_id, om.role, ak.scopes
+		`SELECT ak.id, ak.org_id, ak.user_id, om.role, ak.scopes, u.email
 		 FROM api_keys ak
 		 JOIN org_members om ON om.org_id = ak.org_id AND om.user_id = ak.user_id
+		 JOIN users u ON u.id = ak.user_id
 		 WHERE ak.key_hash = $1
 		   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`,
 		keyHash,
-	).Scan(&keyID, &orgID, &userID, &role, &scopes)
+	).Scan(&keyID, &orgID, &userID, &role, &scopes, &email)
 	if err != nil {
 		return nil, err
 	}
-
-	var email string
-	_ = db.pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, userID).Scan(&email)
 
 	return &auth.Identity{
 		UserID:   userID,
@@ -649,17 +641,7 @@ func (db *DB) ListAPIKeys(ctx context.Context, orgID, userID string) ([]models.A
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var keys []models.APIKey
-	for rows.Next() {
-		var k models.APIKey
-		if err := rows.Scan(&k.ID, &k.Name, &k.Scopes, &k.CreatedAt, &k.ExpiresAt); err != nil {
-			return nil, err
-		}
-		keys = append(keys, k)
-	}
-	return keys, nil
+	return pgx.AppendRows([]models.APIKey(nil), rows, pgx.RowToStructByPos[models.APIKey])
 }
 
 // DeleteAPIKey deletes an API key by ID (scoped to org).
@@ -675,18 +657,12 @@ func (db *DB) DeleteAPIKey(ctx context.Context, orgID, keyID string) error {
 // ---------------------------------------------------------------------------
 
 func (db *DB) GetEffectiveIgnorePolicy(ctx context.Context, orgID, userID string) (*models.EffectiveIgnorePolicy, error) {
-	orgPolicy, err := db.GetOrgIgnorePolicy(ctx, orgID)
-	if err != nil {
-		return nil, err
-	}
-	userPolicy, err := db.GetUserIgnorePolicy(ctx, orgID, userID)
-	if err != nil {
-		return nil, err
-	}
-	return &models.EffectiveIgnorePolicy{
-		OrgPatterns:  orgPolicy.Patterns,
-		UserPatterns: userPolicy.Patterns,
-	}, nil
+	policy := &models.EffectiveIgnorePolicy{}
+	err := db.pool.QueryRow(ctx, `SELECT
+		COALESCE((SELECT patterns FROM org_ignore_policies WHERE org_id=$1), ''),
+		COALESCE((SELECT patterns FROM user_ignore_policies WHERE org_id=$1 AND user_id=$2), '')`,
+		orgID, userID).Scan(&policy.OrgPatterns, &policy.UserPatterns)
+	return policy, err
 }
 
 func (db *DB) GetOrgIgnorePolicy(ctx context.Context, orgID string) (*models.IgnorePolicy, error) {
@@ -760,15 +736,18 @@ func (db *DB) SetUserIgnorePolicy(ctx context.Context, orgID, userID, patterns s
 // Org Members
 // ---------------------------------------------------------------------------
 
-// AddOrgMember adds a user to an org with a role.
-func (db *DB) AddOrgMember(ctx context.Context, orgID, userID string, role auth.Role) error {
-	_, err := db.pool.Exec(ctx,
-		`INSERT INTO org_members (org_id, user_id, role)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3`,
-		orgID, userID, string(role),
-	)
-	return err
+// changeOrgMember serializes authorization and mutation in the database. A nil
+// actor is reserved for the separately authenticated platform-admin endpoint.
+func (db *DB) changeOrgMember(ctx context.Context, orgID string, actor *auth.Identity, userID string, role auth.Role, mode string) (*models.OrgMember, error) {
+	actorID, keyID := "", ""
+	if actor != nil {
+		actorID, keyID = actor.UserID, actor.APIKeyID
+	}
+	var member models.OrgMember
+	err := db.pool.QueryRow(ctx, `SELECT * FROM change_org_member($1,$2,$3,$4,$5,$6)`,
+		orgID, actorID, keyID, userID, string(role), mode).Scan(
+		&member.UserID, &member.Email, &member.Name, &member.AvatarURL, &member.Role, &member.JoinedAt)
+	return &member, err
 }
 
 func (db *DB) InviteOrgMember(ctx context.Context, orgID, email string, role auth.Role, invitedByUserID string) (*models.OrgInvite, error) {
@@ -838,14 +817,6 @@ func (db *DB) DeleteOrgInvite(ctx context.Context, orgID, inviteID string) error
 	return err
 }
 
-func (db *DB) UpdateOrgMemberRole(ctx context.Context, orgID, userID string, role auth.Role) error {
-	_, err := db.pool.Exec(ctx,
-		`UPDATE org_members SET role = $3 WHERE org_id = $1 AND user_id = $2`,
-		orgID, userID, string(role),
-	)
-	return err
-}
-
 func (db *DB) GetOrgMember(ctx context.Context, orgID, userID string) (*models.OrgMember, error) {
 	var m models.OrgMember
 	err := db.pool.QueryRow(ctx,
@@ -884,73 +855,15 @@ func (db *DB) ListOrgMembers(ctx context.Context, orgID string) ([]models.OrgMem
 	return members, nil
 }
 
-func (db *DB) CountOrgMembersByRole(ctx context.Context, orgID string, role auth.Role) (int, error) {
-	var count int
-	err := db.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM org_members WHERE org_id = $1 AND role = $2`,
-		orgID, string(role),
-	).Scan(&count)
-	return count, err
-}
-
-// RemoveOrgMember removes a user from an org.
-func (db *DB) RemoveOrgMember(ctx context.Context, orgID, userID string) error {
-	_, err := db.pool.Exec(ctx,
-		`DELETE FROM org_members WHERE org_id = $1 AND user_id = $2`, orgID, userID,
-	)
-	return err
-}
-
 // CreateGroup creates or updates an organization group used for root grants.
 func (db *DB) CreateGroup(ctx context.Context, orgID, id, name, externalID string) (*models.Group, error) {
-	name = strings.TrimSpace(name)
-	externalID = strings.TrimSpace(externalID)
 	if id == "" {
 		id = uuid.New().String()
 	}
-
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-
-	if externalID != "" {
-		var existingID string
-		err := tx.QueryRow(ctx,
-			`SELECT id FROM groups WHERE org_id = $1 AND external_id = $2`,
-			orgID, externalID,
-		).Scan(&existingID)
-		if err == nil {
-			id = existingID
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			return nil, err
-		}
-	}
-
 	group := &models.Group{}
-	err = tx.QueryRow(ctx,
-		`INSERT INTO groups (id, org_id, name, external_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, NOW(), NOW())
-		 ON CONFLICT (id) DO UPDATE SET
-		   name = EXCLUDED.name,
-		   external_id = EXCLUDED.external_id,
-		   updated_at = NOW()
-		 RETURNING id, org_id, name, external_id, created_at, updated_at`,
-		id, orgID, name, externalID,
-	).Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	tx = nil
-	return group, nil
+	err := db.pool.QueryRow(ctx, `SELECT * FROM upsert_org_group($1,$2,$3,$4)`, orgID, id, name, externalID).
+		Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt)
+	return group, err
 }
 
 func (db *DB) GetGroup(ctx context.Context, orgID, groupID string) (*models.Group, error) {
@@ -967,40 +880,17 @@ func (db *DB) GetGroup(ctx context.Context, orgID, groupID string) (*models.Grou
 }
 
 func (db *DB) ListGroups(ctx context.Context, orgID string) ([]models.Group, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT id, org_id, name, external_id, created_at, updated_at
-		 FROM groups WHERE org_id = $1 ORDER BY name`,
-		orgID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	var groups []models.Group
-	for rows.Next() {
-		var group models.Group
-		if err := rows.Scan(&group.ID, &group.OrgID, &group.Name, &group.ExternalID, &group.CreatedAt, &group.UpdatedAt); err != nil {
-			return nil, err
-		}
-		groups = append(groups, group)
-	}
-	return groups, rows.Err()
+	err := db.pool.QueryRow(ctx, `SELECT (SELECT jsonb_agg(to_jsonb(g) ORDER BY g.name)
+		FROM groups g WHERE g.org_id=o.id) FROM organizations o WHERE o.id=$1`, orgID).Scan(&groups)
+	return groups, err
 }
 
 func (db *DB) AddGroupMember(ctx context.Context, orgID, groupID, userID string) (*models.GroupMember, error) {
 	member := &models.GroupMember{}
-	err := db.pool.QueryRow(ctx,
-		`INSERT INTO group_members (org_id, group_id, user_id, joined_at)
-		 VALUES ($1, $2, $3, NOW())
-		 ON CONFLICT (org_id, group_id, user_id) DO UPDATE SET joined_at = group_members.joined_at
-		 RETURNING group_id, user_id, joined_at`,
-		orgID, groupID, userID,
-	).Scan(&member.GroupID, &member.UserID, &member.JoinedAt)
-	if err != nil {
-		return nil, err
-	}
-	return member, nil
+	err := db.pool.QueryRow(ctx, `SELECT group_id,user_id,joined_at FROM add_org_group_member($1,$2,$3)`, orgID, groupID, userID).
+		Scan(&member.GroupID, &member.UserID, &member.JoinedAt)
+	return member, err
 }
 
 func (db *DB) DeleteGroupMember(ctx context.Context, orgID, groupID, userID string) error {
@@ -1018,97 +908,96 @@ func (db *DB) DeleteGroupMember(ctx context.Context, orgID, groupID, userID stri
 }
 
 func (db *DB) ListGroupMembers(ctx context.Context, orgID, groupID string) ([]models.GroupMember, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT gm.group_id, gm.user_id, u.email, u.name, gm.joined_at
-		 FROM group_members gm
-		 JOIN users u ON u.id = gm.user_id
-		 WHERE gm.org_id = $1 AND gm.group_id = $2
-		 ORDER BY u.email`,
-		orgID, groupID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	var members []models.GroupMember
-	for rows.Next() {
-		var member models.GroupMember
-		if err := rows.Scan(&member.GroupID, &member.UserID, &member.Email, &member.Name, &member.JoinedAt); err != nil {
-			return nil, err
-		}
-		members = append(members, member)
-	}
-	return members, rows.Err()
+	err := db.pool.QueryRow(ctx, `SELECT (SELECT jsonb_agg(jsonb_build_object(
+		'group_id',gm.group_id,'user_id',gm.user_id,'email',u.email,'name',u.name,'joined_at',gm.joined_at) ORDER BY u.email)
+		FROM group_members gm JOIN users u ON u.id=gm.user_id
+		WHERE gm.org_id=g.org_id AND gm.group_id=g.id)
+		FROM groups g WHERE g.org_id=$1 AND g.id=$2`, orgID, groupID).Scan(&members)
+	return members, err
 }
 
 // ---------------------------------------------------------------------------
 // Roots
 // ---------------------------------------------------------------------------
 
-// CreateRoot creates a new root metadata entry scoped to an org.
-func (db *DB) CreateRoot(ctx context.Context, orgID, name, sourcePath string) (*models.RootMetadata, error) {
-	return db.CreateRootWithScope(ctx, orgID, name, sourcePath, models.RootScopeOrg, "")
-}
+var (
+	errRootOrgMissing         = errors.New("org not found")
+	errRootOwnerMissing       = errors.New("owner must be a member of the org")
+	errRootCreateUnauthorized = errors.New("root creation is no longer authorized")
+)
 
-func (db *DB) CreateRootWithScope(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string) (*models.RootMetadata, error) {
-	return db.CreateRootWithScopeAndFeatures(ctx, orgID, name, sourcePath, scope, ownerUserID, true)
-}
-
-func (db *DB) CreateRootWithScopeAndFeatures(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string, vectorDisabled bool) (*models.RootMetadata, error) {
-	if scope == "" {
-		scope = models.RootScopeOrg
+// Create the root and its entire namespace directory in one atomic statement.
+// Authorization uses the statement snapshot, after the complete body arrives;
+// nil actor is reserved for the authenticated platform-admin route.
+func (db *DB) createRoot(ctx context.Context, orgID, name, sourcePath, scope, ownerUserID string, vectorDisabled bool, actor *auth.Identity) (*models.RootMetadata, error) {
+	now := time.Now()
+	root := &models.RootMetadata{ID: uuid.NewString(), OrgID: orgID, Name: name,
+		SourcePath: sourcePath, Scope: scope, OwnerUserID: ownerUserID,
+		VectorDisabled: vectorDisabled, CreatedAt: now, UpdatedAt: now}
+	userID, keyID := "", ""
+	if actor != nil {
+		userID, keyID = actor.UserID, actor.APIKeyID
 	}
-	if scope != models.RootScopeUser {
-		ownerUserID = ""
-	}
-	root := &models.RootMetadata{
-		ID:                   uuid.New().String(),
-		OrgID:                orgID,
-		Name:                 name,
-		SourcePath:           sourcePath,
-		Scope:                scope,
-		OwnerUserID:          ownerUserID,
-		VectorDisabled:       vectorDisabled,
-		VisibleGenerationID:  "",
-		VisibleGenerationSeq: 0,
-		CreatedAt:            time.Now(),
-		UpdatedAt:            time.Now(),
-	}
-
-	tx, err := db.pool.Begin(ctx)
+	names := rootIndexNamespaceNames(orgID, root.ID, rootIndexNamespaceShardCount())
+	var problem string
+	err := db.pool.QueryRow(ctx, `WITH actor AS (
+        SELECT m.role,COALESCE(k.scopes,ARRAY[]::text[]) AS scopes
+        FROM org_members m LEFT JOIN api_keys k ON k.id=$10 AND k.org_id=m.org_id AND k.user_id=m.user_id
+            AND (k.expires_at IS NULL OR k.expires_at>clock_timestamp())
+        WHERE m.org_id=$2 AND m.user_id=$9 AND ($10='' OR k.id IS NOT NULL)
+    ), permission AS (
+        SELECT CASE
+            WHEN NOT EXISTS(SELECT 1 FROM organizations WHERE id=$2) THEN 'org'
+            WHEN $9<>'' AND NOT EXISTS(SELECT 1 FROM actor a
+                WHERE (cardinality(a.scopes)=0 OR a.scopes && ARRAY['sync','root:create','write','*'])
+                AND CASE $5
+                    WHEN 'org' THEN a.role IN ('owner','admin','editor')
+                    WHEN 'user' THEN $6=$9 OR a.role IN ('owner','admin')
+                    WHEN 'restricted' THEN a.role IN ('owner','admin') AND
+                        (cardinality(a.scopes)=0 OR a.scopes && ARRAY['org:admin','admin','write','*'])
+                    ELSE FALSE END) THEN 'actor'
+            WHEN $5='user' AND ($9='' OR $6<>$9)
+                AND NOT EXISTS(SELECT 1 FROM org_members WHERE org_id=$2 AND user_id=$6) THEN 'owner'
+            ELSE '' END AS problem
+    ), created AS (
+        INSERT INTO roots(id,org_id,name,source_path,scope,owner_user_id,vector_disabled,created_at,updated_at)
+        SELECT $1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$8 FROM permission WHERE problem=''
+        RETURNING id,org_id,created_at
+    ), namespaces AS (
+        INSERT INTO root_index_namespaces(id,org_id,root_id,namespace,shard_index,shard_count,created_at)
+        SELECT gen_random_uuid()::text,r.org_id,r.id,n.name,n.ordinal-1,cardinality($11::text[]),r.created_at
+        FROM created r CROSS JOIN unnest($11::text[]) WITH ORDINALITY AS n(name,ordinal)
+    ) SELECT problem FROM permission`,
+		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.VectorDisabled, now, userID, keyID, names).Scan(&problem)
 	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback(ctx)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			switch pgErr.ConstraintName {
+			case "roots_org_id_fkey":
+				return nil, errRootOrgMissing
+			case "roots_owner_user_id_fkey":
+				return nil, errRootOwnerMissing
+			}
 		}
-	}()
-
-	_, err = tx.Exec(ctx,
-		`INSERT INTO roots (id, org_id, name, source_path, scope, owner_user_id, vector_disabled, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9)`,
-		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.VectorDisabled, root.CreatedAt, root.UpdatedAt,
-	)
-	if err != nil {
 		return nil, err
 	}
-	if err := db.insertRootIndexNamespacesTx(ctx, tx, root, rootIndexNamespaceShardCount()); err != nil {
-		return nil, err
+	switch problem {
+	case "org":
+		return nil, errRootOrgMissing
+	case "owner":
+		return nil, errRootOwnerMissing
+	case "actor":
+		return nil, errRootCreateUnauthorized
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	tx = nil
 	return root, nil
 }
 
-const rootSelectColumns = `r.id, r.org_id, r.name, r.source_path, r.scope, COALESCE(r.owner_user_id, ''), r.vector_disabled, r.visible_generation_id, COALESCE(g.seq, 0), r.created_at, r.updated_at`
+const rootSelectColumns = `r.id, r.org_id, r.name, r.source_path, r.scope, COALESCE(r.owner_user_id, ''), r.vector_disabled, r.created_at, r.updated_at`
 
 func scanRoot(row pgx.Row) (*models.RootMetadata, error) {
 	root := &models.RootMetadata{}
-	err := row.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope, &root.OwnerUserID, &root.VectorDisabled, &root.VisibleGenerationID, &root.VisibleGenerationSeq, &root.CreatedAt, &root.UpdatedAt)
+	err := row.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope, &root.OwnerUserID, &root.VectorDisabled, &root.CreatedAt, &root.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1120,7 +1009,6 @@ func (db *DB) GetRoot(ctx context.Context, orgID, id string) (*models.RootMetada
 	return scanRoot(db.pool.QueryRow(ctx,
 		`SELECT `+rootSelectColumns+`
 		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.id = $1 AND r.org_id = $2`, id, orgID,
 	))
 }
@@ -1129,18 +1017,7 @@ func (db *DB) GetRootAnyOrg(ctx context.Context, id string) (*models.RootMetadat
 	return scanRoot(db.pool.QueryRow(ctx,
 		`SELECT `+rootSelectColumns+`
 		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.id = $1`, id,
-	))
-}
-
-// GetRootByName retrieves a root by name, scoped to an org.
-func (db *DB) GetRootByName(ctx context.Context, orgID, name string) (*models.RootMetadata, error) {
-	return scanRoot(db.pool.QueryRow(ctx,
-		`SELECT `+rootSelectColumns+`
-		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
-		 WHERE r.name = $1 AND r.org_id = $2`, name, orgID,
 	))
 }
 
@@ -1149,7 +1026,6 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+rootSelectColumns+`
 		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.org_id = $1 ORDER BY r.created_at DESC`, orgID,
 	)
 	if err != nil {
@@ -1160,30 +1036,10 @@ func (db *DB) ListRoots(ctx context.Context, orgID string) ([]models.RootMetadat
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
-	}
-	return roots, nil
-}
-
-func (db *DB) ListAccessibleRoots(ctx context.Context, orgID, userID string, role auth.Role) ([]models.RootMetadata, error) {
-	allRoots, err := db.ListRoots(ctx, orgID)
-	if err != nil {
-		return nil, err
-	}
-	roots := make([]models.RootMetadata, 0, len(allRoots))
-	for _, root := range allRoots {
-		perms, source, err := db.RootPermissions(ctx, &root, userID, role)
-		if err != nil {
-			return nil, err
-		}
-		if rootPermissionAllowed(perms, models.RootPermissionRead) {
-			root.Access = perms
-			root.AccessSource = source
-			roots = append(roots, root)
-		}
 	}
 	return roots, nil
 }
@@ -1192,7 +1048,6 @@ func (db *DB) ListRootsOwnedByUser(ctx context.Context, userID string) ([]models
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+rootSelectColumns+`
 		 FROM roots r
-		 LEFT JOIN sync_generations g ON g.id = r.visible_generation_id
 		 WHERE r.owner_user_id = $1
 		 ORDER BY r.created_at DESC`,
 		userID,
@@ -1205,7 +1060,7 @@ func (db *DB) ListRootsOwnedByUser(ctx context.Context, userID string) ([]models
 	var roots []models.RootMetadata
 	for rows.Next() {
 		var r models.RootMetadata
-		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.VisibleGenerationID, &r.VisibleGenerationSeq, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.Name, &r.SourcePath, &r.Scope, &r.OwnerUserID, &r.VectorDisabled, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		roots = append(roots, r)
@@ -1226,57 +1081,18 @@ func (db *DB) DeleteRoot(ctx context.Context, orgID, rootID string) error {
 	return nil
 }
 
-// PrepareRootDeletion makes deletion terminal before remote cleanup starts.
-// The root row stays present so a failed cleanup can be retried, while the
-// deleting marker prevents concurrent capture registration. Historical jobs
-// are cancelled as an upgrade safeguard; this runtime creates none.
-func (db *DB) PrepareRootDeletion(ctx context.Context, orgID, rootID string) (int, error) {
-	tx, err := db.pool.Begin(ctx)
+// PrepareRootDeletion fences capture and persists cleanup targets before IO.
+func (db *DB) PrepareRootDeletion(ctx context.Context, orgID, rootID string) error {
+	tag, err := db.pool.Exec(ctx, `UPDATE roots
+        SET deleting_at=COALESCE(deleting_at,NOW()),updated_at=NOW()
+        WHERE id=$1 AND org_id=$2`, rootID, orgID)
 	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx,
-		`UPDATE roots
-		 SET deleting_at = COALESCE(deleting_at, NOW()), updated_at = NOW()
-		 WHERE id = $1 AND org_id = $2`,
-		rootID, orgID,
-	)
-	if err != nil {
-		return 0, err
+		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return 0, pgx.ErrNoRows
+		return pgx.ErrNoRows
 	}
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE sync_generations
-		 SET status = 'failed'
-		 WHERE org_id = $1 AND root_id = $2 AND status = 'building'`,
-		orgID, rootID,
-	); err != nil {
-		return 0, err
-	}
-
-	tag, err = tx.Exec(ctx,
-		`UPDATE sync_jobs
-		 SET status = 'failed',
-		     finished_at = NOW(),
-		     updated_at = NOW(),
-		     errors = errors || '[{"error":"root deleted while sync was active"}]'::jsonb
-		 WHERE org_id = $1 AND root_id = $2
-		   AND status NOT IN ('completed', 'failed')`,
-		orgID, rootID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	cancelled := int(tag.RowsAffected())
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return cancelled, nil
+	return nil
 }
 
 func (db *DB) CreateRootGrant(ctx context.Context, orgID, rootID, principalType, principalID string, permissions []string) (*models.RootGrant, error) {
@@ -1333,41 +1149,47 @@ func (db *DB) DeleteRootGrant(ctx context.Context, orgID, rootID, grantID string
 	return nil
 }
 
-func (db *DB) RootPermissions(ctx context.Context, root *models.RootMetadata, userID string, role auth.Role) ([]string, string, error) {
-	if root == nil {
-		return nil, "", nil
-	}
-	rows, err := db.pool.Query(ctx,
-		`SELECT principal_type, permissions
-		 FROM root_grants rg
-		 WHERE rg.org_id = $1 AND rg.root_id = $2
-		   AND (
-		     (rg.principal_type = 'org' AND rg.principal_id = $1)
-		     OR (rg.principal_type = 'user' AND rg.principal_id = $3)
-		     OR (rg.principal_type = 'group' AND EXISTS (
-		       SELECT 1 FROM group_members gm
-		       WHERE gm.org_id = rg.org_id
-		         AND gm.group_id = rg.principal_id
-		         AND gm.user_id = $3
-		     ))
-		   )`,
-		root.OrgID, root.ID, userID,
-	)
+// accessibleRoots loads root metadata and applicable grants in one statement
+// snapshot. nil selects all org roots; a non-nil ID list bounds explicit lookups.
+// Nothing is cached between requests or servers. Capture commits still lock and
+// recheck their authorization after object-store IO.
+func (db *DB) accessibleRoots(ctx context.Context, orgID, userID string, role auth.Role, ids []string) ([]models.RootMetadata, error) {
+	rows, err := db.pool.Query(ctx, `SELECT `+rootSelectColumns+`, (
+		SELECT jsonb_agg(jsonb_build_object('principal_type', rg.principal_type,
+			'permissions', rg.permissions) ORDER BY rg.id)
+		FROM root_grants rg WHERE rg.org_id=r.org_id AND rg.root_id=r.id AND (
+			(rg.principal_type='org' AND rg.principal_id=$1) OR
+			(rg.principal_type='user' AND rg.principal_id=$2) OR
+			(rg.principal_type='group' AND EXISTS (
+				SELECT 1 FROM group_members gm WHERE gm.org_id=rg.org_id
+				AND gm.group_id=rg.principal_id AND gm.user_id=$2))))
+		FROM roots r
+		WHERE r.org_id=$1 AND ($3::text[] IS NULL OR r.id=ANY($3))
+		ORDER BY r.created_at DESC,r.id`, orgID, userID, ids)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	defer rows.Close()
-	grants, err := pgx.CollectRows(rows, pgx.RowToStructByPos[rootGrantPermissions])
-	if err != nil {
-		return nil, "", err
+	roots := make([]models.RootMetadata, 0)
+	for rows.Next() {
+		var root models.RootMetadata
+		var grants []rootGrantPermissions
+		if err := rows.Scan(&root.ID, &root.OrgID, &root.Name, &root.SourcePath, &root.Scope,
+			&root.OwnerUserID, &root.VectorDisabled,
+			&root.CreatedAt, &root.UpdatedAt, &grants); err != nil {
+			return nil, err
+		}
+		root.Access, root.AccessSource = effectiveRootPermissions(&root, userID, role, grants)
+		if rootPermissionAllowed(root.Access, models.RootPermissionRead) {
+			roots = append(roots, root)
+		}
 	}
-	permissions, source := effectiveRootPermissions(root, userID, role, grants)
-	return permissions, source, nil
+	return roots, rows.Err()
 }
 
 type rootGrantPermissions struct {
-	PrincipalType string
-	Permissions   []string
+	PrincipalType string   `json:"principal_type"`
+	Permissions   []string `json:"permissions"`
 }
 
 // Permission policy is shared by ordinary reads and locked capture snapshots.
@@ -1451,26 +1273,6 @@ func rootPermissionAllowed(permissions []string, action string) bool {
 	return false
 }
 
-func (db *DB) insertRootIndexNamespacesTx(ctx context.Context, tx pgx.Tx, root *models.RootMetadata, shardCount int) error {
-	if shardCount < 1 {
-		shardCount = defaultRootIndexNamespaceShards
-	}
-	if shardCount > maxRootIndexNamespaceShards {
-		shardCount = maxRootIndexNamespaceShards
-	}
-	for shardIndex := 0; shardIndex < shardCount; shardIndex++ {
-		_, err := tx.Exec(ctx,
-			`INSERT INTO root_index_namespaces (id, org_id, root_id, namespace, shard_index, shard_count, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			uuid.NewString(), root.OrgID, root.ID, rootIndexNamespaceName(root.OrgID, root.ID, shardIndex), shardIndex, shardCount, root.CreatedAt,
-		)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 const rootIndexNamespaceSelectColumns = `id, org_id, root_id, namespace, shard_index, shard_count, created_at, retired_at`
 
 func scanRootIndexNamespaces(rows pgx.Rows) ([]models.RootIndexNamespace, error) {
@@ -1486,7 +1288,7 @@ func scanRootIndexNamespaces(rows pgx.Rows) ([]models.RootIndexNamespace, error)
 	return namespaces, rows.Err()
 }
 
-func (db *DB) listRootIndexNamespaces(ctx context.Context, orgID, rootID string) ([]models.RootIndexNamespace, error) {
+func (db *DB) ListRootIndexNamespaces(ctx context.Context, orgID, rootID string) ([]models.RootIndexNamespace, error) {
 	rows, err := db.pool.Query(ctx,
 		`SELECT `+rootIndexNamespaceSelectColumns+`
 		 FROM root_index_namespaces
@@ -1500,63 +1302,6 @@ func (db *DB) listRootIndexNamespaces(ctx context.Context, orgID, rootID string)
 	return scanRootIndexNamespaces(rows)
 }
 
-func (db *DB) ListRootIndexNamespaces(ctx context.Context, orgID, rootID string) ([]models.RootIndexNamespace, error) {
-	namespaces, err := db.listRootIndexNamespaces(ctx, orgID, rootID)
-	if err != nil {
-		return nil, err
-	}
-	if len(namespaces) > 0 {
-		return namespaces, nil
-	}
-	if err := db.EnsureRootIndexNamespaces(ctx, orgID, rootID); err != nil {
-		return nil, err
-	}
-	return db.listRootIndexNamespaces(ctx, orgID, rootID)
-}
-
-func (db *DB) EnsureRootIndexNamespaces(ctx context.Context, orgID, rootID string) error {
-	namespaces, err := db.listRootIndexNamespaces(ctx, orgID, rootID)
-	if err != nil {
-		return err
-	}
-	if len(namespaces) > 0 {
-		return nil
-	}
-
-	root, err := db.GetRoot(ctx, orgID, rootID)
-	if err != nil {
-		return err
-	}
-
-	tx, err := db.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if tx != nil {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-
-	var existing int
-	if err := tx.QueryRow(ctx,
-		`SELECT COUNT(*) FROM root_index_namespaces WHERE org_id = $1 AND root_id = $2 AND retired_at IS NULL`,
-		orgID, rootID,
-	).Scan(&existing); err != nil {
-		return err
-	}
-	if existing == 0 {
-		if err := db.insertRootIndexNamespacesTx(ctx, tx, root, rootIndexNamespaceShardCount()); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	tx = nil
-	return nil
-}
-
 func (db *DB) DeleteOrganization(ctx context.Context, orgID string) error {
 	tag, err := db.pool.Exec(ctx, `DELETE FROM organizations WHERE id = $1`, orgID)
 	if err != nil {
@@ -1566,48 +1311,6 @@ func (db *DB) DeleteOrganization(ctx context.Context, orgID string) error {
 		return pgx.ErrNoRows
 	}
 	return nil
-}
-
-func (db *DB) RootHasActiveSync(ctx context.Context, orgID, rootID string) (bool, error) {
-	var exists bool
-	err := db.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-			SELECT 1 FROM sync_generations
-			 WHERE org_id = $1 AND root_id = $2 AND status = 'building'
-			UNION ALL
-			SELECT 1 FROM sync_jobs
-			 WHERE org_id = $1 AND root_id = $2 AND status NOT IN ('completed', 'failed')
-		)`,
-		orgID, rootID,
-	).Scan(&exists)
-	return exists, err
-}
-
-func (db *DB) OrgHasActiveSync(ctx context.Context, orgID string) (bool, error) {
-	var exists bool
-	err := db.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-			SELECT 1 FROM sync_generations
-			 WHERE org_id = $1 AND status = 'building'
-			UNION ALL
-			SELECT 1 FROM sync_jobs
-			 WHERE org_id = $1 AND status NOT IN ('completed', 'failed')
-		)`,
-		orgID,
-	).Scan(&exists)
-	return exists, err
-}
-
-func (db *DB) UserHasActiveSync(ctx context.Context, userID string) (bool, error) {
-	var exists bool
-	err := db.pool.QueryRow(ctx,
-		`SELECT EXISTS (
-			SELECT 1 FROM sync_jobs
-			 WHERE user_id = $1 AND status NOT IN ('completed', 'failed')
-		)`,
-		userID,
-	).Scan(&exists)
-	return exists, err
 }
 
 func (db *DB) DeleteUser(ctx context.Context, userID string) error {
@@ -1620,15 +1323,11 @@ func (db *DB) DeleteUser(ctx context.Context, userID string) error {
 	if _, err := tx.Exec(ctx, `DELETE FROM api_keys WHERE user_id = $1`, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM content_proofs WHERE user_id = $1`, userID); err != nil {
-		return err
-	}
+
 	if _, err := tx.Exec(ctx, `DELETE FROM org_members WHERE user_id = $1`, userID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM sync_jobs WHERE user_id = $1`, userID); err != nil {
-		return err
-	}
+
 	tag, err := tx.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
 	if err != nil {
 		return err
@@ -1637,39 +1336,6 @@ func (db *DB) DeleteUser(ctx context.Context, userID string) error {
 		return pgx.ErrNoRows
 	}
 	return tx.Commit(ctx)
-}
-
-func (db *DB) ListSyncGenerationIDs(ctx context.Context, orgID, rootID string) ([]string, error) {
-	rows, err := db.pool.Query(ctx,
-		`SELECT id FROM sync_generations WHERE org_id = $1 AND root_id = $2`,
-		orgID, rootID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-func (db *DB) LoadStateRecord(ctx context.Context, rootID string) (*RootStateRecord, error) {
-	var state map[string]models.FileState
-	var stateRef string
-	err := db.pool.QueryRow(ctx,
-		`SELECT state, COALESCE(state_ref, '') FROM root_states WHERE root_id = $1`, rootID,
-	).Scan(&state, &stateRef)
-	if err != nil {
-		return &RootStateRecord{State: make(map[string]models.FileState)}, nil
-	}
-	return &RootStateRecord{State: state, Ref: stateRef}, nil
 }
 
 func (db *DB) CreateACL(ctx context.Context, orgID, rootID, pathPrefix, grantTo, permission string) (*models.RootACL, error) {

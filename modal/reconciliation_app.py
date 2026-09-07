@@ -8,9 +8,10 @@ app = modal.App(os.getenv("PUFFERFS_RECONCILIATION_APP_NAME", "pufferfs-reconcil
 image = (
     modal.Image.from_registry("python:3.12-slim-trixie")
     .apt_install("ca-certificates")
-    .pip_install("boto3>=1.34.0", "psycopg[binary]>=3.2,<4", "turbopuffer>=2.9,<3")
+    .pip_install("boto3>=1.34.0", "psycopg[binary]>=3.2,<4", "psycopg-pool>=3.2,<4", "turbopuffer>=2.9,<3")
     .env({"SSL_CERT_FILE": "/etc/ssl/certs/ca-certificates.crt"})
     .add_local_file("file_runtime.py", "/root/file_runtime.py", copy=True)
+    .add_local_file("worker_metrics.py", "/root/worker_metrics.py", copy=True)
     .add_local_file("file_reconciliation.py", "/root/file_reconciliation.py", copy=True)
 )
 for module in ("aws_clients", "root_cleanup", "index_cleanup", "index_client", "index_routing", "source_io", "embedding_cleanup", "artifact_cleanup", "source_cleanup"):
@@ -29,7 +30,7 @@ def reconcile():
     from root_cleanup import cleanup_deleted_roots
     from embedding_cleanup import cleanup_embeddings
     from artifact_cleanup import cleanup_obsolete_extractions
-    from source_cleanup import backfill_source_extents, cleanup_source_packs
+    from source_cleanup import cleanup_source_packs
     from index_client import SCHEMA, turbopuffer_client
 
     # Bounded network operations; the next schedule repairs an interrupted send.
@@ -51,7 +52,6 @@ def reconcile():
                 result["index_cleanup"] = cleanup_index(s3, os.environ["AWS_BUCKET_NAME"], apply)
                 result["embedding_cleanup"] = cleanup_embeddings(s3, os.environ["AWS_BUCKET_NAME"])
                 result["artifact_cleanup"] = cleanup_obsolete_extractions(s3, os.environ["AWS_BUCKET_NAME"])
-                result["source_backfill"] = backfill_source_extents(s3, os.environ["AWS_BUCKET_NAME"])
                 result["source_cleanup"] = cleanup_source_packs(s3, os.environ["AWS_BUCKET_NAME"])
         print(result, flush=True)
         return result

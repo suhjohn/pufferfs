@@ -56,12 +56,10 @@ class SourcePackCache:
         if time.monotonic() >= self.deadline:
             raise TimeoutError("source verification deadline exceeded")
 
-    def get_object(self, *, Bucket, Key, Range=None):
+    def get_object(self, *, Bucket, Key, Range):
         self.check_deadline()
         if Bucket != self.bucket:
             raise ValueError("source bucket mismatch")
-        if Range is None:
-            return self.s3.get_object(Bucket=Bucket, Key=Key)  # Small manifest, checked by source_io.
         size = self.allowed_sizes.get(Key)
         match = re.fullmatch(r"bytes=(\d+)-(\d+)", Range)
         if type(size) is not int or not 0 < size <= min(128 << 20, self.capacity) or match is None:
@@ -135,7 +133,7 @@ def verify_sources(s3, bucket, org_id, root_id, emit, *, connect=database, timeo
                     emit(dict(record, status="tombstone"))
                     continue
                 try:
-                    manifest = read_manifest(cache, bucket, version)
+                    manifest = read_manifest(s3, bucket, version)
                     keys = list({extent["object_key"] for extent in manifest.get("extents") or []})
                     with read_catalog(connect) as conn:
                         objects = conn.execute("""SELECT object_key,size_bytes FROM source_objects

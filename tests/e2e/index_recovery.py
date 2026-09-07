@@ -1,12 +1,14 @@
 """Black-box in-flight index faults through real CLI, workers and Turbopuffer."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 import run
 
@@ -94,8 +96,7 @@ def lost_capture():
     assert not file["indexed_version_id"]
     assert raw_rows(event["namespace"], row["extraction_id"]), "held write did not reach real Turbopuffer"
     assert not search(state, state["root"], "Orchid"), "unacknowledged write became publicly visible"
-    vectors = run.sql("""SELECT content_hash,object_key,byte_offset,byte_length,dimensions
-        FROM embedding_locations WHERE org_id=%s ORDER BY content_hash""", (state["org"],))
+    vectors = run.embedding_locations(state["org"])
     assert len(vectors) == 1 and vectors[0]["dimensions"] == 768
     state.update(lost_version=file["version_id"], lost_work=row, lost_event=event, vectors=vectors,
                  stamps=[object_stamp(key) for key in [row["mutation_ref"], vectors[0]["object_key"]]])
@@ -105,6 +106,25 @@ def lost_capture():
 
 def release():
     relay("POST", "/release")
+
+
+def database_recovered():
+    state = json.loads(run.STATE.read_text())
+    run.eventually("API database readiness after Postgres restart",
+        lambda: run.request("GET", "/readyz", statuses=(200, 503)).get("status") == "ready", 90)
+    vectors = run.embedding_locations(state["org"])
+    directory = Path("/state/lost-index-response")
+    source = (directory / "record.txt").read_text()
+    path = directory / "reconnected.txt"
+    path.write_text(source)
+    run.cli(state, "sync", str(directory), "--id", state["root"])
+    files = run.wait_indexed(state)
+    assert run.embedding_locations(state["org"]) == vectors, "reconnection lost the durable cache"
+    run.assert_source_retained(files[path.name])
+    result = run.request("POST", f"/roots/{state['root']}/read",
+        {"path": path.name, "lines": {"start": 1, "end": 1}}, key=state["key"])
+    assert result["lines"][0]["content"] == source.rstrip("\n")
+    print("After an actual Postgres restart, existing worker pools reconnected and reused the S3 vector cache; exact read passed.")
 
 
 def lost_recovered():
@@ -124,6 +144,55 @@ def lost_recovered():
         assert search(state, state["root"], "observatory telescope", mode)
     run.wait_queue_empty("index")
     print("A new worker attempt replayed identical index payload bytes after the normal lease; vector/mutation objects were unchanged and all search modes work.")
+
+
+def live_superseded():
+    from api_access import servers
+    from source_retention import upload
+
+    state = json.loads(run.STATE.read_text())
+    peers = servers()
+    for deleted in (False, True):
+        root = run.new_root(state, "Live publication supersession", "/state/live-publication-"+str(deleted), True)
+
+        def capture(text, previous, peer):
+            file = {"path":"record.txt","previous_version_id":previous}
+            if text is None:
+                file["deleted"] = True
+            else:
+                data = text.encode()
+                key = upload(state,root,data)["object_key"]
+                file["source"] = {"format":1,"size":len(data),
+                    "content_hash":"sha256:"+hashlib.sha256(data).hexdigest(),
+                    "extents":[{"object_key":key,"offset":0,"length":len(data)}]}
+            return run.request("POST",f"/roots/{root}/versions",{"capture_id":str(uuid.uuid4()),"files":[file]},
+                key=state["key"],server=peer,statuses=(202,))["versions"][0]["version_id"]
+
+        initial = capture("Original orchid calibration notes.\n","",peers[0])
+        published(state,root,initial)
+        fault = arm(root,"hold_response")
+        old = capture("Pending citrine calibration notes.\n",initial,peers[0])
+        event = held(fault,"response_held")
+        assert event["upstream_status"] == 200
+        before = work(root,old)
+        assert before["status"] == "running" and before["acknowledged_batches"] == 0
+        stamp = object_stamp(before["mutation_ref"])
+        latest = capture(None if deleted else "Current vermilion calibration notes.\n",old,peers[1])
+        assert run.catalog(state,root)["record.txt"]["indexed_version_id"] == initial
+        release()  # The original worker remains alive and receives the real acknowledgment.
+        published(state,root,latest)
+        after = work(root,old)
+        assert after["status"] == "superseded" and after["acknowledged_batches"] == 1
+        assert after["attempt_count"] == 1 and after["attempt_token"] == before["attempt_token"]
+        assert object_stamp(after["mutation_ref"]) == stamp
+        for peer in peers:
+            assert not run.request("POST","/query",{"root_id":root,"query":"citrine","mode":"fts"},
+                key=state["key"],server=peer)["results"]
+            result = run.request("POST",f"/roots/{root}/read",{"path":"record.txt","lines":{"start":1,"end":1}},
+                key=state["key"],server=peer,statuses=(404,) if deleted else (200,))
+            if not deleted:
+                assert result["lines"][0]["content"] == "Current vermilion calibration notes."
+        print(f"Live index acknowledgment fenced by a newer {'tombstone' if deleted else 'capture'} from the second API; one attempt, durable mutation unchanged.",flush=True)
 
 
 def stale_capture():
@@ -254,6 +323,7 @@ def root_cleaned():
 if __name__ == "__main__":
     phase = sys.argv[1]
     phases = {"lost-capture": lost_capture, "release": release, "lost-recovered": lost_recovered,
+              "database-recovered": database_recovered, "live-superseded": live_superseded,
               "stale-capture": stale_capture, "stale-current": stale_current, "stale-released": stale_released,
               "root-deleted": root_deleted, "root-cleaned": root_cleaned}
     started, status = time.monotonic(), "failed"

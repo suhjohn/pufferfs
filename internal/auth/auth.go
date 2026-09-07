@@ -135,6 +135,10 @@ func HashAPIKey(raw string) string {
 // APIKeyResolver is called to look up an API key hash → Identity.
 type APIKeyResolver func(ctx context.Context, keyHash string) (*Identity, error)
 
+// SessionResolver loads current membership for a verified signed identity.
+// Embedded JWT role/email values are not an authorization cache.
+type SessionResolver func(ctx context.Context, userID, orgID string) (*Identity, error)
+
 // tokenFromRequest extracts the bearer token from the Authorization header, or
 // falls back to the session cookie set by the OAuth callback (browser clients).
 func tokenFromRequest(r *http.Request) (string, bool) {
@@ -154,7 +158,7 @@ func tokenFromRequest(r *http.Request) (string, bool) {
 // Middleware creates auth middleware that supports JWT (header or session
 // cookie) and API key auth. Unauthenticated paths (health, readyz, OAuth
 // endpoints, the CLI version manifest, the Stripe webhook) are skipped.
-func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handler) http.Handler {
+func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver, resolveSession SessionResolver) func(http.Handler) http.Handler {
 	unauthPaths := map[string]bool{
 		"/healthz":           true,
 		"/readyz":            true,
@@ -185,11 +189,10 @@ func Middleware(jwtSecret []byte, resolveAPIKey APIKeyResolver) func(http.Handle
 
 			// Try JWT first
 			if claims, err := ValidateJWT(jwtSecret, token); err == nil {
-				id := &Identity{
-					UserID: claims.UserID,
-					OrgID:  claims.OrgID,
-					Role:   Role(claims.Role),
-					Email:  claims.Email,
+				id, err := resolveSession(r.Context(), claims.UserID, claims.OrgID)
+				if err != nil {
+					http.Error(w, `{"error":"invalid or expired session"}`, http.StatusUnauthorized)
+					return
 				}
 				ctx := WithIdentity(r.Context(), id)
 				next.ServeHTTP(w, r.WithContext(ctx))
@@ -235,24 +238,6 @@ func AdminMiddleware(adminKeyHash string) func(http.Handler) http.Handler {
 	}
 }
 
-// RequireRole returns middleware that checks the user has at least the given role.
-func RequireRole(minRole Role) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := IdentityFromContext(r.Context())
-			if id == nil {
-				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
-				return
-			}
-			if !hasMinRole(id.Role, minRole) {
-				http.Error(w, `{"error":"insufficient permissions"}`, http.StatusForbidden)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
 // roleLevel returns a numeric level for role comparison.
 func roleLevel(r Role) int {
 	switch r {
@@ -272,8 +257,4 @@ func roleLevel(r Role) int {
 // HasMinRole checks if userRole meets or exceeds minRole.
 func HasMinRole(userRole, minRole Role) bool {
 	return roleLevel(userRole) >= roleLevel(minRole)
-}
-
-func hasMinRole(userRole, minRole Role) bool {
-	return HasMinRole(userRole, minRole)
 }

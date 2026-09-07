@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/pufferfs/pufferfs/internal/auth"
+	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -24,10 +25,15 @@ type CapturedFileVersion struct {
 	Size              int64                 `json:"size"`
 	SourceManifestRef string                `json:"source_manifest_ref"`
 	Deleted           bool                  `json:"deleted"`
-	Extents           []models.SourceExtent `json:"-"`
+	Extents           []models.SourceExtent `json:"extents,omitempty"`
 }
 
 type RegisteredFileVersion = models.RegisteredFileVersion
+
+type registeredCapture struct {
+	versions   []RegisteredFileVersion
+	deliveries []queue.JobMessage
+}
 
 var ErrFileVersionConflict = errors.New("captured file version changed")
 var ErrCapturePathForbidden = errors.New("capture path is not writable")
@@ -39,13 +45,12 @@ func (e *retiredSourcePacksError) Error() string {
 }
 
 var errSourceExtentUnavailable = errors.New("source extent is unavailable, outside its object, or not authorized for this file")
-var errSourceCatalogPending = errors.New("source catalog backfill pending; retry the same capture")
 
 // RegisterFileVersions atomically advances captured heads and records the SQS
 // handoffs that must be published. It never waits for or advances indexing.
 // Repeating an identical capture is idempotent even after a later capture.
-func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity, rootID, captureID, revision string, files []CapturedFileVersion) ([]RegisteredFileVersion, error) {
-	if identity == nil || identity.OrgID == "" || identity.UserID == "" || captureID == "" || revision == "" || len(files) == 0 {
+func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity, rootID, captureID, revision string, files []CapturedFileVersion) (*registeredCapture, error) {
+	if identity == nil || identity.OrgID == "" || identity.UserID == "" || captureID == "" || revision == "" || len(files) == 0 || len(files) > 128 {
 		return nil, fmt.Errorf("capture ID, extraction revision and files are required")
 	}
 	orgID := identity.OrgID
@@ -91,91 +96,106 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 			return nil, ErrCapturePathForbidden
 		}
 	}
-	result := make([]RegisteredFileVersion, 0, len(files))
-	newPacks := make(map[string]bool)
-	var reuploadKeys []string
-	for _, f := range files {
-		if _, err = tx.Exec(ctx, `INSERT INTO file_catalog(id,root_id,path) VALUES($1,$2,$3) ON CONFLICT(root_id,path) DO NOTHING`, uuid.NewString(), rootID, f.Path); err != nil {
-			return nil, err
+	paths := make([]string, len(files))
+	for i, file := range files {
+		paths[i] = file.Path
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO file_catalog(id,root_id,path)
+		SELECT gen_random_uuid()::text,$1,path FROM unnest($2::text[]) AS path
+		ON CONFLICT(root_id,path) DO NOTHING`, rootID, paths); err != nil {
+		return nil, err
+	}
+	// Read after the root lock and catalog insert. Replays use the original
+	// extraction revision, even when a newer capture is already the head.
+	rows, err := tx.Query(ctx, `SELECT f.id,f.path,COALESCE(f.captured_version_id,''),
+		COALESCE(v.id,''),COALESCE(v.sequence,0),COALESCE(v.content_hash,''),
+		COALESCE(v.size_bytes,0),COALESCE(v.source_manifest_ref,''),COALESCE(v.deleted,false),
+		COALESCE(v.previous_version_id,''),COALESCE(first.revision,''),COALESCE(first.needs_delivery,false)
+		FROM file_catalog f LEFT JOIN file_versions v ON v.file_id=f.id AND v.capture_id=$3
+		LEFT JOIN LATERAL (SELECT e.revision,w.status='pending' AND w.enqueued_at IS NULL AS needs_delivery
+			FROM file_extractions e LEFT JOIN file_work w ON w.extraction_id=e.id
+				AND w.stage=CASE WHEN v.deleted THEN 'index' ELSE 'transform' END
+			WHERE e.version_id=v.id ORDER BY e.sequence LIMIT 1) first ON true
+		WHERE f.root_id=$1 AND f.path=ANY($2::text[]) ORDER BY f.path FOR UPDATE OF f`, rootID, paths, captureID)
+	if err != nil {
+		return nil, err
+	}
+	type capturedHead struct {
+		fileID, head, versionID, revision string
+		sequence                          int64
+		needsDelivery                     bool
+		file                              CapturedFileVersion
+	}
+	heads := make(map[string]capturedHead, len(files))
+	for rows.Next() {
+		var h capturedHead
+		if err = rows.Scan(&h.fileID, &h.file.Path, &h.head, &h.versionID, &h.sequence,
+			&h.file.ContentHash, &h.file.Size, &h.file.SourceManifestRef, &h.file.Deleted,
+			&h.file.PreviousVersionID, &h.revision, &h.needsDelivery); err != nil {
+			break
 		}
-		var fileID string
-		var head *string
-		if err = tx.QueryRow(ctx, `SELECT id,captured_version_id FROM file_catalog WHERE root_id=$1 AND path=$2 FOR UPDATE`, rootID, f.Path).Scan(&fileID, &head); err != nil {
-			return nil, err
+		heads[h.file.Path] = h
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	result := &registeredCapture{versions: make([]RegisteredFileVersion, len(files))}
+	var writes []captureWrite
+	for i, f := range files {
+		h, ok := heads[f.Path]
+		if !ok {
+			return nil, pgx.ErrNoRows
 		}
-		versionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(fileID+":"+captureID)).String()
-		var sequence int64
-		var hash, ref string
-		var size int64
-		var deleted bool
-		var previous *string
-		err = tx.QueryRow(ctx, `SELECT sequence,content_hash,size_bytes,source_manifest_ref,deleted,previous_version_id FROM file_versions WHERE id=$1`, versionID).Scan(&sequence, &hash, &size, &ref, &deleted, &previous)
-		exists := err == nil
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return nil, err
-		}
-		if exists {
-			if hash != f.ContentHash || size != f.Size || ref != f.SourceManifestRef || deleted != f.Deleted || pointerString(previous) != f.PreviousVersionID {
-				return nil, fmt.Errorf("capture ID reused with different metadata for %s", f.Path)
-			}
-		} else {
-			if pointerString(head) != f.PreviousVersionID {
-				return nil, fmt.Errorf("%w: %s", ErrFileVersionConflict, f.Path)
-			}
-			// Validate after the root lock, before advancing any catalog head.
-			// GC takes this lock too. An identical accepted capture above remains
-			// replayable even when its historical source bytes have expired.
-			if err = authorizeSourceExtents(ctx, tx, identity, rootID, captureID, f, newPacks); err != nil {
-				var reupload *retiredSourcePacksError
-				if errors.As(err, &reupload) {
-					reuploadKeys = append(reuploadKeys, reupload.Keys...)
-					continue
-				}
-				return nil, err
-			}
-			err = tx.QueryRow(ctx, `INSERT INTO file_versions(id,file_id,capture_id,previous_version_id,content_hash,size_bytes,source_manifest_ref,deleted)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING sequence`, versionID, fileID, captureID, head, f.ContentHash, f.Size, f.SourceManifestRef, f.Deleted).Scan(&sequence)
+		fileRevision := revision
+		versionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(h.fileID+":"+captureID)).String()
+		if h.versionID != "" {
+			storedIdentity, err := sourceManifestIdentity(h.file.SourceManifestRef)
 			if err != nil {
 				return nil, err
 			}
-			for ordinal, extent := range f.Extents {
-				if _, err = tx.Exec(ctx, `INSERT INTO file_version_extents(version_id,ordinal,object_key,byte_offset,byte_length) VALUES($1,$2,$3,$4,$5)`, versionID, ordinal, extent.ObjectKey, extent.Offset, extent.Length); err != nil {
-					return nil, err
-				}
-			}
-			if _, err = tx.Exec(ctx, `UPDATE file_versions SET extents_indexed_at=NOW() WHERE id=$1`, versionID); err != nil {
+			replayIdentity, err := sourceManifestIdentity(f.SourceManifestRef)
+			if err != nil {
 				return nil, err
 			}
-			if _, err = tx.Exec(ctx, `UPDATE file_catalog SET captured_version_id=$1,deleted=$2,updated_at=NOW() WHERE id=$3`, versionID, f.Deleted, fileID); err != nil {
-				return nil, err
+			if h.file.ContentHash != f.ContentHash || h.file.Size != f.Size || storedIdentity != replayIdentity || h.file.Deleted != f.Deleted || h.file.PreviousVersionID != f.PreviousVersionID {
+				return nil, fmt.Errorf("capture ID reused with different metadata for %s", f.Path)
 			}
-		}
-		fileRevision := revision
-		if exists {
-			// A lost capture response may be replayed after a worker upgrade.
-			// Keep its original extraction identity, inputs and paid provider work.
-			if err = tx.QueryRow(ctx, `SELECT revision FROM file_extractions WHERE version_id=$1 ORDER BY sequence LIMIT 1`, versionID).Scan(&fileRevision); err != nil {
-				return nil, err
+			if h.revision == "" {
+				return nil, pgx.ErrNoRows
 			}
+			versionID, fileRevision = h.versionID, h.revision
+		} else if h.head != f.PreviousVersionID {
+			return nil, fmt.Errorf("%w: %s", ErrFileVersionConflict, f.Path)
 		}
 		extractionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(versionID+":"+fileRevision)).String()
-		status, stage := "pending", "transform"
+		stage := "transform"
 		if f.Deleted {
-			status, stage = "complete", "index"
-		}
-		if _, err = tx.Exec(ctx, `INSERT INTO file_extractions(id,version_id,revision,status) VALUES($1,$2,$3,$4) ON CONFLICT(version_id,revision) DO NOTHING`, extractionID, versionID, fileRevision, status); err != nil {
-			return nil, err
+			stage = "index"
 		}
 		workID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(extractionID+":"+stage)).String()
-		if _, err = tx.Exec(ctx, `INSERT INTO file_work(id,extraction_id,stage) VALUES($1,$2,$3) ON CONFLICT(extraction_id,stage) DO NOTHING`, workID, extractionID, stage); err != nil {
+		result.versions[i] = RegisteredFileVersion{FileID: h.fileID, VersionID: versionID, Sequence: h.sequence,
+			ExtractionID: extractionID, WorkID: workID, Stage: stage}
+		if h.versionID == "" || h.needsDelivery {
+			result.deliveries = append(result.deliveries, queue.JobMessage{JobID: workID, WorkID: workID,
+				OrgID: orgID, RootID: rootID, FileID: h.fileID, VersionID: versionID, ExtractionID: extractionID, Stage: stage})
+		}
+		if h.versionID == "" {
+			writes = append(writes, captureWrite{CapturedFileVersion: f, RegisteredFileVersion: result.versions[i], Revision: fileRevision, Slot: i})
+		}
+	}
+	if len(writes) > 0 {
+		// Validate the entire batch before binding source packs or advancing any
+		// head. Identical historical retries do not need retained source bytes.
+		if err = authorizeCaptureSources(ctx, tx, identity, rootID, captureID, writes); err != nil {
 			return nil, err
 		}
-		result = append(result, RegisteredFileVersion{FileID: fileID, VersionID: versionID, Sequence: sequence, ExtractionID: extractionID, WorkID: workID, Stage: stage})
-	}
-	// Roll back the entire capture and report all expired packs together; the
-	// client can re-upload one bounded batch instead of failing once per file.
-	if len(reuploadKeys) > 0 {
-		return nil, &retiredSourcePacksError{Keys: reuploadKeys}
+		if err = writeCapturedVersions(ctx, tx, captureID, writes, result.versions); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
@@ -183,56 +203,60 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 	return result, nil
 }
 
-func pointerString(value *string) string {
-	if value == nil {
-		return ""
-	}
-	return *value
+// Only new versions enter this bounded write batch; replay receipts are already
+// complete. Input order is returned through Slot, not database execution order.
+type captureWrite struct {
+	CapturedFileVersion
+	RegisteredFileVersion
+	Revision string `json:"revision"`
+	Slot     int    `json:"slot"`
 }
 
-// FileWorkDelivery contains only durable identities. Content is read from S3
-// by the worker, never relayed in an SQS message or through the API server.
-type FileWorkDelivery struct {
-	ID           string `json:"work_id"`
-	OrgID        string `json:"org_id"`
-	RootID       string `json:"root_id"`
-	FileID       string `json:"file_id"`
-	VersionID    string `json:"version_id"`
-	ExtractionID string `json:"extraction_id"`
-	Stage        string `json:"stage"`
-}
-
-// UnpublishedFileWork is a bounded recovery scan for the catalog-to-SQS gap.
-// It does not claim or execute jobs. Consumers must tolerate republishing.
-func (db *DB) UnpublishedFileWork(ctx context.Context, limit int) ([]FileWorkDelivery, error) {
-	if limit < 1 || limit > 1000 {
-		return nil, fmt.Errorf("delivery limit must be 1..1000")
-	}
-	rows, err := db.pool.Query(ctx, `SELECT w.id,r.org_id,f.root_id,f.id,v.id,e.id,w.stage
-		FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
-		JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
-		JOIN roots r ON r.id=f.root_id
-		WHERE w.enqueued_at IS NULL AND w.status='pending' AND r.deleting_at IS NULL
-		ORDER BY w.updated_at,w.id LIMIT $1`, limit)
+func writeCapturedVersions(ctx context.Context, tx pgx.Tx, captureID string, writes []captureWrite, result []RegisteredFileVersion) error {
+	rows, err := tx.Query(ctx, `WITH input AS MATERIALIZED (
+		SELECT * FROM jsonb_to_recordset($2) AS i(slot int,file_id text,version_id text,
+			previous_version_id text,content_hash text,size bigint,source_manifest_ref text,
+			deleted boolean,extents jsonb,extraction_id text,revision text,work_id text,stage text)
+	), versions AS (
+		INSERT INTO file_versions(id,file_id,capture_id,previous_version_id,content_hash,size_bytes,
+			source_manifest_ref,deleted)
+		SELECT version_id,file_id,$1,NULLIF(previous_version_id,''),content_hash,size,
+			source_manifest_ref,deleted FROM input RETURNING id,sequence
+	), extents AS (
+		INSERT INTO file_version_extents(version_id,ordinal,object_key,byte_offset,byte_length)
+		SELECT v.id,e.ordinal-1,e.value->>'object_key',(e.value->>'offset')::bigint,(e.value->>'length')::bigint
+		FROM versions v JOIN input i ON i.version_id=v.id
+		CROSS JOIN LATERAL jsonb_array_elements(COALESCE(i.extents,'[]'::jsonb)) WITH ORDINALITY e(value,ordinal)
+	), heads AS (
+		UPDATE file_catalog f SET captured_version_id=v.id,deleted=i.deleted,updated_at=NOW()
+		FROM versions v JOIN input i ON i.version_id=v.id WHERE f.id=i.file_id
+	), extractions AS (
+		INSERT INTO file_extractions(id,version_id,revision,status)
+		SELECT i.extraction_id,v.id,i.revision,CASE WHEN i.deleted THEN 'complete' ELSE 'pending' END
+		FROM versions v JOIN input i ON i.version_id=v.id RETURNING id
+	), work AS (
+		INSERT INTO file_work(id,extraction_id,stage)
+		SELECT i.work_id,e.id,i.stage FROM extractions e JOIN input i ON i.extraction_id=e.id
+	) SELECT i.slot,v.sequence FROM versions v JOIN input i ON i.version_id=v.id`, captureID, writes)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-	var out []FileWorkDelivery
 	for rows.Next() {
-		var d FileWorkDelivery
-		if err = rows.Scan(&d.ID, &d.OrgID, &d.RootID, &d.FileID, &d.VersionID, &d.ExtractionID, &d.Stage); err != nil {
-			return nil, err
+		var slot int
+		var sequence int64
+		if err = rows.Scan(&slot, &sequence); err != nil {
+			return err
 		}
-		out = append(out, d)
+		result[slot].Sequence = sequence
 	}
-	return out, rows.Err()
+	return rows.Err()
 }
 
-// MarkFileWorkEnqueued is called only after SQS accepts the message. A crash
+// MarkFileWorkEnqueued records only confirmed SQS sends. A crash
 // before this update causes harmless redelivery, rather than lost work.
-func (db *DB) MarkFileWorkEnqueued(ctx context.Context, id string) error {
-	_, err := db.pool.Exec(ctx, `UPDATE file_work SET enqueued_at=COALESCE(enqueued_at,NOW()) WHERE id=$1`, id)
+func (db *DB) MarkFileWorkEnqueued(ctx context.Context, ids []string) error {
+	_, err := db.pool.Exec(ctx, `UPDATE file_work SET enqueued_at=NOW() WHERE id=ANY($1::text[]) AND enqueued_at IS NULL`, ids)
 	return err
 }
 

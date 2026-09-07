@@ -5,8 +5,8 @@ versions while preserving source bytes and access controls.
 
 The per-file pipeline is now the only implementation in this checkout. It is
 not yet a production rollout: the deployed fleet may still run an older release.
-Existing data needs a recapture audit before upgrading readers. See the
-[implementation ledger](ingestion-implementation.md) for verification evidence.
+Previous storage formats are not converted. See the
+[fresh-schema audit](fresh-schema-audit.md) for the removed compatibility paths.
 
 ## Per-file pipeline: deployment roles
 
@@ -45,6 +45,7 @@ LOCAL AGENT --immutable source packs-----------------------------> S3
                                          publication to Postgres
 
 SEARCH: API --> QUERY EMBEDDER [separate Modal GPU pool] --> API --> Turbopuffer
+COLLECTION: COLLECTOR DISPATCHER [scheduled Modal CPU] --> BATCH COLLECTOR workers
 RECOVERY: RECONCILER [scheduled Modal CPU] --> Postgres/S3 --> SQS/Turbopuffer
 ```
 
@@ -54,7 +55,8 @@ RECOVERY: RECONCILER [scheduled Modal CPU] --> Postgres/S3 --> SQS/Turbopuffer
 | API server | ECS; authenticated client HTTP | Capture metadata → Postgres catalog and transform SQS messages; serves catalog/read/search/ACL APIs |
 | Transform consumer | ECS service; polls transform SQS | Claims receipts → bounded HTTP worker invocations; maintains visibility and acknowledges durable completion/handoff |
 | Transform worker | `transform_app.py`, Modal CPU; HTTP invocation | S3 originals → native chunks in S3 or temporary Gemini inputs and durable Batch mappings; publishes ready index IDs |
-| Batch collector | `collector_app.py`, Modal CPU; minute schedule | Provider mappings/results → S3 text chunks, extraction completion and index SQS messages |
+| Collector dispatcher | `collector_app.py`, Modal CPU; minute schedule | Configured worker count → independent collector invocations |
+| Batch collectors | `collector_app.py`, Modal CPU; dispatcher invocation | Leased batch ranges and S3 manifests → text/results/cleanup checkpoints, extraction completion and index SQS messages |
 | Index consumer | ECS service; polls index SQS | Claims receipts → CPU or Nomic index endpoint according to root configuration |
 | CPU index worker | `index_cpu_app.py`, Modal CPU; HTTP invocation | Chunks/deletions → durable S3 mutations, real index writes and per-file publication; no embedding computation |
 | GPU index worker | `index_gpu_app.py`, Modal GPU; HTTP invocation | Chunks and reusable vectors → Nomic vectors, durable mutations, index writes and per-file publication |
@@ -69,7 +71,11 @@ Nomic loading code with bulk indexing but receives no worker/database/provider
 credentials. Transform, collector, CPU index, GPU index and reconciliation also
 have separate application definitions.
 
-Postgres is the catalog/ownership/recovery ledger, not an execution queue.
+Postgres retains catalog ownership, per-file work and compact provider-batch
+coordination. Provider follow-up scans claim batch leases; detailed per-input
+mappings, retry results and cleanup outcomes live in S3. See the
+[batch-manifest design](provider-batch-manifests.md) for the current schema,
+recovery rules and dispatcher/worker topology.
 The API enqueues transformation jobs; native transforms and the collector enqueue
 index jobs. Reconciliation repairs committed-but-unsent handoffs. Small job
 messages carry IDs and artifact references, never file bytes, chunks or vectors.
@@ -98,7 +104,9 @@ The index worker builds durable vector/mutation packs, applies all mutation
 batches to Turbopuffer, then advances the file's indexed extraction pointer.
 Search validates candidates against those pointers; read pins one file's
 publication throughout pagination. Pending or superseded rows are never public.
-Replayed messages reuse durable artifacts and acknowledged progress.
+Replayed messages reuse complete durable artifacts. Workers persist
+acknowledgment once, with final publication;
+an interrupted attempt may replay already accepted batches.
 
 ## Shared product surfaces
 
@@ -110,10 +118,9 @@ status/wait, search/read, supervised watch services and upgrades.
 See [formats](file-ingestion-and-chunking.md), [API](api-reference.md),
 [configuration](configuration.md), and [security](security-and-data-handling.md).
 
-## Historical data
+## Schema contract
 
-Executed SQL migrations remain intact. Read-only root inventory/audit and old
-artifact-prefix cleanup remain so upgrading does not discard recoverable data.
-No previous generation worker, upload endpoint, NATS backend or PostgreSQL
-vector-body cache is used by this runtime. Removal of code does not delete
-existing cloud services, queues, objects or database tables.
+The runtime uses the current S3 pack and per-file publication contracts only.
+Old provider/embedding locators, generation jobs, root-state inventory, and
+migration backfill readers are removed. Schema changes do not convert old
+artifacts into current ones. See the [audit](fresh-schema-audit.md).

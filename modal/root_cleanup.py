@@ -32,11 +32,9 @@ def clear_prefix(s3, bucket, target, *, deadline=float("inf"), clock=time.monoto
             raise ValueError("invalid extraction cleanup identity")
         allowed = {f"{kind}/{org}/{root}/{extraction}/" for kind in ("extractions", "mutations")}
     else:
-        allowed = {f"{kind}/{root}/" for kind in ("files", "bundles", "states", "chunks")}
-        if org:
-            allowed.update(f"{kind}/{org}/{root}/" for kind in ("sources", "extractions", "mutations"))
-        if re.fullmatch(r"syncs/[A-Za-z0-9_-]+/", prefix):
-            allowed.add(prefix)
+        if any(not isinstance(part, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in (org, root)):
+            raise ValueError("invalid root cleanup identity")
+        allowed = {f"{kind}/{org}/{root}/" for kind in ("sources", "extractions", "mutations")}
     if prefix not in allowed:
         raise ValueError("invalid root cleanup prefix")
     page = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)

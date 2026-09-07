@@ -3,25 +3,20 @@
 from itertools import islice
 
 from embedding_artifacts import MAX_ROWS, embedding_vectors
-from file_runtime import database, heartbeat
+from file_runtime import database
 from index_mutations import deletion_mutation, index_row, mutation_batches
-from index_routing import namespace_for_path
 from source_io import iter_chunks, write_chunks
 
 MUTATION_RECORD_BYTES = 8 * 1024 * 1024
 
 
-def prepare_mutations(job, encode, s3, bucket, *, connect=database):
+def prepare_mutations(job, namespace, encode, s3, bucket, *, connect=database):
     if job["stage"] != "index":
         raise ValueError("only index work can prepare mutations")
     if job["mutation_ref"]:
         if job["mutation_batch_count"] is None:
             raise ValueError("mutation artifact missing batch count")
         return job["mutation_ref"], job["mutation_batch_count"]
-    with connect() as conn:
-        namespaces = conn.execute("""SELECT namespace,shard_index,shard_count FROM root_index_namespaces
-            WHERE root_id=%s AND org_id=%s AND retired_at IS NULL""", (job["root_id"], job["org_id"])).fetchall()
-    namespace = namespace_for_path(namespaces, job["file_path"])
 
     def rows():
         if job["version_deleted"]:
@@ -30,7 +25,9 @@ def prepare_mutations(job, encode, s3, bucket, *, connect=database):
         seen = 0
         try:
             while batch := list(islice(source, MAX_ROWS)):
-                heartbeat(job, connect=connect)
+                # The index worker renews its lease in the background. The
+                # mutation registration below fences ownership before publish;
+                # do not write a heartbeat for every embedding/cache batch.
                 for chunk in batch:
                     if chunk["chunk_index"] != seen:
                         raise ValueError("noncontiguous extraction chunk ordinals")

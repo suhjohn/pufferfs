@@ -20,6 +20,7 @@ UPSTREAM = "https://generativelanguage.googleapis.com"
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 events = deque(maxlen=128)
+listings = deque(maxlen=128)
 fault = None
 
 
@@ -46,7 +47,7 @@ async def health():
 @app.get("/status")
 async def status(request: Request):
     control(request)
-    return {"events": list(events)}
+    return {"events": list(events), "listings": list(listings)}
 
 
 @app.post("/fault")
@@ -105,6 +106,12 @@ async def forward(path: str, request: Request):
         if request.url.query:
             url += "?" + request.url.query
         response = await app.state.client.request(request.method, url, content=bytes(body), headers=headers)
+        if request.method == "GET" and path == "v1beta/batches" and response.is_success:
+            result = response.json()
+            listings.append({"page_size": request.query_params.get("pageSize"),
+                "request_cursor_hash": hashlib.sha256(request.query_params.get("pageToken", "").encode()).hexdigest(),
+                "next_cursor_hash": hashlib.sha256((result.get("nextPageToken") or "").encode()).hexdigest(),
+                "count": len(result.get("operations") or [])})
         if event is not None:
             event["upstream_status"] = response.status_code
             if response.is_success:

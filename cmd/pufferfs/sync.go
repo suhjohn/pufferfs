@@ -127,7 +127,7 @@ wins. Only selected files are updated; unselected files stay visible.`),
 	cmd.Flags().BoolVar(&noVector, "no-vector", false, "Create the root without vector search support")
 	cmd.Flags().BoolVar(&force, "force", false, "Force reindex and retain rejected conflicting captures before recapturing current files")
 	addFollowFlags(cmd, &options)
-	cmd.AddCommand(syncStatusCmd(), syncWaitCmd(), syncAuditCmd())
+	cmd.AddCommand(syncStatusCmd(), syncWaitCmd())
 
 	return cmd
 }

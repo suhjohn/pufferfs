@@ -295,14 +295,14 @@ def check_embedding_retention(state):
     root = run.new_root(state, "embedding retention", directory, False)
     run.cli(state, "sync", str(directory), "--id", root)
     run.wait_indexed(state, root)
-    first = run.sql("SELECT * FROM embedding_locations WHERE org_id=%s", (state["org"],))
+    first = run.embedding_locations(state["org"])
     assert len(first) == 1
     key = first[0]["object_key"]
     run.s3.head_object(Bucket=run.BUCKET, Key=key)
     (directory / "second.txt").write_text(text)
     run.cli(state, "sync", str(directory), "--id", root)
     run.wait_indexed(state, root)
-    assert run.sql("SELECT * FROM embedding_locations WHERE org_id=%s", (state["org"],)) == first
+    assert run.embedding_locations(state["org"]) == first
     assert len(run.sql("SELECT object_key FROM embedding_packs WHERE org_id=%s AND retired_at IS NULL", (state["org"],))) == 1
     mutations = run.sql("""SELECT w.id,w.mutation_ref,w.attempt_count,w.acknowledged_batches
         FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
@@ -314,7 +314,8 @@ def check_embedding_retention(state):
         row, = run.sql("SELECT retired_at,deleted_at FROM embedding_packs WHERE object_key=%s", (key,))
         return row["retired_at"] is not None and row["deleted_at"] is not None
     run.eventually("scheduled expiry of the cold shared embedding pack", retired, 240)
-    assert not run.sql("SELECT * FROM embedding_locations WHERE org_id=%s", (state["org"],))
+    assert not run.embedding_locations(state["org"])
+    assert run.sql("SELECT content_hashes FROM embedding_packs WHERE object_key=%s", (key,)) == [{"content_hashes": []}]
     try:
         run.s3.head_object(Bucket=run.BUCKET, Key=key)
     except run.s3.exceptions.ClientError as error:
@@ -328,11 +329,13 @@ def check_embedding_retention(state):
         assert run.s3.head_object(Bucket=run.BUCKET, Key=ref)["ETag"] == etag
         for record in run.chunks(ref):
             rows = record["write"]["upsert_rows"]
-            assert rows and all(len(row["vector"]) == 768 for row in rows)
+            assert rows
+            for row in rows:
+                run.vector_bytes(row["vector"], 768)
     (directory / "third.txt").write_text(text)
     run.cli(state, "sync", str(directory), "--id", root)
     files = run.wait_indexed(state, root)
-    replacement, = run.sql("SELECT * FROM embedding_locations WHERE org_id=%s", (state["org"],))
+    replacement, = run.embedding_locations(state["org"])
     assert replacement["object_key"] != key and replacement["content_hash"] == first[0]["content_hash"]
     assert run.sql("""SELECT id,mutation_ref,attempt_count,acknowledged_batches FROM file_work
         WHERE id=ANY(%s) ORDER BY id""", ([row["id"] for row in mutations],)) == mutations

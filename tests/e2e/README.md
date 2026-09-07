@@ -50,7 +50,7 @@ reconciler --bounded cleanup--> S3 / Turbopuffer
 | Transform delivery consumer | `transform-consumer` | Actual Go worker claims SQS receipts; invokes HTTP transform worker |
 | Index delivery consumer | `index-consumer` | Actual Go worker claims index SQS; selects CPU or Nomic endpoint |
 | Transformation worker | `transform` | Same `transform_app.transform_file` entrypoint; LibreOffice/FFmpeg and actual Google SDK |
-| Batch collector | `collector` | Same scheduled production function every 60 seconds |
+| Batch collectors | `collector` | Production collector invocation every 60 seconds; recovery suite scales to two processes |
 | No-vector index worker | `index-cpu` | Same authenticated production entrypoint, actual Turbopuffer SDK |
 | Bulk embedding/index worker | `index-vector` | Same Indexer class and pinned Nomic revisions; CPU device locally |
 | Query embedding worker | `query` | Same QueryEmbedder class, separate process/model |
@@ -95,6 +95,30 @@ Results and credential-redacted logs go to `tests/e2e/artifacts/`. The private
 state volume holds fixture bytes and test API keys; it is not uploaded to CI.
 
 ## Scenarios implemented
+
+`bash scripts/test-e2e-capture-handoff.sh` checks capture delivery through two
+API processes before execution starts. A separate HTTP relay forwards real
+SQS requests to LocalStack and can disconnect sends after a specified number
+of requests; it never fabricates a successful provider response. The scenario
+checks one acknowledgment for 128 files, no sends for acknowledged retries,
+a second-batch connection failure, retry of only missing IDs through the other
+API, mixed stages, concurrent captures, scheduled repair after API restarts,
+and exact search/read/tombstones after processing. SQL/SQS inspection is
+read-only except for returning inspected SQS receipts to normal visibility.
+The external search provider is real; faulted AWS SQS, GPU execution and
+Gemini extraction are not covered by this local native-text scenario.
+
+The focused native transformation handoff suite runs with
+`bash scripts/test-e2e-transform-handoff.sh`. It uses two API processes, two
+transformation processes and two transform consumers, real Postgres/S3/SQS
+interfaces and real Turbopuffer. Its dedicated Toxiproxy disconnects only the
+transformation workers' SQS traffic. The driver checks exact reference-only
+messages, no immediate delivery-ledger reads, committed chunks during a queue
+outage, scheduled repair while transformation processes are stopped, and
+search/read after restarts, updates and deletes. Like other local native
+scenarios it uses LocalStack and CPU indexing without vectors; it does not
+exercise Gemini extraction or GPU indexing. The cloud throughput suite covers
+the same native handoff followed by real GPU indexing separately.
 
 1. Disconnect application SQS delivery, then capture 12 files through the CLI.
    Confirm all versions are accepted with unconfirmed delivery and zero worker
@@ -207,8 +231,9 @@ PRs. Never approve untrusted PR code to receive those secrets.
 
 `bash scripts/test-e2e-index-recovery.sh` adds the optional
 `compose.e2e-index-recovery.yml` topology, with fresh disposable resources and
-the same production CLI/API/consumer/index entrypoints. It uses one small real
-Nomic vector root and a native-text CPU root; it submits no Gemini jobs.
+the same production CLI/API/consumer/index entrypoints, with two API processes.
+It uses a small real Nomic vector root and native-text CPU roots; it submits no
+Gemini jobs.
 
 ```text
 index worker --original write--> test relay --same bytes, HTTPS--> Turbopuffer
@@ -241,6 +266,11 @@ fabricate a successful provider response: writes reach the real provider.
    that it removes the physical rows and source prefixes using durable deletion
    artifacts, with tombstones surviving the removed catalog. This scenario
    now passes in sequence with the first two scenarios in one invocation.
+4. After restarting Postgres with existing worker pools alive, hold a successful
+   index response while the second API accepts a newer capture. Release the
+   response to the original live worker and require acknowledged-but-superseded
+   work with one attempt and an unchanged mutation object. Repeat with a newer
+   tombstone. Both APIs must expose only the new contents or deletion.
 
 No leases, attempt tokens, delivery counts or application database rows are
 edited by the driver. This models delayed requests at an intermediate network
@@ -257,43 +287,56 @@ driver was edited. This validates runtime behavior, not a fresh build of the
 new Dockerfile cache arrangement or execution on GitHub-hosted runners. See the
 [implementation ledger](../../docs/ingestion-implementation.md) for run IDs.
 
-## Provider submission and partial-retry suite
+## Provider batch-manifest recovery suite
 
 `bash scripts/test-e2e-provider-recovery.sh` adds
-`compose.e2e-provider-recovery.yml`. A separate relay forwards the SDK's real
-Google traffic using its documented `GOOGLE_GEMINI_BASE_URL` setting. It has no
-application imports, database access, host ports or configurable upstream host.
-It does not edit payloads or invent provider outcomes.
+`compose.e2e-provider-recovery.yml`, two API processes, two collector processes,
+one transformation endpoint process, and external Gemini/S3 relays. Relays
+forward actual requests and responses without editing payloads or synthesizing
+provider outcomes. They have no application imports or database access.
 
-```text
-transform / collector --original requests--> provider relay --> real Gemini
-test driver --hold/release next submission------^
-shell --SIGKILL/restart--> actual transform worker
-test driver --delete exact synthetic uploads-----------------> real Gemini
-```
+1. Capture 17 pages and hold the successful input-manifest S3 PUT response.
+   Assert that the object exists but no batch row or paid provider job exists.
+   Kill/restart the transformation process. After the ordinary lease expires,
+   the whole uncommitted batch prepares again with new upload IDs. Require one
+   batch row, one paid job, two input-manifest PUTs, ordered page reads/search.
+2. Capture 65 pages and hold the first 64-input batch's accepted Gemini create
+   response. Kill/restart transformation. Recover the same job and upload IDs;
+   prepare only the remaining page, seal the total, then publish all 65 pages.
+   `pg_stat_statements` confirms one batch INSERT per range, and schema assertions
+   require all three per-input provider tables to be absent.
+3. Delete alternate exact uploads before forwarding a four-input paid request.
+   Gemini itself supplies partial successes/failures. With collectors stopped,
+   require a durable provider handoff and an acknowledged transform SQS message.
+   Hold the result-manifest S3 PUT response and kill both collectors. After
+   restart/lease expiry, recover the same result without another paid create.
+   Preserve successful artifact references/ETags while failed inputs retry in
+   the same batch row. Both API processes independently serve ordered pages/FTS.
+4. Require S3 cleanup checkpoints for all committed upload IDs; independently
+   read the real Files API to confirm inaccessibility. An ambiguous 403 for an
+   upload explicitly deleted by the test remains pending until its unchanged
+   expiry deadline; it is never counted as a deletion acknowledgement.
 
-1. Hold a real successful batch-create response. Kill the transform process
-   before it can record the returned job ID, then restart it and the collector.
-   The normal provider listing and SQS lease paths must recover the same job,
-   preserve input IDs, publish searchable chunks, and issue no duplicate create.
-2. Hold a four-page submission before forwarding. Delete alternate exact
-   run-owned page uploads through Google's API, then release the unchanged
-   request. Gemini itself must report alternating successful/failed requests.
-   Start collection; snapshot successful result objects before the next scheduled
-   retry. Only failed pages may acquire new uploads or higher attempt counts.
-   Check unchanged successful result references/ETags, final page order and FTS.
-3. Require the scheduled production collector to acknowledge upload deletion,
-   then confirm that provider reads cannot access the files (403 or 404).
-   A 403 alone is not deletion evidence. No direct cleanup-function calls or DB
-   updates. For the uploads explicitly removed by the fault, capture their real
-   provider expiry timestamps before deletion. Require the collector either to
-   acknowledge absence or to preserve the ambiguous 403 with the same future
-   expiry deadline, never falsely recording deletion/expiry. Report this pending
-   state separately. The short suite does not fast-forward time or prove the
-   later 48-hour expiry transition; that remains an elapsed-time verification gate.
+Only production entrypoints advance workflow state. SQL/S3 inspection is for
+assertions. Synthetic orphan uploads known to the fault relay are deleted during
+isolated resource teardown; production recovery permits unrecorded uploads to
+expire. The short suite does not fast-forward provider time, verify the full
+48-hour elapsed-expiry transition, or exercise Modal's remote dispatcher.
+Consult [the batch-manifest design](../../docs/provider-batch-manifests.md) for
+execution evidence once the run has completed.
 
-These are implemented scenarios, not a claim of a passing run. Consult the
-implementation ledger for exact execution results.
+`bash scripts/test-e2e-provider-deletion.sh` deletes a root while a real accepted
+submission response is held. It verifies retained batch/manifest identity,
+terminal provider state, acknowledged upload cleanup, absent root artifacts and
+no resurrected index work through two API and collector processes.
+
+`bash scripts/test-e2e-provider-discovery.sh` holds a paid request before it reaches
+Google, kills transformation, and waits for normal lease expiry. A collector
+must checkpoint a bounded negative listing without replaying creation. After
+restarting collectors and forwarding the original request, discovery must resume
+its committed cursor and eventually index the original job. The external relay
+records only listing counts, page size and cursor hashes, not other jobs' data.
+No fake result, database-state injection, or shortened production lease is used.
 
 ## Expanded media suite
 
@@ -455,6 +498,12 @@ production queue/database into the test. The test checks scoped AWS credentials,
 130 distinct vectors over several packed GPU batches, mutations and all search
 modes, then an append with cached-vector reuse. Public multipart APIs exercise
 real upload/resume/completion; root deletion exercises listing/abort/deletion.
+The cloud runner accepts `--shards 1` and `--shards 2` (default). Vector-ranking
+assertions capture eight additional text files through the CLI, obtain real query
+embeddings, and compare public single/selected/all-root results with read-only
+provider queries. They check nearest-first distances and global top-k across
+populated roots, uncaptured roots, and every configured shard. No synthetic
+vectors or provider responses are injected.
 This is a separate opt-in cloud run, not an automatic GitHub PR provisioning job.
 It cannot prove the deployed ECS task principal, cloud failure domains, physical
 deletion in versioned buckets, or production migration/cutover.
@@ -462,3 +511,202 @@ deletion in versioned buckets, or production migration/cutover.
 Run `eb6c0db4478041579561c8a4eb15ddfc` passed this actual-cloud path in 183.14
 seconds and API cleanup in 1.84 seconds, with both GPU roles on CUDA/float16.
 Temporary cloud and Compose resources were removed; production was unchanged.
+
+### Throughput and cache-directory upgrade
+
+The cloud runner accepts `--scenario worker-throughput --workers 1` for cold
+and forced warm-cache publication of four synthetic JSONL files (968 chunks).
+It checks exact retained bytes/line reads, FTS/vector/hybrid results, one attempt
+per job, completed extraction/work state, acknowledged mutation batches, five S3
+vector packs, absence of the removed locator table and cache identity reuse. `--workers 2` scales independent Compose transform/consumer processes
+and permits two bulk GPU containers. Default cloud consumer concurrency is one.
+
+`python3 scripts/worker-throughput-report.py LOG...` summarizes only work IDs
+from successfully validated phases. Its chunks/s uses worker invocation time,
+not queue/startup-inclusive wall time; phase timings are inclusive. Reports include
+worker regions and application statement counts with connection probes excluded.
+See the
+[measurement and rollout notes](../../docs/worker-throughput.md).
+
+`bash scripts/test-e2e-retention.sh embedding-retention` runs the existing cache
+retention workflow alone with real 120-second expiry and scheduled reconciliation:
+cache reuse, cleared directory, deleted S3 bytes, preserved search/mutation
+artifacts and later re-encoding. It does not run the broader authorization or
+source-retention scenarios. Cloud logs are saved per project under `artifacts/`;
+cloud databases share the provisioning cluster's total connection budget, so
+run cloud scenarios sequentially when its spare capacity is limited.
+
+### Multiple API servers and request query counts
+
+`bash scripts/test-e2e-api-access.sh` starts two real API containers using Compose
+service replicas, with shared Postgres/S3/SQS and separate production CLI,
+transform, CPU index, consumer and reconciler processes. The driver resolves
+both API IPs and sends public requests to each, without server-affinity state.
+It checks org/user/restricted root visibility, user/org/group grants and
+revocations, role changes, API-key deletion, combined ignore policies, CLI
+capture through exact source/read/FTS search, and both API processes restarting.
+Single-root, deduplicated root selection and all-root searches are exercised.
+
+`api_search.py` observes batched routing, publication and ACL/proof reads across
+four populated shards in two roots. Separate test relays hold real index writes
+and query responses. An accepted but unacknowledged write must remain hidden,
+only its namespace may retry, and publishing it must become visible on both
+APIs. Other cases cover overlapping provider calls across roots, folder denies
+changed on the second API during search, root deletion during provider IO,
+timeout/recovery, identical paths with separate per-root proofs, stale proof
+hashes after updates, and both API restarts. The runtime and providers remain
+the production implementations; relays delay actual network traffic only.
+
+`api_roots.py` checks one-statement root/directory creation through both public
+and platform routes. It covers roles/scopes, synthetic signed sessions, revoked
+keys and changed roles/memberships during HTTP body arrival, twelve concurrent
+creations, complete namespace directories, and uncaptured-root creation racing
+with organization deletion. One restricted root is captured through the CLI and
+read/searched on both APIs before and after restart. Root/directory assertions
+use read-only SQL; all state changes use the production API or CLI.
+
+The disposable Postgres initializer installs `pg_stat_statements` only for
+read-only observations. Assertions count the identity, obsolete email-only,
+root/access and effective-policy statements around individual requests. They
+verify one identity statement and one root/access statement, including listing
+multiple roots, and one statement for combined policies. Search has additional
+namespace/ACL/publication/provider operations that these counters do not claim
+to eliminate. No source or application state is written through SQL by the test.
+
+The first complete run `21d2f910b33c4fe580bc019006ebac4a` passed both server
+processes before and after restart, plus API cleanup. Capture commit races also
+passed separately in `34b7b3baa4aa4856b5b6790250246c8f` (37.87 seconds, cleanup
+4.40 seconds), covering all nine existing revoked-grant/membership/role/key and
+folder-denial cases at the actual manifest-upload response boundary. These
+are native-text/no-vector runs with real Turbopuffer, local Postgres/LocalStack
+and test-only query instrumentation; they do not verify browser JWT revocation,
+cloud failure domains or GPU/media behavior.
+
+Final read-path run `7b5d5e530739481ca0f2e96acbb233b0` also passed three distinct
+authorized roots in selected/all-root queries with unchanged identity/access
+statement counts, the consolidated root loader, both server restarts and cleanup.
+Subsequent removal of unreachable Go wrappers passed repository call-site review
+and `go build ./...`; it did not change any exercised request path.
+
+The API suite also runs `api_membership.py`: one database function call for each
+member mutation, no data update for unchanged roles (checked using row version
+and joined time), privilege parity across POST/PUT/DELETE, and 18 simultaneous
+owner changes sent to different API servers. Exactly one succeeds and exactly
+one owner remains. All restores go through the platform-admin API. Database
+function calls are counted as client round trips; internal lock/check statements
+are not claimed to disappear.
+
+`browser_session.py` uses synthetic HS256 cookie fixtures signed with the
+isolated server's configured key, then sends real HTTP cookie requests to both
+API processes. It verifies current roles, removed membership, invalid/expired
+credentials, retained-source reads and restart behavior. It imports no production
+authentication code and uses no bypass route or test mode. This tests token
+validation and authorization, not the email/OAuth issuance workflow. Existing
+signed-cookie roles cannot remain authoritative after membership changes.
+
+Combined run `d1a35d382b9d490ca21be8f15e188745` passed the final membership
+function (including profile reuse without a reload), 18 owner races, cookie
+membership freshness, invalid/expired credentials, both API restarts and cleanup.
+Migration 042 must precede an API rollout; all old API mutation writers must be
+drained before relying on the new per-organization serialization protocol.
+
+The API suite additionally runs `api_reads.py` against the real search provider
+through an external HTTP relay. It checks a Unicode line spanning more than 512
+chunks, exact reconstruction across provider pages, missing and stale personal
+content proofs, an empty-range metadata fallback pinned across a concurrent
+replacement, and folder ACL denial committed on the second API while a read or
+search response is held. Selected SQL counters require one routing/publication
+lookup and one combined post-provider ACL/proof lookup. Namespace row versions
+must remain unchanged throughout reads and updates. Provider content and
+credentials are not logged by the relay; synthetic publication IDs and request
+hashes are available for assertions. Index workers continue writing directly to
+real Turbopuffer. This adds a test-only network hop to the local no-vector topology;
+it does not emulate search, require production fault hooks, or validate media/GPU
+processing. Final run evidence is recorded in `docs/api-simplification.md`.
+
+`api_groups.py` adds concurrent platform-admin group provisioning and membership
+operations across both API processes. SQL observations check function/listing call
+counts and unchanged row versions on no-op retries. Public requests cover shared
+IDs, external-ID precedence, name conflicts, absent parents, foreign organization
+IDs, ordinary-key rejection, membership PUT/DELETE races and organization deletion.
+The suite checks group profiles again after restarting both APIs. PostgreSQL
+constraints and production migration 043 supply concurrency behavior; the tests
+add no SQL writes, mocks, alternate auth routes or production fault hooks.
+
+`api_keys.py` exercises public and platform-admin key creation, real key resolution,
+metadata-only lists, scope aliases, missing memberships, revocation on the second
+API, and empty lists. A real HTTP client sends `Expect: 100-continue`, waits until
+the authenticated handler reads the body, then revokes authorization through the
+other API before completing that body. It checks that no key was inserted. Eight
+simultaneous creations race a real user deletion. Migration 044 is inspected for
+removed duplicate indexes and retained unique indexes; production read/capture
+workflows exercise the remaining indexes. Active/revoked keys are checked again
+after both APIs restart. Synthetic cookie inputs test authorization, not actual
+email/OAuth issuance. Expired stored API keys and provider-issued login flows are
+not separately exercised by this scenario.
+
+`api_search.py` verifies batched routing over 13 logical roots, exact provider
+request counts through the real-response relay, empty vector roots, first capture,
+selected/all-root FTS and hybrid queries, globs, authorization and both API restarts.
+It holds a real provider response past the production search deadline and requires
+HTTP 504, then checks recovery through the other API. The local topology has no
+query-embedding process: uncaptured vector roots need no embedding call. The cloud
+index scenario separately tests actual vector/hybrid embeddings and publication
+with single/selected/all-root requests including an empty vector-enabled root.
+
+### Batched capture across API servers
+
+Run `bash scripts/test-e2e-capture-batches.sh` with the repository's real Gemini
+and Turbopuffer credentials. This focused sync-to-index suite uses two production
+API processes, real Postgres with read-only statement observation, LocalStack
+S3/SQS, native transformation and no-vector CPU indexing. It covers the 128-file
+batch limit, multi-extent append, capture races, replay identity, empty/deleted
+files, source provenance, capture revocations during network IO, source expiry
+and API restarts. Source expiry waits for the ordinary signed-upload deadline,
+so allow more than 15 minutes. No database writes manufacture application state.
+The separate `cloud-index` scenario covers real AWS and GPU compatibility.
+
+### Capture manifest packing
+
+Run `scripts/test-e2e-manifest-packs.sh` with the usual real provider credentials.
+It starts two current API processes and exercises 128-file packed captures,
+reordered and subset retries, tombstones, source verification as a separate operator process,
+and root cleanup. A test-only HTTP relay counts actual manifest PUT responses
+and flips/truncates range GET responses without changing S3 objects. Normal
+workers must reject those responses and recover through the queue after the
+fault clears. The full capture-batch suite then covers appends, concurrent
+captures, capture authorization during S3 IO, actual signed-upload expiry,
+retained-byte re-upload, and reads/search after both API processes restart.
+
+The test uses production roles and migrations, real Postgres and real
+Turbopuffer. LocalStack supplies S3/SQS and the network relay supplies explicit
+transport faults; these differ from AWS. Native text uses CPU indexing with
+vectors disabled; GPU/provider-media execution is outside this scenario.
+`cloud_index.py --scenario cloud-index --workers 1` separately exercises real
+AWS S3 range reads, multipart/append and GPU indexing. Previous source formats are intentionally unsupported.
+
+### Mutation acknowledgment and full artifact replay
+
+`bash scripts/test-e2e-index-checkpoints.sh` uses the normal real provider
+credentials and current source for every role. A synthetic 1,025-chunk file
+produces three mutation batches. The relay lets the first response through and
+holds the second successful response; the shell kills the actual index process.
+No application/provider success is fabricated and no database clock is edited.
+
+After the normal five-minute lease, the worker must replay all three batches,
+retain the exact S3 mutation object, and atomically publish acknowledgment.
+The test compares repeated payload hashes, verifies every source line and FTS
+through both APIs, then repeats reads after both API processes restart.
+Cleanup removes the isolated root and objects. This uses real Postgres,
+LocalStack S3/SQS, native CPU indexing without vectors, and real Turbopuffer.
+GPU/cache/search-mode coverage is separate in the cloud throughput and index
+recovery suites. No old worker checkout or partial-checkpoint path is supported.
+
+`bash scripts/test-e2e-index-renewal.sh` holds the second real provider response
+for a three-batch file, stops Postgres for 100 seconds (covering the production
+60-second heartbeat and 30-second pool-acquisition deadline), then starts it
+again and releases the response. It requires the live worker to stop before
+sending the next batch, retain its mutation object and retry successfully in
+the same container process. All 1,025 source lines are checked through both
+APIs in ranges of at most 1,000 lines. This uses the same native CPU/real
+Turbopuffer/LocalStack boundaries as the checkpoint suite.

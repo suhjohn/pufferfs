@@ -12,6 +12,8 @@ app = modal.App(os.getenv("PUFFERFS_INDEX_GPU_APP_NAME", "pufferfs-index-gpu"))
 
 @app.cls(image=gpu_image, secrets=[worker_secret, endpoint_secret],
          gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"), cpu=2, memory=4096, timeout=3600,
+         region=os.getenv("PUFFERFS_MODAL_WORKER_REGION") or None,
+         cloud=os.getenv("PUFFERFS_MODAL_WORKER_CLOUD") or None,
          max_containers=int(os.getenv("PUFFERFS_MODAL_INDEX_MAX_CONTAINERS", "16")), scaledown_window=900)
 class Indexer:
     @modal.enter()

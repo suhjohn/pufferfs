@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 from collections.abc import Iterable, Iterator
+from worker_metrics import timed, count as metric_count
 
 READ_BYTES = 64 * 1024
 
@@ -61,16 +62,23 @@ def read_manifest(s3, bucket: str, version: dict) -> dict:
     if any(not isinstance(value, str) or not value or "/" in value for value in (org, root)):
         raise ValueError("invalid source owner")
     prefix = f"sources/{org}/{root}/"
-    key = version["source_manifest_ref"]
-    match = re.fullmatch(re.escape(prefix) + r"manifests/([0-9a-f]{64})\.json", key)
+    ref = version["source_manifest_ref"]
+    match = re.fullmatch(re.escape(prefix) +
+        r"manifests/[0-9a-f]{64}\.jsonl#(0|[1-9][0-9]*):([1-9][0-9]*):([0-9a-f]{64})", ref)
     if match is None:
-        raise ValueError("source manifest is outside its catalog owner or not content-addressed")
-    response = s3.get_object(Bucket=bucket, Key=key)
+        raise ValueError("source manifest requires an owned pack range and checksum")
+    offset, length, digest = int(match[1]), int(match[2]), match[3]
+    limit = 16 * 1024 * 1024
+    if length > limit or offset > limit - length:
+        raise ValueError("source manifest range exceeds 16 MiB pack bounds")
+    options = {"Bucket": bucket, "Key": ref.rsplit("#", 1)[0],
+               "Range": f"bytes={offset}-{offset + length - 1}"}
+    response = s3.get_object(**options)
     with response["Body"] as body:
-        raw = body.read(16 * 1024 * 1024 + 1)
-    if len(raw) > 16 * 1024 * 1024:
-        raise ValueError("source manifest exceeds 16 MiB")
-    if hashlib.sha256(raw).hexdigest() != match[1]:
+        raw = body.read(length + 1)
+    if len(raw) != length:
+        raise ValueError("source manifest response length mismatch")
+    if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("stored source manifest hash mismatch")
     manifest = json.loads(raw)
     validate_manifest(manifest)
@@ -141,7 +149,9 @@ def write_chunks(s3, bucket: str, prefix: str, chunks: Iterable[dict], *, max_re
             while data := raw.read(READ_BYTES):
                 digest.update(data)
         key = f"{prefix.rstrip('/')}/{digest.hexdigest()}.jsonl.gz"
-        s3.upload_file(path, bucket, key, ExtraArgs={"ContentType": "application/gzip"})
+        with timed("artifact_upload"):
+            s3.upload_file(path, bucket, key, ExtraArgs={"ContentType": "application/gzip"})
+        metric_count("artifact_records", count)
     return key, count
 
 

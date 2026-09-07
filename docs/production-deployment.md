@@ -7,10 +7,12 @@ This repository uses four deployment surfaces:
 - Modal for independently deployed transformation, collection, indexing, query and reconciliation roles.
 - S3 + CloudFront for the static web app and installer script.
 
-This checkout contains only per-file processing. Before upgrading an older
-fleet, stop/drain legacy writers and queues, audit historical recapture and
-publication coverage, apply migrations, and deploy matching CLI/API/consumer
-and Modal roles. There is no mixed-generation read fallback.
+This checkout contains only current-format per-file processing. The schema
+replaces old provider/embedding ledgers and removes generation inventory; it
+does not convert previous artifact formats. Deploy matching API/consumer and
+Modal roles against the current schema. Existing captures require an explicit
+cutover decision before replacement; see the [audit](fresh-schema-audit.md).
+There is no mixed-format reader or recapture-audit compatibility command.
 
 The backend/all workflow deploys `transform_app.py`, `collector_app.py`,
 `index_cpu_app.py`, `index_gpu_app.py`, `query_app.py`, and
@@ -64,14 +66,12 @@ Defaults preserve the production names and 16-container limit; isolated cloud
 validation supplies unique names and a one-container limit. Each bulk container
 has two CPUs and 4 GiB RAM in addition to its configured GPU.
 
-Apply migrations through the API deployment before starting updated ingestion
-workers or reconciliation. The new embedding cache requires migration 037,
-obsolete-extraction cleanup requires 038, and source-pack reachability/ownership
-requires 039 plus the cascade-order fix in 040; query embedding does not depend on these tables. Audit unaccepted
-pre-039 uploads (which lack uploader identity) and finish legacy extent backfill
-before enabling pack retirement on existing catalogs. Review the ordinary
-30-day source/cache/artifact retention defaults before
-enabling the updated reconciler. Its external Modal principal needs S3 delete,
+The API applies the schema before updated ingestion workers and reconciliation
+start. The current schema includes pack-based embedding directories (041), S3
+provider manifests (045), and removal of generation/backfill state (046). Query
+embedding does not depend on those tables. Review the ordinary 30-day
+source/cache/artifact retention settings when configuring the reconciler.
+Its external Modal principal needs S3 delete,
 listing and multipart-abort permissions for the documented artifact prefixes.
 An ECS task-role policy does not establish those permissions for Modal.
 The Compose suite verifies fresh-database builds; it does not by itself validate

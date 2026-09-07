@@ -1,60 +1,48 @@
-"""Local prepared inputs -> temporary Google files -> durable batch handoff."""
+"""Prepare contiguous input batches, publishing one S3 manifest per batch."""
 
 from contextlib import closing
+from itertools import islice
 
-from extraction import file_family
-from file_runtime import database, heartbeat, stable_id
-from media_prepare import media_clip_seconds, media_inputs
-from provider_submission import MAX_BATCH_REQUESTS, finish_preparation, reserve_batch, submit_batch
-from provider_refresh import refresh_batch_inputs, upload_prepared
-from visual_prepare import visual_inputs
+from file_runtime import database
+from provider_manifests import MAX_BATCH_REQUESTS
+from provider_refresh import prepared_inputs, upload_inputs, persist_inputs, refresh_batch_inputs
+from provider_runtime import claim_batch, batch_lease
+from provider_submission import batch_identity, finish_preparation, reserve_batch, submit_batch
 
 
-def prepare_provider(job, path, client, *, connect=database):
-    # Resume durable batches before opening the renderer/decoder. Source bytes
-    # were already hash-verified by transform(); mappings belong to this exact
-    # source version and extraction revision. Keep at most 64 mappings in memory.
+def prepare_provider(job, path, client, s3, bucket, *, connect=database):
     count = 0
-    previous_batch = None
     while True:
         with connect() as conn:
-            recorded = conn.execute("""SELECT ordinal,batch_id FROM provider_requests
-                WHERE extraction_id=%s AND ordinal>=%s ORDER BY ordinal LIMIT %s""",
-                (job["extraction_id"], count, MAX_BATCH_REQUESTS)).fetchall()
+            recorded = conn.execute("""SELECT * FROM provider_batches
+                WHERE extraction_id=%s AND ordinal_start>=%s ORDER BY ordinal_start LIMIT 64""",
+                (job["extraction_id"], count)).fetchall()
         if not recorded:
             break
-        if any(row["ordinal"] != count + i or not row["batch_id"] for i, row in enumerate(recorded)):
-            raise ValueError("persisted provider preparation is not a contiguous prefix")
-        for row in recorded:
-            if row["batch_id"] != previous_batch:
-                heartbeat(job, connect=connect)
-                refresh_batch_inputs(row["batch_id"], client, path=path, connect=connect)
-                submit_batch(row["batch_id"], client, connect=connect)
-                previous_batch = row["batch_id"]
-        count += len(recorded)
-
-    # A range is constant-size even for a very large recorded prefix. Media
-    # still decodes preceding samples for exact timing, but doesn't write WAVs.
-    ordinals = range(count, 1 << 63)
-    inputs = (media_inputs(path, clip_seconds=media_clip_seconds(job["revision"]), ordinals=ordinals)
-              if file_family(path) in {"audio", "video"} else visual_inputs(path, ordinals=ordinals))
-    batch = []
-    with closing(inputs):
-        for item in inputs:
-            if type(item["ordinal"]) is not int or item["ordinal"] != count:
+        for batch in recorded:
+            if batch["ordinal_start"] != count:
+                raise ValueError("persisted provider ranges are not a contiguous prefix")
+            if not batch["provider_job_id"]:
+                batch = claim_batch(batch["id"], connect=connect)
+                if batch is None:
+                    raise RuntimeError("provider batch is owned by another worker")
+                with batch_lease(batch, connect=connect):
+                    refresh_batch_inputs(batch, client, s3, bucket, path=path, connect=connect)
+                    submit_batch(batch, client, s3, bucket, connect=connect)
+            count += batch["request_count"]
+    with closing(prepared_inputs(path, job["revision"], range(count, 1 << 63))) as inputs:
+        while True:
+            requests, uploads = upload_inputs(client, islice(inputs, MAX_BATCH_REQUESTS), job["extraction_id"], 1)
+            if not requests:
+                break
+            if [item["ordinal"] for item in requests] != list(range(count, count + len(requests))):
                 raise ValueError("prepared provider inputs are not contiguous")
-            heartbeat(job, connect=connect)
-            key = stable_id(job["extraction_id"], str(count))
-            uploaded = upload_prepared(client, item, key, job["extraction_id"], connect=connect)
-            batch.append(dict(item, input_file_id=uploaded.name, input_uri=uploaded.uri))
-            count += 1
-            if len(batch) == MAX_BATCH_REQUESTS:
-                batch_id = reserve_batch(job, batch, connect=connect)
-                submit_batch(batch_id, client, connect=connect)
-                batch.clear()
-        if batch:
-            batch_id = reserve_batch(job, batch, connect=connect)
-            submit_batch(batch_id, client, connect=connect)
+            batch = batch_identity(job, count, len(requests))
+            ref = persist_inputs(batch, requests, uploads, client, s3, bucket)
+            batch = reserve_batch(job, batch, ref, connect=connect)
+            with batch_lease(batch, connect=connect):
+                submit_batch(batch, client, s3, bucket, connect=connect)
+            count += len(requests)
     if count:
         finish_preparation(job, count, connect=connect)
     return count

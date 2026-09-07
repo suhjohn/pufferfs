@@ -12,10 +12,9 @@ CLIP_SECONDS = 60
 
 
 def media_clip_seconds(revision):
-    # Persisted extraction revisions pin retry boundaries. Never reinterpret
-    # a pre-upgrade ordinal using the new clip duration.
-    return {"visual-gemini-3.5-flash-lite-v1": 300,
-            "visual-gemini-3.5-flash-lite-v2": 60}[revision]
+    if revision != "visual-gemini-3.5-flash-lite-v2":
+        raise ValueError("unsupported media extraction revision")
+    return CLIP_SECONDS
 
 
 def media_inputs(path: str, *, clip_seconds: int = CLIP_SECONDS, timeout: int = 3600, ordinals=None):

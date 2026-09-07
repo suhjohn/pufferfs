@@ -4,13 +4,16 @@ SQL and S3 reads inspect actual durable effects. The duplicate-delivery scenario
 uses SQS's public API; it never invokes worker processing directly or mutates its DB state.
 """
 
+import base64
 import gzip
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
+import struct
 import socket
 import sys
 import tempfile
@@ -33,11 +36,14 @@ s3 = boto3.client("s3")
 sqs = boto3.client("sqs")
 
 
-def request(method, path, payload=None, *, key=None, statuses=(200,)):
+def request(method, path, payload=None, *, key=None, statuses=(200,), server=None, cookie=None):
     data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(API + path, data=data, method=method,
-        headers={"Authorization": "Bearer " + (key or os.environ["PUFFERFS_ADMIN_KEY"]),
-                 "Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if cookie is not None:
+        headers["Cookie"] = "pf_session=" + cookie
+    else:
+        headers["Authorization"] = "Bearer " + (key or os.environ["PUFFERFS_ADMIN_KEY"])
+    req = urllib.request.Request((server or API) + path, data=data, method=method, headers=headers)
     try:
         response = urllib.request.urlopen(req, timeout=180)
     except urllib.error.HTTPError as error:
@@ -52,6 +58,28 @@ def sql(query, args=()):
     with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row,
                          options="-c default_transaction_read_only=on -c statement_timeout=15000") as conn:
         return conn.execute(query, args).fetchall()
+
+
+def embedding_locations(org):
+    """Read-only expansion of durable pack directories for vector assertions."""
+    return sql("""SELECT DISTINCT ON (p.model_revision,h.hash) p.org_id,p.model_revision,
+        h.hash AS content_hash,p.object_key,(h.slot-1)*p.dimensions::bigint*4 AS byte_offset,
+        p.dimensions*4 AS byte_length,p.dimensions
+        FROM embedding_packs p,unnest(p.content_hashes) WITH ORDINALITY AS h(hash,slot)
+        WHERE p.org_id=%s AND p.retired_at IS NULL AND h.hash IS NOT NULL
+        ORDER BY p.model_revision,h.hash,p.object_key""", (org,))
+
+
+def vector_bytes(value, dimensions):
+    """Validate either provider wire encoding and return its exact float32 bytes."""
+    if isinstance(value, str):
+        packed = base64.b64decode(value, validate=True)
+    else:
+        assert isinstance(value, list) and len(value) == dimensions
+        packed = struct.pack(f"<{dimensions}f", *value)
+    assert len(packed) == dimensions * 4
+    assert all(math.isfinite(number) for number, in struct.iter_unpack("<f", packed))
+    return packed
 
 
 def save(state):
@@ -100,8 +128,19 @@ def wait_indexed(state, root=None):
 
 
 def object_json(key):
-    with s3.get_object(Bucket=BUCKET, Key=key)["Body"] as body:
-        return json.load(body)
+    options = {"Bucket": BUCKET, "Key": key}
+    packed = ".jsonl#" in key
+    if packed:
+        options["Key"], locator = key.rsplit("#", 1)
+        offset, length, digest = locator.split(":")
+        offset, length = int(offset), int(length)
+        assert offset >= 0 and length > 0
+        options["Range"] = f"bytes={offset}-{offset+length-1}"
+    with s3.get_object(**options)["Body"] as body:
+        raw = body.read()
+    if packed:
+        assert len(raw) == length and hashlib.sha256(raw).hexdigest() == digest
+    return json.loads(raw)
 
 
 def chunks(key):
@@ -370,7 +409,7 @@ def inspect_sqs_deliveries(work, stage):
     received, receipts = {}, []
     url = os.environ[f"PUFFERFS_SQS_{stage.upper()}_QUEUE_URL"]
     try:
-        for _ in range(10):
+        for _ in range((len(expected) + 9) // 10 + 10):
             messages = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1,
                                           MessageSystemAttributeNames=["MessageGroupId"],
                                           VisibilityTimeout=60).get("Messages", [])
@@ -422,8 +461,9 @@ def native_capture():
         except urllib.error.HTTPError as error:
             assert error.code == 404
             error.close()
-    assert not sql("SELECT id FROM sync_jobs LIMIT 1")
-    assert not sql("SELECT id FROM sync_generations LIMIT 1")
+    for name in ("sync_jobs", "sync_generations", "sync_job_shards", "root_states",
+                 "embedding_cache", "embedding_locations", "content_proofs"):
+        assert sql("SELECT to_regclass(%s) AS table_name", (name,))[0]["table_name"] is None
     current = subprocess.run(["pufferfs", "root", "current", "--json"], cwd=directory,
         env=dict(os.environ, PUFFERFS_API_KEY=state["key"]), capture_output=True, text=True, timeout=30)
     assert current.returncode == 0, current.stderr
@@ -485,7 +525,7 @@ def native_transformed():
     assert all(w["status"] == "pending" and w["attempt_count"] == 0 for w in index_work)
     inspect_sqs_deliveries(index_work, "index")
     assert not sql("SELECT id FROM provider_batches LIMIT 1"), "native input submitted Gemini work"
-    assert not sql("SELECT org_id FROM embedding_locations LIMIT 1"), "transformation generated vectors"
+    assert not sql("SELECT org_id FROM embedding_packs LIMIT 1"), "transformation generated vectors"
     assert not sql("SELECT id FROM file_work WHERE mutation_ref<>'' LIMIT 1"), "transformation created index mutations"
     # Also drain the preceding handoff-recovery root before stopping this role.
     wait_queue_empty("transform")
@@ -697,6 +737,16 @@ def verify():
         JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE f.root_id=%s""", (state["root"],))
     assert len(rows) == len(files)
     assert all(row["acknowledged_batches"] == row["mutation_batch_count"] for row in rows)
+    batches = sql("SELECT * FROM provider_batches WHERE root_id=%s", (state["root"],))
+    assert batches, "provider-backed fixtures did not produce batch results"
+    packed_results = {}
+    for batch in batches:
+        assert batch["status"] == "complete"
+        for result in provider_records(batch):
+            assert result["status"] == "complete" and not result["error"] and result["result_ref"]
+            packed_results.setdefault(result["result_ref"], set()).add(result["request_key"])
+    for ref, expected_keys in packed_results.items():
+        assert {chunk["request_key"] for chunk in chunks(ref)} == expected_keys
     for row in rows:
         path = row["path"]
         expected = state["fixture_expectations"].get(path, {})
@@ -721,8 +771,7 @@ def verify():
         if expected.get("diarized"):
             assert count > 0
         if missing:
-            jobs = sql("""SELECT DISTINCT b.provider_job_id FROM provider_requests p
-                JOIN provider_batches b ON b.id=p.batch_id WHERE p.extraction_id=%s""", (row["extraction_id"],))
+            jobs = sql("""SELECT provider_job_id FROM provider_batches WHERE extraction_id=%s""", (row["extraction_id"],))
             print(json.dumps({"failed_fixture": path, "missing_terms": sorted(missing),
                 "content_excerpt": excerpt, "chunk_count": count, "locations": locations,
                 "provider_jobs": [job["provider_job_id"] for job in jobs]}), flush=True)
@@ -742,7 +791,7 @@ def verify():
     # No rendered pages or converted clips in durable object storage.
     objects = [item for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET) for item in page.get("Contents", [])]
     assert not any(item["Key"].lower().endswith((".png", ".jpg", ".wav", ".mp4", ".pdf")) for item in objects)
-    assert not sql("SELECT * FROM embedding_locations WHERE org_id=%s", (state["org"],)), "no-vector root embedded content"
+    assert not embedding_locations(state["org"]), "no-vector root embedded content"
     vector_dir = Path("/state/vector")
     vector_dir.mkdir()
     (vector_dir / "astronomy.txt").write_text("An observatory uses a telescope to study stars and galaxies.\n")
@@ -755,73 +804,110 @@ def verify():
         result = request("POST", "/query", {"root_id": state["vector_root"], "query": "astronomy telescope stars",
                          "mode": mode, "top_k": 1}, key=state["key"])
         assert result["results"][0]["file_path"] == "astronomy.txt"
-    assert sql("SELECT * FROM embedding_locations WHERE org_id=%s AND dimensions=768", (state["org"],))
+    assert [row for row in embedding_locations(state["org"]) if row["dimensions"] == 768]
     state["before"] = files
     save(state)
     authorization()
     provider_cleanup()
 
 
+def provider_manifest(ref):
+    # Independent read-only assertion, not an application helper invocation.
+    import re
+    match = re.fullmatch(r"maintenance/provider/[0-9a-f]{64}/(input|result|cleanup)/([0-9a-f]{64})\.json", ref)
+    assert match, "noncanonical provider manifest reference"
+    with s3.get_object(Bucket=BUCKET, Key=ref)["Body"] as body:
+        raw = body.read(4 * 1024 * 1024 + 1)
+    assert len(raw) <= 4 * 1024 * 1024
+    assert hashlib.sha256(raw).hexdigest() == match[2]
+    value = json.loads(raw)
+    assert value["format"] == 1 and value["kind"] == match[1]
+    return value
+
+
+def provider_records(batch):
+    manifest = provider_manifest(batch["output_ref"] or batch["input_ref"])
+    if manifest["attempt"] != batch["attempt_count"]:
+        manifest = provider_manifest(batch["input_ref"])
+    records = manifest["requests"]
+    assert len(records) == batch["request_count"] <= 64
+    assert [r["ordinal"] for r in records] == list(range(batch["ordinal_start"], batch["ordinal_start"] + len(records)))
+    return [dict(item, batch_id=batch["id"], extraction_id=batch["extraction_id"]) for item in records]
+
+
+def provider_uploads(batch):
+    uploads, ref = {}, batch["input_ref"]
+    seen = set()
+    while ref:
+        assert ref not in seen
+        seen.add(ref)
+        manifest = provider_manifest(ref)
+        assert 1 <= len(manifest["uploads"]) <= 65
+        for item in manifest["uploads"]:
+            assert item["file_id"] not in uploads, "retry reused a temporary upload"
+            uploads[item["file_id"]] = dict(item, deleted_at=None, expired_at=None, error="")
+        ref = manifest["previous"]
+    return uploads
+
+
 def provider_cleanup(*, externally_deleted=None):
-    # The collector must release actual provider uploads after durable
-    # completion. We never mark rows deleted or invoke cleanup in-process.
-    # Generated batch results are provider-managed, not Files.delete resources.
-    owned = sql("""SELECT DISTINCT f.file_id FROM provider_files f
-        JOIN provider_batch_files bf ON bf.file_id=f.file_id JOIN provider_batches b ON b.id=bf.batch_id
-        WHERE b.status IN ('complete','failed')""")
-    assert owned, "no provider files were tracked for completed batches"
-    ids = [row["file_id"] for row in owned]
+    from datetime import datetime, timezone
+    batches = sql("SELECT * FROM provider_batches WHERE status IN ('complete','failed')")
+    assert batches, "no completed provider batches"
+    owned = {}
+    for batch in batches:
+        owned.update(provider_uploads(batch))
+    assert owned
     externally_deleted = externally_deleted or {}
-    assert set(externally_deleted) <= set(ids), "untracked externally deleted fixture upload"
+    assert set(externally_deleted) <= set(owned)
 
     def settled():
-        from datetime import datetime
-        files = sql("""SELECT file_id,deleted_at,expired_at,expires_at,error,
-            expires_at<=NOW() AS expiry_due FROM provider_files WHERE file_id=ANY(%s)""", (ids,))
-        assert len(files) == len(ids), "cleanup erased upload identities before verification"
-        for file in files:
-            if file["file_id"] in externally_deleted:
-                # This expectation is captured from the real Files API before
-                # the fault explicitly deletes the upload. Never derive an
-                # exception from a failed assertion or change database state.
-                assert file["expires_at"] == datetime.fromisoformat(externally_deleted[file["file_id"]])
+        outcomes = {}
+        for batch in sql("SELECT * FROM provider_batches WHERE status IN ('complete','failed')"):
+            ref, seen = batch["cleanup_ref"], set()
+            while ref:
+                assert ref not in seen
+                seen.add(ref)
+                checkpoint = provider_manifest(ref)
+                assert len(checkpoint["files"]) <= 65
+                for file in checkpoint["files"]:
+                    outcomes.setdefault(file["file_id"], file)
+                ref = checkpoint["previous"]
+        for file_id, upload in owned.items():
+            if file_id not in outcomes:
+                return None
+            file = outcomes[file_id]
+            assert file["expires_at"] == upload["expires_at"]
+            expiry_due = datetime.fromisoformat(file["expires_at"]) <= datetime.now(timezone.utc)
+            if file_id in externally_deleted:
+                assert datetime.fromisoformat(file["expires_at"]) == datetime.fromisoformat(externally_deleted[file_id])
             if file["deleted_at"]:
                 continue
             if file["expired_at"]:
-                assert file["expiry_due"], "collector declared expiry before its deadline"
+                assert expiry_due
                 continue
-            if file["file_id"] in externally_deleted and file["error"] == "ClientError status=403":
-                assert not file["expiry_due"], "expired upload still awaiting permission recovery"
-                continue  # Explicitly pending expiry, not a successful deletion.
+            if file_id in externally_deleted and file["error"] == "ClientError status=403":
+                assert not expiry_due
+                continue
             return None
-        return files
+        return [outcomes[file_id] for file_id in owned]
 
-    try:
-        files = eventually("provider deletion/expiry outcomes from the scheduled collector", settled, timeout=600)
-    except AssertionError:
-        print(json.dumps({"provider_cleanup_pending": sql("""SELECT f.file_id,f.error,
-            bf.batch_id,b.provider_job_id,b.status FROM provider_files f
-            LEFT JOIN provider_batch_files bf ON bf.file_id=f.file_id
-            LEFT JOIN provider_batches b ON b.id=bf.batch_id
-            WHERE f.file_id=ANY(%s) AND f.deleted_at IS NULL""", (ids,))}), flush=True)
-        raise
+    files = eventually("S3 batch cleanup checkpoints", settled, timeout=600)
     from google import genai
     with genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"retry_options": {"attempts": 1}}) as client:
-        for file_id in ids:
+        for file_id in owned:
             try:
                 client.files.get(name=file_id)
             except Exception as error:
-                # deleted_at above requires an acknowledged successful delete
-                # (or 404), not a permission error. Gemini masks missing upload
-                # identities with 403 as well as 404. Here we additionally prove
-                # inaccessibility; a 403 by itself never establishes deletion.
-                assert getattr(error, "code", None) in {403, 404}, "deleted provider upload remains accessible or its status is unknown"
+                assert getattr(error, "code", None) in {403, 404}
             else:
-                raise AssertionError("provider still serves an upload reported deleted, expired or externally removed")
-    outcomes = {"acknowledged_deletions": sum(bool(file["deleted_at"]) for file in files),
-                "provider_deadlines_passed": sum(bool(file["expired_at"]) and not file["deleted_at"] for file in files),
-                "external_deletions_pending_expiry": sum(not file["deleted_at"] and not file["expired_at"] for file in files)}
-    print(json.dumps({"provider_upload_cleanup": outcomes}), flush=True)
+                raise AssertionError("provider still serves a settled upload")
+    for table in ("provider_requests", "provider_files", "provider_batch_files"):
+        assert sql("SELECT to_regclass(%s) AS relation", (table,))[0]["relation"] is None
+    print(json.dumps({"provider_upload_cleanup": {
+        "acknowledged_deletions": sum(bool(file["deleted_at"]) for file in files),
+        "provider_deadlines_passed": sum(bool(file["expired_at"]) and not file["deleted_at"] for file in files),
+        "external_deletions_pending_expiry": sum(not file["deleted_at"] and not file["expired_at"] for file in files)}}), flush=True)
 
 
 def authorization():
@@ -1023,6 +1109,14 @@ def cleanup():
                 raise
             if remote.state.name not in {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}:
                 client.batches.cancel(name=batch["provider_job_id"])
+    if state.get("orphan_uploads"):
+        with genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"retry_options": {"attempts": 1}}) as client:
+            for upload in state["orphan_uploads"]:
+                try:
+                    client.files.delete(name=upload["file_id"])
+                except Exception as error:
+                    if getattr(error, "code", None) not in {403, 404}:
+                        raise
     for root in state.get("roots", []):
         request("DELETE", f"/roots/{root}", key=state["key"], statuses=(200, 404))
         prefix = f"sources/{state['org']}/{root}/"
@@ -1048,6 +1142,9 @@ if __name__ == "__main__":
                  "malformed-published": malformed_published,
                  "verify": verify, "authorization": authorization,
                  "outage": outage, "resumed": resumed, "cleanup": cleanup}
+    if phase == "embedding-retention":
+        from retention_security import check_embedding_retention
+        functions[phase] = lambda: check_embedding_retention(provision())
     if phase == "retention-security":
         from retention_security import verify as verify_retention_security
         functions[phase] = verify_retention_security
@@ -1063,6 +1160,9 @@ if __name__ == "__main__":
     if phase == "cloud-index":
         from cloud_index_scenario import verify as verify_cloud_index
         functions[phase] = verify_cloud_index
+    if phase == "worker-throughput":
+        from worker_throughput import verify as verify_worker_throughput
+        functions[phase] = verify_worker_throughput
     started = time.monotonic()
     status = "failed"
     try:

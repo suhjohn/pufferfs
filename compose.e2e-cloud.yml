@@ -13,7 +13,7 @@ x-environment: &environment
   SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
   PUFFERFS_SQS_TRANSFORM_QUEUE_URL: ${PUFFERFS_SQS_TRANSFORM_QUEUE_URL:?}
   PUFFERFS_SQS_INDEX_QUEUE_URL: ${PUFFERFS_SQS_INDEX_QUEUE_URL:?}
-  PUFFERFS_TP_NAMESPACE_SHARDS: '2'
+  PUFFERFS_TP_NAMESPACE_SHARDS: ${PUFFERFS_TP_NAMESPACE_SHARDS:-2}
   MODAL_TRANSFORM_ENDPOINT: http://transform:8080/
   MODAL_FILE_CPU_INDEX_ENDPOINT: http://index-cpu:8080/
   MODAL_FILE_INDEX_ENDPOINT: ${MODAL_FILE_INDEX_ENDPOINT:?}
@@ -68,7 +68,7 @@ services:
       <<: *environment
       PUFFERFS_PROCESS: worker
       PUFFERFS_WORKER_STAGE: transform
-      PUFFERFS_WORKER_CONCURRENCY: '2'
+      PUFFERFS_WORKER_CONCURRENCY: '1'
     depends_on:
       transform: {condition: service_healthy}
   index-consumer:
@@ -77,7 +77,7 @@ services:
       <<: *environment
       PUFFERFS_PROCESS: worker
       PUFFERFS_WORKER_STAGE: index
-      PUFFERFS_WORKER_CONCURRENCY: '2'
+      PUFFERFS_WORKER_CONCURRENCY: '1'
     depends_on:
       api-ready: {condition: service_completed_successfully}
   e2e:

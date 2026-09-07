@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,7 +159,7 @@ func (s *Server) handleSourcePackComplete(w http.ResponseWriter, r *http.Request
 // Clients must never interpret an arbitrary 403/404 or network error as GC.
 func (s *Server) writeRetiredSourcePack(w http.ResponseWriter, r *http.Request, key, userID string) bool {
 	var retired bool
-	err := s.db.pool.QueryRow(r.Context(), `SELECT retired_at IS NOT NULL OR uploader_id IS NULL FROM source_objects WHERE object_key=$1 AND root_id=$2 AND (uploader_id=$3 OR uploader_id IS NULL)`, key, r.PathValue("id"), userID).Scan(&retired)
+	err := s.db.pool.QueryRow(r.Context(), `SELECT retired_at IS NOT NULL FROM source_objects WHERE object_key=$1 AND root_id=$2 AND uploader_id=$3`, key, r.PathValue("id"), userID).Scan(&retired)
 	if err != nil || !retired {
 		return false
 	}
@@ -215,21 +214,22 @@ func (s *Server) handleRegisterFileVersions(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
+	pack, err := packSourceManifests(id.OrgID, rootID, input.Files)
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if pack.key != "" {
+		if err = s.s3.Upload(r.Context(), pack.key, pack.body, "application/x-ndjson"); err != nil {
+			writeJSON(w, 503, map[string]string{"error": "source manifest persistence failed"})
+			return
+		}
+	}
 	versions := make([]CapturedFileVersion, 0, len(input.Files))
-	for _, f := range input.Files {
+	for i, f := range input.Files {
 		v := CapturedFileVersion{Path: f.Path, PreviousVersionID: f.PreviousVersionID, Deleted: f.Deleted}
 		if !f.Deleted {
-			data, err := json.Marshal(f.Source)
-			if err != nil {
-				writeJSON(w, 400, map[string]string{"error": "invalid source manifest"})
-				return
-			}
-			ref := fmt.Sprintf("sources/%s/%s/manifests/%x.json", id.OrgID, rootID, sha256.Sum256(data))
-			if err = s.s3.Upload(r.Context(), ref, data, "application/json"); err != nil {
-				writeJSON(w, 503, map[string]string{"error": "source manifest persistence failed"})
-				return
-			}
-			v.ContentHash, v.Size, v.SourceManifestRef = f.Source.ContentHash, f.Source.Size, ref
+			v.ContentHash, v.Size, v.SourceManifestRef = f.Source.ContentHash, f.Source.Size, pack.refs[i]
 			v.Extents = f.Source.Extents
 		}
 		versions = append(versions, v)
@@ -255,9 +255,7 @@ func (s *Server) handleRegisterFileVersions(w http.ResponseWriter, r *http.Reque
 		if errors.Is(err, errSourceExtentUnavailable) {
 			status = http.StatusBadRequest
 		}
-		if errors.Is(err, errSourceCatalogPending) {
-			status = http.StatusServiceUnavailable
-		}
+
 		writeJSON(w, status, body)
 		return
 	}
@@ -265,12 +263,12 @@ func (s *Server) handleRegisterFileVersions(w http.ResponseWriter, r *http.Reque
 	// reconciliation role republishes the unmarked delivery ledger records.
 	// A proof-write failure is recoverable by retrying this same capture ID;
 	// never acknowledge it while the user's captured hashes are unrecorded.
-	if err = s.db.RecordCapturedProofs(r.Context(), id.OrgID, id.UserID, rootID, registered); err != nil {
+	if err = s.db.RecordCapturedProofs(r.Context(), id.OrgID, id.UserID, rootID, registered.versions); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "captured proof persistence failed; retry the same capture"})
 		return
 	}
-	if _, err = publishFileWork(r.Context(), s.db, s.queue, 128); err != nil {
+	if err = s.publishFileWork(r.Context(), registered.deliveries); err != nil {
 		log.Printf("file capture accepted; SQS handoff needs reconciliation: %v", err)
 	}
-	writeJSON(w, http.StatusAccepted, models.CaptureVersionsResponse{CaptureID: input.CaptureID, Versions: registered})
+	writeJSON(w, http.StatusAccepted, models.CaptureVersionsResponse{CaptureID: input.CaptureID, Versions: registered.versions})
 }

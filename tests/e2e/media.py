@@ -24,9 +24,9 @@ def verify():
         row, = run.sql("""SELECT e.id,e.chunks_ref,e.chunk_count FROM file_extractions e
             JOIN file_catalog f ON f.indexed_extraction_id=e.id WHERE f.id=%s""", (file["file_id"],))
         records = list(run.chunks(row["chunks_ref"]))
-        requests = run.sql("""SELECT p.ordinal,p.request_key,p.location,p.status,p.error,b.provider_job_id
-            FROM provider_requests p JOIN provider_batches b ON b.id=p.batch_id
-            WHERE p.extraction_id=%s ORDER BY p.ordinal""", (row["id"],))
+        batches = run.sql("SELECT * FROM provider_batches WHERE extraction_id=%s ORDER BY ordinal_start", (row["id"],))
+        requests = [dict(item, provider_job_id=batch["provider_job_id"])
+                    for batch in batches for item in run.provider_records(batch)]
         observation = {"path": path, "source_hash": file["content_hash"],
                        "extraction_id": row["id"], "requests": requests,
                        "chunk_count": len(records), "chunks": records}

@@ -1,0 +1,28 @@
+# Two production API processes share Postgres/S3/SQS. The extension observes
+# SQL call counts only; application workflows never depend on it.
+services:
+  postgres:
+    command: [postgres, -c, max_connections=30, -c, shared_preload_libraries=pg_stat_statements]
+    volumes:
+      - ./tests/e2e/query-observation.sql:/docker-entrypoint-initdb.d/query-observation.sql:ro
+  read-relay: &search-relay
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/index_relay.py]
+    environment:
+      E2E_TURBOPUFFER_UPSTREAM: ${TURBOPUFFER_API_URL:-https://${TURBOPUFFER_REGION:-gcp-us-central1}.turbopuffer.com}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  index-relay: *search-relay
+  index-cpu:
+    environment:
+      TURBOPUFFER_API_URL: http://index-relay:8080
+    depends_on:
+      index-relay: {condition: service_healthy}
+  api:
+    environment:
+      TURBOPUFFER_API_URL: http://read-relay:8080
+    depends_on:
+      read-relay: {condition: service_healthy}

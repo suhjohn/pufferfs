@@ -1,0 +1,15 @@
+# Disconnect only the transformation role's SQS network path. Consumers and
+# reconciliation keep using their independent production queue clients.
+services:
+  transform-sqs:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: [-host, 0.0.0.0, -config, /config/faults.json]
+    volumes:
+      - ./tests/e2e/faults.json:/config/faults.json:ro
+    depends_on:
+      aws: {condition: service_healthy}
+  transform:
+    environment:
+      AWS_ENDPOINT_URL_SQS: http://transform-sqs:8667
+    depends_on:
+      transform-sqs: {condition: service_started}

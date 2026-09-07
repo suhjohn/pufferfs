@@ -39,9 +39,6 @@ type TransactionalEmailSender interface {
 	SendLoginCode(ctx context.Context, login LoginCodeEmail) error
 }
 
-// InviteEmailSender is kept as a compatibility alias for older server wiring.
-type InviteEmailSender = TransactionalEmailSender
-
 // LoginCodeEmail is the data needed to send a one-time email login code.
 type LoginCodeEmail struct {
 	To        string
@@ -67,10 +64,6 @@ type SESTransactionalEmailSender struct {
 	client *sesv2.Client
 	cfg    SESTransactionalEmailConfig
 }
-
-// SESInviteEmailConfig and SESInviteEmailSender are compatibility aliases.
-type SESInviteEmailConfig = SESTransactionalEmailConfig
-type SESInviteEmailSender = SESTransactionalEmailSender
 
 func NewSESTransactionalEmailSender(ctx context.Context, cfg SESTransactionalEmailConfig) (*SESTransactionalEmailSender, error) {
 	cfg.FromEmail = strings.TrimSpace(cfg.FromEmail)
@@ -119,10 +112,6 @@ func NewSESTransactionalEmailSender(ctx context.Context, cfg SESTransactionalEma
 	return &SESTransactionalEmailSender{client: client, cfg: cfg}, nil
 }
 
-func NewSESInviteEmailSender(ctx context.Context, cfg SESInviteEmailConfig) (*SESInviteEmailSender, error) {
-	return NewSESTransactionalEmailSender(ctx, cfg)
-}
-
 func NewTransactionalEmailSenderFromEnv(ctx context.Context) (*SESTransactionalEmailSender, error) {
 	from := firstEnv("TRANSACTIONAL_EMAIL_FROM", "INVITE_EMAIL_FROM")
 	if from == "" {
@@ -151,10 +140,6 @@ func NewTransactionalEmailSenderFromEnv(ctx context.Context) (*SESTransactionalE
 		FeedbackEmail:       os.Getenv("SES_FEEDBACK_EMAIL"),
 		FeedbackIdentityARN: os.Getenv("SES_FEEDBACK_IDENTITY_ARN"),
 	})
-}
-
-func NewInviteEmailSenderFromEnv(ctx context.Context) (*SESInviteEmailSender, error) {
-	return NewTransactionalEmailSenderFromEnv(ctx)
 }
 
 func (s *SESTransactionalEmailSender) SendOrgInvite(ctx context.Context, invite OrgInviteEmail) error {

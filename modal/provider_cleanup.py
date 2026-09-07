@@ -1,111 +1,76 @@
-"""Delete exact provider uploads only after every durable user releases them.
+"""Batch upload cleanup: exact identities and outcomes live in S3, not SQL rows."""
 
-Generated batch results have a separate, provider-managed retention lifecycle;
-Files.delete does not delete them. A batch's disappearance is not proof that
-its result download is gone.
-"""
-
-import re
-import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import uuid
 
 from file_runtime import database
+from provider_manifests import read_manifest, write_manifest
 
 TERMINAL = {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
 
 
-def record_provider_files(files, *, batch_id=None, connect=database):
-    if not 1 <= len(files) <= 65:
-        raise ValueError("invalid provider file registration size")
-    for file_id, extraction_id, expires_at in files:
-        if not isinstance(file_id, str) or not re.fullmatch(r"files/[A-Za-z0-9_-]+", file_id):
-            raise ValueError("invalid provider file identity")
-        if not extraction_id and not batch_id:
-            raise ValueError("provider file must have a durable owner")
-        if expires_at is not None and (not isinstance(expires_at, datetime) or expires_at.utcoffset() is None):
-            raise ValueError("provider expiry must be a timezone-aware timestamp")
-    ids, extractions, expirations = map(list, zip(*files))
+def claim_cleanup(*, connect=database):
     with connect() as conn:
-        # Inputs referenced by another batch are already registered. Never
-        # extend their deadline on retry. If an upload response has no expiry,
-        # the documented 48-hour upload policy provides a conservative bound.
-        conn.execute("""INSERT INTO provider_files(file_id,extraction_id,expires_at)
-            SELECT id,extraction,COALESCE(expiration,NOW()+INTERVAL '48 hours')
-            FROM unnest(%s::text[],%s::text[],%s::timestamptz[]) AS f(id,extraction,expiration)
-            ON CONFLICT(file_id) DO NOTHING""", (ids, extractions, expirations))
-        if batch_id:
-            conn.execute("""INSERT INTO provider_batch_files(batch_id,file_id)
-                SELECT %s,unnest(%s::text[]) ON CONFLICT DO NOTHING""", (batch_id, ids))
+        return conn.execute("""WITH due AS (
+            SELECT id FROM provider_batches WHERE NOT cleanup_complete
+                AND status IN ('complete','failed') AND cleanup_after<=NOW()
+                AND (lease_until IS NULL OR lease_until<=NOW())
+                AND (submission_started_at IS NULL OR provider_job_id IS NOT NULL)
+            ORDER BY cleanup_after,id LIMIT 1 FOR UPDATE SKIP LOCKED
+        ) UPDATE provider_batches b SET lease_token=%s,lease_until=NOW()+INTERVAL '5 minutes',
+            cleanup_after=NOW()+INTERVAL '5 minutes'
+            FROM due WHERE b.id=due.id RETURNING b.*""", (uuid.uuid4().hex,)).fetchone()
 
 
-def cleanup_provider_files(client, *, connect=database, limit=64, time_budget=30):
-    if not 1 <= limit <= 256 or not 0 < time_budget <= 60:
-        raise ValueError("invalid provider cleanup bounds")
-    deadline = time.monotonic() + time_budget
-    result = {"deleted": 0, "expired": 0, "failed": 0, "cancelled": 0}
-    with connect() as conn:
-        # Expiry is provider-controlled, even while a batch is outstanding.
-        # This records passage of the retention deadline, not a successful
-        # DELETE or independently verified physical erasure. No source, request
-        # mapping or batch recovery state is removed. Keep any last error.
-        expired = conn.execute("""WITH due AS (
-            SELECT file_id FROM provider_files WHERE deleted_at IS NULL
-            AND expired_at IS NULL AND expires_at<=NOW()
-            ORDER BY expires_at,file_id LIMIT %s FOR UPDATE SKIP LOCKED
-        ) UPDATE provider_files f SET expired_at=NOW() FROM due
-            WHERE f.file_id=due.file_id RETURNING f.file_id""", (limit,)).fetchall()
-        result["expired"] = len(expired)
-    # Root deletion removes request rows, but must not erase the provider job
-    # or uploaded-file identities needed to cancel and clean up afterward.
-    with connect() as conn:
-        abandoned = conn.execute("""SELECT b.id,b.provider_job_id FROM provider_batches b
-            WHERE b.status='submitted' AND b.provider_job_id IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM provider_requests p WHERE p.batch_id=b.id)
-            ORDER BY b.updated_at LIMIT %s""", (limit,)).fetchall()
-    for batch in abandoned:
-        if time.monotonic() >= deadline:
-            return result
-        try:
-            remote = client.batches.get(name=batch["provider_job_id"])
-            if remote.state.name not in TERMINAL:
-                client.batches.cancel(name=batch["provider_job_id"])
-                result["cancelled"] += 1
-                continue  # A cancellation request does not prove terminality.
-            with connect() as conn:
-                conn.execute("""UPDATE provider_batches SET status='failed',error='source removed',updated_at=NOW()
-                    WHERE id=%s AND status='submitted'
-                    AND NOT EXISTS (SELECT 1 FROM provider_requests WHERE batch_id=%s)""", (batch["id"], batch["id"]))
-        except Exception:
-            result["failed"] += 1
-    with connect() as conn:
-        files = conn.execute("""SELECT f.file_id FROM provider_files f
-            WHERE f.deleted_at IS NULL AND f.expired_at IS NULL
-            AND f.expires_at>NOW() AND f.next_check_at<=NOW()
-            AND NOT EXISTS (SELECT 1 FROM file_work w WHERE w.extraction_id=f.extraction_id
-                AND w.stage='transform' AND w.status IN ('pending','running','waiting_provider'))
-            AND NOT EXISTS (SELECT 1 FROM provider_batch_files bf JOIN provider_batches b ON b.id=bf.batch_id
-                WHERE bf.file_id=f.file_id AND b.status IN ('preparing','submitted'))
-            AND NOT EXISTS (SELECT 1 FROM provider_requests p JOIN file_extractions e ON e.id=p.extraction_id
-                WHERE p.input_file_id=f.file_id AND p.status<>'complete' AND e.status='waiting_provider')
-            ORDER BY f.next_check_at,f.file_id LIMIT %s FOR UPDATE OF f SKIP LOCKED""", (limit,)).fetchall()
-        for file in files:
-            conn.execute("UPDATE provider_files SET next_check_at=NOW()+INTERVAL '5 minutes' WHERE file_id=%s", (file["file_id"],))
-    for file in files:
-        if time.monotonic() >= deadline:
-            break
+def cleanup_provider_files(batch, client, s3, bucket, *, connect=database):
+    checkpoint = (read_manifest(s3, bucket, batch, batch["cleanup_ref"], "cleanup")
+                  if batch["cleanup_ref"] else None)
+    cursor = checkpoint["next_input_ref"] if checkpoint else batch["input_ref"]
+    if not cursor:
+        raise ValueError("provider cleanup cursor is already complete")
+    manifest = read_manifest(s3, bucket, batch, cursor, "input")
+    files = (checkpoint["files"] if checkpoint and checkpoint["input_ref"] == cursor
+             else [dict(item, deleted_at=None, expired_at=None, error="") for item in manifest["uploads"]])
+    if ([item["file_id"] for item in files] != [item["file_id"] for item in manifest["uploads"]]
+            or len(files) > 65):
+        raise ValueError("provider cleanup checkpoint identities changed")
+
+    def remove(file):
+        if file["deleted_at"] or file["expired_at"]:
+            return file
+        now = datetime.now(timezone.utc)
+        if datetime.fromisoformat(file["expires_at"]) <= now:
+            return dict(file, expired_at=now.isoformat())
         try:
             try:
                 client.files.delete(name=file["file_id"])
             except Exception as error:
                 if getattr(error, "code", None) != 404:
-                    raise  # Auth/transport failures never mean already deleted.
-            with connect() as conn:
-                conn.execute("UPDATE provider_files SET deleted_at=NOW(),error='' WHERE file_id=%s", (file["file_id"],))
-            result["deleted"] += 1
+                    raise  # A 403 is not deletion evidence.
+            return dict(file, deleted_at=datetime.now(timezone.utc).isoformat(), error="")
         except Exception as error:
             code = getattr(error, "code", None)
-            detail = f"{type(error).__name__} status={code if type(code) is int else 'unknown'}"
-            with connect() as conn:
-                conn.execute("UPDATE provider_files SET error=%s WHERE file_id=%s", (detail, file["file_id"]))
-            result["failed"] += 1
-    return result
+            return dict(file, error=f"{type(error).__name__} status={code if type(code) is int else 'unknown'}")
+
+    # All 65 outcomes share one S3 checkpoint and one database CAS. If a
+    # deletion's response/checkpoint is lost, retry deletion or await expiry.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        files = list(pool.map(remove, files))
+    settled = all(item["deleted_at"] or item["expired_at"] for item in files)
+    next_ref = manifest["previous"] if settled else cursor
+    ref = write_manifest(s3, bucket, batch, "cleanup", {"input_ref": cursor, "next_input_ref": next_ref,
+        "files": files, "previous": batch["cleanup_ref"]})
+    with connect() as conn:
+        updated = conn.execute("""UPDATE provider_batches SET cleanup_ref=%s,cleanup_complete=%s,
+            cleanup_after=NOW()+make_interval(secs=>%s),updated_at=NOW()
+            WHERE id=%s AND lease_token=%s AND lease_until>NOW() AND cleanup_ref=%s
+              AND input_ref=%s AND status IN ('complete','failed') RETURNING *""",
+            (ref, not next_ref, 0 if settled and next_ref else 300, batch["id"], batch["lease_token"],
+             batch["cleanup_ref"], batch["input_ref"])).fetchone()
+        if updated is None:
+            raise RuntimeError("provider cleanup lost ownership")
+    batch.update(updated)
+    return {"deleted": sum(bool(f["deleted_at"]) for f in files),
+            "expired": sum(bool(f["expired_at"]) for f in files),
+            "pending": sum(not f["deleted_at"] and not f["expired_at"] for f in files)}

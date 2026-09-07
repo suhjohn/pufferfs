@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import os
 from pathlib import Path
 import struct
 import urllib.request
@@ -21,7 +22,7 @@ def verify():
     state = run.provision()
     directory = Path("/state/cloud-index")
     directory.mkdir()
-    # Distinct generic records force multiple 64-vector GPU/cache batches.
+    # Distinct generic records force multiple 64-vector GPU microbatches in one S3 pack.
     path = directory / "measurements.jsonl"
     import json
 
@@ -38,6 +39,7 @@ def verify():
         for number in range(130):
             output.write(record(number, "Orchid telescope measurement " + str(number)))
     state["root"] = run.new_root(state, "cloud GPU publication", directory, False)
+    empty_root = run.new_root(state, "uncaptured vector root", directory / "uncaptured", False)
     run.save(state)
     run.cli(state, "sync", str(directory), "--id", state["root"])
     files = run.wait_indexed(state)
@@ -51,29 +53,39 @@ def verify():
     assert len(mutations) == extraction["mutation_batch_count"]
     published = [row for mutation in mutations for row in mutation["write"]["upsert_rows"]]
     assert len(published) == 130
-    assert all(len(row["vector"]) == 768 for row in published)
-    vectors = run.sql("SELECT * FROM embedding_locations WHERE org_id=%s ORDER BY content_hash", (state["org"],))
-    assert len(vectors) == 130 and len({v["object_key"] for v in vectors}) >= 3
+    vectors = run.embedding_locations(state["org"])
+    assert len(vectors) == 130 and len({v["object_key"] for v in vectors}) == 1
+    assert run.sql("SELECT to_regclass('embedding_locations') AS table_name")[0]["table_name"] is None
     stamps = {}
+    packed_vectors = {}
     for key in {v["object_key"] for v in vectors}:
         with run.s3.get_object(Bucket=run.BUCKET, Key=key)["Body"] as source:
             data = source.read()
         stamps[key] = hashlib.sha256(data).hexdigest()
+        for locator in vectors:
+            if locator["object_key"] == key:
+                offset = locator["byte_offset"]
+                packed_vectors[locator["content_hash"]] = data[offset:offset + locator["byte_length"]]
         assert len(data) % (768 * 4) == 0
         for offset in range(0, len(data), 768 * 4):
             vector = struct.unpack_from("<768f", data, offset)
             assert all(math.isfinite(value) for value in vector)
             assert abs(sum(value * value for value in vector) - 1) < 0.02
+    for row in published:
+        assert run.vector_bytes(row["vector"], 768) == packed_vectors[row["content_hash"]]
     for mode in ("fts", "vector", "hybrid"):
-        result = run.request("POST", "/query", {"root_id": state["root"], "query": "telescope", "mode": mode, "top_k": 5}, key=state["key"])
-        assert result["results"] and all(hit["file_path"] == path.name for hit in result["results"])
+        for selector, count in (({"root_id": state["root"]}, 1),
+                                ({"root_ids": [empty_root, state["root"], empty_root]}, 2), ({"all_roots": True}, 2)):
+            result = run.request("POST", "/query", dict(selector, query="telescope", mode=mode, top_k=5), key=state["key"])
+            assert result["roots_searched"] == count and result["results"]
+            assert all(hit["file_path"] == path.name and hit["root_id"] == state["root"] for hit in result["results"])
     with path.open("a") as output:
         output.write(record(130, "Violet rainfall update"))
     run.cli(state, "sync", str(directory), "--id", state["root"])
     updated = run.wait_indexed(state)
     manifest = run.assert_source_retained(updated[path.name])
     assert manifest["extents"][:len(initial["extents"])] == initial["extents"]
-    current = run.sql("SELECT * FROM embedding_locations WHERE org_id=%s ORDER BY content_hash", (state["org"],))
+    current = run.embedding_locations(state["org"])
     assert len(current) == 131
     assert all(row in current for row in vectors), "append replaced cached vector locators"
     for key, digest in stamps.items():
@@ -81,6 +93,8 @@ def verify():
             assert hashlib.sha256(source.read()).hexdigest() == digest
     read = run.request("POST", f"/roots/{state['root']}/read", {"path": path.name, "lines": {"start": 131, "end": 131}}, key=state["key"])
     assert "Violet rainfall update" in read["lines"][0]["content"]
+
+    verify_vector_ranking(state, empty_root)
 
     # Multipart is exercised through the public API and signed upload URL.
     # Its unaccepted pack is removed by the ordinary root deletion workflow.
@@ -114,3 +128,69 @@ def verify():
     run.eventually("scheduled root cleanup to abort the abandoned AWS upload", multipart_cleaned, timeout=180)
     assert not run.s3.list_objects_v2(Bucket=run.BUCKET, Prefix=f"sources/{state['org']}/{state['root']}/").get("Contents")
     print("Actual AWS multipart init/resume/upload/complete/abort/delete and SQS -> Modal GPU -> S3 vectors/mutations -> search/read passed; append reused 130 cached vectors.", flush=True)
+
+
+def verify_vector_ranking(state, empty_root):
+    """Compare public search with actual provider distances, across roots/shards."""
+    import json
+
+    directory = Path("/state/vector-ranking")
+    directory.mkdir()
+    texts = ["Telescopes observe distant stars and galaxies.",
+             "A gardener plants carrots in fertile soil.",
+             "An optical observatory measures light from a nebula.",
+             "A chef kneads bread dough and preheats the oven.",
+             "Astronomers align telescope mirrors for deep sky imaging.",
+             "A mechanic replaces worn bicycle brakes.",
+             "A spectrograph records the wavelengths of starlight.",
+             "A musician tunes a violin before the concert."]
+    for i, text in enumerate(texts):
+        (directory / f"record-{i}.txt").write_text(text + "\n")
+    root = run.new_root(state, "vector ranking", directory, False)
+    run.cli(state, "sync", str(directory), "--id", root)
+    run.wait_indexed(state, root)
+    query = "telescope"
+    request = urllib.request.Request(os.environ["MODAL_QUERY_EMBED_ENDPOINT"],
+        data=json.dumps({"secret_key": os.environ["MODAL_SECRET_KEY"], "texts": [query]}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=180) as response:
+        vector, = json.load(response)["embeddings"]
+    expected = {}
+    for root_id in (state["root"], root):
+        namespaces = run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root_id,))
+        publications = [row["indexed_extraction_id"] for row in run.sql(
+            "SELECT indexed_extraction_id FROM file_catalog WHERE root_id=%s AND NOT deleted", (root_id,))]
+        counts = []
+        distances = {}
+        for namespace in namespaces:
+            # Read-only assertions against the real provider; every document was
+            # created through CLI capture and the ordinary publication pipeline.
+            rows = run.request("POST", f"/v2/namespaces/{namespace['namespace']}/query",
+                {"rank_by": ["vector", "ANN", vector], "limit": 200,
+                 "filters": ["extraction_id", "In", publications],
+                 "include_attributes": ["file_path", "chunk_index"]},
+                key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"], statuses=(200, 404))
+            rows = rows.get("rows", [])
+            counts.append(len(rows))
+            distances.update({(root_id, row["file_path"], row["chunk_index"]): row["$dist"] for row in rows})
+        if root_id == root:
+            assert sum(counts) == len(texts)
+            assert sum(count > 0 for count in counts) == len(namespaces), "fixture did not populate every configured shard"
+        expected[root_id] = distances
+    selections = [[state["root"]], [root], [empty_root, state["root"]],
+                  [root, state["root"]], [state["root"], root, empty_root]]
+    cases = [(dict(root_id=selected[0]) if len(selected) == 1 else dict(root_ids=selected), selected)
+             for selected in selections]
+    cases.append(({"all_roots": True}, selections[-1]))
+    for selector, selected in cases:
+        reference = {key: value for root_id in selected for key, value in expected.get(root_id, {}).items()}
+        for top_k in (5, 200):
+            result = run.request("POST", "/query", dict(selector, query=query, mode="vector", top_k=top_k), key=state["key"])
+            assert result["roots_searched"] == len(selected)
+            hits = result["results"]
+            assert len(hits) == min(top_k, len(reference))
+            scores = [hit["score"] for hit in hits]
+            assert scores == sorted(scores), "vector distances must rank nearest first across roots and shards"
+            assert all(abs(hit["score"] - reference[(hit["root_id"], hit["file_path"], hit["chunk_index"])]) < 1e-4 for hit in hits), "vector search replaced provider distances with fusion scores"
+            assert all(abs(score - wanted) < 1e-4 for score, wanted in zip(scores, sorted(reference.values())[:top_k])), "global top-k omitted a nearer candidate"
+    print("Vector ranking matched real provider distances and global top-k across populated/empty roots and every configured shard.", flush=True)

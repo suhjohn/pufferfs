@@ -1,13 +1,10 @@
 package server
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -16,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
 	"github.com/pufferfs/pufferfs/internal/queue"
@@ -59,11 +57,6 @@ func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
 // SetQueue connects source registration to SQS delivery.
 func (s *Server) SetQueue(q *queue.SQSQueue) {
 	s.queue = q
-}
-
-// SetInviteEmailSender enables best-effort email notifications for org invites.
-func (s *Server) SetInviteEmailSender(sender InviteEmailSender) {
-	s.emails = sender
 }
 
 // SetTransactionalEmailSender enables best-effort transactional product emails.
@@ -121,9 +114,9 @@ func (s *Server) routes() {
 	// Org management
 	s.mux.HandleFunc("GET /org", s.handleGetOrg)
 	s.mux.HandleFunc("GET /org/members", s.handleListMembers)
-	s.mux.HandleFunc("POST /org/members", s.handleAddMember)
-	s.mux.HandleFunc("PUT /org/members/{userId}", s.handleUpdateMemberRole)
-	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleRemoveMember)
+	s.mux.HandleFunc("POST /org/members", s.handleChangeMember)
+	s.mux.HandleFunc("PUT /org/members/{userId}", s.handleChangeMember)
+	s.mux.HandleFunc("DELETE /org/members/{userId}", s.handleChangeMember)
 	s.mux.HandleFunc("GET /org/invites", s.handleListInvites)
 	s.mux.HandleFunc("POST /org/invites", s.handleCreateInvite)
 	s.mux.HandleFunc("DELETE /org/invites/{id}", s.handleDeleteInvite)
@@ -164,7 +157,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots/{id}/versions", s.handleRegisterFileVersions)
 	s.mux.HandleFunc("GET /roots/{id}/captured-files", s.handleListCapturedFiles)
 	s.mux.HandleFunc("POST /roots/{id}/captured-proofs", s.handleCapturedProofs)
-	s.mux.HandleFunc("GET /roots/{id}/state", s.handleGetState)
 	s.mux.HandleFunc("POST /roots/{id}/read", s.handleReadFile)
 
 	// ACLs
@@ -314,9 +306,13 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, scopes)
+	rawKey, err := s.db.CreateAPIKey(r.Context(), id.OrgID, id.UserID, req.Name, scopes, id.APIKeyID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "key creation is no longer authorized"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return
 	}
 
@@ -438,133 +434,71 @@ func (s *Server) handleListMembers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, members)
 }
 
-func (s *Server) handleAddMember(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleChangeMember(w http.ResponseWriter, r *http.Request) {
 	id, ok := requireOrgAdmin(w, r)
 	if !ok {
 		return
 	}
-
-	var req struct {
-		UserID string `json:"user_id"`
-		Role   string `json:"role"`
+	mode, userID, role := "delete", r.PathValue("userId"), auth.Role("")
+	if r.Method != http.MethodDelete {
+		var req struct {
+			UserID string `json:"user_id"`
+			Role   string `json:"role"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		var err error
+		role, err = parseRole(req.Role, auth.RoleViewer)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		mode = "update"
+		if r.Method == http.MethodPost {
+			mode, userID = "upsert", strings.TrimSpace(req.UserID)
+		}
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	role, err := parseRole(req.Role, auth.RoleViewer)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !canAssignRole(id.Role, role) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot assign that role"})
-		return
-	}
-	if strings.TrimSpace(req.UserID) == "" {
+	if userID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "user_id required"})
 		return
 	}
-	if err := s.db.AddOrgMember(r.Context(), id.OrgID, strings.TrimSpace(req.UserID), role); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	member, err := s.db.changeOrgMember(r.Context(), id.OrgID, id, userID, role, mode)
+	if err != nil {
+		writeMutationError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
+	switch mode {
+	case "upsert":
+		writeJSON(w, http.StatusOK, map[string]string{"status": "added"})
+	case "update":
+		s.captureBackendEvent(r.Context(), id, "org_member_role_updated", map[string]any{"target_role": member.Role})
+		writeJSON(w, http.StatusOK, member)
+	case "delete":
+		s.captureBackendEvent(r.Context(), id, "org_member_removed", map[string]any{"target_role": member.Role})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+	}
 }
 
-func (s *Server) handleUpdateMemberRole(w http.ResponseWriter, r *http.Request) {
-	id, ok := requireOrgAdmin(w, r)
-	if !ok {
-		return
-	}
-	userID := r.PathValue("userId")
-	if userID == id.UserID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot change your own role"})
-		return
-	}
-	member, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
-		return
-	}
-
-	var req struct {
-		Role string `json:"role"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
-		return
-	}
-	role, err := parseRole(req.Role, auth.RoleViewer)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	if !canAssignRole(id.Role, role) || !canManageMemberRole(id.Role, auth.Role(member.Role)) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot change that member role"})
-		return
-	}
-	if auth.Role(member.Role) == auth.RoleOwner && role != auth.RoleOwner {
-		if ok, err := s.canRemoveOwner(r.Context(), id.OrgID); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		} else if !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "organization must keep at least one owner"})
-			return
+func writeMutationError(w http.ResponseWriter, err error) {
+	status, message := http.StatusInternalServerError, err.Error()
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "PF400":
+			status, message = http.StatusBadRequest, pgErr.Message
+		case "PF403":
+			status, message = http.StatusForbidden, pgErr.Message
+		case "PF409":
+			status, message = http.StatusConflict, pgErr.Message
+		case "PF404":
+			status, message = http.StatusNotFound, pgErr.Message
+		case "23503":
+			status, message = http.StatusNotFound, "user not found"
 		}
 	}
-	if err := s.db.UpdateOrgMemberRole(r.Context(), id.OrgID, userID, role); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	updated, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	s.captureBackendEvent(r.Context(), id, "org_member_role_updated", map[string]any{
-		"target_role": updated.Role,
-	})
-	writeJSON(w, http.StatusOK, updated)
-}
-
-func (s *Server) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
-	id, ok := requireOrgAdmin(w, r)
-	if !ok {
-		return
-	}
-	userID := r.PathValue("userId")
-	if userID == id.UserID {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot remove yourself"})
-		return
-	}
-	member, err := s.db.GetOrgMember(r.Context(), id.OrgID, userID)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
-		return
-	}
-	memberRole := auth.Role(member.Role)
-	if !canManageMemberRole(id.Role, memberRole) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot remove that member"})
-		return
-	}
-	if memberRole == auth.RoleOwner {
-		if ok, err := s.canRemoveOwner(r.Context(), id.OrgID); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		} else if !ok {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "organization must keep at least one owner"})
-			return
-		}
-	}
-	if err := s.db.RemoveOrgMember(r.Context(), id.OrgID, userID); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	s.captureBackendEvent(r.Context(), id, "org_member_removed", map[string]any{
-		"target_role": string(memberRole),
-	})
-	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
 func (s *Server) handleListInvites(w http.ResponseWriter, r *http.Request) {
@@ -768,21 +702,9 @@ func (s *Server) handleAdminUpsertMember(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
-		return
-	}
-	if _, err := s.db.GetUser(r.Context(), userID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
-		return
-	}
-	if err := s.db.AddOrgMember(r.Context(), orgID, userID, role); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	member, err := s.db.GetOrgMember(r.Context(), orgID, userID)
+	member, err := s.db.changeOrgMember(r.Context(), orgID, nil, userID, role, "upsert")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMutationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, member)
@@ -808,13 +730,9 @@ func (s *Server) handleAdminCreateGroup(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
-	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
-		return
-	}
 	group, err := s.db.CreateGroup(r.Context(), orgID, strings.TrimSpace(req.ID), req.Name, strings.TrimSpace(req.ExternalID))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMutationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, group)
@@ -826,13 +744,13 @@ func (s *Server) handleAdminListGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	orgID := r.PathValue("orgId")
-	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
-		return
-	}
 	groups, err := s.db.ListGroups(r.Context(), orgID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
+		} else {
+			writeMutationError(w, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, groups)
@@ -845,13 +763,13 @@ func (s *Server) handleAdminListGroupMembers(w http.ResponseWriter, r *http.Requ
 	}
 	orgID := r.PathValue("orgId")
 	groupID := r.PathValue("groupId")
-	if _, err := s.db.GetGroup(r.Context(), orgID, groupID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
-		return
-	}
 	members, err := s.db.ListGroupMembers(r.Context(), orgID, groupID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
+		} else {
+			writeMutationError(w, err)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, members)
@@ -865,17 +783,9 @@ func (s *Server) handleAdminAddGroupMember(w http.ResponseWriter, r *http.Reques
 	orgID := r.PathValue("orgId")
 	groupID := r.PathValue("groupId")
 	userID := r.PathValue("userId")
-	if _, err := s.db.GetGroup(r.Context(), orgID, groupID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
-		return
-	}
-	if _, err := s.db.GetOrgMember(r.Context(), orgID, userID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
-		return
-	}
 	member, err := s.db.AddGroupMember(r.Context(), orgID, groupID, userID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMutationError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, member)
@@ -927,13 +837,13 @@ func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if _, err := s.db.GetOrgMember(r.Context(), orgID, userID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
-		return
-	}
-	rawKey, err := s.db.CreateAPIKey(r.Context(), orgID, userID, req.Name, scopes)
+	rawKey, err := s.db.CreateAPIKey(r.Context(), orgID, userID, req.Name, scopes, "")
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "member not found"})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -944,6 +854,15 @@ func (s *Server) handleAdminCreateAPIKey(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+type createRootRequest struct {
+	Name           string `json:"name"`
+	SourcePath     string `json:"source_path"`
+	Scope          string `json:"scope"`
+	OwnerUserID    string `json:"owner_user_id"`
+	VectorDisabled bool   `json:"vector_disabled"`
+	DisableVector  bool   `json:"disable_vector"`
+}
+
 func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 	if !auth.IsAdmin(r.Context()) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin API key required"})
@@ -951,14 +870,7 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	orgID := r.PathValue("orgId")
-	var req struct {
-		Name           string `json:"name"`
-		SourcePath     string `json:"source_path"`
-		Scope          string `json:"scope"`
-		OwnerUserID    string `json:"owner_user_id"`
-		VectorDisabled bool   `json:"vector_disabled"`
-		DisableVector  bool   `json:"disable_vector"`
-	}
+	var req createRootRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
@@ -966,10 +878,6 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 	req.Name = strings.TrimSpace(req.Name)
 	if req.Name == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
-		return
-	}
-	if _, err := s.db.GetOrganization(r.Context(), orgID); err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
 		return
 	}
 	scope, err := parseRootScope(req.Scope)
@@ -983,17 +891,13 @@ func (s *Server) handleAdminCreateRoot(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner_user_id is required for user roots"})
 			return
 		}
-		if _, err := s.db.GetOrgMember(r.Context(), orgID, ownerUserID); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be a member of the org"})
-			return
-		}
 	} else {
 		ownerUserID = ""
 	}
 
-	root, err := s.db.CreateRootWithScopeAndFeatures(r.Context(), orgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector)
+	root, err := s.db.createRoot(r.Context(), orgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector, nil)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeRootCreateError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, root)
@@ -1086,7 +990,7 @@ func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	cancelled, err := s.db.PrepareRootDeletion(r.Context(), root.OrgID, root.ID)
+	err = s.db.PrepareRootDeletion(r.Context(), root.OrgID, root.ID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
 		return
@@ -1108,7 +1012,6 @@ func (s *Server) handleAdminDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"turbopuffer_ns":         result.TurbopufferNamespace,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
-		"sync_jobs_cancelled":    cancelled,
 	})
 }
 
@@ -1123,15 +1026,6 @@ func (s *Server) handleAdminDeleteOrg(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "org not found"})
 		return
 	}
-	active, err := s.db.OrgHasActiveSync(r.Context(), orgID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
-		return
-	}
-	if active {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "org has active sync jobs; wait for them to finish before deleting"})
-		return
-	}
 	roots, err := s.db.ListRoots(r.Context(), orgID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing roots: " + err.Error()})
@@ -1140,6 +1034,10 @@ func (s *Server) handleAdminDeleteOrg(w http.ResponseWriter, r *http.Request) {
 	deletedObjects := 0
 	namespaces := []string{}
 	for _, root := range roots {
+		if err := s.db.PrepareRootDeletion(r.Context(), root.OrgID, root.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
+			return
+		}
 		result, err := s.deleteRootArtifacts(r.Context(), orgID, root.ID)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1173,34 +1071,18 @@ func (s *Server) handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "user not found"})
 		return
 	}
-	active, err := s.db.UserHasActiveSync(r.Context(), userID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
-		return
-	}
-	if active {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "user has active sync jobs; wait for them to finish before deleting"})
-		return
-	}
 	roots, err := s.db.ListRootsOwnedByUser(r.Context(), userID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "listing user roots: " + err.Error()})
 		return
 	}
-	for _, root := range roots {
-		active, err := s.db.RootHasActiveSync(r.Context(), root.OrgID, root.ID)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "checking active syncs: " + err.Error()})
-			return
-		}
-		if active {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "user owns roots with active sync jobs; wait for them to finish before deleting"})
-			return
-		}
-	}
 	deletedObjects := 0
 	namespaces := []string{}
 	for _, root := range roots {
+		if err := s.db.PrepareRootDeletion(r.Context(), root.OrgID, root.ID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
+			return
+		}
 		result, err := s.deleteRootArtifacts(r.Context(), root.OrgID, root.ID)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1242,14 +1124,7 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var req struct {
-		Name           string `json:"name"`
-		SourcePath     string `json:"source_path"`
-		Scope          string `json:"scope"`
-		OwnerUserID    string `json:"owner_user_id"`
-		VectorDisabled bool   `json:"vector_disabled"`
-		DisableVector  bool   `json:"disable_vector"`
-	}
+	var req createRootRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
@@ -1279,10 +1154,6 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "admin role required to create roots for another user"})
 			return
 		}
-		if _, err := s.db.GetOrgMember(r.Context(), id.OrgID, ownerUserID); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "owner must be a member of the org"})
-			return
-		}
 	case models.RootScopeRestricted:
 		if !auth.HasMinRole(id.Role, auth.RoleAdmin) || !auth.HasScope(id, "org:admin", "admin", "write") {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "org admin scope required for restricted roots"})
@@ -1291,9 +1162,9 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		ownerUserID = ""
 	}
 
-	root, err := s.db.CreateRootWithScopeAndFeatures(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector)
+	root, err := s.db.createRoot(r.Context(), id.OrgID, req.Name, req.SourcePath, scope, ownerUserID, req.VectorDisabled || req.DisableVector, id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeRootCreateError(w, err)
 		return
 	}
 
@@ -1303,6 +1174,19 @@ func (s *Server) handleCreateRoot(w http.ResponseWriter, r *http.Request) {
 		"vector_disabled": root.VectorDisabled,
 	})
 	writeJSON(w, http.StatusCreated, root)
+}
+
+func writeRootCreateError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, errRootOrgMissing):
+		status = http.StatusNotFound
+	case errors.Is(err, errRootOwnerMissing):
+		status = http.StatusBadRequest
+	case errors.Is(err, errRootCreateUnauthorized):
+		status = http.StatusForbidden
+	}
+	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
 func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
@@ -1315,7 +1199,7 @@ func (s *Server) handleListRoots(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
 		return
 	}
-	roots, err := s.db.ListAccessibleRoots(r.Context(), id.OrgID, id.UserID, id.Role)
+	roots, err := s.db.accessibleRoots(r.Context(), id.OrgID, id.UserID, id.Role, nil)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1359,7 +1243,7 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 		return
 	}
-	cancelled, err := s.db.PrepareRootDeletion(r.Context(), id.OrgID, rootID)
+	err = s.db.PrepareRootDeletion(r.Context(), id.OrgID, rootID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "preparing root deletion: " + err.Error()})
 		return
@@ -1377,10 +1261,8 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 
 	s.captureBackendEvent(r.Context(), id, "root_deleted", map[string]any{
 		"root_scope":             rootScopeProperty(root),
-		"had_visible_generation": root.VisibleGenerationID != "" || root.VisibleGenerationSeq > 0,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
-		"sync_jobs_cancelled":    cancelled,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":                 "deleted",
@@ -1389,7 +1271,6 @@ func (s *Server) handleDeleteRoot(w http.ResponseWriter, r *http.Request) {
 		"turbopuffer_ns":         result.TurbopufferNamespace,
 		"turbopuffer_namespaces": result.TurbopufferNamespaces,
 		"s3_objects_deleted":     result.S3ObjectsDeleted,
-		"sync_jobs_cancelled":    cancelled,
 	})
 }
 
@@ -1400,10 +1281,6 @@ type rootArtifactDeleteResult struct {
 }
 
 func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) (rootArtifactDeleteResult, error) {
-	generationIDs, err := s.db.ListSyncGenerationIDs(ctx, orgID, rootID)
-	if err != nil {
-		return rootArtifactDeleteResult{}, fmt.Errorf("listing sync generations: %w", err)
-	}
 	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, orgID, rootID)
 	if err != nil {
 		return rootArtifactDeleteResult{}, fmt.Errorf("listing root index namespaces: %w", err)
@@ -1412,12 +1289,12 @@ func (s *Server) deleteRootArtifacts(ctx context.Context, orgID, rootID string) 
 	for _, ns := range indexNamespaces {
 		namespaces = append(namespaces, ns.Namespace)
 	}
-	return s.deleteKnownRootArtifacts(ctx, orgID, rootID, generationIDs, namespaces)
+	return s.deleteKnownRootArtifacts(ctx, orgID, rootID, namespaces)
 }
 
 // deleteKnownRootArtifacts does not consult root metadata, so a late worker
-// can repeat the cleanup after the root and its generation rows are gone.
-func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID string, generationIDs, namespaces []string) (rootArtifactDeleteResult, error) {
+// can repeat the cleanup after the root metadata is gone.
+func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID string, namespaces []string) (rootArtifactDeleteResult, error) {
 	result := rootArtifactDeleteResult{}
 	seenNamespaces := make(map[string]bool, len(namespaces)+1)
 	for _, namespace := range namespaces {
@@ -1428,10 +1305,9 @@ func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID str
 		seenNamespaces[namespace] = true
 		result.TurbopufferNamespaces = append(result.TurbopufferNamespaces, namespace)
 	}
-	if len(result.TurbopufferNamespaces) == 0 {
-		result.TurbopufferNamespaces = []string{tpNamespace(orgID, rootID)}
+	if len(result.TurbopufferNamespaces) > 0 {
+		result.TurbopufferNamespace = result.TurbopufferNamespaces[0]
 	}
-	result.TurbopufferNamespace = result.TurbopufferNamespaces[0]
 
 	var cleanupErr error
 	if s.tp != nil {
@@ -1446,15 +1322,6 @@ func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID str
 		fmt.Sprintf("sources/%s/%s/", orgID, rootID),
 		fmt.Sprintf("extractions/%s/%s/", orgID, rootID),
 		fmt.Sprintf("mutations/%s/%s/", orgID, rootID),
-		fmt.Sprintf("files/%s/", rootID),
-		fmt.Sprintf("bundles/%s/", rootID),
-		fmt.Sprintf("states/%s/", rootID),
-		fmt.Sprintf("chunks/%s/", rootID),
-	}
-	for _, generationID := range generationIDs {
-		if generationID = strings.TrimSpace(generationID); generationID != "" {
-			prefixes = append(prefixes, fmt.Sprintf("syncs/%s/", generationID))
-		}
 	}
 	if s.s3 == nil {
 		return result, cleanupErr
@@ -1468,32 +1335,6 @@ func (s *Server) deleteKnownRootArtifacts(ctx context.Context, orgID, rootID str
 		result.S3ObjectsDeleted += count
 	}
 	return result, cleanupErr
-}
-
-func (s *Server) handleGetState(w http.ResponseWriter, r *http.Request) {
-	id := auth.IdentityFromContext(r.Context())
-	if id == nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return
-	}
-	if !auth.HasScope(id, "query", "sync", "read", "write") {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "query or sync scope required"})
-		return
-	}
-	rootID := r.PathValue("id")
-
-	_, ok, err := s.rootForPermission(r.Context(), id, rootID, models.RootPermissionRead)
-	if err != nil || !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-		return
-	}
-
-	state, err := s.loadRootState(r.Context(), rootID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, state)
 }
 
 func (s *Server) handleGetEffectiveIgnorePolicy(w http.ResponseWriter, r *http.Request) {
@@ -1757,6 +1598,14 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "exactly one of pages or lines is required"})
 		return
 	}
+	requested := req.Lines
+	if requested == nil {
+		requested = req.Pages
+	}
+	if err := validateReadRange(requested); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	allowed, err := s.checkReadACL(r.Context(), id, rootID, req.Path)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1767,8 +1616,18 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snapshot, err := s.loadFileReadSnapshot(r.Context(), root, req.Path)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, errQueryRootNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
 	if req.Pages != nil {
-		resp, err := s.readFilePages(r.Context(), id, root, &req, r)
+		resp, err := s.readFilePages(r.Context(), id, root, &req, snapshot)
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, errFilePermissionsUnavailable) {
@@ -1782,7 +1641,7 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	resp, err := s.readFileLines(r.Context(), id, root, &req)
+	resp, err := s.readFileLines(r.Context(), id, root, &req, snapshot)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errFilePermissionsUnavailable) {
@@ -1796,25 +1655,21 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest, r *http.Request) (models.ReadFileResponse, error) {
-	if err := validateReadRange(req.Pages); err != nil {
-		return models.ReadFileResponse{}, err
-	}
+func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest, snapshot fileReadSnapshot) (models.ReadFileResponse, error) {
 	startPage := req.Pages.Start - 1
 	endPage := req.Pages.End - 1
 	pageFilters := []any{
-		[]any{"file_path", "Eq", req.Path},
 		[]any{"page_number", "Lte", endPage},
 	}
 	if startPage > 0 {
 		pageFilters = append(pageFilters, []any{"page_number", "Gt", startPage - 1})
 	}
 	filters := []any{"And", pageFilters}
-	rows, err := s.readFileRows(ctx, root, req.Path, filters)
+	rows, err := s.readFileRows(ctx, snapshot, filters)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
-	rows, err = s.filterReadRows(ctx, id, root, rows)
+	rows, err = s.filterRowsAccess(ctx, id, root, rows)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
@@ -1857,29 +1712,26 @@ func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *mod
 	return resp, nil
 }
 
-func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest) (models.ReadFileResponse, error) {
-	if err := validateReadRange(req.Lines); err != nil {
-		return models.ReadFileResponse{}, err
-	}
+func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *models.RootMetadata, req *models.ReadFileRequest, snapshot fileReadSnapshot) (models.ReadFileResponse, error) {
 	filters := []any{"And", []any{
-		[]any{"file_path", "Eq", req.Path},
 		[]any{"line_end", "Gt", req.Lines.Start - 1},
 		[]any{"line_start", "Lte", req.Lines.End},
 	}}
-	rows, err := s.readFileRows(ctx, root, req.Path, filters)
+	rows, err := s.readFileRows(ctx, snapshot, filters)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
-	rows, err = s.filterReadRows(ctx, id, root, rows)
+	rows, err = s.filterRowsAccess(ctx, id, root, rows)
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
 	if len(rows) == 0 {
-		metadataRows, metaErr := s.readFileMetadataRows(ctx, root, req.Path)
+		metadataRows, metaErr := s.tp.Query(ctx, snapshot.namespace, TPQuery{RankBy: []any{"chunk_index", "asc"}, Limit: 1000,
+			Filters: snapshot.filters(nil), ExcludeAttributes: append(readExcludedAttrs(), "content")})
 		if metaErr != nil {
 			return models.ReadFileResponse{}, fmt.Errorf("line range %d:%d unavailable for %s; could not inspect indexed file metadata: %w", req.Lines.Start, req.Lines.End, req.Path, metaErr)
 		}
-		metadataRows, metaErr = s.filterReadRows(ctx, id, root, metadataRows)
+		metadataRows, metaErr = s.filterRowsAccess(ctx, id, root, metadataRows)
 		if metaErr != nil {
 			return models.ReadFileResponse{}, metaErr
 		}
@@ -2000,38 +1852,6 @@ func readLineRangeUnavailableError(filePath string, requested *models.ReadRange,
 	return fmt.Errorf("line ranges unavailable for %s; indexed chunks do not include line metadata; resync this file or root and retry --lines", filePath)
 }
 
-func (s *Server) readFileMetadataRows(ctx context.Context, root *models.RootMetadata, path string) ([]map[string]any, error) {
-	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, root.OrgID, root.ID)
-	if err != nil {
-		return nil, fmt.Errorf("listing root index namespaces: %w", err)
-	}
-	if len(activeRootIndexNamespaces(indexNamespaces)) == 0 {
-		return nil, nil
-	}
-	ns, err := rootIndexNamespaceForPath(indexNamespaces, path)
-	if err != nil {
-		return nil, err
-	}
-	visibility, err := s.catalogVisibilitySnapshot(ctx, root.OrgID, root.ID, path)
-	if err != nil {
-		return nil, fmt.Errorf("resolving file publication: %w", err)
-	}
-	return s.tp.Query(ctx, ns.Namespace, TPQuery{RankBy: []any{"chunk_index", "asc"}, Limit: 1000,
-		Filters: tpAndFilter([]any{[]any{"file_path", "Eq", path}, visibility}), ExcludeAttributes: readExcludedAttrs()})
-}
-
-func (s *Server) filterReadRows(ctx context.Context, id *auth.Identity, root *models.RootMetadata, rows []map[string]any) ([]map[string]any, error) {
-	denied, err := s.buildACLFilter(ctx, id, root.ID)
-	if err != nil {
-		return nil, err
-	}
-	rows = filterDeniedQueryRows(rows, denied)
-	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		rows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, rows)
-	}
-	return rows, nil
-}
-
 func validateReadRange(r *models.ReadRange) error {
 	if r == nil || r.Start <= 0 || r.End <= 0 {
 		return fmt.Errorf("range start and end must be positive")
@@ -2062,21 +1882,6 @@ func readExcludedAttrs() []string {
 
 var errFilePermissionsUnavailable = errors.New("file permissions unavailable")
 
-// checkWriteACL checks if a user has write permission for a path in a root.
-// If no ACLs are configured for the root, all org editors+ have access.
-func (s *Server) checkWriteACL(ctx context.Context, id *auth.Identity, rootID, filePath string) bool {
-	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil {
-		return false
-	}
-	if len(acls) == 0 {
-		_, ok, rootErr := s.rootForPermission(ctx, id, rootID, models.RootPermissionSync)
-		return rootErr == nil && ok
-	}
-
-	return checkPermission(acls, filePath, "write")
-}
-
 // checkReadACL checks if a user has read permission for a path in a root.
 func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, filePath string) (bool, error) {
 	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
@@ -2084,24 +1889,6 @@ func (s *Server) checkReadACL(ctx context.Context, id *auth.Identity, rootID, fi
 		return false, errFilePermissionsUnavailable
 	}
 	return checkPermission(acls, filePath, "read"), nil
-}
-
-// buildACLFilter returns denied literal path prefixes for post-filtering.
-// An empty successful result means unrestricted; a lookup error never does.
-func (s *Server) buildACLFilter(ctx context.Context, id *auth.Identity, rootID string) ([]string, error) {
-	acls, err := s.db.GetACLsForUser(ctx, id.OrgID, rootID, id.UserID, id.Role)
-	if err != nil {
-		return nil, errFilePermissionsUnavailable
-	}
-
-	// Collect denied path prefixes
-	var denied []string
-	for _, acl := range acls {
-		if acl.Permission == "none" {
-			denied = append(denied, acl.PathPrefix)
-		}
-	}
-	return denied, nil
 }
 
 // checkPermission evaluates ACLs for a specific path and permission.
@@ -2115,57 +1902,6 @@ func checkPermission(acls []models.RootACL, filePath, _ string) bool {
 		}
 	}
 	return true // No matching ACL → allow
-}
-
-// ---------------------------------------------------------------------------
-// Historical root inventory (read-only migration audit)
-// ---------------------------------------------------------------------------
-
-func (s *Server) loadRootState(ctx context.Context, rootID string) (map[string]models.FileState, error) {
-	record, err := s.db.LoadStateRecord(ctx, rootID)
-	if err != nil {
-		return nil, err
-	}
-	if record.Ref == "" {
-		if record.State == nil {
-			return make(map[string]models.FileState), nil
-		}
-		return record.State, nil
-	}
-	if err := validateStateRef(rootID, record.Ref); err != nil {
-		return nil, err
-	}
-	data, err := s.s3.Download(ctx, record.Ref)
-	if err != nil {
-		return nil, fmt.Errorf("downloading root state %s: %w", record.Ref, err)
-	}
-	state, err := decodeRootState(record.Ref, data)
-	if err != nil {
-		return nil, err
-	}
-	return state, nil
-}
-
-func decodeRootState(ref string, data []byte) (map[string]models.FileState, error) {
-	reader := io.Reader(bytes.NewReader(data))
-	var gz *gzip.Reader
-	var err error
-	if strings.HasSuffix(ref, ".gz") {
-		gz, err = gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, fmt.Errorf("opening compressed root state %s: %w", ref, err)
-		}
-		defer gz.Close()
-		reader = gz
-	}
-	var state map[string]models.FileState
-	if err := json.NewDecoder(reader).Decode(&state); err != nil {
-		return nil, fmt.Errorf("parsing root state %s: %w", ref, err)
-	}
-	if state == nil {
-		state = make(map[string]models.FileState)
-	}
-	return state, nil
 }
 
 func filteredQueryLimit(topK int) int {
@@ -2236,25 +1972,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "mode must be fts, vector, or hybrid"})
 		return
 	}
-	if len(selection.roots) == 0 {
-		s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
-			"mode":             req.Mode,
-			"top_k":            req.TopK,
-			"has_glob":         req.Glob != "",
-			"query_scope":      selection.scope,
-			"roots_searched":   0,
-			"namespace_count":  0,
-			"raw_result_count": 0,
-			"result_count":     0,
-		})
-		writeJSON(w, http.StatusOK, models.QueryResponse{
-			Results:       []models.QueryResult{},
-			Query:         req.Query,
-			Mode:          req.Mode,
-			RootsSearched: 0,
-		})
-		return
-	}
 
 	if req.Mode == "vector" {
 		for _, root := range selection.roots {
@@ -2265,10 +1982,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	namespaces, err := s.db.queryNamespaces(r.Context(), id.OrgID, selection.roots)
+	if err != nil {
+		writeQueryError(w, err)
+		return
+	}
+
 	var needsEmbedding bool
 	if req.Mode == "vector" || req.Mode == "hybrid" {
 		for _, root := range selection.roots {
-			if !root.VectorDisabled {
+			if !root.VectorDisabled && len(namespaces[root.ID]) > 0 {
 				needsEmbedding = true
 				break
 			}
@@ -2285,35 +2008,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	allResults := make([]models.QueryResult, 0)
-	totalNamespaces := 0
-	rawResultCount := 0
-	for _, root := range selection.roots {
-		rootResults, stats, err := s.queryOneRoot(r.Context(), id, &req, root, embedding, queryLimit)
-		if err != nil {
-			if errors.Is(err, errQueryRootNotFound) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
-				return
-			}
-			if errors.Is(err, errSearchPublicationBusy) {
-				w.Header().Set("Retry-After", "1")
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "search_publication_busy", "error": errSearchPublicationBusy.Error()})
-				return
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "index search timed out"})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		totalNamespaces += stats.namespaceCount
-		rawResultCount += stats.rawResultCount
-		allResults = append(allResults, rootResults...)
+	allResults, stats, err := s.querySearchRoots(r.Context(), id, &req, selection.roots, namespaces, embedding, queryLimit)
+	if err != nil {
+		writeQueryError(w, err)
+		return
 	}
 
 	if len(selection.roots) > 1 {
 		sort.SliceStable(allResults, func(i, j int) bool {
+			if req.Mode == "vector" {
+				return allResults[i].Score < allResults[j].Score
+			}
 			return allResults[i].Score > allResults[j].Score
 		})
 	}
@@ -2327,8 +2032,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"has_glob":         req.Glob != "",
 		"query_scope":      selection.scope,
 		"roots_searched":   len(selection.roots),
-		"namespace_count":  totalNamespaces,
-		"raw_result_count": rawResultCount,
+		"namespace_count":  stats.namespaceCount,
+		"raw_result_count": stats.rawResultCount,
 		"result_count":     len(allResults),
 	})
 
@@ -2338,6 +2043,20 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		Mode:          req.Mode,
 		RootsSearched: len(selection.roots),
 	})
+}
+
+func writeQueryError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errQueryRootNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
+	case errors.Is(err, errSearchPublicationBusy):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "search_publication_busy", "error": errSearchPublicationBusy.Error()})
+	case errors.Is(err, context.DeadlineExceeded):
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "index search timed out"})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	}
 }
 
 var errQueryRootNotFound = errors.New("root not found")
@@ -2366,7 +2085,7 @@ func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *
 	}
 
 	if req.AllRoots {
-		roots, err := s.db.ListAccessibleRoots(ctx, id.OrgID, id.UserID, id.Role)
+		roots, err := s.db.accessibleRoots(ctx, id.OrgID, id.UserID, id.Role, nil)
 		if err != nil {
 			return queryRootSelection{}, fmt.Errorf("listing accessible roots: %w", err)
 		}
@@ -2381,106 +2100,104 @@ func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *
 		return queryRootSelection{roots: []models.RootMetadata{*root}, scope: "single_root"}, nil
 	}
 
-	seen := make(map[string]struct{}, len(req.RootIDs))
-	roots := make([]models.RootMetadata, 0, len(req.RootIDs))
-	for _, rawRootID := range req.RootIDs {
-		rootID := strings.TrimSpace(rawRootID)
-		if rootID == "" {
-			continue
+	seen := make(map[string]bool, len(req.RootIDs))
+	ids := make([]string, 0, len(req.RootIDs))
+	for _, raw := range req.RootIDs {
+		if rootID := strings.TrimSpace(raw); rootID != "" && !seen[rootID] {
+			seen[rootID] = true
+			ids = append(ids, rootID)
 		}
-		if _, ok := seen[rootID]; ok {
-			continue
-		}
-		seen[rootID] = struct{}{}
-		root, ok, err := s.rootForPermission(ctx, id, rootID, models.RootPermissionRead)
-		if err != nil || !ok {
+	}
+	if len(ids) == 0 {
+		return queryRootSelection{}, fmt.Errorf("root_ids must include at least one non-empty root id")
+	}
+	loaded, err := s.db.accessibleRoots(ctx, id.OrgID, id.UserID, id.Role, ids)
+	if err != nil {
+		return queryRootSelection{}, errQueryRootNotFound
+	}
+	byID := make(map[string]models.RootMetadata, len(loaded))
+	for _, root := range loaded {
+		byID[root.ID] = root
+	}
+	roots := make([]models.RootMetadata, 0, len(ids))
+	for _, rootID := range ids {
+		root, ok := byID[rootID]
+		if !ok {
 			return queryRootSelection{}, errQueryRootNotFound
 		}
-		roots = append(roots, *root)
-	}
-	if len(roots) == 0 {
-		return queryRootSelection{}, fmt.Errorf("root_ids must include at least one non-empty root id")
+		roots = append(roots, root)
 	}
 	return queryRootSelection{roots: roots, scope: "selected_roots"}, nil
 }
 
-type queryRootStats struct {
+type queryStats struct {
 	namespaceCount int
 	rawResultCount int
 }
 
-func (s *Server) queryOneRoot(ctx context.Context, id *auth.Identity, req *models.QueryRequest, root models.RootMetadata, embedding []float64, queryLimit int) ([]models.QueryResult, queryRootStats, error) {
+func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string][]models.RootIndexNamespace, embedding []float64, queryLimit int) ([]models.QueryResult, queryStats, error) {
+	stats := queryStats{}
+	results := make([]models.QueryResult, 0)
+	var searches []namespaceSearch
+	fts, ann := []any{"content", "BM25", req.Query}, []any{"vector", "ANN", embedding}
+	for _, root := range roots {
+		rankings := []any{fts}
+		if req.Mode == "vector" {
+			rankings = []any{ann}
+		}
+		if req.Mode == "hybrid" && !root.VectorDisabled {
+			rankings = []any{ann, fts}
+		}
+		for _, ns := range namespaces[root.ID] {
+			searches = append(searches, namespaceSearch{rootID: root.ID, namespace: ns.Namespace, rankings: rankings})
+		}
+	}
+	stats.namespaceCount = len(searches)
+	if len(searches) == 0 {
+		return results, stats, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	indexNamespaces, err := s.db.ListRootIndexNamespaces(ctx, id.OrgID, root.ID)
-	if err != nil {
-		return nil, queryRootStats{}, fmt.Errorf("listing root index namespaces: %w", err)
-	}
-	activeNamespaces := activeRootIndexNamespaces(indexNamespaces)
-	stats := queryRootStats{namespaceCount: len(activeNamespaces)}
-	if len(activeNamespaces) == 0 {
-		return nil, stats, nil
-	}
-
-	fts, ann := []any{"content", "BM25", req.Query}, []any{"vector", "ANN", embedding}
-	var rankings []any
-	switch req.Mode {
-	case "fts":
-		rankings = []any{fts}
-	case "vector":
-		if root.VectorDisabled {
-			return nil, stats, fmt.Errorf("root %s has vector search disabled", root.ID)
+	err := s.queryPublishedRows(ctx, id.OrgID, searches, func(search namespaceSearch, visibility any) ([][]map[string]any, error) {
+		filters := []any{visibility}
+		if req.Glob != "" {
+			filters = append(filters, []any{"file_path", "Glob", req.Glob})
 		}
-		rankings = []any{ann}
-	case "hybrid":
-		rankings = []any{ann, fts}
-		if root.VectorDisabled {
-			rankings = []any{fts}
+		queries := make([]TPQuery, len(search.rankings))
+		for i, rank := range search.rankings {
+			queries[i] = TPQuery{RankBy: rank, Limit: queryLimit, Filters: tpAndFilter(filters), ExcludeAttributes: readExcludedAttrs()}
 		}
-	default:
-		return nil, stats, fmt.Errorf("mode must be fts, vector, or hybrid")
-	}
-	rows, err := queryRootIndexNamespaces(activeNamespaces, queryLimit, func(namespace string) ([]map[string]any, error) {
-		sets, err := s.queryPublishedRows(ctx, root.OrgID, root.ID, func(visibility any) ([][]map[string]any, error) {
-			filters := []any{visibility}
-			if req.Glob != "" {
-				filters = append(filters, []any{"file_path", "Glob", req.Glob})
-			}
-			queries := make([]TPQuery, len(rankings))
-			for i, rank := range rankings {
-				queries[i] = TPQuery{RankBy: rank, Limit: queryLimit, Filters: tpAndFilter(filters), ExcludeAttributes: readExcludedAttrs()}
-			}
-			if len(queries) == 1 {
-				rows, err := s.tp.Query(ctx, namespace, queries[0])
-				return [][]map[string]any{rows}, err
-			}
-			return s.tp.MultiQuery(ctx, namespace, queries)
-		})
-		if err != nil {
-			return nil, err
+		if len(queries) == 1 {
+			rows, err := s.tp.Query(ctx, search.namespace, queries[0])
+			return [][]map[string]any{rows}, err
 		}
-		if len(sets) == 1 {
-			return sets[0], nil
-		}
-		return reciprocalRankFusion(sets, 60), nil
+		return s.tp.MultiQuery(ctx, search.namespace, queries)
 	})
 	if err != nil {
 		return nil, stats, err
 	}
-	stats.rawResultCount = len(rows)
-
-	deniedPrefixes, err := s.buildACLFilter(ctx, id, root.ID)
-	if err != nil {
+	byRoot := make(map[string][][]map[string]any)
+	for _, search := range searches {
+		rows := mergeNamespaceRows(search.sets, "hybrid", 0)
+		byRoot[search.rootID] = append(byRoot[search.rootID], rows)
+	}
+	sets := make([][]map[string]any, len(roots))
+	for i, root := range roots {
+		sets[i] = mergeNamespaceRows(byRoot[root.ID], req.Mode, queryLimit)
+		stats.rawResultCount += len(sets[i])
+	}
+	if err := s.filterSearchRowsAccess(ctx, id, roots, sets); err != nil {
 		return nil, stats, err
 	}
-	filteredRows := filterDeniedQueryRows(rows, deniedPrefixes)
-	if root.Scope == models.RootScopeUser && !auth.HasMinRole(id.Role, auth.RoleAdmin) {
-		filteredRows = s.filterByContentProof(ctx, id.OrgID, id.UserID, root.ID, filteredRows)
+	for i, root := range roots {
+		rows := sets[i]
+		if len(rows) > req.TopK {
+			rows = rows[:req.TopK]
+		}
+		results = append(results, queryResultsFromRows(root, rows)...)
 	}
-	if len(filteredRows) > req.TopK {
-		filteredRows = filteredRows[:req.TopK]
-	}
-	return queryResultsFromRows(root, filteredRows), stats, nil
+
+	return results, stats, nil
 }
 
 func filterDeniedQueryRows(rows []map[string]any, deniedPrefixes []string) []map[string]any {
@@ -2586,14 +2303,6 @@ func canManageMemberRole(actorRole, targetRole auth.Role) bool {
 	}
 }
 
-func (s *Server) canRemoveOwner(ctx context.Context, orgID string) (bool, error) {
-	count, err := s.db.CountOrgMembersByRole(ctx, orgID, auth.RoleOwner)
-	if err != nil {
-		return false, err
-	}
-	return count > 1, nil
-}
-
 func parseRootScope(raw string) (string, error) {
 	scope := strings.TrimSpace(raw)
 	if scope == "" {
@@ -2686,17 +2395,15 @@ func (s *Server) rootForPermission(ctx context.Context, id *auth.Identity, rootI
 	if id == nil {
 		return nil, false, nil
 	}
-	root, err := s.db.GetRoot(ctx, id.OrgID, rootID)
+	roots, err := s.db.accessibleRoots(ctx, id.OrgID, id.UserID, id.Role, []string{rootID})
 	if err != nil {
 		return nil, false, err
 	}
-	perms, source, err := s.db.RootPermissions(ctx, root, id.UserID, id.Role)
-	if err != nil {
-		return nil, false, err
+	if len(roots) == 0 {
+		return nil, false, pgx.ErrNoRows
 	}
-	root.Access = perms
-	root.AccessSource = source
-	return root, rootPermissionAllowed(perms, permission), nil
+	root := &roots[0]
+	return root, rootPermissionAllowed(root.Access, permission), nil
 }
 
 func tpAndFilter(filters []any) any {

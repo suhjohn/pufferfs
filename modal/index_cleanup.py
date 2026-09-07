@@ -24,22 +24,18 @@ def cleanup_record(file):
     if type(sequence) is not int or sequence < 1 or type(file["version_deleted"]) is not bool:
         raise ValueError("invalid indexed cleanup cutoff")
     older = [["version_sequence", "Lte" if file["version_deleted"] else "Lt", sequence]]
-    if not file["version_deleted"] and file["extraction_sequence"] is not None:
+    if not file["version_deleted"]:
         if type(file["extraction_sequence"]) is not int or file["extraction_sequence"] < 1:
             raise ValueError("invalid indexed extraction cutoff")
         older.append(["And", [["version_sequence", "Eq", sequence],
                               ["extraction_id", "NotEq", file["indexed_extraction_id"]],
-                              ["extraction_sequence", "NotEq", None],
                               ["extraction_sequence", "Lt", file["extraction_sequence"]]]])
     return {"namespace": file["namespace"], "write": {
         "delete_by_filter": ["And", [
             ["root_id", "Eq", file["root_id"]],
             ["file_path", "Eq", file["file_path"]],
-            ["Or", [
-                ["And", [["file_id", "Eq", file["file_id"]],
-                         ["version_sequence", "NotEq", None], ["Or", older]]],
-                ["file_id", "Eq", None],
-            ]],
+            ["file_id", "Eq", file["file_id"]],
+            ["Or", older],
         ]], "delete_by_filter_allow_partial": True,
     }}
 
@@ -58,7 +54,7 @@ def cleanup_index(s3, bucket, apply_write, *, connect=database, limit=MAX_FILES,
                 e.sequence AS extraction_sequence,
                 v.sequence,v.deleted AS version_deleted,r.org_id,r.vector_disabled
             FROM file_catalog f JOIN file_versions v ON v.id=f.indexed_version_id
-            LEFT JOIN file_extractions e ON e.id=f.indexed_extraction_id
+            JOIN file_extractions e ON e.id=f.indexed_extraction_id
             JOIN roots r ON r.id=f.root_id
             WHERE f.indexed_version_id IS NOT NULL
                 AND f.index_cleanup_due_at<=NOW() AND r.deleting_at IS NULL

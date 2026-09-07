@@ -26,9 +26,9 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index-relay index-cpu index-vector query reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index-cpu index-vector query reconciler
 runner_started=1
-"${compose[@]}" up -d transform-consumer index-consumer
+"${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_recovery.py)
 "${driver[@]}" lost-capture
 # Kill the actual embedding/index process after real provider acceptance but
@@ -37,6 +37,11 @@ driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_re
 "${driver[@]}" release
 "${compose[@]}" up -d --no-deps --wait index-vector
 "${driver[@]}" lost-recovered
+# Leave worker processes alive so this exercises their existing pooled sockets,
+# rather than testing only fresh-process database connections.
+"${compose[@]}" restart postgres
+"${driver[@]}" database-recovered
+"${driver[@]}" live-superseded
 # Keep stale physical rows available for the publication-filter assertions.
 # This phase does not claim recurring stale-row cleanup is being verified.
 "${compose[@]}" stop reconciler

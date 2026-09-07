@@ -113,7 +113,7 @@ func main() {
 	}
 
 	// Auth middleware: supports both JWT and tenant API key for normal routes.
-	appHandler := auth.Middleware(jwtSecret, db.ResolveAPIKey)(srv.Handler())
+	appHandler := auth.Middleware(jwtSecret, db.ResolveAPIKey, db.ResolveSession)(srv.Handler())
 	adminHandler := auth.AdminMiddleware(adminKeyHash())(srv.Handler())
 
 	topMux := http.NewServeMux()
@@ -141,7 +141,9 @@ func main() {
 			JWTSecret:          jwtSecret,
 			FrontendURL:        frontendURL,
 			Cookie:             cookieCfg,
-			CreateAPIKey:       db.CreateAPIKey,
+			CreateAPIKey: func(ctx context.Context, orgID, userID, name string, scopes []string) (string, error) {
+				return db.CreateAPIKey(ctx, orgID, userID, name, scopes, "")
+			},
 			LoginSucceeded: func(ctx context.Context, event auth.OAuthLoginEvent) {
 				analyticsClient.Capture(ctx, productanalytics.Event{
 					DistinctID: event.UserID,

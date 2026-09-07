@@ -1,0 +1,16 @@
+services:
+  capture-sqs:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/queue_relay.py]
+    depends_on:
+      aws: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  api:
+    environment:
+      AWS_ENDPOINT_URL_SQS: http://capture-sqs:8080
+    depends_on:
+      capture-sqs: {condition: service_healthy}

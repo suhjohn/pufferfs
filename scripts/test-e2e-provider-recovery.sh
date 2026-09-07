@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler provider-relay || true
+    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler provider-relay provider-manifest-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -27,17 +27,28 @@ finish() {
 trap finish EXIT
 "${compose[@]}" build
 # Keep collection stopped until the accepted response has been lost.
-"${compose[@]}" up -d --wait postgres aws api api-ready transform provider-relay index-cpu index-vector query reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform provider-relay provider-manifest-relay index-cpu index-vector query reconciler
 runner_started=1
-"${compose[@]}" up -d transform-consumer index-consumer
+"${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/provider_recovery.py)
+"${driver[@]}" manifest-capture
+"${compose[@]}" kill -s SIGKILL transform
+"${driver[@]}" manifest-release
+"${compose[@]}" up -d --no-deps --wait --scale collector=2 transform collector
+"${driver[@]}" manifest-recovered
+"${compose[@]}" stop collector
 "${driver[@]}" lost-capture
 "${compose[@]}" kill -s SIGKILL transform
 "${driver[@]}" release
-"${compose[@]}" up -d --no-deps --wait transform collector
+"${compose[@]}" up -d --no-deps --wait --scale collector=2 transform collector
 "${driver[@]}" lost-recovered
 "${compose[@]}" stop collector
 "${driver[@]}" partial-capture
-"${compose[@]}" up -d --no-deps --wait collector
+"${driver[@]}" result-arm
+"${compose[@]}" up -d --no-deps --wait --scale collector=2 collector
+"${driver[@]}" result-held
+"${compose[@]}" kill -s SIGKILL collector
+"${driver[@]}" manifest-release
+"${compose[@]}" up -d --no-deps --wait --scale collector=2 collector
 "${driver[@]}" partial-collected
 "${driver[@]}" partial-recovered

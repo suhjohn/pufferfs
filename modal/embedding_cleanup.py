@@ -22,17 +22,15 @@ def cleanup_embeddings(s3, bucket, *, connect=database, limit=100):
             ORDER BY last_used_at,object_key LIMIT %s FOR UPDATE SKIP LOCKED""", (retention, limit)).fetchall()
         keys = [row["object_key"] for row in cold]
         if keys:
-            conn.execute("DELETE FROM embedding_locations WHERE object_key=ANY(%s)", (keys,))
-            conn.execute("""UPDATE embedding_packs SET retired_at=NOW(),cleanup_due_at=NOW()
+            conn.execute("""UPDATE embedding_packs SET retired_at=NOW(),cleanup_due_at=NOW(),content_hashes='{}'
                 WHERE object_key=ANY(%s)""", (keys,))
         pending = conn.execute("""SELECT object_key,org_id FROM embedding_packs
             WHERE retired_at IS NOT NULL AND cleanup_due_at<=NOW()
             ORDER BY cleanup_due_at,object_key LIMIT %s FOR UPDATE SKIP LOCKED""", (limit,)).fetchall()
         for row in pending:
-            # Reject unexpected targets before any deletion. Supports both
-            # historical content-addressed keys and new single-use pack IDs.
+            # Reject unexpected targets before any deletion.
             prefix = f"embeddings/{row['org_id']}/"
-            if not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}/[0-9a-f]{64}(?:-[0-9a-f]{32})?\.f32", row["object_key"]):
+            if not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}/[0-9a-f]{64}-[0-9a-f]{32}\.f32", row["object_key"]):
                 raise ValueError("invalid embedding cleanup target")
         pending_keys = [row["object_key"] for row in pending]
         if pending_keys:

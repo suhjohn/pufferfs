@@ -196,7 +196,7 @@ func (s *Server) handleEmailLoginVerify(w http.ResponseWriter, r *http.Request) 
 	})
 
 	if challenge.Flow == "cli" {
-		rawKey, err := s.db.CreateAPIKey(r.Context(), login.OrgID, login.UserID, "CLI key from pufferfs init", []string{"sync", "query", "root:delete"})
+		rawKey, err := s.db.CreateAPIKey(r.Context(), login.OrgID, login.UserID, "CLI key from pufferfs init", []string{"sync", "query", "root:delete"}, "")
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "creating CLI key: " + err.Error()})
 			return

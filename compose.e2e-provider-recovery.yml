@@ -1,6 +1,10 @@
 # Test-only network topology. The SDK's documented base URL setting routes
 # actual provider calls through a relay; responses and paid jobs remain real.
 services:
+  postgres:
+    command: [postgres, -c, max_connections=25, -c, shared_preload_libraries=pg_stat_statements]
+    volumes:
+      - ./tests/e2e/query-observation.sql:/docker-entrypoint-initdb.d/query-observation.sql:ro
   provider-relay:
     image: ${COMPOSE_PROJECT_NAME}-worker
     build:
@@ -13,13 +17,25 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  provider-manifest-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/provider_manifest_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
   transform:
     environment:
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
+      AWS_ENDPOINT_URL_S3: http://provider-manifest-relay:8080
     depends_on:
       provider-relay: {condition: service_healthy}
+      provider-manifest-relay: {condition: service_healthy}
   collector:
     environment:
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
+      AWS_ENDPOINT_URL_S3: http://provider-manifest-relay:8080
     depends_on:
       provider-relay: {condition: service_healthy}
+      provider-manifest-relay: {condition: service_healthy}

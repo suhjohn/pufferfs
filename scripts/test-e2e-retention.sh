@@ -34,4 +34,4 @@ trap finish EXIT
 "${compose[@]}" up -d --wait postgres aws api api-ready transform index-cpu index-vector query reconciler
 runner_started=1
 "${compose[@]}" up -d transform-consumer index-consumer
-"${compose[@]}" run --rm --no-deps e2e retention-security
+"${compose[@]}" run --rm --no-deps e2e "${1:-retention-security}"

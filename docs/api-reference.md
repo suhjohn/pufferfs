@@ -401,17 +401,9 @@ Response `200`:
   "name": "workspace",
   "turbopuffer_ns": "org-...-root-...",
   "turbopuffer_namespaces": ["..."],
-  "s3_objects_deleted": 1234,
-  "sync_jobs_cancelled": 1
+  "s3_objects_deleted": 1234
 }
 ```
-
-### `GET /roots/{id}/state`
-
-Return the root's historical committed file-state map
-(`{ "<path>": { "size", "content_hash", "mtime" } }`). Requires read access.
-Retained for migration audits. Current file inventory and publication status
-come from `GET /roots/{id}/captured-files`.
 
 ### `POST /roots/{id}/read`
 
@@ -567,9 +559,11 @@ Response (`QueryResponse`):
 ```
 
 `page_number` is present for page-based results. Image storage paths are not returned.
-For a single ranking in one shard, `score` is the provider's `$dist` (lower for
-cosine distance, higher for BM25). Hybrid or cross-shard fusion uses reciprocal
-rank scores, where higher ranks first. Scores across these modes are not comparable.
+For vector search, `score` is the provider's cosine distance and smaller values
+rank first across all roots and shards. For FTS in one shard, `score` is the
+provider's BM25 score (higher ranks first). Hybrid search and FTS across shards
+use reciprocal rank scores (higher ranks first). Scores across these modes are
+not comparable.
 
 ---
 
@@ -625,7 +619,6 @@ Deletes return `409` while sync jobs are active and report
   "id": "string", "org_id": "string", "name": "string",
   "source_path": "string", "scope": "org|user|restricted", "owner_user_id": "string?",
   "access": ["read", "sync"], "access_source": "org|owner|role|user|group",
-  "visible_generation_id": "string", "visible_generation_seq": 0,
   "created_at": "RFC3339", "updated_at": "RFC3339"
 }
 ```
@@ -668,6 +661,7 @@ Deletes return `409` while sync jobs are active and report
 | Source pack | 1–128 MiB |
 | Catalog page | 1–1000 files; default 500 |
 | Capture request body | 4 MiB |
+| Read range | At most 1000 lines or pages per request |
 | Read response content | 32 MiB; request smaller ranges above this |
 | Default query top_k | 10 |
 | Namespace shards per root | 1 default, 256 max |
@@ -685,6 +679,11 @@ version IDs alone is insufficient when a newer extraction revision is pending.
 successful indexing. Raw worker errors, artifact bodies, and provider payloads
 are not exposed. These are live pages, not an atomic whole-root snapshot.
 
+`acknowledged_batches` is durably recorded progress. Current index workers update
+it when all mutation batches finish, in the same transaction that completes or
+supersedes the work. While running, it remains zero even after the provider
+has accepted some batches. A retry replays the full immutable artifact.
+
 The status option uses the same pagination, root sync permission, and path ACLs
 as ordinary catalog reads. It reads only Postgres. Omit the option (or use
 `processing=false`) for the cheaper capture-bootstrap metadata query.
@@ -695,7 +694,10 @@ Requires sync/write scope, root sync permission and existing path ACL access.
 Returns `files` and optional `next_cursor`. Limit is 1–1000; default 500. Each
 entry contains `file_id`, `path`, captured `version_id`/`sequence`,
 `indexed_version_id`, `content_hash`, `size`, `deleted` and
-`source_manifest_ref`. No source/chunk/vector bodies are returned.
+`source_manifest_ref`. No source/chunk/vector bodies are returned. Treat this
+reference as opaque in clients. It is a packed locator ending in
+`.jsonl#OFFSET:LENGTH:RECORD_SHA256` and identifies a checksummed byte range, not an S3 key including the fragment.
+Application reads should continue through the read API.
 
 Continue while `next_cursor` is present, including when `files` is empty after
 ACL filtering. Pagination is a live catalog scan, not a root-wide snapshot;

@@ -10,51 +10,7 @@ import re
 import time
 
 from file_runtime import database
-from source_io import read_manifest
-
-
-def backfill_source_extents(s3, bucket, *, connect=database, limit=25, time_budget=10):
-    deadline = time.monotonic() + time_budget
-    with connect() as conn:
-        rows = conn.execute("""SELECT v.*,f.root_id,r.org_id FROM file_versions v
-            JOIN file_catalog f ON f.id=v.file_id JOIN roots r ON r.id=f.root_id
-            WHERE v.extents_indexed_at IS NULL AND v.extents_backfill_after<=NOW()
-              AND r.deleting_at IS NULL
-            ORDER BY v.extents_backfill_after,v.id LIMIT %s FOR UPDATE OF v SKIP LOCKED""", (limit,)).fetchall()
-        if rows:
-            conn.execute("UPDATE file_versions SET extents_backfill_after=NOW()+INTERVAL '5 minutes' WHERE id=ANY(%s)",
-                         ([row["id"] for row in rows],))
-    result = {"indexed": 0, "failed": 0}
-    for version in rows:
-        if time.monotonic() >= deadline:
-            break
-        try:
-            manifest = read_manifest(s3, bucket, version)
-            with connect() as conn:
-                root = conn.execute("SELECT id FROM roots WHERE id=%s AND deleting_at IS NULL FOR UPDATE", (version["root_id"],)).fetchone()
-                if not root:
-                    continue
-                current = conn.execute("SELECT extents_indexed_at FROM file_versions WHERE id=%s", (version["id"],)).fetchone()
-                if not current or current["extents_indexed_at"] is not None:
-                    continue
-                for ordinal, extent in enumerate(manifest.get("extents") or []):
-                    source = conn.execute("""SELECT size_bytes FROM source_objects WHERE object_key=%s AND org_id=%s
-                        AND root_id=%s AND completed_at IS NOT NULL AND retired_at IS NULL""",
-                        (extent["object_key"], version["org_id"], version["root_id"])).fetchone()
-                    if not source or extent["offset"] + extent["length"] > source["size_bytes"]:
-                        raise ValueError("legacy source extent is unavailable")
-                    conn.execute("""INSERT INTO file_version_extents(version_id,ordinal,object_key,byte_offset,byte_length)
-                        VALUES(%s,%s,%s,%s,%s)""", (version["id"], ordinal, extent["object_key"], extent["offset"], extent["length"]))
-                conn.execute("UPDATE file_versions SET extents_indexed_at=NOW() WHERE id=%s", (version["id"],))
-            result["indexed"] += 1
-        except Exception:
-            # Corrupt/missing legacy metadata fails closed for its root. Delay
-            # this target so it cannot starve backfill of other roots forever.
-            result["failed"] += 1
-    return result
-
-
-ELIGIBLE_VERSION = """v.source_retired_at IS NULL AND v.extents_indexed_at IS NOT NULL
+ELIGIBLE_VERSION = """v.source_retired_at IS NULL
     AND v.created_at<NOW()-make_interval(secs=>%s) AND r.deleting_at IS NULL
     AND v.id IS DISTINCT FROM f.captured_version_id AND v.id IS DISTINCT FROM f.indexed_version_id
     AND NOT EXISTS (SELECT 1 FROM file_extractions e WHERE e.version_id=v.id
@@ -62,16 +18,14 @@ ELIGIBLE_VERSION = """v.source_retired_at IS NULL AND v.extents_indexed_at IS NO
     AND NOT EXISTS (SELECT 1 FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
         WHERE e.version_id=v.id AND (w.status NOT IN ('complete','superseded')
             OR w.updated_at>=NOW()-make_interval(secs=>%s)))
-    AND NOT EXISTS (SELECT 1 FROM provider_requests p JOIN provider_batches b ON b.id=p.batch_id
-        JOIN file_extractions e ON e.id=p.extraction_id WHERE e.version_id=v.id
-        AND b.status IN ('preparing','submitted'))"""
+    AND NOT EXISTS (SELECT 1 FROM provider_batches b
+        JOIN file_extractions e ON e.id=b.extraction_id WHERE e.version_id=v.id
+        AND b.status IN ('preparing','submitted','retry'))"""
 
 ELIGIBLE_PACK = """o.retired_at IS NULL AND o.authorized_until<NOW()
     AND o.created_at<NOW()-make_interval(secs=>%s) AND r.deleting_at IS NULL
     AND NOT EXISTS (SELECT 1 FROM file_version_extents x JOIN file_versions v ON v.id=x.version_id
-        WHERE x.object_key=o.object_key AND v.source_retired_at IS NULL)
-    AND NOT EXISTS (SELECT 1 FROM file_versions v JOIN file_catalog f ON f.id=v.file_id
-        WHERE f.root_id=o.root_id AND v.extents_indexed_at IS NULL)"""
+        WHERE x.object_key=o.object_key AND v.source_retired_at IS NULL)"""
 
 
 def cleanup_source_packs(s3, bucket, *, connect=database, limit=100, time_budget=15):

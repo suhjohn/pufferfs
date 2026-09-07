@@ -118,19 +118,17 @@ type APIKey struct {
 
 // RootMetadata represents a synced directory root.
 type RootMetadata struct {
-	ID                   string    `json:"id" db:"id"`
-	OrgID                string    `json:"org_id" db:"org_id"`
-	Name                 string    `json:"name" db:"name"`
-	SourcePath           string    `json:"source_path" db:"source_path"`
-	Scope                string    `json:"scope" db:"scope"`
-	OwnerUserID          string    `json:"owner_user_id,omitempty" db:"owner_user_id"`
-	VectorDisabled       bool      `json:"vector_disabled" db:"vector_disabled"`
-	Access               []string  `json:"access,omitempty" db:"-"`
-	AccessSource         string    `json:"access_source,omitempty" db:"-"`
-	VisibleGenerationID  string    `json:"visible_generation_id" db:"visible_generation_id"`
-	VisibleGenerationSeq int64     `json:"visible_generation_seq" db:"visible_generation_seq"`
-	CreatedAt            time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time `json:"updated_at" db:"updated_at"`
+	ID             string    `json:"id" db:"id"`
+	OrgID          string    `json:"org_id" db:"org_id"`
+	Name           string    `json:"name" db:"name"`
+	SourcePath     string    `json:"source_path" db:"source_path"`
+	Scope          string    `json:"scope" db:"scope"`
+	OwnerUserID    string    `json:"owner_user_id,omitempty" db:"owner_user_id"`
+	VectorDisabled bool      `json:"vector_disabled" db:"vector_disabled"`
+	Access         []string  `json:"access,omitempty" db:"-"`
+	AccessSource   string    `json:"access_source,omitempty" db:"-"`
+	CreatedAt      time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // RootIndexNamespace maps a logical root to one physical Turbopuffer namespace shard.

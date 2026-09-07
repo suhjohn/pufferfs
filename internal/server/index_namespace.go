@@ -33,8 +33,13 @@ func rootIndexNamespaceShardCount() int {
 	return n
 }
 
-func rootIndexNamespaceName(orgID, rootID string, shardIndex int) string {
-	return fmt.Sprintf("pfs_%s_%s_s%03d", shortNamespaceHash(orgID), shortNamespaceHash(rootID), shardIndex)
+func rootIndexNamespaceNames(orgID, rootID string, count int) []string {
+	prefix := fmt.Sprintf("pfs_%s_%s_s", shortNamespaceHash(orgID), shortNamespaceHash(rootID))
+	names := make([]string, count)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s%03d", prefix, i)
+	}
+	return names
 }
 
 func shortNamespaceHash(value string) string {

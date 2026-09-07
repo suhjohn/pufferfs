@@ -10,6 +10,7 @@ Run: uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_i
 """
 
 from contextlib import ExitStack
+import argparse
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,13 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenario", choices=("cloud-index", "worker-throughput"), default="cloud-index")
+    parser.add_argument("--workers", type=int, choices=range(1, 17), default=1,
+                        help="Independent transform/consumer processes and maximum bulk GPU containers")
+    parser.add_argument("--shards", type=int, choices=(1, 2), default=2,
+                        help="Exercise single- or multiple-namespace root routing")
+    args = parser.parse_args()
     for name in ("DATABASE_URL", "GEMINI_API_KEY", "TURBOPUFFER_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         if not os.environ.get(name):
             raise RuntimeError(f"{name} is required")
@@ -56,7 +64,7 @@ def main():
     identity = sts.get_caller_identity()
     if ":user/" not in identity["Arn"]:
         raise RuntimeError("STS federation requires an IAM-user provisioning identity")
-    print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region}), flush=True)
+    print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region, "workers": args.workers, "shards": args.shards}), flush=True)
     recovery = Path(tempfile.mkdtemp(prefix=identifier + "-"))
     state_path = recovery / "resources.json"
     state = {"identifier": identifier, "database": None, "role": None, "bucket": None,
@@ -151,7 +159,7 @@ def main():
             "TURBOPUFFER_API_KEY": os.environ["TURBOPUFFER_API_KEY"],
             "TURBOPUFFER_API_URL": os.environ.get("TURBOPUFFER_API_URL") or f"https://{os.environ.get('TURBOPUFFER_REGION', 'gcp-us-central1')}.turbopuffer.com",
             "PUFFERFS_SQS_TRANSFORM_QUEUE_URL": urls["transform"], "PUFFERFS_SQS_INDEX_QUEUE_URL": urls["index"],
-            "PUFFERFS_TP_NAMESPACE_SHARDS": "2", "PUFFERFS_EMBEDDING_DEVICE": "cuda"}
+            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards), "PUFFERFS_EMBEDDING_DEVICE": "cuda"}
         worker_name, auth_name = identifier + "-worker", identifier + "-auth"
         for name, values in ((worker_name, worker_env), (auth_name, {"PUFFERFS_MODAL_ENDPOINT_AUTH_KEY": auth_key})):
             modal.Secret.objects.create(name, values)
@@ -161,7 +169,7 @@ def main():
         # reused even while the temporary application is running.
         os.environ.update(PUFFERFS_WORKER_SECRET_NAME=worker_name, PUFFERFS_MODAL_ENDPOINT_SECRET_NAME=auth_name,
             PUFFERFS_INDEX_GPU_APP_NAME=identifier + "-index", PUFFERFS_INDEX_GPU_ENDPOINT_LABEL=identifier + "-index",
-            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query", PUFFERFS_MODAL_INDEX_MAX_CONTAINERS="1",
+            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query", PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.workers),
             PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS="0", PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS="1")
         sys.path.insert(0, str(REPOSITORY / "modal"))
         os.chdir(REPOSITORY / "modal")
@@ -184,15 +192,20 @@ def main():
                 compose("build", "api", "transform", "e2e")
                 state["compose_started"] = True
                 save()
-                compose("up", "-d", "--wait", "api", "api-ready", "transform", "index-cpu", "reconciler", "transform-consumer", "index-consumer")
-                compose("run", "--rm", "--no-deps", "e2e", "cloud-index")
+                compose("up", "-d", "--wait", "--scale", f"transform={args.workers}",
+                        "--scale", f"transform-consumer={args.workers}", "--scale", f"index-consumer={args.workers}", "api", "api-ready", "transform", "index-cpu", "reconciler", "transform-consumer", "index-consumer")
+                compose("run", "--rm", "--no-deps", "e2e", args.scenario)
             finally:
                 if state["compose_started"]:
                     compose("stop", "transform-consumer", "index-consumer", "transform", "index-cpu", "reconciler", check=False)
                     state["application_cleaned"] = compose("run", "--rm", "--no-deps", "e2e", "cleanup", check=False) == 0
                     save()
-                    with (REPOSITORY / "tests/e2e/artifacts/cloud-index.log").open("w") as output:
+                    log_path = REPOSITORY / "tests/e2e/artifacts" / f"{identifier}.log"
+                    with log_path.open("w") as output:
                         compose("logs", "--no-color", check=False, log=output)
+                    for line in log_path.read_text().splitlines():
+                        if '"event":"file_work_metrics"' in line:
+                            print(line, flush=True)
                     if not state["application_cleaned"]:
                         raise RuntimeError("Application cleanup failed; cloud resources retained for recovery")
                     compose("down", "--volumes", "--remove-orphans")

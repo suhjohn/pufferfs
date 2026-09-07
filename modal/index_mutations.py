@@ -1,5 +1,6 @@
 """Build version-isolated index rows. External publication lives in the worker."""
 
+import base64
 import json
 import posixpath
 
@@ -10,15 +11,12 @@ from extraction import indexed_file_type
 def deletion_mutation(job):
     if not job["version_deleted"] or type(job["sequence"]) is not int or job["sequence"] < 1:
         raise ValueError("deletion requires a valid tombstone version")
-    # Newer incarnations survive even if this request finishes after their
-    # publication. Legacy rows lack a file ID and are scoped by root + path.
+    # Newer incarnations survive even if this request finishes after publication.
     return {"delete_by_filter": ["And", [
         ["root_id", "Eq", job["root_id"]],
         ["file_path", "Eq", job["file_path"]],
-        ["Or", [
-            ["And", [["file_id", "Eq", job["file_id"]], ["version_sequence", "Lte", job["sequence"]]]],
-            ["file_id", "Eq", None],
-        ]],
+        ["file_id", "Eq", job["file_id"]],
+        ["version_sequence", "Lte", job["sequence"]],
     ]], "delete_by_filter_allow_partial": True}
 
 
@@ -42,7 +40,7 @@ def index_row(job, chunk, vector=None):
         if key in chunk["location"]:
             row[key] = chunk["location"][key]
     if vector is not None:
-        row["vector"] = vector
+        row["vector"] = base64.b64encode(vector).decode("ascii")
     return row
 
 

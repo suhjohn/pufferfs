@@ -26,8 +26,8 @@ def cleanup_obsolete_extractions(s3, bucket, *, connect=database, limit=5, time_
               AND v.id IS DISTINCT FROM f.indexed_version_id
               AND NOT EXISTS (SELECT 1 FROM file_work w WHERE w.extraction_id=e.id
                   AND (w.status NOT IN ('complete','superseded') OR w.updated_at>=NOW()-make_interval(secs=>%s)))
-              AND NOT EXISTS (SELECT 1 FROM provider_requests p JOIN provider_batches b ON b.id=p.batch_id
-                  WHERE p.extraction_id=e.id AND b.status IN ('preparing','submitted'))
+              AND NOT EXISTS (SELECT 1 FROM provider_batches b
+                  WHERE b.extraction_id=e.id AND b.status IN ('preparing','submitted','retry'))
             ORDER BY e.updated_at,e.id LIMIT %s FOR UPDATE OF e SKIP LOCKED)
             UPDATE file_extractions e SET artifacts_retired_at=NOW(),artifact_cleanup_due_at=NOW()
             FROM candidates c WHERE e.id=c.id RETURNING e.id""", (retention, retention, limit)).fetchall()
