@@ -97,6 +97,13 @@ one successful small-file test does not establish this result.
 
 Revision `3bb90ae` was fully deployed by successful Actions run
 [34198430937](https://github.com/suhjohn/pufferfs/actions/runs/34198430937).
+The final full deployment of `cd53596` also passed
+[34209306617](https://github.com/suhjohn/pufferfs/actions/runs/34209306617).
+Post-deploy checks verified both API replicas, one consumer per stage, K=16/32,
+DB pools of two, all six Modal role allocations, unchanged measured GPU image,
+and HTTP 200 from health, CLI version, homepage and docs. CLI latest remains
+0.8.0; these backend/tooling changes did not require another CLI release.
+
 The stable window ran September 8, 08:27:00–08:47:01 UTC (1,201.03 seconds),
 with one index consumer and eight workers on the committed image. Inventory
 sampling followed actual containers, independently of Modal's native HTTP
@@ -193,8 +200,44 @@ The initial sessions capture failed after 5,649.29 seconds because one
 resume gap and resumed work separately; do not present this as one clean run.
 The resumed capture succeeded at 03:40:25 after 3,734.06 seconds. The final
 accepted source contains 5,350 files / 20,317,775,847 bytes and transformed into
-3,656,533 chunks. Full indexing is still pending; capture completion is not
-the end of the benchmark.
+3,656,533 chunks. All 5,350 files were observed published at **10:24:51 UTC**:
+**34,756.82 seconds (9 hours 39 minutes 17 seconds)** from the original capture
+start. Final FTS/vector/hybrid queries each returned five correctly scoped
+results, and exact five-line prefix reads passed for seven files, explicitly
+including the last large file. The original root is retained.
+
+The final work catalog recorded 32 additional index attempts and no transform
+retries. Both work queues and both dead-letter queues were empty. This wall
+time includes failed capture/resume, changing allocations, deployments, natural
+platform preemptions and the extra synthetic load. It is an operational timing
+record, not an uninterrupted benchmark of the selected eight-worker profile.
+
+The long-file tail exposed a rollout limit as well. Modal retired an old
+container at 09:41:23 while a cancelled HTTP handler continued in a background
+thread. At least 79,872 of the last file's 86,360 rows had been prepared locally;
+its vectors were already stored in S3, but the whole-file mutation artifact was
+not yet durable. The ordinary lease/reconciler path started attempt three at
+09:46:44 on the same committed image. Cache reuse avoids re-encoding those
+vectors; rebuilding and publishing the artifact still costs IO and CPU time.
+This was a platform lifecycle event during the authorized deployment, not an
+injected production fault. Work permits bound execution within a container;
+they do not guarantee that Modal retains it after its native HTTP inputs exit.
+Long-lived durable worker dispatch or finer work units would need a separate
+architecture change and recovery validation.
+
+That final retry completed in 2,284.19 seconds. Its counters recorded 81,534
+cache hits and 4,525 misses (duplicate content is deduplicated within each
+embedding batch). GPU encoding took 209.23 seconds; preparation took 1,608.75
+seconds, including 696.41 seconds across 169 directory lookups and 576.05
+seconds across 407 cache reads. Publication took 673.69 seconds for 169 writes.
+These timings are inclusive, not additive. DB acquisition totaled only 1.78
+seconds across 599 acquisitions. This tail was dominated by metadata/IO and
+serial publication rather than waiting for a connection slot; raising pool
+limits or adding GPUs would not remove that single-file constraint.
+
+Later long-file processing also logged PyTorch allocator OOM warnings under
+B=32. The table's zero recorded errors applies only to its bounded measurement
+window; the measured memory peak is not an all-input safety guarantee.
 
 ### Bulk container sweep at fixed admission
 
