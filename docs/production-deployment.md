@@ -242,6 +242,10 @@ endpoint. Deployment installs it as `DATABASE_URL` in the worker secret, coverin
 transformation, indexing, collection and reconciliation. The API and ECS
 consumers retain the direct `DATABASE_URL` for startup migrations and their
 session advisory lock. Query embedding has no database connection.
+Secret updates reach newly started containers. For otherwise unchanged apps,
+use `modal app rollover APP --env main --strategy rolling` to refresh their
+configuration, then verify the new containers use the pooled endpoint before
+increasing capacity. Running work finishes on the previous containers.
 
 Keep the pooler's server connection limit separate from its client limit. For
 example, with 25 database connections and 3 reserved, four pooled server
@@ -251,6 +255,14 @@ that to 20; leave the remaining connections for administration and startup.
 Worker client connections can exceed four because each releases its server
 connection when its transaction ends. Keep certificate and hostname verification
 enabled, and measure transaction waits before increasing worker concurrency.
+
+Tune transformation's container count separately from its input concurrency.
+For example, four containers with `PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER=4`
+give the transform consumer 16 outstanding job slots. This overlaps storage
+and provider IO within each existing 2-vCPU/4-GiB worker. Keep the total at most
+64, and measure memory and throughput with representative file formats.
+Bulk GPU workers still process one file at a time because their encoder already
+batches texts and consumes substantial device memory.
 
 The Compose suites route Python workers through a real transaction-mode
 PgBouncer process capped at four server connections, while the API, consumers

@@ -26,7 +26,8 @@ def main():
         "collector": ("collector_app", "collect"),
         "reconciler": ("reconciliation_app", "reconcile"),
     }[role]
-    entry = getattr(importlib.import_module(target[0]), target[1])
+    module = importlib.import_module(target[0])
+    entry = getattr(module, target[1])
     if role in {"collector", "reconciler"}:
         stopped = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_: stopped.set())
@@ -55,10 +56,9 @@ def main():
     import uvicorn
 
     app = FastAPI()
-    # These Modal roles do not opt into @modal.concurrent: each container
-    # processes one input at a time. FastAPI's default thread pool must not
-    # introduce shared-model concurrency absent from the deployed topology.
-    invocation = threading.Lock()
+    # Match the decorated production role's input limit. GPU/query models
+    # remain single-input; transformation explicitly permits concurrent IO.
+    invocation = threading.BoundedSemaphore(module.MAX_INPUTS if role == "transform" else 1)
 
     @app.get("/healthz")
     def health():

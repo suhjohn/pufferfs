@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 import os
+import threading
 
 import boto3
 import botocore.session
@@ -10,6 +11,9 @@ from botocore.credentials import (
     CredentialProvider,
     DeferredRefreshableCredentials,
 )
+
+
+_client_lock = threading.Lock()
 
 
 class ModalIdentity(CredentialProvider):
@@ -39,4 +43,7 @@ def session():
 
 
 def client(service, **options):
-    return session().client(service, **options)
+    # Boto3 sessions mutate component caches during client construction. Each
+    # invocation owns its clients; only construction shares the session lock.
+    with _client_lock:
+        return session().client(service, **options)

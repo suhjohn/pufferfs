@@ -78,7 +78,15 @@ pulumi config set pufferfs:modalWorkspaceId "$MODAL_WORKSPACE_ID"
 pulumi config set pufferfs:modalEnvironment "$MODAL_ENVIRONMENT"
 set_config_if_present pufferfs:modalOidcProviderArn "${MODAL_OIDC_PROVIDER_ARN:-}"
 set_config_if_present pufferfs:dbMaxConnections "${PUFFERFS_DB_MAX_CONNS:-}"
-set_config_if_present pufferfs:workerTransformConcurrency "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}"
+if [[ -n "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}" ]]; then
+  transform_inputs="${PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER:-1}"
+  if ! [[ "$PUFFERFS_TRANSFORM_MAX_CONTAINERS" =~ ^[1-9][0-9]*$ && "$transform_inputs" =~ ^[1-9][0-9]*$ ]] ||
+      (( PUFFERFS_TRANSFORM_MAX_CONTAINERS > 64 || transform_inputs > 16 || PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs > 64 )); then
+    echo "Transform capacity must be 1..16 inputs per container and at most 64 total inputs." >&2
+    exit 1
+  fi
+  pulumi config set pufferfs:workerTransformConcurrency "$((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs))"
+fi
 set_config_if_present pufferfs:workerIndexConcurrency "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}"
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"

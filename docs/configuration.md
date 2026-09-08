@@ -228,6 +228,13 @@ Both `PUFFERFS_SQS_TRANSFORM_QUEUE_URL` and
 `PUFFERFS_WORKER_CONCURRENCY` (default 4, maximum 64). Pulumi defaults to
 16 concurrent jobs per consumer service.
 
+`PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER` controls simultaneous transformation
+requests inside one Modal container (1–16, default 1). The deployment workflow
+sets the transform consumer's slots to `PUFFERFS_TRANSFORM_MAX_CONTAINERS`
+times this input limit, rejecting totals above 64. Each invocation owns its AWS
+clients and temporary files; short database transactions share the worker pool.
+Bulk GPU indexing remains one request per container, with 64-text encoder batches.
+
 ### Billing (Stripe)
 
 | Variable | Meaning |
