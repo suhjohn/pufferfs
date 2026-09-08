@@ -32,9 +32,13 @@ def embedding_vectors(org_id, chunks, encode, s3, bucket, *, connect=database):
             raise ValueError("chunk content hash mismatch")
         texts[digest] = chunk["content"]
     with timed("cache_lookup"), connect() as conn:
+        # Hash membership avoids comparing every requested hash with every
+        # element of a packed directory when Postgres chooses a sequential
+        # scan. Keep one batched lookup and return each matching pack once.
         packs = conn.execute("""SELECT object_key,content_hashes,dimensions FROM embedding_packs
             WHERE org_id=%s AND model_revision=%s AND retired_at IS NULL
-              AND content_hashes && %s::text[]""", (org_id, CACHE_REVISION, list(texts))).fetchall()
+              AND EXISTS (SELECT 1 FROM unnest(content_hashes) AS entry(hash)
+                  WHERE entry.hash=ANY(%s::text[]))""", (org_id, CACHE_REVISION, list(texts))).fetchall()
     vectors = {}
     # Concurrent cold misses may publish overlapping packs. Prefer the pack
     # covering the most requested hashes; never depend on a single writer or

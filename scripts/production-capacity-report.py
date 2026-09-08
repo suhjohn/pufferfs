@@ -5,6 +5,11 @@ production-query-capacity.events.jsonl, production-pufferfs-index-gpu.log and th
 resource files named by each completed sweep event. Live backlog comparisons
 are observations, not controlled speedup estimates: file sizes and cache hits
 can change, and publication occurs only when a whole file finishes.
+
+Optional embedding-pack-uploads.jsonl contains S3 LastModified timestamps as
+at, size_bytes and vectors for one cache format. Its matching -metadata.json
+must record the inventory's started_at. Scan after the measurement window and
+before retention removes its packs; pack uploads are not search publication.
 """
 
 import argparse
@@ -56,10 +61,17 @@ def main():
     observations = rows(directory / "capacity-metrics.jsonl")
     queries = rows(directory / "production-query-capacity.events.jsonl")
     workers = worker_metrics(directory / "production-pufferfs-index-gpu.log")
-    starts, phases = {}, []
+    uploads_path = directory / "embedding-pack-uploads.jsonl"
+    uploads = rows(uploads_path) if uploads_path.exists() else []
+    upload_metadata = json.loads(uploads_path.with_name("embedding-pack-uploads-metadata.json").read_text()) if uploads else {}
+    starts, phases, requested = {}, [], {}
+    configuration_fields = ("consumer_replicas", "consumer_concurrency", "max_inputs",
+                            "batch", "commit", "database_settings")
     for event in events:
-        if event.get("event") == "capacity_sweep_started":
-            starts[event["containers"]] = event
+        if event.get("event") == "capacity_sweep_requested":
+            requested[event["containers"]] = {k: event[k] for k in configuration_fields if k in event}
+        elif event.get("event") == "capacity_sweep_started":
+            starts[event["containers"]] = {**requested.get(event["containers"], {}), **event}
         elif event.get("event") == "capacity_sweep_finished":
             phases.append((starts.pop(event["containers"]), event))
     if not phases:
@@ -76,6 +88,7 @@ def main():
         assert samples and len(settings) == start["containers"]
         assert {r["container"] for r in settings} == set(start["container_ids"])
         result = {"start": start["at"], "end": end["at"], "containers": start["containers"],
+                  "configuration": {k: start[k] for k in configuration_fields if k in start},
                   "seconds": round(duration, 3), "live_settings": settings,
                   "resource_samples": len(samples),
                   "gpu_util_percent_mean": round(statistics.mean(float(r["gpu"].split(",")[1]) for r in samples), 2),
@@ -107,6 +120,15 @@ def main():
         result.update(fully_observed_jobs=len(measured), statuses=dict(Counter(r["status"] for r in measured)),
                       peak_inputs_from_fully_observed_jobs=peaks, counts=dict(counts),
                       inclusive_worker_seconds={k: round(v, 3) for k, v in seconds.items()})
+        if uploads and timestamp(upload_metadata["started_at"]) >= finish:
+            produced = [r for r in uploads if begin <= timestamp(r["at"]) <= finish]
+            vectors = sum(r["vectors"] for r in produced)
+            result["cache_pack_uploads"] = {"packs": len(produced), "vectors": vectors,
+                "bytes": sum(r["size_bytes"] for r in produced),
+                "vectors_per_second": round(vectors / duration, 3)}
+            if args.gpu_second_price is not None and vectors:
+                cost = start["containers"] * duration * args.gpu_second_price
+                result["cache_pack_uploads"]["gpu_dollars_per_million_uploaded_vectors"] = round(cost * 1e6 / vectors, 3)
         snapshots = [r for r in observations if begin <= timestamp(r["at"]) <= finish and "work" in r]
         if len(snapshots) >= 2:
             first, last = snapshots[0], snapshots[-1]
