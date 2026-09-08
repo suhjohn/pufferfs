@@ -8,8 +8,9 @@ vector-locator backfill and partial index checkpoints are no longer supported.
 The API server, transformation consumer/worker, index consumer/worker and
 scheduled reconciler remain separately deployable roles. Their queue ownership
 and deployment topology are shown in the [role diagram and table](architecture-and-functionality.md#per-file-pipeline-deployment-roles).
-This optimization is implemented in the checkout; it has not been deployed to
-production. One consumer process can have multiple invocation slots; each slot
+Pack caching and pooling were deployed on September 7, 2026. Subsequent capacity
+experiments and their deployment status are tracked in [capacity tuning](capacity-tuning.md).
+One consumer process can have multiple invocation slots; each slot
 has one outstanding worker request. Modal independently starts worker containers
 up to the configured cap. Increasing consumer processes does not require a
 shared process-local work coordinator.
@@ -26,7 +27,7 @@ shared process-local work coordinator.
 - Redundant foreground lease renewals were removed. Background renewals and
   live-lease checks at durable completion/mutation registration remain.
 - Each immutable S3 embedding pack holds up to 512 float32 vectors (1.5 MiB for
-  the pinned 768-dimensional model). The encoder retains its internal 64-text
+  the pinned 768-dimensional model). The encoder has a separately configurable
   GPU microbatch, so larger storage batches do not enlarge GPU microbatches.
 - New vectors create a compact `embedding_packs` directory, with ordered content
   hashes, model revision and dimensions. Their array position locates the S3
@@ -35,16 +36,18 @@ shared process-local work coordinator.
 The database still stores hashes and their GIN lookup index, plus work ownership,
 publication and cleanup metadata. Five rows does not mean five hashes or a
 corresponding reduction in every byte of database storage. Each new cache pack
-uses two write statements and one locking SELECT across two transactions:
-register its cleanup target, lock the live pack, then publish its directory and
-timestamp after successful S3 upload.
+uses two write statements across two short transactions: register its cleanup
+target, then conditionally publish its directory and timestamp after S3 upload.
 Chunks, vector bodies and replayable search mutations remain in S3.
 
 Concurrent cold misses may create overlapping immutable packs. Reads resolve
 these deterministically without requiring a single writer; duplicates are safe
-and expire through ordinary cache retention. A row lock spans each bounded S3
-read/write so retirement cannot remove a pack in use. Cache retirement clears
-its hash directory and keeps a tombstone for late-object cleanup.
+and expire through ordinary cache retention. Cache S3 reads and writes occur
+outside database transactions. If a read loses a race with retirement, its 404
+becomes a cache miss. A late upload cannot revive a retired directory; the
+already computed vectors still support publication, and the tombstone schedules
+object cleanup. Existing daily tombstone sweeps also cover a writer dying after
+a late PUT or a concurrent cleanup completion delaying the next sweep.
 
 ## Controlled single-worker measurement
 

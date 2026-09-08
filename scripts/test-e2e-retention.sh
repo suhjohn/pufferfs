@@ -10,6 +10,9 @@ export PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS=120
 export PUFFERFS_SOURCE_RETENTION_SECONDS=120
 project="pufferfs-retention-${GITHUB_RUN_ID:-local}-$$"
 compose=(docker compose --env-file /dev/null --profile test -p "$project" -f compose.e2e.yml)
+if [[ "${1:-}" == "embedding-io" ]]; then
+  compose+=(-f compose.e2e-embedding-io.yml)
+fi
 mkdir -p tests/e2e/artifacts
 runner_started=0
 finish() {

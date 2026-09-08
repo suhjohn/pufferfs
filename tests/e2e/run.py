@@ -1145,6 +1145,9 @@ if __name__ == "__main__":
     if phase == "embedding-retention":
         from retention_security import check_embedding_retention
         functions[phase] = lambda: check_embedding_retention(provision())
+    if phase == "embedding-io":
+        from embedding_io import verify as verify_embedding_io
+        functions[phase] = verify_embedding_io
     if phase == "retention-security":
         from retention_security import verify as verify_retention_security
         functions[phase] = verify_retention_security

@@ -1,7 +1,7 @@
 """Retire cold vector-cache packs; published mutations already contain vectors.
 
-Readers/writers hold a pack row lock through S3 IO. Retirement removes cache
-locators atomically and permanently fences that object identity. No publication,
+Readers/writers release database transactions before S3 IO. Retirement removes
+cache locators atomically and permanently fences that object identity. No publication,
 source, chunk, work lease or retry record is removed. A cache miss can be encoded
 again; an existing mutation can still be replayed without the cache.
 """

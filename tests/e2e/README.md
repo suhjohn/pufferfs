@@ -553,6 +553,18 @@ source-retention scenarios. Cloud logs are saved per project under `artifacts/`;
 cloud databases share the provisioning cluster's total connection budget, so
 run cloud scenarios sequentially when its spare capacity is limited.
 
+`bash scripts/test-e2e-retention.sh embedding-io` delays actual embedding-cache
+GET and PUT requests through an external S3 relay. Scheduled 120-second expiry
+must retire/delete the pack while the worker's network call remains in flight.
+Releasing the GET returns a real S3 404 and the worker re-encodes; releasing the
+PUT writes real bytes after retirement, preserves the directory tombstone and
+schedules those late bytes for deletion. Both cases verify one work attempt,
+durable vector mutations, exact CLI-captured source reads and all search modes.
+The scenario uses the ordinary SDK setting `AWS_MAX_ATTEMPTS=10` so network
+retries outlast the shortened TTL. It shares the documented Compose differences
+(CPU Nomic execution, local Postgres and LocalStack) and injects no production
+faults or clock/database mutations.
+
 ### Multiple API servers and request query counts
 
 `bash scripts/test-e2e-api-access.sh` starts two real API containers using Compose

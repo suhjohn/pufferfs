@@ -13,7 +13,10 @@ native text/logs, cached reindexing, and document/media provider work.
 - Keep direct API/consumer connection pools at two per process, Python worker
   client pools at two per process, and the existing transaction pooler's shared
   backend limit at four. Do not use more connections to conceal long transactions.
-- Use synthetic isolated inputs for E2E experiments. Track the separately
+- Use synthetic isolated inputs for fault/recovery E2E experiments. Production
+  capacity testing is explicitly authorized: capture synthetic user roots using
+  the released CLI, observe real queues/workers and measure search under load.
+  Track the separately
   authorized sessions reindex as an operational observation, not a controlled
   before/after comparison.
 - Find efficient per-container input concurrency before increasing container
@@ -51,3 +54,59 @@ prove a controlled speedup or an optimum across file formats.
 The final deliverable must contain tested K/N/I/B/H settings and a scaling rule
 for each role, deployment verification, and explicit limits. A green build or
 one successful small-file test does not establish this result.
+
+## September 7 production experiment ledger
+
+This ledger distinguishes desired configuration from observed execution. Times
+below use UTC on September 8 (September 7 in Pacific time).
+
+| Revision / event | Observed result | Limitation |
+| --- | --- | --- |
+| `41ddc6f`: native index input concurrency; separate encoder wait/run metrics | Recovery E2E passed in 546.33 s; full corpus E2E passed in 903.96 s. Compose index and transform processes each reached four concurrent inputs. | Most full-corpus index work uses the CPU role; this does not establish concurrent GPU throughput. |
+| Initial 64-text L4 batch | One CUDA OOM at 03:00:19 in an older, single-input worker. | Predates execution of the concurrent revision. Batch 64 is not a reliable baseline for all captured records. |
+| 03:13:35: two L4 containers, four inputs, batch 32 deployed | Modal continued serving old workers and reported insufficient L4 scheduling capacity. | Exclude this transition from stable throughput comparisons. |
+| `b5d0763`: deployment shell correction | The old `/bin/sh` interpreter skipped Bash capacity conditions. Fresh deployment applied one index consumer with K=8, verified in ECS task revision 62. | Earlier desired K=8 observations actually ran K=16; account for this in historical comparisons. |
+| `76495ec`: configurable bulk GPU type | A10 experiment requested at 03:25:10 with the same N=2, I=4, B=32 and K=8. | Record actual startup, placement, throughput, memory and errors before choosing hardware. |
+| Rollout probes at 03:33:43 and 03:35:49 | Temporarily allowing N=3 brought up one replacement during each probe. The cap returned to N=2 after 60 s and 10 s respectively; A10 workers started at 03:34:10 and 03:36:12. | Old workers draining long jobs can temporarily exceed the steady allocation. Scheduling messages alone did not identify the constraint. Exclude the transition from comparisons. |
+| Cache IO transaction change | Real delayed-GET and late-PUT retirement E2E passed in 450.69 s; index crash/restart/replay E2E passed in 536.80 s. | Production throughput measurements still pending. |
+
+The transform consumer remains one replica with K=16 (N=4, I=4). Both consumers
+request 1 ECS vCPU and 2 GiB. Modal execution workers request `cpu=2` and 4096
+MiB; Modal counts CPU in **physical cores**, so this is four vCPUs in Modal's
+pricing terminology. Memory is a request, not a hard cap. See
+[Modal resource units](https://modal.com/docs/guide/resources).
+
+GPU-only base rates are $0.7992/hour for L4 and $1.1016/hour for A10, excluding
+CPU, memory, network and any placement premium. Compare completed chunks per
+dollar, including idle/warm container time, rather than GPU hourly price alone.
+[Modal pricing](https://modal.com/pricing)
+
+The initial sessions capture failed after 5,649.29 seconds because one
+128-file batch exceeded the default 2 GiB spool. A normal resume began at
+02:38:10 with an explicitly configured 4 GiB spool. Report the failed attempt,
+resume gap and resumed work separately; do not present this as one clean run.
+
+The synthetic production root captures 16 distinct JSONL files (3,872 chunks),
+one 500-row CSV and one four-page PDF. Capture accepted 18 files / 16,941,934
+bytes in 3.678 seconds. The PDF completed real provider transformation about
+109 seconds after enqueue. Indexing initially waited behind the sessions
+backlog; capture acceptance is not search readiness.
+
+Reproduce CLI observations with `scripts/production-capacity.py`: `capture`
+creates its own root and stores fixture expectations/cleanup identity in
+`--state`; `verify` waits for publication and checks reads/search; `query`
+measures FTS/vector/hybrid latency; `cleanup` deletes only the recorded synthetic
+root. Supply the released binary using `--binary`. Query probes include CLI
+startup and network time and are low-rate responsiveness checks, not a query
+capacity benchmark. Root/work identities and logs remain in private artifacts.
+
+Modal gives containers the same hostname (`modal`), so per-container aggregation
+must use the documented `MODAL_TASK_ID`; local Compose uses its unique hostname.
+Metrics now also identify the image. Historical metrics containing only that
+shared hostname cannot establish per-container peaks across multiple workers.
+
+CloudWatch's preceding two-hour observation (120 one-minute samples per service)
+reported average consumer CPU below 0.14% and peak one-minute CPU below 0.98%;
+average memory below 0.39% of the requested 2 GiB. These consumers hold queue
+receipts and outstanding HTTP calls. Their idle CPU is not evidence of spare
+GPU computation or a reason to request larger consumer instances.

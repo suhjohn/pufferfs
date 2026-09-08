@@ -42,7 +42,9 @@ def profile_work(stage):
         def measured(work, *args, **kwargs):
             metrics = {"event": "file_work_metrics", "stage": stage, "work_id": work,
                        "seconds": {}, "counts": {}, "status": "error",
-                       "started_at": time.time(), "container": socket.gethostname(),
+                       "started_at": time.time(),
+                       "container": os.getenv("MODAL_TASK_ID") or socket.gethostname(),
+                       "image": os.getenv("MODAL_IMAGE_ID", "local"),
                        "region": os.getenv("MODAL_REGION", "local")}
             token = current.set(metrics)
             started = time.perf_counter()

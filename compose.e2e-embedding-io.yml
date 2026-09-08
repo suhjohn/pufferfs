@@ -1,0 +1,18 @@
+services:
+  embedding-relay:
+    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-worker
+    entrypoint: [python, /e2e/embedding_relay.py]
+    depends_on:
+      aws: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  index-vector:
+    environment:
+      AWS_ENDPOINT_URL_S3: http://embedding-relay:8080
+      # Keep real SDK retries in flight through actual 120-second cache expiry.
+      AWS_MAX_ATTEMPTS: '10'
+    depends_on:
+      embedding-relay: {condition: service_healthy}
