@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 set -eu
 
 require_env() {
@@ -86,6 +86,7 @@ if [[ -n "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}" ]]; then
     exit 1
   fi
   pulumi config set pufferfs:workerTransformConcurrency "$((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs))"
+  echo "Transform consumer concurrency: $((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs)) (${PUFFERFS_TRANSFORM_MAX_CONTAINERS} containers x ${transform_inputs} inputs)"
 fi
 if [[ -n "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}" ]]; then
   index_inputs="${PUFFERFS_INDEX_INPUTS_PER_CONTAINER:-1}"
@@ -95,6 +96,7 @@ if [[ -n "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}" ]]; then
     exit 1
   fi
   pulumi config set pufferfs:workerIndexConcurrency "$((PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs))"
+  echo "Index consumer concurrency: $((PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs)) (${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS} containers x ${index_inputs} inputs)"
 fi
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
