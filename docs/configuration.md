@@ -111,6 +111,7 @@ variables. Group by concern below.
 | Variable | Meaning | Default / notes |
 | --- | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. | **Required.** |
+| `PUFFERFS_WORKER_DATABASE_URL` | Deployment-only override for the Python worker database URL, such as a transaction-pooled endpoint. Installed as `DATABASE_URL` in the Modal worker secret; API and consumer migration connections keep their original URL. | Defaults to `DATABASE_URL`. |
 | `PUFFERFS_WORKER_DB_MAX_CONNS` | Maximum PostgreSQL connections per Python worker process; 2–16, with no reserved minimum. Idle connections expire after one minute. | `2` |
 | `PUFFERFS_DB_MAX_CONNS` | Maximum PostgreSQL connections per Go API/consumer process; 1–64. Idle connections expire after one minute. | `4` |
 | `PORT` | HTTP listen port. | server default |

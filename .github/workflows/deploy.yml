@@ -58,6 +58,7 @@ jobs:
       IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
       CLI_RELEASE_VERSION: ${{ inputs.cli_release_version || vars.PUFFERFS_CLI_LATEST_VERSION }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PUFFERFS_WORKER_DATABASE_URL: ${{ secrets.PUFFERFS_WORKER_DATABASE_URL }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
       MODAL_SECRET_KEY: ${{ secrets.MODAL_SECRET_KEY }}

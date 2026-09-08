@@ -1,3 +1,9 @@
+FROM postgres:17-alpine AS pgbouncer
+RUN apk add --no-cache pgbouncer
+COPY tests/e2e/pgbouncer.ini tests/e2e/pgbouncer-users.txt /etc/pgbouncer/
+USER postgres
+ENTRYPOINT ["pgbouncer", "/etc/pgbouncer/pgbouncer.ini"]
+
 FROM golang:1.25 AS cli
 WORKDIR /src
 COPY go.mod go.sum ./

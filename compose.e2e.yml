@@ -33,17 +33,22 @@ x-environment: &environment
   # Python SDK reject a fixed URL, even when its region argument is omitted.
   TURBOPUFFER_API_URL: ${TURBOPUFFER_API_URL:-https://${TURBOPUFFER_REGION:-gcp-us-central1}.turbopuffer.com}
 
+x-worker-environment: &worker-environment
+  <<: *environment
+  DATABASE_URL: postgres://postgres:e2e-only@pgbouncer:6432/pufferfs_e2e?sslmode=disable
+
 x-worker: &worker
   image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-worker
   build:
     context: .
     dockerfile: tests/e2e/Dockerfile
     target: worker
-  environment: *environment
+  environment: *worker-environment
   init: true
   restart: 'no'
   depends_on:
     api-ready: {condition: service_completed_successfully}
+    pgbouncer: {condition: service_healthy}
   healthcheck:
     test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
     interval: 5s
@@ -68,6 +73,19 @@ services:
       POSTGRES_PASSWORD: e2e-only
     healthcheck:
       test: [CMD-SHELL, pg_isready -U postgres -d pufferfs_e2e]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  pgbouncer:
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: pgbouncer
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -p, '6432', -U, postgres, -d, pufferfs_e2e]
       interval: 2s
       timeout: 3s
       retries: 30
@@ -142,14 +160,14 @@ services:
     <<: *worker
     command: [transform]
     environment:
-      <<: *environment
+      <<: *worker-environment
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
 
   collector:
     <<: *worker
     command: [collector]
     environment:
-      <<: *environment
+      <<: *worker-environment
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     healthcheck:
       test: [CMD, python, -c, "import pathlib,time; assert time.time()-pathlib.Path('/tmp/role-heartbeat').stat().st_mtime < 1000"]
@@ -169,7 +187,7 @@ services:
       dockerfile: tests/e2e/Dockerfile
       target: vector
     environment:
-      <<: *environment
+      <<: *worker-environment
       PUFFERFS_EMBEDDING_DEVICE: cpu
       OMP_NUM_THREADS: '2'
       HF_HUB_OFFLINE: '1'

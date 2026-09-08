@@ -236,6 +236,29 @@ administrative connections. For a small database, begin with 2 for all three
 settings and increase only with measured headroom. Compose limits Postgres to
 25 connections and Go pools to 2 to exercise this constraint.
 
+To share database connections across Python workers, set the production GitHub
+environment secret `PUFFERFS_WORKER_DATABASE_URL` to a transaction-pooled
+endpoint. Deployment installs it as `DATABASE_URL` in the worker secret, covering
+transformation, indexing, collection and reconciliation. The API and ECS
+consumers retain the direct `DATABASE_URL` for startup migrations and their
+session advisory lock. Query embedding has no database connection.
+
+Keep the pooler's server connection limit separate from its client limit. For
+example, with 25 database connections and 3 reserved, four pooled server
+connections plus four Go processes capped at two each consume at most 12
+application connections in steady operation. Rolling Go replicas can raise
+that to 20; leave the remaining connections for administration and startup.
+Worker client connections can exceed four because each releases its server
+connection when its transaction ends. Keep certificate and hostname verification
+enabled, and measure transaction waits before increasing worker concurrency.
+
+The Compose suites route Python workers through a real transaction-mode
+PgBouncer process capped at four server connections, while the API, consumers
+and assertion runner use direct Postgres connections. The local pooler uses
+isolated fixture credentials without TLS; production uses provider-managed
+PgBouncer with verified TLS. Postgres version and hosting differences remain
+as documented for the existing Compose environment.
+
 Optional CLI release variables:
 
 ```text

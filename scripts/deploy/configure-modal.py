@@ -17,6 +17,9 @@ def main():
     outputs = json.loads(subprocess.check_output(["pulumi", "stack", "output", "--json"], cwd=infra))
     region = os.environ.get("AWS_REGION", "us-west-2")
     values = {name: os.environ[name] for name in required[:3]}
+    # Workers use short transactions and can share a transaction pooler. Keep
+    # API/consumer startup migrations on the independently configured URL.
+    values["DATABASE_URL"] = os.environ.get("PUFFERFS_WORKER_DATABASE_URL", "").strip() or values["DATABASE_URL"]
     values.update({
         "AWS_REGION": region, "AWS_DEFAULT_REGION": region,
         "AWS_BUCKET_NAME": outputs["artifactBucket"],
