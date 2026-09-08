@@ -13,6 +13,7 @@ app = modal.App(os.getenv("PUFFERFS_COLLECTOR_APP_NAME", "pufferfs-batch-collect
 COLLECTOR_WORKERS = int(os.environ.get("PUFFERFS_COLLECTOR_WORKERS", "1"))
 if not 1 <= COLLECTOR_WORKERS <= 16:
     raise ValueError("PUFFERFS_COLLECTOR_WORKERS must be 1..16")
+collector_image = cpu_image.env({"PUFFERFS_COLLECTOR_WORKERS": str(COLLECTOR_WORKERS)})
 
 
 def advance_batch(batch, client, s3, bucket):
@@ -50,7 +51,7 @@ def advance_batch(batch, client, s3, bucket):
     collect_batch(batch, client, s3, bucket)
 
 
-@app.function(image=cpu_image, secrets=[worker_secret], cpu=2, memory=4096,
+@app.function(image=collector_image, secrets=[worker_secret], cpu=2, memory=4096,
               timeout=900, max_containers=COLLECTOR_WORKERS)
 def collect():
     from aws_clients import client as aws_client
@@ -99,7 +100,7 @@ def collect():
     publish_pending(sqs)
 
 
-@app.function(image=cpu_image, secrets=[worker_secret], timeout=60,
+@app.function(image=collector_image, secrets=[worker_secret], timeout=60,
               max_containers=1, schedule=modal.Period(minutes=1))
 def dispatch():
     for _ in range(COLLECTOR_WORKERS):

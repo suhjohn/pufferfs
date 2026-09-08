@@ -6,17 +6,19 @@ import modal
 from nomic_model import cache_model
 
 app = modal.App(os.getenv("PUFFERFS_QUERY_APP_NAME", "pufferfs-query"))
+GPU = os.getenv("PUFFERFS_MODAL_QUERY_EMBED_GPU", "L4")
 image = (modal.Image.debian_slim(python_version="3.12")
          .pip_install("sentence-transformers>=3", "torch>=2", "einops>=0.7", "fastapi[standard]")
          .add_local_file("nomic_model.py", "/root/nomic_model.py", copy=True)
          .add_local_file("role_auth.py", "/root/role_auth.py", copy=True)
-         .run_function(cache_model))
+         .run_function(cache_model)
+         .env({"PUFFERFS_EMBEDDING_DEVICE": "cpu" if GPU == "none" else "cuda"}))
 endpoint_secret = modal.Secret.from_name(
     os.getenv("PUFFERFS_MODAL_ENDPOINT_SECRET_NAME", "pufferfs-endpoint-auth"))
 
 
 @app.cls(image=image, secrets=[endpoint_secret],
-         gpu=os.getenv("PUFFERFS_MODAL_QUERY_EMBED_GPU", "L4"), cpu=2, memory=4096,
+         gpu=None if GPU == "none" else GPU, cpu=2, memory=4096,
          timeout=300, scaledown_window=900,
          min_containers=int(os.getenv("PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS", "1")),
          max_containers=int(os.getenv("PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS", "2")))

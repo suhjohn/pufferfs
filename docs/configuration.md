@@ -181,7 +181,7 @@ Source capture tuning uses plain integer byte values:
 | `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | Bulk pool limit; default 16 |
 | `PUFFERFS_INDEX_INPUTS_PER_CONTAINER` | Concurrent jobs inside each CPU/GPU index container; 1–16, default 1 |
 | `PUFFERFS_EMBED_BATCH_SIZE` | Texts per bulk model batch; 1–128, default 64. Choose within the GPU's measured memory capacity. |
-| `PUFFERFS_MODAL_QUERY_EMBED_GPU` | Query GPU; default L4 |
+| `PUFFERFS_MODAL_QUERY_EMBED_GPU` | Query GPU; default L4. Set `none` for the same model on CPU. The selected device is embedded in the query image. |
 | `PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS` | Warm query workers; default 1 |
 | `PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS` | Query pool limit; default 2 |
 
@@ -584,7 +584,10 @@ transformation worker (default 4, range 1–16). It does not change the 64-input
 batch size or the number of worker containers. `PUFFERFS_COLLECTOR_WORKERS`
 is set when deploying the collector application (default 1, range 1–16). It
 controls both the maximum concurrent collector containers and the invocations
-started by the minute dispatcher. Collectors independently claim renewable leases. Each alternates provider collection, extraction assembly
+started by the minute dispatcher. The value is embedded in the deployed image
+so the remote dispatcher's module import uses the same count as its container
+cap. GitHub deployments accept the matching environment variable. Collectors
+independently claim renewable leases. Each alternates provider collection, extraction assembly
 and cleanup during a nominal 50-second work window; a long operation may extend
 the invocation, within its 900-second timeout.
 

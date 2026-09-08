@@ -3,9 +3,10 @@
 PufferFS turns changing local files into independently recoverable, searchable
 versions while preserving source bytes and access controls.
 
-The per-file pipeline is now the only implementation in this checkout. It is
-not yet a production rollout: the deployed fleet may still run an older release.
-Previous storage formats are not converted. See the
+The per-file pipeline is the production implementation, deployed September 7,
+2026. [Capacity tuning](capacity-tuning.md) records current experiments and
+distinguishes desired settings from live workers. Previous storage formats are
+not converted. See the
 [fresh-schema audit](fresh-schema-audit.md) for the removed compatibility paths.
 
 ## Per-file pipeline: deployment roles

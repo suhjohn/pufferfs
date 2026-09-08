@@ -30,6 +30,34 @@ compute/provider batch, and H is CPU/RAM/GPU per container. The initial admissio
 relationship with one consumer is K = N × I. Index CPU/GPU destinations share
 one consumer budget today; that relationship assumes a homogeneous destination.
 
+The [deployment diagram and role table](architecture-and-functionality.md#per-file-pipeline-deployment-roles)
+define each role's trigger, input, output and handoff. Their baseline allocations
+for this experiment are below. Modal CPU numbers are physical cores; ECS CPU
+numbers are vCPUs. Memory values are requests unless explicitly called limits.
+
+| Deployable role | Baseline replicas / admission | Per-instance resources | Scaling signal and next adjustment |
+| --- | --- | --- | --- |
+| Local agent | One capture; four uploads; batches of 128 files | User machine; this run explicitly uses a 4 GiB spool limit | Measure upload/link and local hashing rates before increasing upload concurrency; a capture batch must fit the configured spool. |
+| API server | Two replicas; DB pool two each | ECS: 1 vCPU / 2 GiB each | Keep redundancy. Size or scale against request latency, CPU and memory; account for added direct DB connections and rolling overlap. |
+| Transform consumer | One replica; K=16 | ECS: 1 vCPU / 2 GiB | Within this one-replica experiment, change K with transformation execution slots, not in response to idle consumer CPU. |
+| Transformation worker | N=4, I=4 | Modal: two cores / 4 GiB | Increase I when IO leaves CPU idle and measured RSS permits it; increase N when runnable work waits with the existing workers busy. Provider uploads also have their own per-job concurrency limit. |
+| Collector dispatcher | One scheduled invocation per minute | Modal default: 0.125 core / 128 MiB | Launch the configured collector count; dispatcher replicas do not accelerate a provider job. |
+| Provider collector / assembler | N=1, I=1; 50-second loop, up to 900 seconds for a long operation | Modal: two cores / 4 GiB | Increase N when overdue polls, completed provider results or assembly work wait on busy collectors. Remote provider processing time alone is not this signal. Claims use renewable DB leases. |
+| Index consumer | One replica; K=8 | ECS: 1 vCPU / 2 GiB | Admit enough jobs to feed the chosen CPU/GPU slots. Both destinations share K and one SQS queue today; a mixed workload can consume slots unevenly. |
+| CPU index worker | N=2, I=4 | Modal: two cores / 4 GiB | Overlap IO first; add containers only when publication throughput rises without exceeding DB/search limits. |
+| Bulk index worker | N=2, I=4, B=32; N=2/3/4 sweep in progress at fixed K=8 | Modal: A10, two cores / 4 GiB | Stop increasing I when encoder wait dominates and GPU utilization is high. Compare N using publication throughput, utilization, DB waits and cost; do not treat a higher cap as added capacity until workers are running. |
+| Query embedder | One warm, maximum two; I=1 | Modal: L4, two cores / 4 GiB | Preserve a separate query pool. Compare CPU/GPU latency on the same search workload before choosing hardware; scale against query queueing and latency. |
+| Reconciler | One scheduled invocation per minute | Modal: one core / 512 MiB | Track oldest unrepaired handoff and cleanup work. The current deployment is a singleton; multi-reconciler execution needs separate E2E coverage before raising this cap. |
+
+For R consumer replicas, total admitted work is R × K. Adding replicas while
+keeping K unchanged also increases outstanding worker calls and direct DB
+connections. Start a horizontal scaling calculation with the required service
+rate and measured per-container rate; do not derive GPU count from a consumer's
+spare CPU. The fixed shared pooler's four backends do not grow with worker count.
+Stop a scaling step when throughput flattens, DB acquisition/query latency rises,
+publication/provider limits bind, or query responsiveness degrades. These are
+scaling rules; unmeasured steps above the tested sweep are not capacity claims.
+
 1. Record source revision, deployed settings, workload size/type, cache state,
    warm/cold model state, resource placement, and fixed downstream limits.
 2. Compare index I = 1, 2, 4 on the same bounded GPU allocation. Separate actual
