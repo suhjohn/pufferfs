@@ -7,6 +7,7 @@ CLI's ordinary configuration. Production fault injection is outside its scope.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
 from pathlib import Path
@@ -24,10 +25,16 @@ def main():
     parser.add_argument("--query", default="telescope calibration")
     parser.add_argument("--seconds", type=int, default=600)
     parser.add_argument("--interval", type=float, default=15)
+    parser.add_argument("--operation-timeout", type=int, default=600,
+                        help="Seconds allowed for one CLI operation, including a large capture")
+    parser.add_argument("--read-concurrency", type=int, default=1,
+                        help="Maximum simultaneous fixture verification requests (1..16)")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    if args.seconds < 1 or args.interval < 1:
-        parser.error("seconds and interval must be positive")
+    if args.seconds < 1 or args.interval < 1 or args.operation_timeout < 1:
+        parser.error("seconds, interval and operation timeout must be positive")
+    if not 1 <= args.read_concurrency <= 16:
+        parser.error("read concurrency must be 1..16")
     if args.root and args.mode != "query":
         parser.error("--root is only accepted for read-only query measurements")
     args.state.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +51,8 @@ def main():
 
     def cli(*arguments):
         started = time.monotonic()
-        response = subprocess.run([args.binary, *arguments], capture_output=True, text=True, timeout=600)
+        response = subprocess.run([args.binary, *arguments], capture_output=True, text=True,
+                                  timeout=args.operation_timeout)
         elapsed = time.monotonic() - started
         if response.returncode:
             event(operation=arguments[0], exit_code=response.returncode, seconds=round(elapsed, 3))
@@ -144,12 +152,17 @@ def main():
         time.sleep(args.interval)
     else:
         raise RuntimeError("Observation deadline reached; root and state retained for continued verification")
-    for fixture in state["fixtures"]:
+    def verify_fixture(fixture):
         if fixture["kind"] == "native":
-            result, _ = cli("read", fixture["path"], "--root", root, "--lines",
-                            f"1:{fixture['lines']}", "--json")
             expected = (Path(state["directory"]) / fixture["path"]).read_text().splitlines()
-            assert [row["content"] for row in result["lines"]] == expected
+            assert len(expected) == fixture["lines"]
+            # The public read contract permits at most 1,000 items per call.
+            for start in range(0, len(expected), 1000):
+                end = min(start + 1000, len(expected))
+                result, _ = cli("read", fixture["path"], "--root", root, "--lines",
+                                f"{start + 1}:{end}", "--json")
+                assert [row["content"] for row in result["lines"]] == expected[start:end]
+            event(operation="native_read_verified", path=fixture["path"], lines=len(expected))
         elif fixture["kind"] == "document":
             result, _ = cli("read", fixture["path"], "--root", root,
                             "--pages", f"1:{fixture['pages']}", "--json")
@@ -169,6 +182,9 @@ def main():
                 assert any(text in hit["content"] for hit in hits)
                 event(operation="structured_search_verified", path=fixture["path"],
                       seconds=round(elapsed, 3), results=len(hits))
+    with ThreadPoolExecutor(max_workers=args.read_concurrency) as executor:
+        for _ in executor.map(verify_fixture, state["fixtures"]):
+            pass
     for mode in ("fts", "vector", "hybrid"):
         result, elapsed = cli("query", "telescope calibration", "--root", root,
                               "--mode", mode, "--top-k", "5", "--json")

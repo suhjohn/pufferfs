@@ -1,6 +1,16 @@
-# Capacity tuning: measurement contract
+# Capacity tuning: measured production profile
 
-Status: experiments in progress; no final optimum has been established.
+The selected profile is **one index consumer, K=32, up to eight A10 workers,
+four file inputs per worker and embedding batches of 32**. GPU workers request
+two vCPUs and 6 GiB. The 20-minute production window kept GPUs 88.89% busy and
+published 260.94 chunks/s while vector/hybrid query p95 remained 1.317/1.702 s.
+The database plan, connection pools and shared pooler capacity did not change.
+
+This is a measured operating point for the tested native-text workload. It is
+not a global optimum, a controlled speedup comparison, or a capacity guarantee
+for all document/media formats. Eight is a scale-out cap; bulk workers retain
+min=0 and a 900-second scale-down window. An idle allocation can therefore
+remain billed briefly after its queue drains.
 
 ## Objective and fixed constraints
 
@@ -31,21 +41,21 @@ relationship with one consumer is K = N × I. Index CPU/GPU destinations share
 one consumer budget today; that relationship assumes a homogeneous destination.
 
 The [deployment diagram and role table](architecture-and-functionality.md#per-file-pipeline-deployment-roles)
-define each role's trigger, input, output and handoff. Their baseline allocations
-for this experiment are below. Modal CPU numbers are physical cores; ECS CPU
-numbers are vCPUs. Memory values are requests unless explicitly called limits.
+define each role's trigger, input, output and handoff. The selected allocations
+are below; later sections preserve the earlier experimental settings. Modal CPU
+numbers are physical cores; ECS CPU numbers are vCPUs. Memory values are requests unless explicitly called limits.
 
-| Deployable role | Baseline replicas / admission | Per-instance resources | Scaling signal and next adjustment |
+| Deployable role | Selected replicas / admission | Per-instance resources | Scaling signal and next adjustment |
 | --- | --- | --- | --- |
-| Local agent | One capture; four uploads; batches of 128 files | User machine; this run explicitly uses a 4 GiB spool limit | Measure upload/link and local hashing rates before increasing upload concurrency; a capture batch must fit the configured spool. |
+| Local agent | One capture; serial source-pack/part uploads; batches of 128 files | User machine; the sessions run explicitly uses a 4 GiB spool limit | The released capture journal uploads immutable packs and multipart parts serially. Measure link and hashing rates before changing this path; a capture batch must fit the configured spool. |
 | API server | Two replicas; DB pool two each | ECS: 1 vCPU / 2 GiB each | Keep redundancy. Size or scale against request latency, CPU and memory; account for added direct DB connections and rolling overlap. |
 | Transform consumer | One replica; K=16 | ECS: 1 vCPU / 2 GiB | Within this one-replica experiment, change K with transformation execution slots, not in response to idle consumer CPU. |
 | Transformation worker | N=4, I=4 | Modal: two cores / 4 GiB | Increase I when IO leaves CPU idle and measured RSS permits it; increase N when runnable work waits with the existing workers busy. Provider uploads also have their own per-job concurrency limit. |
 | Collector dispatcher | One scheduled invocation per minute | Modal default: 0.125 core / 128 MiB | Launch the configured collector count; dispatcher replicas do not accelerate a provider job. |
-| Provider collector / assembler | N=1, I=1; 50-second loop, up to 900 seconds for a long operation | Modal: two cores / 4 GiB | Increase N when overdue polls, completed provider results or assembly work wait on busy collectors. Remote provider processing time alone is not this signal. Claims use renewable DB leases. |
-| Index consumer | One replica; K=8 | ECS: 1 vCPU / 2 GiB | Admit enough jobs to feed the chosen CPU/GPU slots. Both destinations share K and one SQS queue today; a mixed workload can consume slots unevenly. |
-| CPU index worker | N=2, I=4 | Modal: two cores / 4 GiB | Overlap IO first; add containers only when publication throughput rises without exceeding DB/search limits. |
-| Bulk index worker | N=2, I=4, B=32; N=2/3/4 sweep completed at fixed K=8 | Modal: A10, two cores / 4 GiB | Stop increasing I when encoder wait dominates and GPU utilization is high. Compare N using publication throughput, utilization, DB waits and cost; do not treat a higher cap as added capacity until workers are running. |
+| Provider collector / assembler | N=2, I=1; 50-second loop, up to 900 seconds for a long operation | Modal: two cores / 4 GiB | Increase N when overdue polls, completed provider results or assembly work wait on busy collectors. Remote provider processing time alone is not this signal. Claims use renewable DB leases. |
+| Index consumer | One replica; K=32 | ECS: 1 vCPU / 2 GiB | Admit enough jobs to feed the chosen CPU/GPU slots. Both destinations share K and one SQS queue today; a mixed workload can consume slots unevenly. |
+| CPU index worker | N=8, I=4 | Modal: two cores / 4 GiB | Overlap IO first; add containers only when publication throughput rises without exceeding DB/search limits. |
+| Bulk index worker | N=8, I=4, B=32 | Modal: A10, one physical core (two vCPUs) / 6 GiB | Stop increasing I when encoder wait dominates and GPU utilization is high. Compare N using publication throughput, utilization, DB waits and cost; do not treat a higher cap as added capacity until workers are running. |
 | Query embedder | One warm, maximum two; I=1 | Modal: CPU, two cores / 4 GiB | Preserve a separate query pool. The CPU query experiment below removed the warm L4. Scale against query queueing and latency. |
 | Reconciler | One scheduled invocation per minute | Modal: one core / 512 MiB | Track oldest unrepaired handoff and cleanup work. The current deployment is a singleton; multi-reconciler execution needs separate E2E coverage before raising this cap. |
 
@@ -60,8 +70,8 @@ scaling rules; unmeasured steps above the tested sweep are not capacity claims.
 
 1. Record source revision, deployed settings, workload size/type, cache state,
    warm/cold model state, resource placement, and fixed downstream limits.
-2. Compare index I = 1, 2, 4 on the same bounded GPU allocation. Separate actual
-   encoder time from encoder-lock wait, database wait/transaction time, S3 IO,
+2. For a future controlled concurrency sweep, compare index I = 1, 2, 4 on the
+   same bounded GPU allocation. Separate actual encoder time from encoder-lock wait, database wait/transaction time, S3 IO,
    and search writes. Compare B where memory and encoder measurements justify it.
 3. Measure native transformation, provider submission/collection, CPU indexing,
    query latency under ingestion load, and local capture. Tune the observed
@@ -71,7 +81,7 @@ scaling rules; unmeasured steps above the tested sweep are not capacity claims.
 5. Verify the chosen configuration with complete CLI/API workflows, updates,
    deletes, duplicate delivery, crashes/restarts, authorization, and source reads.
 
-## Evidence required before completion
+## Measurement contract
 
 Record capture-to-search time, sustained source bytes/chunks per second, queue
 wait, CPU/GPU utilization, peak RAM/VRAM, error/retry rates, database connection
@@ -83,10 +93,78 @@ The final deliverable must contain tested K/N/I/B/H settings and a scaling rule
 for each role, deployment verification, and explicit limits. A green build or
 one successful small-file test does not establish this result.
 
-## September 7 production experiment ledger
+## Selected profile: completed production window
+
+Revision `3bb90ae` was fully deployed by successful Actions run
+[34198430937](https://github.com/suhjohn/pufferfs/actions/runs/34198430937).
+The stable window ran September 8, 08:27:00–08:47:01 UTC (1,201.03 seconds),
+with one index consumer and eight workers on the committed image. Inventory
+sampling followed actual containers, independently of Modal's native HTTP
+runner count. All 960 resource probes succeeded; eight containers were observed
+throughout, with no replacement in this window.
+
+| Measurement | Result |
+| --- | ---: |
+| K / N / I / B | 32 / 8 / 4 / 32 |
+| GPU / CPU / RAM request per index worker | A10 / 2 vCPU / 6 GiB |
+| Mean GPU utilization | 88.89% |
+| Mean process CPU / peak RSS | 1.275 logical cores / 5.047 GiB |
+| Peak observed VRAM | 22,129 MiB |
+| Completed attempts / recorded errors | 167 / 0 |
+| Published files / chunks / source bytes | 167 / 313,391 / 1,788,551,450 |
+| Publication rate | 260.94 chunks/s; 1.489 MB/s |
+| New cache pack vectors / upload rate | 231,119 / 192.44 vectors/s |
+| GPU-only cost per million uploaded vectors | $12.72 |
+| FTS / vector / hybrid CLI p95 | 1.174 / 1.317 / 1.702 s |
+| Peak observed other database connections | 14 |
+
+Publication totals include all roots served by the measured allocation, including
+files whose execution started before the window. S3 pack uploads also include
+unfinished work and duplicate concurrent cache misses; they are not unique
+searchable chunks. The workload mixed the remaining real sessions with dense
+synthetic JSONL. Query measurements have 37 samples per mode. Placement was
+unpinned. Process RSS and sampled VRAM are observations, not hard memory limits.
+GPU-only cost uses sampled allocation time and excludes CPU, memory, network,
+placement premiums and warm-up outside the window.
+
+Start/finish telemetry observed a maximum of four executing attempts on every
+worker, including unfinished attempts; 32 remained active at the end. Two
+finished attempts lacked start events in the collected log, so telemetry is not
+an exhaustive execution audit. The separate cancellation/restart E2E establishes
+the permit's behavior across the external process boundary.
+
+At 08:49 the cap briefly increased to 16 and the single consumer to K=64. The
+dense synthetic root progressed from 321/512 completed files at 08:49:19 to all
+512 at 09:02:05. This includes rollout, cold starts and a draining workload.
+No comparable 16-worker resource window was captured, so neither its utilization
+nor cost efficiency is established. The cap returned to eight / K=32 at 09:11.
+A matched-workload 8-versus-16 test remains future work if more service rate is
+required; the current data does not justify calling sixteen optimal.
+
+Four inputs already overlap IO while one encoder fills each GPU. Additional
+inputs cannot multiply the GPU's compute capacity, and measured VRAM leaves
+limited batch-size headroom. Keep I=4/B=32. For a homogeneous GPU backlog, use
+K=N×4 with one consumer; with R consumers, divide the intended total admission
+across them instead of multiplying K accidentally. Increase N only when queued
+work requires more service rate and measurements show useful additional
+throughput without worse query latency or DB waits. Mixed CPU/GPU work shares
+one queue and K today; independent admission by destination would require a
+separate design and E2E validation.
+
+Other roles retain the table's allocations. CPU indexing and transformation
+have four-input recovery/corpus coverage; two collectors have provider recovery
+coverage. Their maximum sustainable production rates were not independently
+measured. The local capture producer, remote providers, collector assembly and
+shared database remain possible limits on other workloads. Do not infer capacity
+for these roles from the native GPU result or claim every CPU/RAM allocation
+should be fully occupied. A file is the scheduling unit: a tail of fewer large
+files than workers leaves GPUs idle regardless of K. Splitting one large file
+across workers is a separate architectural change, not a container setting.
+
+## September 7–8 production experiment ledger
 
 This ledger distinguishes desired configuration from observed execution. Times
-below use UTC on September 8 (September 7 in Pacific time).
+below use UTC on September 8 (September 7–8 in Pacific time).
 
 | Revision / event | Observed result | Limitation |
 | --- | --- | --- |
@@ -99,8 +177,8 @@ below use UTC on September 8 (September 7 in Pacific time).
 | `6d1c52f`: cache IO transaction change | Real delayed-GET and late-PUT retirement E2E passed in 450.69 s; index crash/restart/replay E2E passed in 536.80 s. Production measurements below use this image. | These tests establish recovery behavior, not a controlled throughput improvement from the transaction change alone. |
 
 The transform consumer remains one replica with K=16 (N=4, I=4). Both consumers
-request 1 ECS vCPU and 2 GiB. Modal execution workers request `cpu=2` and 4096
-MiB; Modal counts CPU in **physical cores**, so this is four vCPUs in Modal's
+request 1 ECS vCPU and 2 GiB. At this earlier stage, Modal execution workers
+requested `cpu=2` and 4096 MiB; Modal counts CPU in **physical cores**, so this is four vCPUs in Modal's
 pricing terminology. Memory is a request, not a hard cap. See
 [Modal resource units](https://modal.com/docs/guide/resources).
 
@@ -143,7 +221,7 @@ Two containers were the most cost-efficient observed allocation. Four published
 more chunks during their window, but eight admitted jobs left substantially
 more GPU capacity unused. This does not establish the behavior of four
 containers with K=16, nor a global optimum. For a homogeneous GPU workload,
-K=8/N=2/I=4 is the current measured starting point for one consumer.
+K=8/N=2/I=4 was the initial measured starting point for one consumer.
 
 These are sequential observations of a changing real backlog, with mixed file
 sizes, token lengths and cache hits. Whole-file publication is bursty and some
@@ -203,8 +281,8 @@ A read-only lease audit also found 39 live index attempts while Modal reported
 32 running inputs. All eight containers remained in the inventory even when
 the SDK's runner count temporarily reported fewer. The initial eight-worker
 resource collector also missed its last reading on one container (959 of 960
-expected samples). That window is retained as provisional and is being repeated,
-not promoted to a completed capacity result.
+expected samples). That window remains provisional; the completed bounded
+eight-worker window above supersedes it.
 
 Earlier tables report configured I, not a proven bound on work surviving HTTP
 cancellation. GPU allocation/utilization and completed publication measurements
@@ -220,8 +298,8 @@ adapter's extra invocation gate is removed so E2E runs exercise these production
 limits directly. The strengthened recovery E2E passed in 615.85 seconds: all four
 original handlers stayed within the work limit while four replacement requests
 waited, and all eight files published with one attempt and passed CLI read/search.
-The full corpus E2E also passed in 1,015.62 seconds. A fresh production capacity
-comparison remains pending.
+The full corpus E2E also passed in 1,015.62 seconds. The completed production
+window above measured the deployed work limit.
 
 Consumer logs also confirmed that Go's default ten-redirect limit terminated
 several long-running Modal calls, despite their one-hour HTTP timeout. Modal
@@ -311,12 +389,12 @@ rewrite. The lower vector/publication rates do not establish a regression or
 speedup: this later window processed a different mix of records, and the new
 workers ran in `eu-frankfurt-1` and `us-ashburn-1`. Four inputs already kept these
 GPUs busy; increasing input concurrency alone cannot multiply encoder compute
-capacity. The next bounded experiment tests N=8 with one consumer at K=32,
-retaining I=4/B=32/A10 and the database budget. Observed process CPU averaged
-about 1.14–1.17 logical cores and peaked below 1.6, while RSS reached 5.343 GiB.
-The next deployment requests one physical CPU core (two vCPUs) and 6 GiB per
-bulk GPU worker. This allocation still needs production measurement; earlier
-results used two physical cores and a 4 GiB request.
+capacity. The subsequent bounded experiment above measured N=8 with one
+consumer at K=32, retaining I=4/B=32/A10 and the database budget. Observed process
+CPU averaged about 1.14–1.17 logical cores and peaked below 1.6, while RSS reached 5.343 GiB.
+Revision `3bb90ae` reduced the CPU request to one physical core (two vCPUs)
+and raised memory to 6 GiB per bulk GPU worker. Its measured allocation appears
+above; earlier results used two physical cores and a 4 GiB request.
 
 The synthetic production root captures 16 distinct JSONL files (3,872 chunks),
 one 500-row CSV and one four-page PDF. Capture accepted 18 files / 16,941,934
@@ -329,6 +407,25 @@ physical line reads for a spreadsheet; that failed attempt is retained. The
 corrected verifier follows the spreadsheet search contract and preserves the
 first publication observation. This is backlog latency, not isolated service time.
 
+The same 18 source files were captured into a new synthetic root to exercise
+tenant-scoped vector reuse. All 3,880 vectors were cache hits, with zero misses
+and zero GPU encoding. Each file completed in one attempt. Exact native reads,
+all PDF pages, spreadsheet content search and FTS/vector/hybrid queries passed.
+
+| Small synthetic corpus | Cold capture | Cached capture |
+| --- | ---: | ---: |
+| Capture acceptance | 3.678 s | 11.988 s |
+| Capture to observed publication, including queue wait | 14,077.873 s | 2,439.497 s |
+| New vectors / reused vectors | 3,880 / 0 | 0 / 3,880 |
+| Summed GPU encoding time | 26.473 s | 0 s |
+| Summed worker invocation time | 1,149.700 s | 407.478 s |
+
+The two runs had different queue conditions, placement and serving revisions;
+their wall times are not a controlled speedup comparison. The cache counters
+establish reuse. Both roots were deleted through the CLI after verification;
+read-only inspection confirmed empty storage prefixes and index rows, removed
+catalog entries, and retained durable deletion artifacts/tombstones.
+
 Reproduce CLI observations with `scripts/production-capacity.py`: `capture`
 creates its own root and stores fixture expectations/cleanup identity in
 `--state`; `verify` waits for publication and checks reads/search; `query`
@@ -336,6 +433,29 @@ measures FTS/vector/hybrid latency; `cleanup` deletes only the recorded syntheti
 root. Supply the released binary using `--binary`. Query probes include CLI
 startup and network time and are low-rate responsiveness checks, not a query
 capacity benchmark. Root/work identities and logs remain in private artifacts.
+
+For a bounded, denser machine-generated-text workload, first run
+`scripts/production-capacity-fixtures.py --state <manifest> --files 512 --records 1024`,
+then pass that manifest to the same capture/verify/cleanup commands. This creates
+512 equal JSONL files, 524,288 records and approximately 2.96 GB. Each record
+mixes prose with separate hexadecimal identifiers of up to 64 characters; a sample contains
+3,592 tokens with the deployed pinned tokenizer. It is an explicit stress
+workload, not a replay of the sessions distribution. For large local uploads,
+set `--operation-timeout 7200` on capture; the default observation limit is ten
+minutes. The current run resumed its original upload journal after adjusting
+that observer limit and must not be presented as an uninterrupted capture.
+All 512 files were observed published at 09:02:05 UTC, 5,147.36 seconds
+(85.79 minutes) after capture began. Capture acceptance took 1,595.57 seconds
+including the interruption, or 1.858 MB/s of acknowledged source bytes. An
+initial verifier exceeded the API's 1,000-item read limit; verification now
+pages through all fixture lines using that public contract. `--read-concurrency`
+can bound simultaneous verification requests; it defaults to one. All 524,288
+source lines across 512 files matched exactly, and FTS/vector/hybrid queries
+passed at 09:15:32. The work catalog recorded one index attempt per file.
+Collected metrics covered 509 of those files, with 521,216 misses and zero hits;
+missing log events prevent claiming complete cache telemetry. CLI deletion and
+durable cleanup were verified at 09:17:33: the root catalog was removed, three
+object prefixes and its index rows were empty, and deletion artifacts remained.
 
 Modal gives containers the same hostname (`modal`), so per-container aggregation
 must use the documented `MODAL_TASK_ID`; local Compose uses its unique hostname.

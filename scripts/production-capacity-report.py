@@ -33,6 +33,18 @@ def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(fraction * len(values)) - 1)] if values else None
 
 
+def allocation_seconds(inventories, begin, finish, initial_count):
+    cursor, count, total = begin, initial_count, 0
+    for snapshot in sorted(inventories, key=lambda r: r["at"]):
+        if snapshot["at"] > finish:
+            break
+        if snapshot["at"] > begin:
+            total += count * (snapshot["at"] - cursor)
+            cursor = snapshot["at"]
+        count = len(snapshot["container_ids"])
+    return total + count * (finish - cursor)
+
+
 def worker_metrics(path, event_type="file_work_metrics"):
     result = {}
     for line in path.read_text(errors="replace").splitlines():
@@ -68,55 +80,85 @@ def main():
     upload_metadata = json.loads(uploads_path.with_name("embedding-pack-uploads-metadata.json").read_text()) if uploads else {}
     starts, phases, requested = {}, [], {}
     configuration_fields = ("consumer_replicas", "consumer_concurrency", "max_inputs",
-                            "batch", "commit", "database_settings")
+                            "batch", "commit", "database_settings", "cpu_physical_cores",
+                            "memory_mib", "gpu", "sampling_mode")
     for event in events:
+        key = event.get("measurement_id", event.get("containers"))
         if event.get("event") == "capacity_sweep_requested":
-            requested[event["containers"]] = {k: event[k] for k in configuration_fields if k in event}
+            requested[key] = {k: event[k] for k in configuration_fields if k in event}
         elif event.get("event") == "capacity_sweep_started":
-            starts[event["containers"]] = {**requested.get(event["containers"], {}), **event}
+            starts[key] = {**requested.get(key, {}), **event}
         elif event.get("event") == "capacity_sweep_measurement_started":
             # An explicit readiness observation can exclude rollout drain time
             # while retaining the original resource samples and event history.
-            phase = starts[event["containers"]]
+            phase = starts[key]
             phase["allocation_ready_at"] = phase["at"]
             phase["at"] = event["at"]
             phase["warmup_exclusion_reason"] = event["reason"]
         elif event.get("event") == "capacity_sweep_caveat":
-            starts[event["containers"]].setdefault("caveats", []).append(event["reason"])
+            starts[key].setdefault("caveats", []).append(event["reason"])
         elif event.get("event") == "capacity_sweep_finished":
-            phases.append((starts.pop(event["containers"]), event))
+            phases.append((starts.pop(key), event))
     if not phases:
         raise SystemExit("No completed capacity measurement window yet")
     for start, end in phases:
         begin, finish = timestamp(start["at"]), timestamp(end["at"])
         duration = finish - begin
-        samples, settings = [], []
+        samples, settings, inventories = [], [], []
         for filename in end["resource_files"]:
             # Resolve by basename so private artifact directories can be moved.
             resource = rows(directory / Path(filename).name)
             settings.extend(r for r in resource if r.get("event") == "settings")
             samples.extend(r for r in resource if r.get("event") == "sample" and begin <= r["at"] <= finish)
-        assert samples and len(settings) == start["containers"]
-        assert {r["container"] for r in settings} == set(start["container_ids"])
+            inventories.extend(r for r in resource if r.get("event") == "inventory" and begin <= r["at"] <= finish)
+        adaptive = start.get("sampling_mode") == "periodic_inventory"
+        container_ids = set(end["observed_container_ids"] if adaptive else start["container_ids"])
+        assert samples
+        assert {r["container"] for r in settings} == set(end["sampled_container_ids"] if adaptive else start["container_ids"])
+        assert len(settings) == len({r["container"] for r in settings})
+        if not adaptive:
+            assert len(settings) == start["containers"]
+        gpu_seconds = start["containers"] * duration
+        if adaptive:
+            assert inventories
+            gpu_seconds = allocation_seconds(inventories, begin, finish, start["containers"])
         result = {"start": start["at"], "end": end["at"], "containers": start["containers"],
                   "configuration": {k: start[k] for k in configuration_fields if k in start},
                   "seconds": round(duration, 3), "live_settings": settings,
                   "resource_samples": len(samples),
                   "gpu_util_percent_mean": round(statistics.mean(float(r["gpu"].split(",")[1]) for r in samples), 2),
                   "gpu_memory_mib_peak": max(float(r["gpu"].split(",")[3]) for r in samples),
-                  "process_cpu_cores_mean": round(statistics.mean(r["cpu_cores"] for r in samples), 3),
+                  "process_cpu_cores_mean": round(statistics.mean(r["cpu_cores"] for r in samples if r["cpu_cores"] is not None), 3),
                   "process_rss_gib_peak": round(max(r["rss_bytes"] for r in samples) / 2**30, 3)}
+        if adaptive:
+            result["container_lifecycle"] = {"observed_containers": len(container_ids),
+                "final_containers": len(end["final_container_ids"]),
+                "peak_inventory": max(len(r["container_ids"]) for r in inventories),
+                "sampled_gpu_allocation_seconds": round(gpu_seconds, 3),
+                "probe_count": end["probe_count"], "unavailable_probes": end["unavailable_probes"],
+                "resource_coverage_fraction": end["resource_coverage_fraction"]}
         if "allocation_ready_at" in start:
             result["allocation_ready_at"] = start["allocation_ready_at"]
             result["warmup_exclusion_reason"] = start["warmup_exclusion_reason"]
         if "caveats" in start:
             result["caveats"] = start["caveats"]
-        measured = [r for r in workers if r["container"] in start["container_ids"]
+        measured = [r for r in workers if r["container"] in container_ids
                     and begin <= r["started_at"] and r["started_at"] + r["total_seconds"] <= finish]
-        finished_attempts = [r for r in workers if r["container"] in start["container_ids"]
+        finished_attempts = [r for r in workers if r["container"] in container_ids
                              and begin <= r["started_at"] + r["total_seconds"] <= finish]
         result["finished_attempt_statuses"] = dict(Counter(r["status"] for r in finished_attempts))
-        admitted = [r for r in attempt_starts if r["container"] in start["container_ids"]
+        # Count publication across all roots served by this allocation, including
+        # jobs that started before the window. An already-complete duplicate
+        # returns without source/chunk counts and contributes no new publication.
+        published_work = {r["work_id"]: r for r in finished_attempts
+                          if r["status"] == "complete" and "chunks" in r["counts"]}
+        published_chunks = sum(r["counts"]["chunks"] for r in published_work.values())
+        published_bytes = sum(r["counts"]["source_bytes"] for r in published_work.values())
+        result["publication_from_worker_metrics"] = {
+            "files": len(published_work), "chunks": published_chunks, "source_bytes": published_bytes,
+            "chunks_per_second": round(published_chunks / duration, 3),
+            "source_bytes_per_second": round(published_bytes / duration, 3)}
+        admitted = [r for r in attempt_starts if r["container"] in container_ids
                     and r["started_at"] <= finish
                     and completion_times.get((r["work_id"], r["started_at"]), math.inf) >= begin]
         if admitted:
@@ -133,8 +175,14 @@ def main():
                     peak = max(peak, current)
                 peaks[container] = peak
             result["peak_executing_attempts_from_start_events"] = peaks
+            final_ids = set(end["final_container_ids"]) if adaptive else container_ids
             result["attempts_open_at_window_end"] = sum(
-                completion_times.get((r["work_id"], r["started_at"]), math.inf) > finish for r in admitted)
+                completion_times.get((r["work_id"], r["started_at"]), math.inf) > finish
+                and r["container"] in final_ids for r in admitted)
+            if adaptive:
+                result["unfinished_attempts_on_departed_containers"] = sum(
+                    completion_times.get((r["work_id"], r["started_at"]), math.inf) > finish
+                    and r["container"] not in final_ids for r in admitted)
             known_starts = {(r["work_id"], r["started_at"]) for r in admitted}
             result["finished_attempts_missing_start_event"] = sum(
                 (r["work_id"], r["started_at"]) not in known_starts for r in finished_attempts)
@@ -165,7 +213,7 @@ def main():
                 "bytes": sum(r["size_bytes"] for r in produced),
                 "vectors_per_second": round(vectors / duration, 3)}
             if args.gpu_second_price is not None and vectors:
-                cost = start["containers"] * duration * args.gpu_second_price
+                cost = gpu_seconds * args.gpu_second_price
                 result["cache_pack_uploads"]["gpu_dollars_per_million_uploaded_vectors"] = round(cost * 1e6 / vectors, 3)
         snapshots = [r for r in observations if begin <= timestamp(r["at"]) <= finish and "work" in r]
         if len(snapshots) >= 2:
@@ -181,7 +229,9 @@ def main():
                 "source_bytes_per_second": round(delta["bytes"] / wall, 3),
                 "max_observed_connections": max(sum(c["count"] for c in r.get("connections", [])) for r in snapshots)}
             if args.gpu_second_price is not None:
-                cost = start["containers"] * wall * args.gpu_second_price
+                allocated = allocation_seconds(inventories, timestamp(first["at"]), timestamp(last["at"]),
+                                               start["containers"]) if adaptive else start["containers"] * wall
+                cost = allocated * args.gpu_second_price
                 result["observed_root_publication"].update(gpu_allocation_dollars=round(cost, 4),
                     gpu_dollars_per_million_published_chunks=round(cost * 1e6 / delta["chunks"], 3) if delta["chunks"] > 0 else None)
         result["query_latency_seconds"] = {}
