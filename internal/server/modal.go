@@ -30,7 +30,18 @@ func NewModalClient() *ModalClient {
 		fileCPUIndexURL: os.Getenv("MODAL_FILE_CPU_INDEX_ENDPOINT"),
 		queryEmbedURL:   os.Getenv("MODAL_QUERY_EMBED_ENDPOINT"),
 		secretKey:       os.Getenv("MODAL_SECRET_KEY"),
-		httpClient:      &http.Client{Timeout: time.Hour},
+		httpClient: &http.Client{
+			Timeout: time.Hour,
+			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+				// Modal polls long-running web inputs with a 303 every 150s.
+				// Go's default ten redirects ends a valid one-hour call early.
+				// Retain a finite redirect bound alongside the overall timeout.
+				if len(via) >= 32 {
+					return fmt.Errorf("Modal exceeded 32 redirects")
+				}
+				return nil
+			},
+		},
 	}
 }
 

@@ -73,6 +73,7 @@ async def arm(request: Request):
     if (config.get("operation", "write") not in {"write", "query"}
             or config.get("mode") not in {"hold_request", "hold_response"}
             or type(config.get("skip", 0)) is not int or not 0 <= config.get("skip", 0) <= 100
+            or type(config.get("count", 1)) is not int or not 1 <= config.get("count", 1) <= 64
             or not isinstance(names, list) or not 1 <= len(names) <= 256
             or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", name) for name in names)):
         raise HTTPException(400)
@@ -80,7 +81,7 @@ async def arm(request: Request):
         raise HTTPException(409, "release the previous fault first")
     fault = {"id": uuid.uuid4().hex, "namespaces": set(names), "mode": config["mode"],
              "operation": config.get("operation", "write"), "skip": config.get("skip", 0),
-             "claimed": False, "gate": asyncio.Event()}
+             "remaining": config.get("count", 1), "gate": asyncio.Event()}
     return {"fault_id": fault["id"]}
 
 
@@ -104,12 +105,12 @@ async def write(namespace: str, request: Request):
             raise HTTPException(413)
     operation = "query" if request.url.path.endswith("/query") else "write"
     selected = None
-    if fault is not None and not fault["claimed"] and namespace in fault["namespaces"] and operation == fault["operation"]:
+    if fault is not None and fault["remaining"] and namespace in fault["namespaces"] and operation == fault["operation"]:
         if fault["skip"]:
             fault["skip"] -= 1
         else:
             selected = fault
-            selected["claimed"] = True
+            selected["remaining"] -= 1
     encoding = request.headers.get("content-encoding", "identity").lower()
     if encoding == "gzip":
         with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:

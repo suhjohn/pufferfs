@@ -170,8 +170,67 @@ aggregate throughput.
 The next production deployment (`a97d35b`, successful Actions run
 `34187912797`) raised N to four and K to sixteen while retaining I=4/B=32 and
 one consumer per stage. It also deployed two collectors and retained CPU query
-embedding. The K=16 measurement is in progress; exclude the rolling deployment
-from stable comparisons and do not treat this candidate as the final choice.
+embedding. Its 04:57:53–05:17:59 window produced the following observations:
+
+| N / K / I / B | GPU utilization | New cache vectors/s | Published chunks/s | GPU-only $ / million uploaded vectors | Completed attempts / errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 / 16 / 4 / 32 | 85.26% | 101.20 | 105.20 | 12.10 | 234 / 0 |
+
+Increasing admission from eight to sixteen filled the four-GPU allocation:
+all sixteen input slots stayed occupied, and GPU utilization rose from the
+earlier 59.86% observation to 85.26%. Compared with two GPUs / eight jobs, the
+new-vector upload rate approximately doubled at essentially equal GPU cost
+per vector. Workload differences still apply. This supports I=4 and K=N×4 as
+a starting ratio for this GPU workload, not a capacity guarantee for arbitrary
+file formats or larger allocations. Choose N according to the required service
+rate and cost budget; a consumer replica does not imply a unique GPU count.
+
+All four measured containers ran the same GPU image, with three in `us-west-2`
+and one in `eu-frankfurt-1`. Two belonged to the previous deployment version;
+the image and runtime input/batch settings were identical. Modal's latest-version
+runner count therefore reported two while the full inventory contained four.
+Peak RSS reached 5.343 GiB and VRAM 15,429 MiB. Other database connections peaked
+at twelve. Low-rate vector/hybrid query p95 was 1.641/1.048 seconds, respectively.
+
+### HTTP cancellation and execution limits
+
+The N=8/K=32 rollout revealed a distinction between Modal input accounting and
+work executing inside synchronous FastAPI handlers. Production logs recorded
+HTTP input cancellations followed by additional admitted requests while the
+cancelled handlers continued to heartbeat and eventually publish. Overlapping
+completed invocation intervals reached six jobs in a nominal I=4 container.
+A read-only lease audit also found 39 live index attempts while Modal reported
+32 running inputs. All eight containers remained in the inventory even when
+the SDK's runner count temporarily reported fewer. The initial eight-worker
+resource collector also missed its last reading on one container (959 of 960
+expected samples). That window is retained as provisional and is being repeated,
+not promoted to a completed capacity result.
+
+Earlier tables report configured I, not a proven bound on work surviving HTTP
+cancellation. GPU allocation/utilization and completed publication measurements
+remain observations, but rollout overlap prevents treating them as exact
+per-input scaling ratios. The production measurement artifacts retain this
+caveat instead of discarding the conflicting evidence.
+
+The fix retains native `@modal.concurrent` scheduling and adds a work semaphore
+inside each synchronous transform/index handler. A permit is held through
+publication and cleanup, including after its HTTP input is cancelled. Query
+encoding retains a model lock for the same lifetime distinction. The Compose
+adapter's extra invocation gate is removed so E2E runs exercise these production
+limits directly. The strengthened recovery E2E passed in 615.85 seconds: all four
+original handlers stayed within the work limit while four replacement requests
+waited, and all eight files published with one attempt and passed CLI read/search.
+The full corpus E2E also passed in 1,015.62 seconds. A fresh production capacity
+comparison remains pending.
+
+Consumer logs also confirmed that Go's default ten-redirect limit terminated
+several long-running Modal calls, despite their one-hour HTTP timeout. Modal
+uses 303 result-polling redirects after 150 seconds. The client now permits up
+to 32 redirects while retaining the one-hour overall timeout. The recovery
+suite forwards real worker calls through a transport relay with more than ten
+short redirects and asserts that the actual consumer reaches the final poll.
+This is a protocol-boundary test, not a simulation of GPU execution or Modal
+scheduling. See [Modal request timeouts](https://modal.com/docs/guide/webhook-timeouts).
 
 ### Query hardware and provider recovery
 
@@ -229,15 +288,46 @@ describes hashed scalar-array membership.
 
 The rewrite retains one batched database call, pack-level metadata, tenant/model
 scope, retirement filtering and one returned row per matching pack. Index
-crash/restart/replay E2E passed in 537.59 seconds. Cache-retirement E2E and the
-delayed-IO retirement races passed in 446.19 seconds. The production rollout
-and throughput comparison are still in progress.
+crash/restart/replay E2E passed in 537.59 seconds. Cache-retirement E2E, including
+delayed-IO races, passed in 446.19 seconds. The GPU-only production rollout of
+`57bcee3` completed at 05:20:24; the measurement excluded the rolling transition
+and ran from 05:32:31 to 05:52:36. All four workers used image
+`im-HiPFUcJrIG1QQWJxkdCBcI`, the committed source, and dependency versions
+identical to the previous measured image.
+
+| N / K / I / B | GPU utilization | New cache vectors/s | Published chunks/s | GPU-only $ / million uploaded vectors | Completed attempts / errors |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 / 16 / 4 / 32 | 90.07% | 84.26 | 74.11 | 14.53 | 118 / 0 |
+
+For jobs entirely contained within each window, average cache lookup time fell
+from 5.07 to 0.98 seconds per call and DB acquisition from 0.213 to 0.006 seconds
+per call. These are inclusive worker timings with long-job censoring, not
+aggregate database CPU measurements. Observed other DB connections peaked at
+eleven; vector/hybrid query p95 was 1.043/1.026 seconds. Peak process RSS was
+4.942 GiB and VRAM 21,663 MiB.
+
+The higher GPU utilization and lower DB waits support retaining the lookup
+rewrite. The lower vector/publication rates do not establish a regression or
+speedup: this later window processed a different mix of records, and the new
+workers ran in `eu-frankfurt-1` and `us-ashburn-1`. Four inputs already kept these
+GPUs busy; increasing input concurrency alone cannot multiply encoder compute
+capacity. The next bounded experiment tests N=8 with one consumer at K=32,
+retaining I=4/B=32/A10 and the database budget. Observed process CPU averaged
+about 1.14–1.17 logical cores and peaked below 1.6, while RSS reached 5.343 GiB.
+The next deployment requests one physical CPU core (two vCPUs) and 6 GiB per
+bulk GPU worker. This allocation still needs production measurement; earlier
+results used two physical cores and a 4 GiB request.
 
 The synthetic production root captures 16 distinct JSONL files (3,872 chunks),
 one 500-row CSV and one four-page PDF. Capture accepted 18 files / 16,941,934
 bytes in 3.678 seconds. The PDF completed real provider transformation about
 109 seconds after enqueue. Indexing initially waited behind the sessions
-backlog; capture acceptance is not search readiness.
+backlog; all 18 files were observed published at 06:51:45 UTC, 14,077.87 seconds
+after capture began. Exact native reads, all PDF pages, structured content search
+and all three search modes passed. An initial verifier incorrectly requested
+physical line reads for a spreadsheet; that failed attempt is retained. The
+corrected verifier follows the spreadsheet search contract and preserves the
+first publication observation. This is backlog latency, not isolated service time.
 
 Reproduce CLI observations with `scripts/production-capacity.py`: `capture`
 creates its own root and stores fixture expectations/cleanup identity in

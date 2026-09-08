@@ -45,7 +45,7 @@ LOCAL AGENT --immutable source packs-----------------------------> S3
                                          mutations to Turbopuffer
                                          publication to Postgres
 
-SEARCH: API --> QUERY EMBEDDER [separate Modal GPU pool] --> API --> Turbopuffer
+SEARCH: API --> QUERY EMBEDDER [separate Modal CPU pool] --> API --> Turbopuffer
 COLLECTION: COLLECTOR DISPATCHER [scheduled Modal CPU] --> BATCH COLLECTOR workers
 RECOVERY: RECONCILER [scheduled Modal CPU] --> Postgres/S3 --> SQS/Turbopuffer
 ```
@@ -61,7 +61,7 @@ RECOVERY: RECONCILER [scheduled Modal CPU] --> Postgres/S3 --> SQS/Turbopuffer
 | Index consumer | ECS service; polls index SQS | Claims receipts → CPU or Nomic index endpoint according to root configuration |
 | CPU index worker | `index_cpu_app.py`, Modal CPU; HTTP invocation | Chunks/deletions → durable S3 mutations, real index writes and per-file publication; no embedding computation |
 | GPU index worker | `index_gpu_app.py`, Modal GPU; HTTP invocation | Chunks and reusable vectors → Nomic vectors, durable mutations, index writes and per-file publication |
-| Query embedder | `QueryEmbedder` in `query_app.py`, Modal GPU; API HTTP | Query text → Nomic query vector returned to API; separate deployment, endpoint-auth secret only |
+| Query embedder | `QueryEmbedder` in `query_app.py`, Modal CPU; API HTTP | Query text → Nomic query vector returned to API; separate deployment, endpoint-auth secret only |
 | Reconciler | `reconciliation_app.py`, Modal CPU; minute schedule | Durable delivery/cleanup records → repaired SQS sends and bounded S3/index cleanup |
 
 These roles share a repository, not a single server process. ECS starts the two

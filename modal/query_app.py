@@ -1,6 +1,7 @@
 """Independent query deployment. No S3, Postgres, queue or provider credentials."""
 
 import os
+import threading
 import modal
 
 from nomic_model import cache_model
@@ -27,6 +28,7 @@ class QueryEmbedder:
     def load_model(self):
         from nomic_model import load_model
         self.model, self.device = load_model(os.getenv("PUFFERFS_EMBEDDING_DEVICE", "cuda"))
+        self.model_lock = threading.Lock()
         print(f"Query model ready: device={self.device}, dtype={next(self.model.parameters()).dtype}", flush=True)
 
     @modal.fastapi_endpoint(method="POST", label=os.getenv("PUFFERFS_QUERY_ENDPOINT_LABEL", "pufferfs-query-embed"))
@@ -46,4 +48,6 @@ class QueryEmbedder:
             raise HTTPException(status_code=400, detail="texts must be valid UTF-8") from error
         if size > 1 << 20:
             raise HTTPException(status_code=413, detail="query text exceeds 1 MiB")
-        return {"embeddings": encode_texts(self.model, self.device, texts, "search_query: ")}
+        # A cancelled HTTP request may still be encoding in its worker thread.
+        with self.model_lock:
+            return {"embeddings": encode_texts(self.model, self.device, texts, "search_query: ")}

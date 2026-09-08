@@ -56,9 +56,8 @@ def main():
     import uvicorn
 
     app = FastAPI()
-    # .local() bypasses Modal's input scheduler. Mirror the production limit;
-    # the GPU role itself serializes encoding while overlapping job IO.
-    invocation = threading.BoundedSemaphore(module.MAX_INPUTS if role != "query" else 1)
+    # The actual role owns its execution limit, including abandoned HTTP
+    # handlers. Do not add a test-only gate that could conceal a missing limit.
     startup = threading.Lock()
     initialized = role not in {"index-vector", "query"}
 
@@ -69,18 +68,17 @@ def main():
     @app.post("/")
     def execute(item: dict):
         nonlocal initialized
-        with invocation:
-            # Modal initializes a class before dispatching concurrent inputs.
-            # Its local adapter initializes lazily without a startup lock.
-            # Serialize the first successful local invocation to preserve that
-            # boundary without inspecting private SDK state or bypassing entry.
-            if not initialized:
-                with startup:
-                    if not initialized:
-                        result = entry.local(item)
-                        initialized = True
-                        return result
-            return entry.local(item)
+        # Modal initializes a class before dispatching concurrent inputs.
+        # Its local adapter initializes lazily without a startup lock.
+        # Serialize the first successful local invocation to preserve that
+        # boundary without inspecting private SDK state or bypassing entry.
+        if not initialized:
+            with startup:
+                if not initialized:
+                    result = entry.local(item)
+                    initialized = True
+                    return result
+        return entry.local(item)
 
     uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False)
 

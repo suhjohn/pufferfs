@@ -1,6 +1,7 @@
 """Deploy role: `cd modal && modal deploy transform_app.py`."""
 
 import os
+import threading
 from contextlib import closing
 
 import modal
@@ -11,6 +12,7 @@ app = modal.App(os.getenv("PUFFERFS_TRANSFORM_APP_NAME", "pufferfs-transform"))
 MAX_INPUTS = int(os.getenv("PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER", "1"))
 if not 1 <= MAX_INPUTS <= 16:
     raise ValueError("PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER must be 1..16")
+work_slots = threading.BoundedSemaphore(MAX_INPUTS)
 
 
 @app.function(
@@ -30,5 +32,6 @@ def transform_file(item: dict) -> dict:
     from transform_worker import transform
 
     work, token = require_work_request(item)
-    with closing(client("s3")) as s3, closing(client("sqs")) as sqs:
+    # The synchronous handler retains its permit after HTTP cancellation.
+    with work_slots, closing(client("s3")) as s3, closing(client("sqs")) as sqs:
         return transform(work, token, s3, sqs)

@@ -46,6 +46,12 @@ def profile_work(stage):
                        "container": os.getenv("MODAL_TASK_ID") or socket.gethostname(),
                        "image": os.getenv("MODAL_IMAGE_ID", "local"),
                        "region": os.getenv("MODAL_REGION", "local")}
+            # Starts pair with completed metrics to expose long-running work
+            # that may outlive its HTTP input. No source text or credentials.
+            print(json.dumps({"event": "file_work_started", **{
+                key: metrics[key] for key in
+                ("stage", "work_id", "started_at", "container", "image", "region")
+            }}, separators=(",", ":")), flush=True)
             token = current.set(metrics)
             started = time.perf_counter()
             try:

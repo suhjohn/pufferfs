@@ -236,6 +236,7 @@ It uses a small real Nomic vector root and native-text CPU roots; it submits no
 Gemini jobs.
 
 ```text
+index consumer --POST / 303 result polls--> worker redirect relay --> Nomic index worker
 index worker --original write--> test relay --same bytes, HTTPS--> Turbopuffer
 test driver --arm/release----------^
 API --read/search, bypassing relay------------------------------> Turbopuffer
@@ -271,6 +272,20 @@ fabricate a successful provider response: writes reach the real provider.
    response to the original live worker and require acknowledged-but-superseded
    work with one attempt and an unchanged mutation object. Repeat with a newer
    tombstone. Both APIs must expose only the new contents or deletion.
+5. Occupy every index-consumer slot with real accepted writes whose responses
+   remain held. Terminate the caller, capture an equal number of replacement
+   files, and restart it. Require all replacement SQS receipts to be claimed
+   while the actual role permits keep only the original handlers executing.
+   Release the network responses and verify every file through CLI read and
+   all search modes, with one work attempt each. The worker redirect relay
+   records that the real Go consumer followed more than ten HTTP redirects.
+
+The worker redirect relay synthesizes only the HTTP polling protocol. It
+forwards the original authenticated job to the real Nomic/index process and
+returns that process's response. Its twelve short result redirects exercise
+the redirect-count boundary without reproducing Modal's 150-second polling
+interval. The original provider request survives a disconnected poller. Neither
+relay supplies fake model vectors, database state or successful index responses.
 
 No leases, attempt tokens, delivery counts or application database rows are
 edited by the driver. This models delayed requests at an intermediate network
@@ -394,6 +409,9 @@ editing an assertion does not reinstall PyTorch or download model weights.
 - LocalStack is an AWS-compatible emulator, not AWS IAM, regional latency,
   throttling, failure domains or SQS durability. Version 4.14.0 is pinned so a
   newer licensed image cannot silently change local startup requirements.
+- Compose uses Postgres 17; the September production capacity measurements use
+  Postgres 18. The real production query measurements establish planner/timing
+  observations for that server; local E2E establishes workflow behavior.
 - Compose replaces ECS and Modal scheduling/autoscaling, not application roles.
   Scheduled adapters run serially and do not emulate Modal's hard invocation
   timeouts or overlapping-input backlog. This does not prove deployed IAM,
@@ -403,8 +421,9 @@ editing an assertion does not reinstall PyTorch or download model weights.
   numerics are not proven.
 - Worker-secret assertions cover transform, both index endpoints and the
   standalone query endpoint, including malformed/non-string credentials.
-  The local adapter mirrors each role's configured input limit (four concurrent
-  transform/index inputs in the base Compose file). The production GPU role
+  The production role itself enforces its configured work permits (four
+  transform/index inputs in the base Compose file); the local adapter adds no
+  invocation semaphore that could conceal a missing role limit. The GPU role
   serializes model encoding while overlapping job IO, protecting Nomic's
   mutable model cache. Query calls retain one input per container. Modal's
   `.local()` initializes classes lazily without a startup lock, so Compose

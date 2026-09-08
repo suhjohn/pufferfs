@@ -245,8 +245,13 @@ CPU and GPU index pools currently share these settings and the consumer's slots.
 
 Concurrent index requests own their S3/search clients. GPU requests share one
 model; an encoder-only lock protects mutable model caches and bounds concurrent
-GPU allocations while other requests perform IO. `PUFFERFS_EMBED_BATCH_SIZE`
-controls texts per model batch, separately from concurrent file inputs. Worker
+GPU allocations while other requests perform IO. Each synchronous worker also
+retains a process-local work permit until execution and cleanup finish. An HTTP
+cancellation can release a Modal ASGI input while its handler thread continues;
+the permit keeps that abandoned work inside the same configured limit. Query
+encoding similarly retains a model lock. These guards complement native Modal
+input scheduling. `PUFFERFS_EMBED_BATCH_SIZE` controls texts per model batch,
+separately from concurrent file inputs. Worker
 metrics distinguish `encode_wait` from `encode_run`; `encode` includes both.
 They include invocation start time and container identity to measure actual
 overlap. None of these settings increases database connection limits.

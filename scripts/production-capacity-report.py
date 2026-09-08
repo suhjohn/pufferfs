@@ -33,7 +33,7 @@ def percentile(values, fraction):
     return sorted(values)[max(0, math.ceil(fraction * len(values)) - 1)] if values else None
 
 
-def worker_metrics(path):
+def worker_metrics(path, event_type="file_work_metrics"):
     result = {}
     for line in path.read_text(errors="replace").splitlines():
         start = line.find('{"event":')
@@ -43,7 +43,7 @@ def worker_metrics(path):
             row, _ = json.JSONDecoder().raw_decode(line[start:])
         except json.JSONDecodeError:
             continue
-        if row.get("event") == "file_work_metrics" and "started_at" in row:
+        if row.get("event") == event_type and "started_at" in row:
             result[row["work_id"], row["started_at"]] = row
     return list(result.values())
 
@@ -61,6 +61,8 @@ def main():
     observations = rows(directory / "capacity-metrics.jsonl")
     queries = rows(directory / "production-query-capacity.events.jsonl")
     workers = worker_metrics(directory / "production-pufferfs-index-gpu.log")
+    attempt_starts = worker_metrics(directory / "production-pufferfs-index-gpu.log", "file_work_started")
+    completion_times = {(r["work_id"], r["started_at"]): r["started_at"] + r["total_seconds"] for r in workers}
     uploads_path = directory / "embedding-pack-uploads.jsonl"
     uploads = rows(uploads_path) if uploads_path.exists() else []
     upload_metadata = json.loads(uploads_path.with_name("embedding-pack-uploads-metadata.json").read_text()) if uploads else {}
@@ -72,6 +74,15 @@ def main():
             requested[event["containers"]] = {k: event[k] for k in configuration_fields if k in event}
         elif event.get("event") == "capacity_sweep_started":
             starts[event["containers"]] = {**requested.get(event["containers"], {}), **event}
+        elif event.get("event") == "capacity_sweep_measurement_started":
+            # An explicit readiness observation can exclude rollout drain time
+            # while retaining the original resource samples and event history.
+            phase = starts[event["containers"]]
+            phase["allocation_ready_at"] = phase["at"]
+            phase["at"] = event["at"]
+            phase["warmup_exclusion_reason"] = event["reason"]
+        elif event.get("event") == "capacity_sweep_caveat":
+            starts[event["containers"]].setdefault("caveats", []).append(event["reason"])
         elif event.get("event") == "capacity_sweep_finished":
             phases.append((starts.pop(event["containers"]), event))
     if not phases:
@@ -95,11 +106,38 @@ def main():
                   "gpu_memory_mib_peak": max(float(r["gpu"].split(",")[3]) for r in samples),
                   "process_cpu_cores_mean": round(statistics.mean(r["cpu_cores"] for r in samples), 3),
                   "process_rss_gib_peak": round(max(r["rss_bytes"] for r in samples) / 2**30, 3)}
+        if "allocation_ready_at" in start:
+            result["allocation_ready_at"] = start["allocation_ready_at"]
+            result["warmup_exclusion_reason"] = start["warmup_exclusion_reason"]
+        if "caveats" in start:
+            result["caveats"] = start["caveats"]
         measured = [r for r in workers if r["container"] in start["container_ids"]
                     and begin <= r["started_at"] and r["started_at"] + r["total_seconds"] <= finish]
         finished_attempts = [r for r in workers if r["container"] in start["container_ids"]
                              and begin <= r["started_at"] + r["total_seconds"] <= finish]
         result["finished_attempt_statuses"] = dict(Counter(r["status"] for r in finished_attempts))
+        admitted = [r for r in attempt_starts if r["container"] in start["container_ids"]
+                    and r["started_at"] <= finish
+                    and completion_times.get((r["work_id"], r["started_at"]), math.inf) >= begin]
+        if admitted:
+            admission_changes = defaultdict(list)
+            for row in admitted:
+                ended = completion_times.get((row["work_id"], row["started_at"]), math.inf)
+                admission_changes[row["container"]].extend([
+                    (max(begin, row["started_at"]), 1), (min(finish, ended), -1)])
+            peaks = {}
+            for container, changes in admission_changes.items():
+                current = peak = 0
+                for _, change in sorted(changes):
+                    current += change
+                    peak = max(peak, current)
+                peaks[container] = peak
+            result["peak_executing_attempts_from_start_events"] = peaks
+            result["attempts_open_at_window_end"] = sum(
+                completion_times.get((r["work_id"], r["started_at"]), math.inf) > finish for r in admitted)
+            known_starts = {(r["work_id"], r["started_at"]) for r in admitted}
+            result["finished_attempts_missing_start_event"] = sum(
+                (r["work_id"], r["started_at"]) not in known_starts for r in finished_attempts)
         active = defaultdict(list)
         for row in measured:
             active[row["container"]].extend([(row["started_at"], 1),

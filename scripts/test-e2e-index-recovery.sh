@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform index-cpu index-vector reconciler index-relay || true
+    "${compose[@]}" stop transform-consumer index-consumer transform index-cpu index-vector reconciler index-relay worker-redirect || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -26,7 +26,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index-cpu index-vector query reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index-cpu index-vector worker-redirect query reconciler
 runner_started=1
 "${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_recovery.py)
@@ -41,6 +41,13 @@ driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_re
 # rather than testing only fresh-process database connections.
 "${compose[@]}" restart postgres
 "${driver[@]}" database-recovered
+"${driver[@]}" consumer-capture
+# Close the actual caller's HTTP request while the index worker remains alive
+# behind a real held provider response. Replacement work must share its limit.
+"${compose[@]}" stop -t 10 index-consumer
+"${driver[@]}" consumer-enqueue
+"${compose[@]}" up -d --no-deps index-consumer
+"${driver[@]}" consumer-bounded
 "${driver[@]}" live-superseded
 # Keep stale physical rows available for the publication-filter assertions.
 # This phase does not claim recurring stale-row cleanup is being verified.

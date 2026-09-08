@@ -1,6 +1,31 @@
 # Optional network-fault topology. API queries still hit real Turbopuffer
 # directly; only index-worker writes pass through the controlled relay.
 services:
+  worker-redirect:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    build:
+      context: .
+      dockerfile: tests/e2e/Dockerfile
+      target: worker
+    entrypoint: [python, /e2e/worker_redirect.py]
+    environment:
+      E2E_WORKER_UPSTREAM: http://index-vector:8080/
+      E2E_WORKER_REDIRECTS: '12'
+    depends_on:
+      index-vector: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  index-consumer:
+    environment:
+      MODAL_FILE_INDEX_ENDPOINT: http://worker-redirect:8080/
+    depends_on:
+      worker-redirect: {condition: service_healthy}
+  e2e:
+    environment:
+      E2E_WORKER_REDIRECTS: '12'
   index-relay:
     image: ${COMPOSE_PROJECT_NAME}-worker
     build:

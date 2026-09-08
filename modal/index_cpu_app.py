@@ -1,6 +1,7 @@
 """Deploy CPU/no-vector index role: modal deploy index_cpu_app.py."""
 
 import os
+import threading
 import modal
 from index_image import index_image, worker_secret, endpoint_secret
 
@@ -8,6 +9,7 @@ app = modal.App("pufferfs-index-cpu")
 MAX_INPUTS = int(os.getenv("PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "1"))
 if not 1 <= MAX_INPUTS <= 16:
     raise ValueError("PUFFERFS_INDEX_INPUTS_PER_CONTAINER must be 1..16")
+work_slots = threading.BoundedSemaphore(MAX_INPUTS)
 
 
 @app.function(image=index_image.env({"PUFFERFS_INDEX_INPUTS_PER_CONTAINER": str(MAX_INPUTS)}),
@@ -22,5 +24,6 @@ def index(item: dict):
     from role_auth import require_work_request
 
     work, token = require_work_request(item)
-    with closing(client("s3")) as s3, turbopuffer_client() as tp:
+    # The synchronous handler retains its permit after HTTP cancellation.
+    with work_slots, closing(client("s3")) as s3, turbopuffer_client() as tp:
         return index_file(work, token, None, s3, os.environ["AWS_BUCKET_NAME"], tp, cpu_only=True)

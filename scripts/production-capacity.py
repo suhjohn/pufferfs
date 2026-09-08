@@ -135,7 +135,7 @@ def main():
         event(operation="status", root_id=root, status=result.get("status"),
               total=result.get("total"), states=result.get("states"), seconds=round(elapsed, 3))
         if result.get("status") == "complete":
-            state["publication_observed_at"] = time.time()
+            state.setdefault("publication_observed_at", time.time())
             state["capture_to_search_seconds"] = state["publication_observed_at"] - state["capture_started_at"]
             save()
             break
@@ -157,9 +157,18 @@ def main():
             assert all(text in page["content"].lower() for page in result["pages"]
                        for text in fixture["required_text"])
         elif fixture["kind"] == "structured":
-            result, _ = cli("read", fixture["path"], "--root", root, "--lines", "1:1000", "--json")
-            content = "\n".join(line["content"] for line in result["lines"])
-            assert all(text in content for text in fixture["required_text"])
+            # Spreadsheet chunks carry sheet/row coordinates, not physical
+            # source-line metadata. Verify their supplied content expectations
+            # through the public search contract instead of inventing line reads.
+            for text in fixture["required_text"]:
+                result, elapsed = cli("query", text, "--root", root, "--glob", fixture["path"],
+                                      "--mode", "fts", "--top-k", "20", "--json")
+                hits = result["results"]
+                assert hits and all(hit["root_id"] == root and hit["file_path"] == fixture["path"]
+                                    for hit in hits)
+                assert any(text in hit["content"] for hit in hits)
+                event(operation="structured_search_verified", path=fixture["path"],
+                      seconds=round(elapsed, 3), results=len(hits))
     for mode in ("fts", "vector", "hybrid"):
         result, elapsed = cli("query", "telescope calibration", "--root", root,
                               "--mode", mode, "--top-k", "5", "--json")

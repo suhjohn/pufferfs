@@ -21,7 +21,7 @@ app = modal.App(os.getenv("PUFFERFS_INDEX_GPU_APP_NAME", "pufferfs-index-gpu"))
 
 
 @app.cls(image=gpu_image, secrets=[worker_secret, endpoint_secret],
-         gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"), cpu=2, memory=4096, timeout=3600,
+         gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"), cpu=1, memory=6144, timeout=3600,
          region=os.getenv("PUFFERFS_MODAL_WORKER_REGION") or None,
          cloud=os.getenv("PUFFERFS_MODAL_WORKER_CLOUD") or None,
          max_containers=int(os.getenv("PUFFERFS_MODAL_INDEX_MAX_CONTAINERS", "16")), scaledown_window=900)
@@ -37,6 +37,10 @@ class Indexer:
         # Nomic mutates model caches during encoding. Share one model safely;
         # independent jobs can still overlap S3, database and search IO.
         self.encode_lock = threading.Lock()
+        # ASGI cancellation can release a Modal input while its synchronous
+        # handler is still running. Keep the work permit in that handler until
+        # all of its IO, publication and lease cleanup have actually finished.
+        self.work_slots = threading.BoundedSemaphore(MAX_INPUTS)
         print(f"Bulk model ready: device={self.device}, dtype={next(self.model.parameters()).dtype}", flush=True)
 
     @modal.fastapi_endpoint(method="POST", label=os.getenv("PUFFERFS_INDEX_GPU_ENDPOINT_LABEL", "pufferfs-file-index-gpu"))
@@ -62,5 +66,5 @@ class Indexer:
             finally:
                 self.encode_lock.release()
 
-        with closing(client("s3")) as s3, turbopuffer_client() as tp:
+        with self.work_slots, closing(client("s3")) as s3, turbopuffer_client() as tp:
             return index_file(work, token, encode, s3, os.environ["AWS_BUCKET_NAME"], tp)

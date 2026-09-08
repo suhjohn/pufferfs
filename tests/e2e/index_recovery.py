@@ -21,10 +21,11 @@ def relay(method, path, payload=None):
         return json.load(response)
 
 
-def arm(root, mode):
+def arm(root, mode, count=1):
     names = run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root,))
     assert names
-    return relay("POST", "/fault", {"namespaces": [row["namespace"] for row in names], "mode": mode})["fault_id"]
+    return relay("POST", "/fault", {"namespaces": [row["namespace"] for row in names],
+                                   "mode": mode, "count": count})["fault_id"]
 
 
 def held(fault_id, state):
@@ -108,6 +109,13 @@ def release():
     relay("POST", "/release")
 
 
+def redirect_calls():
+    request = urllib.request.Request("http://worker-redirect:8080/status",
+        headers={"X-E2E-Control": "e2e-worker-redirect-only"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.load(response)["calls"]
+
+
 def database_recovered():
     state = json.loads(run.STATE.read_text())
     run.eventually("API database readiness after Postgres restart",
@@ -144,6 +152,100 @@ def lost_recovered():
         assert search(state, state["root"], "observatory telescope", mode)
     run.wait_queue_empty("index")
     print("A new worker attempt replayed identical index payload bytes after the normal lease; vector/mutation objects were unchanged and all search modes work.")
+
+
+def consumer_capture():
+    state = json.loads(run.STATE.read_text())
+    run.wait_queue_empty("index")
+    directory = Path("/state/consumer-disconnect")
+    directory.mkdir()
+    root = run.new_root(state, "Consumer disconnect admission", directory, False)
+    slots = int(os.environ["PUFFERFS_INDEX_INPUTS_PER_CONTAINER"])
+    expected = {f"observation-{i}.txt": f"Orchid telescope calibration observation {i}.\n" for i in range(slots * 2)}
+    for name, content in list(expected.items())[:slots]:
+        (directory / name).write_text(content)
+    state["consumer_disconnect"] = {"root": root, "directory": str(directory),
+        "expected": expected, "slots": slots, "fault": arm(root, "hold_response", count=len(expected))}
+    run.save(state)
+    run.cli(state, "sync", str(directory), "--id", root)
+    def full():
+        events = [e for e in relay("GET", "/status")["events"]
+                  if e["fault_id"] == state["consumer_disconnect"]["fault"] and e["state"] == "response_held"]
+        assert all(e["upstream_status"] == 200 for e in events)
+        return len(events) == slots
+    run.eventually("all consumer slots held at the real index provider", full, 90)
+    print("Every consumer slot is held after real index acceptance; terminating it cannot abandon an additional empty queue poll.")
+
+
+def consumer_enqueue():
+    state = json.loads(run.STATE.read_text())
+    fixture = state["consumer_disconnect"]
+    for name, content in fixture["expected"].items():
+        (Path(fixture["directory"]) / name).write_text(content)
+    run.cli(state, "sync", fixture["directory"], "--id", fixture["root"])
+    def enqueued():
+        rows = run.sql("""SELECT w.id,w.enqueued_at FROM file_work w
+            JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
+            JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s
+            AND f.captured_version_id=v.id AND w.stage='index'""", (fixture["root"],))
+        return rows if len(rows) == len(fixture["expected"]) and all(r["enqueued_at"] for r in rows) else None
+    fixture["work_ids"] = [r["id"] for r in run.eventually("all replacement index handoffs", enqueued, 90)]
+    run.save(state)
+
+
+def consumer_bounded():
+    state = json.loads(run.STATE.read_text())
+    fixture = state["consumer_disconnect"]
+
+    def index_states():
+        return run.sql("""SELECT w.status,COUNT(*) AS count FROM file_work w
+            JOIN file_extractions e ON e.id=w.extraction_id
+            JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
+            WHERE f.root_id=%s AND w.stage='index' AND v.id=f.captured_version_id
+            GROUP BY w.status""", (fixture["root"],))
+
+    def bounded():
+        statuses = {r["status"]: r["count"] for r in index_states()}
+        slots = fixture["slots"]
+        assert statuses.get("running", 0) <= slots, "disconnected handlers exceeded the role's work permits"
+        events = [e for e in relay("GET", "/status")["events"]
+                  if e["fault_id"] == fixture["fault"] and e["state"] == "response_held"]
+        attributes = run.sqs.get_queue_attributes(QueueUrl=os.environ["PUFFERFS_SQS_INDEX_QUEUE_URL"],
+            AttributeNames=["ApproximateNumberOfMessagesNotVisible"])["Attributes"]
+        polled = {c["work_id"] for c in redirect_calls()
+                  if c["last_poll"] >= int(os.environ["E2E_WORKER_REDIRECTS"])}
+        # The terminated caller's receipts remain temporarily invisible. All
+        # replacement receipts must also be claimed, not merely still queued.
+        return (statuses == {"running": slots, "pending": slots} and len(events) == slots
+                and int(attributes["ApproximateNumberOfMessagesNotVisible"]) == slots * 2
+                and set(fixture["work_ids"]) <= polled)
+
+    run.eventually("all replacement receipts admitted alongside disconnected handlers", bounded, 45)
+    # Keep the real upstream responses held while the replacement consumer has
+    # time to send its requests. The role itself must bound execution;
+    # the Compose adapter has no additional invocation semaphore.
+    for _ in range(5):
+        time.sleep(2)
+        assert bounded()
+    release()
+    files = run.wait_indexed(state, fixture["root"])
+    assert set(files) == set(fixture["expected"])
+    calls = redirect_calls()
+    required_polls = int(os.environ["E2E_WORKER_REDIRECTS"])
+    for file in files.values():
+        current = work(fixture["root"], file["version_id"])
+        assert current["attempt_count"] == 1
+        assert any(c["work_id"] == current["id"] and c["last_poll"] >= required_polls for c in calls), \
+            "the actual consumer did not follow the complete result-polling redirect chain"
+    for name, content in fixture["expected"].items():
+        run.assert_source_retained(files[name])
+        result = json.loads(run.cli(state, "read", name, "--root", fixture["root"], "--lines", "1:1", "--json"))
+        assert result["lines"][0]["content"] == content.rstrip("\n")
+    for mode in ("fts", "vector", "hybrid"):
+        results = search(state, fixture["root"], "Orchid telescope calibration", mode)
+        assert results and all(hit["root_id"] == fixture["root"] for hit in results)
+    run.wait_queue_empty("index")
+    print("Terminating the consumer left its handlers alive, but role permits bounded replacement work; every file published and passed CLI read and search.")
 
 
 def live_superseded():
@@ -324,6 +426,8 @@ if __name__ == "__main__":
     phase = sys.argv[1]
     phases = {"lost-capture": lost_capture, "release": release, "lost-recovered": lost_recovered,
               "database-recovered": database_recovered, "live-superseded": live_superseded,
+              "consumer-capture": consumer_capture, "consumer-enqueue": consumer_enqueue,
+              "consumer-bounded": consumer_bounded,
               "stale-capture": stale_capture, "stale-current": stale_current, "stale-released": stale_released,
               "root-deleted": root_deleted, "root-cleaned": root_cleaned}
     started, status = time.monotonic(), "failed"
