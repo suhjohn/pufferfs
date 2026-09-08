@@ -1,6 +1,5 @@
 """AWS clients with refreshable Modal workload identity credentials."""
 
-from functools import lru_cache
 import os
 import threading
 
@@ -13,7 +12,7 @@ from botocore.credentials import (
 )
 
 
-_client_lock = threading.Lock()
+_sessions = threading.local()
 
 
 class ModalIdentity(CredentialProvider):
@@ -33,17 +32,17 @@ class ModalIdentity(CredentialProvider):
         )
 
 
-@lru_cache(maxsize=1)
 def session():
-    sdk = botocore.session.get_session()
-    role = os.getenv("PUFFERFS_AWS_ROLE_ARN")
-    if role:
-        sdk.get_component("credential_provider").insert_before("env", ModalIdentity(sdk, role))
-    return boto3.Session(botocore_session=sdk)
+    # Sessions and the workload-identity fetcher's client factory are mutable.
+    # Keep both on the request thread, including later credential refreshes.
+    if not hasattr(_sessions, "sdk"):
+        sdk = botocore.session.get_session()
+        role = os.getenv("PUFFERFS_AWS_ROLE_ARN")
+        if role:
+            sdk.get_component("credential_provider").insert_before("env", ModalIdentity(sdk, role))
+        _sessions.sdk = boto3.Session(botocore_session=sdk)
+    return _sessions.sdk
 
 
 def client(service, **options):
-    # Boto3 sessions mutate component caches during client construction. Each
-    # invocation owns its clients; only construction shares the session lock.
-    with _client_lock:
-        return session().client(service, **options)
+    return session().client(service, **options)
