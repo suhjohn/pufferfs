@@ -35,11 +35,24 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("cloud-index", "worker-throughput"), default="cloud-index")
-    parser.add_argument("--workers", type=int, choices=range(1, 17), default=1,
-                        help="Independent transform/consumer processes and maximum bulk GPU containers")
+    parser.add_argument("--containers", "--workers", dest="containers", type=int, choices=range(1, 17), default=1,
+                        help="Maximum bulk GPU containers; consumers remain one replica per stage")
+    parser.add_argument("--inputs", type=int, choices=range(1, 17), default=1,
+                        help="Concurrent inputs per index container")
+    parser.add_argument("--consumer-concurrency", type=int, choices=range(1, 65),
+                        help="Index jobs admitted by the single consumer; defaults to containers times inputs")
+    parser.add_argument("--batch-size", type=int, choices=range(1, 129), default=64,
+                        help="Texts per GPU encoder batch")
+    parser.add_argument("--repeats", type=int, choices=range(1, 17), default=1,
+                        help="Copies of the synthetic throughput workload, with distinct contents")
+    parser.add_argument("--worker-database-port", type=int, choices=(5432, 6432),
+                        help="Optional existing transaction-pooler port for worker connections")
     parser.add_argument("--shards", type=int, choices=(1, 2), default=2,
                         help="Exercise single- or multiple-namespace root routing")
     args = parser.parse_args()
+    concurrency = args.consumer_concurrency or args.containers * args.inputs
+    if concurrency > 64:
+        parser.error("The single index consumer supports at most 64 admitted jobs")
     for name in ("DATABASE_URL", "GEMINI_API_KEY", "TURBOPUFFER_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         if not os.environ.get(name):
             raise RuntimeError(f"{name} is required")
@@ -64,7 +77,10 @@ def main():
     identity = sts.get_caller_identity()
     if ":user/" not in identity["Arn"]:
         raise RuntimeError("STS federation requires an IAM-user provisioning identity")
-    print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region, "workers": args.workers, "shards": args.shards}), flush=True)
+    print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region,
+        "consumer_replicas_per_stage": 1, "index_consumer_concurrency": concurrency,
+        "index_containers": args.containers, "index_inputs": args.inputs,
+        "embed_batch_size": args.batch_size, "repeats": args.repeats, "shards": args.shards}), flush=True)
     recovery = Path(tempfile.mkdtemp(prefix=identifier + "-"))
     state_path = recovery / "resources.json"
     state = {"identifier": identifier, "database": None, "role": None, "bucket": None,
@@ -116,6 +132,11 @@ def main():
         login = role_name + os.environ.get("PUFFERFS_CLOUD_DB_LOGIN_SUFFIX", "")
         authority = f"{quote(login)}:{quote(password)}@{hostname}:{original.port or 5432}"
         database_url = urlunsplit((original.scheme, authority, "/" + db_name, urlencode(query, doseq=True), ""))
+        worker_database_url = database_url
+        if args.worker_database_port:
+            worker_authority = f"{quote(login)}:{quote(password)}@{hostname}:{args.worker_database_port}"
+            worker_database_url = urlunsplit((original.scheme, worker_authority, "/" + db_name,
+                                            urlencode(query, doseq=True), ""))
         with psycopg.connect(database_url, sslrootcert=ca or "system", connect_timeout=15,
                              options="-c default_transaction_read_only=on") as probe:
             assert probe.execute("SELECT current_database(),current_user").fetchone() == (db_name, role_name)
@@ -153,7 +174,7 @@ def main():
             {"Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"], "Resource": arns}]}
         temporary = sts.get_federation_token(Name=identifier, Policy=json.dumps(policy), DurationSeconds=7200)["Credentials"]
         auth_key = secrets.token_urlsafe(36)
-        worker_env = {"DATABASE_URL": database_url, "AWS_REGION": region, "AWS_DEFAULT_REGION": region,
+        worker_env = {"DATABASE_URL": worker_database_url, "AWS_REGION": region, "AWS_DEFAULT_REGION": region,
             "AWS_BUCKET_NAME": identifier, "AWS_ACCESS_KEY_ID": temporary["AccessKeyId"],
             "AWS_SECRET_ACCESS_KEY": temporary["SecretAccessKey"], "AWS_SESSION_TOKEN": temporary["SessionToken"],
             "TURBOPUFFER_API_KEY": os.environ["TURBOPUFFER_API_KEY"],
@@ -169,7 +190,9 @@ def main():
         # reused even while the temporary application is running.
         os.environ.update(PUFFERFS_WORKER_SECRET_NAME=worker_name, PUFFERFS_MODAL_ENDPOINT_SECRET_NAME=auth_name,
             PUFFERFS_INDEX_GPU_APP_NAME=identifier + "-index", PUFFERFS_INDEX_GPU_ENDPOINT_LABEL=identifier + "-index",
-            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query", PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.workers),
+            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query",
+            PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.containers),
+            PUFFERFS_INDEX_INPUTS_PER_CONTAINER=str(args.inputs), PUFFERFS_EMBED_BATCH_SIZE=str(args.batch_size),
             PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS="0", PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS="1")
         sys.path.insert(0, str(REPOSITORY / "modal"))
         os.chdir(REPOSITORY / "modal")
@@ -181,19 +204,26 @@ def main():
             apps.enter_context(index_gpu_app.app.run())
             apps.enter_context(query_app.app.run())
             runtime = dict(os.environ, **worker_env)
+            runtime.update(DATABASE_URL=database_url, PUFFERFS_WORKER_DATABASE_URL=worker_database_url,
+                PUFFERFS_DB_MAX_CONNS="2", PUFFERFS_WORKER_DB_MAX_CONNS="2",
+                PUFFERFS_CLOUD_INDEX_CONCURRENCY=str(concurrency),
+                PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats))
             runtime.update(MODAL_FILE_INDEX_ENDPOINT=index_gpu_app.Indexer().index.get_web_url(),
                 MODAL_QUERY_EMBED_ENDPOINT=query_app.QueryEmbedder().embed_query_endpoint.get_web_url(),
                 MODAL_SECRET_KEY=auth_key, PUFFERFS_ADMIN_KEY=secrets.token_urlsafe(36), JWT_SECRET=secrets.token_urlsafe(36),
                 PUFFERFS_CLOUD_DB_PASSWORD=password, COMPOSE_PROJECT_NAME=identifier)
-            state["runtime"] = {key: runtime[key] for key in (*worker_env, "MODAL_SECRET_KEY", "PUFFERFS_ADMIN_KEY", "JWT_SECRET", "MODAL_FILE_INDEX_ENDPOINT", "MODAL_QUERY_EMBED_ENDPOINT")}
+            state["runtime"] = {key: runtime[key] for key in (*worker_env, "PUFFERFS_WORKER_DATABASE_URL",
+                "PUFFERFS_DB_MAX_CONNS", "PUFFERFS_WORKER_DB_MAX_CONNS", "PUFFERFS_CLOUD_INDEX_CONCURRENCY",
+                "PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "PUFFERFS_EMBED_BATCH_SIZE", "PUFFERFS_E2E_THROUGHPUT_REPEATS",
+                "MODAL_SECRET_KEY", "PUFFERFS_ADMIN_KEY", "JWT_SECRET", "MODAL_FILE_INDEX_ENDPOINT", "MODAL_QUERY_EMBED_ENDPOINT")}
             save()
             print(json.dumps({"bulk_app": index_gpu_app.app.app_id, "query_app": query_app.app.app_id}), flush=True)
             try:
                 compose("build", "api", "transform", "e2e")
                 state["compose_started"] = True
                 save()
-                compose("up", "-d", "--wait", "--scale", f"transform={args.workers}",
-                        "--scale", f"transform-consumer={args.workers}", "--scale", f"index-consumer={args.workers}", "api", "api-ready", "transform", "index-cpu", "reconciler", "transform-consumer", "index-consumer")
+                compose("up", "-d", "--wait", "api", "api-ready", "transform", "index-cpu",
+                        "reconciler", "transform-consumer", "index-consumer")
                 compose("run", "--rm", "--no-deps", "e2e", args.scenario)
             finally:
                 if state["compose_started"]:

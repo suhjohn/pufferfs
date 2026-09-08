@@ -41,7 +41,26 @@ def report(path):
                 for name, seconds in row["seconds"].items():
                     totals[name] = totals.get(name, 0) + seconds
             count = sum(row["chunk_count"] for row in work)
+            overlap = {}
+            if all("started_at" in row and "container" in row for row in measured):
+                first = min(row["started_at"] for row in measured)
+                last = max(row["started_at"] + row["total_seconds"] for row in measured)
+                events = {}
+                for row in measured:
+                    events.setdefault(row["container"], []).extend([
+                        (row["started_at"], 1), (row["started_at"] + row["total_seconds"], -1)])
+                peaks = {}
+                for container, changes in events.items():
+                    active = peak = 0
+                    for _, change in sorted(changes):
+                        active += change
+                        peak = max(peak, active)
+                    peaks[container] = peak
+                overlap = {"worker_wall_span_seconds": round(last - first, 3),
+                    "chunks_per_wall_second": round(count / (last - first), 2),
+                    "observed_peak_inputs_by_container": peaks}
             print(json.dumps({"log": str(path), "run_id": phase["run_id"], "phase": phase["phase"],
+                **overlap,
                 "stage": stage, "files": len(work), "chunks": count,
                 "worker_seconds": round(sum(durations), 3),
                 "chunks_per_worker_second": round(count / sum(durations), 2),

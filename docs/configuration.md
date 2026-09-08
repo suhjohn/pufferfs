@@ -179,6 +179,8 @@ Source capture tuning uses plain integer byte values:
 | `PUFFERFS_MODAL_WORKER_REGION` | Optional deployment-time placement for transformation and bulk GPU workers; unset uses Modal placement. Choose near database/object storage. |
 | `PUFFERFS_MODAL_EMBED_GPU` | Bulk GPU; default L4 |
 | `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | Bulk pool limit; default 16 |
+| `PUFFERFS_INDEX_INPUTS_PER_CONTAINER` | Concurrent jobs inside each CPU/GPU index container; 1–16, default 1 |
+| `PUFFERFS_EMBED_BATCH_SIZE` | Texts per bulk model batch; 1–128, default 64. Choose within the GPU's measured memory capacity. |
 | `PUFFERFS_MODAL_QUERY_EMBED_GPU` | Query GPU; default L4 |
 | `PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS` | Warm query workers; default 1 |
 | `PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS` | Query pool limit; default 2 |
@@ -233,7 +235,21 @@ requests inside one Modal container (1–16, default 1). The deployment workflow
 sets the transform consumer's slots to `PUFFERFS_TRANSFORM_MAX_CONTAINERS`
 times this input limit, rejecting totals above 64. Each invocation owns its AWS
 clients and temporary files; short database transactions share the worker pool.
-Bulk GPU indexing remains one request per container, with 64-text encoder batches.
+`PUFFERFS_INDEX_INPUTS_PER_CONTAINER` independently controls CPU/GPU index
+input concurrency. The workflow sets the index consumer's slots to
+`PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` times this input limit, also capped at 64.
+These products size **one consumer replica per stage**. With additional consumer
+replicas, divide the aggregate admission budget between replicas; multiplying
+consumer replicas without adjusting slots also multiplies downstream admission.
+CPU and GPU index pools currently share these settings and the consumer's slots.
+
+Concurrent index requests own their S3/search clients. GPU requests share one
+model; an encoder-only lock protects mutable model caches and bounds concurrent
+GPU allocations while other requests perform IO. `PUFFERFS_EMBED_BATCH_SIZE`
+controls texts per model batch, separately from concurrent file inputs. Worker
+metrics distinguish `encode_wait` from `encode_run`; `encode` includes both.
+They include invocation start time and container identity to measure actual
+overlap. None of these settings increases database connection limits.
 
 ### Billing (Stripe)
 

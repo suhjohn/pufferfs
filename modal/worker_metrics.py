@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from functools import wraps
 import json
 import os
+import socket
 import time
 
 
@@ -41,6 +42,7 @@ def profile_work(stage):
         def measured(work, *args, **kwargs):
             metrics = {"event": "file_work_metrics", "stage": stage, "work_id": work,
                        "seconds": {}, "counts": {}, "status": "error",
+                       "started_at": time.time(), "container": socket.gethostname(),
                        "region": os.getenv("MODAL_REGION", "local")}
             token = current.set(metrics)
             started = time.perf_counter()

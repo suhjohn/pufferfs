@@ -1,10 +1,11 @@
-"""Single-slot CLI-to-publication benchmark with synthetic, checked contents.
+"""CLI-to-publication benchmark with synthetic, checked contents.
 
 No application imports or direct work invocation. Run with the isolated cloud
 runner so the encoder is the real deployed GPU role and providers are real.
 """
 
 import json
+import os
 from pathlib import Path
 import time
 
@@ -16,7 +17,9 @@ def verify():
     directory = Path("/state/throughput")
     directory.mkdir()
     expected = {}
-    fixtures = ((8, 1), (64, 1), (128, 1), (768, 2))
+    repeats = int(os.environ.get("PUFFERFS_E2E_THROUGHPUT_REPEATS", "1"))
+    assert 1 <= repeats <= 16
+    fixtures = ((8, 1), (64, 1), (128, 1), (768, 2)) * repeats
     for ordinal, (records, _) in enumerate(fixtures):
         lines = []
         for number in range(records):
@@ -30,7 +33,7 @@ def verify():
         path = directory / f"measurements-{ordinal}.jsonl"
         path.write_text("".join(lines))
         expected[path.name] = lines
-    state["root"] = run.new_root(state, "Single worker throughput", directory, False)
+    state["root"] = run.new_root(state, "Worker throughput", directory, False)
     run.save(state)
     cached = None
     for label, flags in (("cold-cache", ()), ("warm-cache", ("--force",))):
@@ -89,6 +92,7 @@ def verify():
             for hit in result["results"]:
                 assert hit["content"] in "".join(expected[hit["file_path"]])
         result = {"event": "worker_throughput", "run_id": state["nonce"], "phase": label,
+                  "source_bytes": sum(len(line.encode()) for lines in expected.values() for line in lines),
                   "files": len(expected), "chunks": sum(map(len, expected.values())),
                   "mutation_records": mutation_records, "mutation_json_bytes": mutation_bytes,
                   "vector_json_bytes": vector_json_bytes,

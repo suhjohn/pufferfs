@@ -87,7 +87,15 @@ if [[ -n "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}" ]]; then
   fi
   pulumi config set pufferfs:workerTransformConcurrency "$((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs))"
 fi
-set_config_if_present pufferfs:workerIndexConcurrency "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}"
+if [[ -n "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}" ]]; then
+  index_inputs="${PUFFERFS_INDEX_INPUTS_PER_CONTAINER:-1}"
+  if ! [[ "$PUFFERFS_MODAL_INDEX_MAX_CONTAINERS" =~ ^[1-9][0-9]*$ && "$index_inputs" =~ ^[1-9][0-9]*$ ]] ||
+      (( PUFFERFS_MODAL_INDEX_MAX_CONTAINERS > 64 || index_inputs > 16 || PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs > 64 )); then
+    echo "Index capacity must be 1..16 inputs per container and at most 64 total inputs." >&2
+    exit 1
+  fi
+  pulumi config set pufferfs:workerIndexConcurrency "$((PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs))"
+fi
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
 

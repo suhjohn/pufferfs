@@ -403,8 +403,14 @@ editing an assertion does not reinstall PyTorch or download model weights.
   numerics are not proven.
 - Worker-secret assertions cover transform, both index endpoints and the
   standalone query endpoint, including malformed/non-string credentials.
-  The local adapter serializes calls per container like Modal's default input
-  limit; it must not concurrently mutate one Nomic instance's position cache.
+  The local adapter mirrors each role's configured input limit (four concurrent
+  transform/index inputs in the base Compose file). The production GPU role
+  serializes model encoding while overlapping job IO, protecting Nomic's
+  mutable model cache. Query calls retain one input per container. Modal's
+  `.local()` initializes classes lazily without a startup lock, so Compose
+  serializes the first successful class invocation before allowing overlap.
+  This adds first-invocation serialization beyond production's initialization
+  boundary and must not be treated as a production cold-start measurement.
 - This is **not yet a replacement for every previous assertion**. Provider
   lost-response/partial-retry and long/alternate media scenarios are implemented;
   their results must be tracked separately from earlier suite passes. Path ACL
@@ -514,12 +520,23 @@ Temporary cloud and Compose resources were removed; production was unchanged.
 
 ### Throughput and cache-directory upgrade
 
-The cloud runner accepts `--scenario worker-throughput --workers 1` for cold
+The cloud runner accepts `--scenario worker-throughput --containers 1` for cold
 and forced warm-cache publication of four synthetic JSONL files (968 chunks).
 It checks exact retained bytes/line reads, FTS/vector/hybrid results, one attempt
 per job, completed extraction/work state, acknowledged mutation batches, five S3
-vector packs, absence of the removed locator table and cache identity reuse. `--workers 2` scales independent Compose transform/consumer processes
-and permits two bulk GPU containers. Default cloud consumer concurrency is one.
+vector packs, absence of the removed locator table and cache identity reuse.
+The runner keeps one consumer replica per stage. `--containers N --inputs I`
+admits N × I index jobs through that consumer, or an explicit
+`--consumer-concurrency K` (maximum 64). `--workers` remains an alias for the
+container limit. `--batch-size B` selects encoder microbatches. `--repeats R`
+generates R copies of the four-file workload with distinct contents and supplied
+expectations, so a small fixture does not silently underfill a larger pool.
+
+`--worker-database-port 6432` uses an **existing** transaction pooler for workers;
+API/consumer processes retain the original direct port. This creates no pooler
+and changes no database settings. Cloud fixtures share the provisioning server's
+connection/CPU budget; establish sufficient spare capacity before running them.
+The runner uses two connections per Go/Python process, matching production.
 
 `python3 scripts/worker-throughput-report.py LOG...` summarizes only work IDs
 from successfully validated phases. Its chunks/s uses worker invocation time,
