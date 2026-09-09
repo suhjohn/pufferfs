@@ -20,6 +20,10 @@ def verify():
     repeats = int(os.environ.get("PUFFERFS_E2E_THROUGHPUT_REPEATS", "1"))
     assert 1 <= repeats <= 16
     fixtures = ((8, 1), (64, 1), (128, 1), (768, 2)) * repeats
+    if os.environ.get("PUFFERFS_E2E_THROUGHPUT_RECORDS"):
+        records = int(os.environ["PUFFERFS_E2E_THROUGHPUT_RECORDS"])
+        assert 1 <= records <= 768
+        fixtures = ((records, (records + 511) // 512),) * len(fixtures)
     for ordinal, (records, _) in enumerate(fixtures):
         lines = []
         for number in range(records):

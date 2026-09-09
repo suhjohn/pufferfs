@@ -69,6 +69,8 @@ def report(path):
                 "regions": sorted({row["region"] for row in measured}),
                 "application_db_statements": counts.get("db_statements", 0) - counts.get("db_health_checks", 0),
                 "counts": counts,
+                "encoder_vectors_per_second": round(counts.get("encoder_texts", 0) / totals["encode_run"], 3)
+                    if totals.get("encode_run", 0) > 0 else None,
                 "inclusive_phase_seconds": {k: round(v, 3) for k, v in totals.items()},
                 "mutation_payload": {k: phase[k] for k in
                     ("mutation_records", "mutation_json_bytes", "vector_json_bytes") if k in phase}

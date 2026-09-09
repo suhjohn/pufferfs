@@ -256,6 +256,15 @@ metrics distinguish `encode_wait` from `encode_run`; `encode` includes both.
 They include invocation start time and container identity to measure actual
 overlap. None of these settings increases database connection limits.
 
+The bulk embedding deployment accepts `PUFFERFS_MODAL_EMBED_GPU=none` to run
+the same pinned model on CPU; the separate no-vector index role is unchanged.
+`PUFFERFS_MODAL_EMBED_CPU` requests physical CPU cores (default one), and
+`PUFFERFS_MODAL_EMBED_MEMORY_MIB` requests memory (default 6144 MiB). These are
+Modal resource requests, not hard limits. CPU encoding uses float32 and CUDA
+encoding uses float16. Changing hardware does not change the model revision,
+vector dimensions or cache identity. Use the cloud throughput runner to compare
+batch sizes and actual memory use before choosing a CPU allocation.
+
 ### Billing (Stripe)
 
 | Variable | Meaning |

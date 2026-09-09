@@ -551,6 +551,16 @@ container limit. `--batch-size B` selects encoder microbatches. `--repeats R`
 generates R copies of the four-file workload with distinct contents and supplied
 expectations, so a small fixture does not silently underfill a larger pool.
 
+For a CPU/GPU batch comparison, `--gpu none --cpu 2 --memory-mib 6144` runs the
+same bulk embedding entrypoint on a real Modal CPU allocation. `--gpu A10 --cpu 1`
+selects an A10 allocation. CPU is measured in physical cores. Both retain the
+pinned Nomic model, using the production CPU float32 / CUDA float16 paths.
+`--records-per-file 64` bounds each of the four fixtures to 64 records while
+retaining exact read/search, cold/warm cache and durable-publication assertions.
+Each cloud run provisions a fresh organization/database, so identical fixture
+contents across batch sizes still require fresh encoding. The report includes
+`encoder_vectors_per_second` separately from whole-worker and capture timings.
+
 `--worker-database-port 6432` uses an **existing** transaction pooler for workers;
 API/consumer processes retain the original direct port. This creates no pooler
 and changes no database settings. Cloud fixtures share the provisioning server's

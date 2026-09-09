@@ -6,6 +6,12 @@ two vCPUs and 6 GiB. The 20-minute production window kept GPUs 88.89% busy and
 published 260.94 chunks/s while vector/hybrid query p95 remained 1.317/1.702 s.
 The database plan, connection pools and shared pooler capacity did not change.
 
+The subsequent [CPU/GPU batch comparison](cpu-gpu-embedding-capacity.md) measured
+0.65–0.71 vectors/s on a four-vCPU CPU worker and 74.8–77.0 vectors/s on one A10
+for the same synthetic inputs. Those are encoder-only rates, distinct from the
+production publication/upload rates below. It supports retaining GPU embedding;
+it does not change the selected production allocation.
+
 This is a measured operating point for the tested native-text workload. It is
 not a global optimum, a controlled speedup comparison, or a capacity guarantee
 for all document/media formats. Eight is a scale-out cap; bulk workers retain

@@ -36,13 +36,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("cloud-index", "worker-throughput"), default="cloud-index")
     parser.add_argument("--containers", "--workers", dest="containers", type=int, choices=range(1, 17), default=1,
-                        help="Maximum bulk GPU containers; consumers remain one replica per stage")
+                        help="Maximum bulk embedding containers; consumers remain one replica per stage")
     parser.add_argument("--inputs", type=int, choices=range(1, 17), default=1,
                         help="Concurrent inputs per index container")
     parser.add_argument("--consumer-concurrency", type=int, choices=range(1, 65),
                         help="Index jobs admitted by the single consumer; defaults to containers times inputs")
     parser.add_argument("--batch-size", type=int, choices=range(1, 129), default=64,
-                        help="Texts per GPU encoder batch")
+                        help="Texts per encoder batch")
+    parser.add_argument("--gpu", default=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
+                        help="Modal accelerator, or none for the same bulk encoder on CPU")
+    parser.add_argument("--cpu", type=float, default=1,
+                        help="Physical CPU cores requested by each bulk encoder")
+    parser.add_argument("--memory-mib", type=int, default=6144,
+                        help="Memory requested by each bulk encoder")
+    parser.add_argument("--records-per-file", type=int, choices=range(1, 769),
+                        help="Override record count in each throughput fixture for a bounded sweep")
     parser.add_argument("--repeats", type=int, choices=range(1, 17), default=1,
                         help="Copies of the synthetic throughput workload, with distinct contents")
     parser.add_argument("--worker-database-port", type=int, choices=(5432, 6432),
@@ -50,6 +58,8 @@ def main():
     parser.add_argument("--shards", type=int, choices=(1, 2), default=2,
                         help="Exercise single- or multiple-namespace root routing")
     args = parser.parse_args()
+    if not 0.125 <= args.cpu <= 64 or not 1024 <= args.memory_mib <= 131072:
+        parser.error("CPU must be 0.125..64 physical cores and memory 1024..131072 MiB")
     concurrency = args.consumer_concurrency or args.containers * args.inputs
     if concurrency > 64:
         parser.error("The single index consumer supports at most 64 admitted jobs")
@@ -80,7 +90,9 @@ def main():
     print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region,
         "consumer_replicas_per_stage": 1, "index_consumer_concurrency": concurrency,
         "index_containers": args.containers, "index_inputs": args.inputs,
-        "embed_batch_size": args.batch_size, "repeats": args.repeats, "shards": args.shards}), flush=True)
+        "embed_batch_size": args.batch_size, "repeats": args.repeats, "shards": args.shards,
+        "gpu": args.gpu, "cpu_physical_cores": args.cpu, "memory_mib": args.memory_mib,
+        "records_per_file": args.records_per_file}), flush=True)
     recovery = Path(tempfile.mkdtemp(prefix=identifier + "-"))
     state_path = recovery / "resources.json"
     state = {"identifier": identifier, "database": None, "role": None, "bucket": None,
@@ -180,7 +192,8 @@ def main():
             "TURBOPUFFER_API_KEY": os.environ["TURBOPUFFER_API_KEY"],
             "TURBOPUFFER_API_URL": os.environ.get("TURBOPUFFER_API_URL") or f"https://{os.environ.get('TURBOPUFFER_REGION', 'gcp-us-central1')}.turbopuffer.com",
             "PUFFERFS_SQS_TRANSFORM_QUEUE_URL": urls["transform"], "PUFFERFS_SQS_INDEX_QUEUE_URL": urls["index"],
-            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards), "PUFFERFS_EMBEDDING_DEVICE": "cuda"}
+            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards),
+            "PUFFERFS_EMBEDDING_DEVICE": "cpu" if args.gpu == "none" else "cuda"}
         worker_name, auth_name = identifier + "-worker", identifier + "-auth"
         for name, values in ((worker_name, worker_env), (auth_name, {"PUFFERFS_MODAL_ENDPOINT_AUTH_KEY": auth_key})):
             modal.Secret.objects.create(name, values)
@@ -192,6 +205,8 @@ def main():
             PUFFERFS_INDEX_GPU_APP_NAME=identifier + "-index", PUFFERFS_INDEX_GPU_ENDPOINT_LABEL=identifier + "-index",
             PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query",
             PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.containers),
+            PUFFERFS_MODAL_EMBED_GPU=args.gpu, PUFFERFS_MODAL_EMBED_CPU=str(args.cpu),
+            PUFFERFS_MODAL_EMBED_MEMORY_MIB=str(args.memory_mib),
             PUFFERFS_INDEX_INPUTS_PER_CONTAINER=str(args.inputs), PUFFERFS_EMBED_BATCH_SIZE=str(args.batch_size),
             PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS="0", PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS="1")
         sys.path.insert(0, str(REPOSITORY / "modal"))
@@ -207,7 +222,8 @@ def main():
             runtime.update(DATABASE_URL=database_url, PUFFERFS_WORKER_DATABASE_URL=worker_database_url,
                 PUFFERFS_DB_MAX_CONNS="2", PUFFERFS_WORKER_DB_MAX_CONNS="2",
                 PUFFERFS_CLOUD_INDEX_CONCURRENCY=str(concurrency),
-                PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats))
+                PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats),
+                PUFFERFS_E2E_THROUGHPUT_RECORDS=str(args.records_per_file or ""))
             runtime.update(MODAL_FILE_INDEX_ENDPOINT=index_gpu_app.Indexer().index.get_web_url(),
                 MODAL_QUERY_EMBED_ENDPOINT=query_app.QueryEmbedder().embed_query_endpoint.get_web_url(),
                 MODAL_SECRET_KEY=auth_key, PUFFERFS_ADMIN_KEY=secrets.token_urlsafe(36), JWT_SECRET=secrets.token_urlsafe(36),
@@ -288,7 +304,7 @@ def main():
         print("Removed this run's temporary cloud resources, secrets and recovery credentials.", flush=True)
     if failure is not None:
         raise RuntimeError("Cloud E2E failed; see sanitized diagnostics") from None
-    print("Cloud GPU index E2E passed. Production endpoints and IAM were unchanged.", flush=True)
+    print("Cloud bulk index E2E passed. Production endpoints and IAM were unchanged.", flush=True)
 
 
 if __name__ == "__main__":

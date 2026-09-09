@@ -1,4 +1,4 @@
-"""Deploy bulk Nomic GPU role: modal deploy index_gpu_app.py. Query pool stays separate."""
+"""Deploy bulk Nomic embedding: modal deploy index_gpu_app.py. Query pool stays separate."""
 
 import os
 import threading
@@ -8,6 +8,9 @@ from nomic_model import cache_model
 
 MAX_INPUTS = int(os.getenv("PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "1"))
 BATCH_SIZE = int(os.getenv("PUFFERFS_EMBED_BATCH_SIZE", "64"))
+GPU = os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4")
+CPU = float(os.getenv("PUFFERFS_MODAL_EMBED_CPU", "1"))
+MEMORY = int(os.getenv("PUFFERFS_MODAL_EMBED_MEMORY_MIB", "6144"))
 if not 1 <= MAX_INPUTS <= 16:
     raise ValueError("PUFFERFS_INDEX_INPUTS_PER_CONTAINER must be 1..16")
 if not 1 <= BATCH_SIZE <= 128:
@@ -16,12 +19,13 @@ if not 1 <= BATCH_SIZE <= 128:
 gpu_image = (index_image.pip_install("sentence-transformers>=3", "torch>=2", "einops>=0.7")
              .run_function(cache_model)
              .env({"PUFFERFS_INDEX_INPUTS_PER_CONTAINER": str(MAX_INPUTS),
-                   "PUFFERFS_EMBED_BATCH_SIZE": str(BATCH_SIZE)}))
+                   "PUFFERFS_EMBED_BATCH_SIZE": str(BATCH_SIZE),
+                   "PUFFERFS_EMBEDDING_DEVICE": "cpu" if GPU == "none" else "cuda"}))
 app = modal.App(os.getenv("PUFFERFS_INDEX_GPU_APP_NAME", "pufferfs-index-gpu"))
 
 
 @app.cls(image=gpu_image, secrets=[worker_secret, endpoint_secret],
-         gpu=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"), cpu=1, memory=6144, timeout=3600,
+         gpu=None if GPU == "none" else GPU, cpu=CPU, memory=MEMORY, timeout=3600,
          region=os.getenv("PUFFERFS_MODAL_WORKER_REGION") or None,
          cloud=os.getenv("PUFFERFS_MODAL_WORKER_CLOUD") or None,
          max_containers=int(os.getenv("PUFFERFS_MODAL_INDEX_MAX_CONTAINERS", "16")), scaledown_window=900)
