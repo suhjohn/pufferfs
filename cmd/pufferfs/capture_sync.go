@@ -179,7 +179,7 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	for offset := 0; offset < len(files); offset += 128 {
+	for offset := 0; offset < len(files); {
 		batch := files[offset:min(offset+128, len(files))]
 		// Retain source extents only for this batch, not the entire root.
 		previous := make(map[string]localCapturedHead, len(batch))
@@ -199,7 +199,7 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 		if err != nil {
 			return nil, err
 		}
-		dir, err := createCaptureSpool(ctx, pendingDir, input.Client.baseURL, input.RootID, input.Dir, batch, previous, 32<<20, available)
+		dir, captured, err := createCaptureSpool(ctx, pendingDir, input.Client.baseURL, input.RootID, input.Dir, batch, previous, 32<<20, available)
 		if err != nil {
 			return nil, err
 		}
@@ -210,6 +210,7 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 			}
 			return nil, err
 		}
+		offset += captured
 		fmt.Fprintf(input.Log, "Capture accepted: %d files; indexing continues independently.\n", result.FilesProcessed)
 	}
 	if result.Status == "unchanged" {

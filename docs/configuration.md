@@ -371,8 +371,13 @@ next sync under its exclusive lock. These were never submit-ready captures.
 `PUFFERFS_CAPTURE_SPOOL_BYTES` bounds captured spool data per server/root/source
 cache (default 2 GiB, minimum 8 MiB). Pending, conflicted and completed metadata
 count toward available capacity; new captures reserve 4 MiB for their journal.
-An oversized capture fails before exceeding its pack-byte budget. Raise the
-limit explicitly for larger files/batches. Cleanup does not erase originals in
+Sync batches at most 128 files and closes a batch before the next whole file's
+new bytes would exceed the available budget. It submits that batch, releases
+accepted pack bytes, and continues. Verified remote prefixes used by appends
+do not consume spool space. If a single file's new bytes cannot fit in an empty
+batch, sync reports the required and available byte counts before copying it;
+raise the limit or resolve retained captures, then rerun sync. Earlier accepted
+files remain durable. Cleanup does not erase originals in
 S3 and never treats an upload error as acceptance. Head metadata scales with
 tracked paths; the limit is not a cap on all CLI disk usage.
 

@@ -40,15 +40,19 @@ def check_local_retention(state):
     root = run.new_root(state, "spool retention", directory, True)
     result = capture(state, directory, root, success=False)
     assert "spool limit" in result.stderr
+    assert "needs 5242880 new bytes" in result.stderr
     cache = local_spools(root)
     assert not list((cache / "pending").glob("*/journal.json")), "failed creation published a retry journal"
-    partial = list((cache / "pending").glob("*/pack-*"))
-    assert partial and sum(p.stat().st_size for p in partial) <= 8 << 20
-    assert not run.catalog(state, root), "capture limit failure registered files"
+    assert not list((cache / "pending").glob("*/pack-*")), "oversized file was partially copied"
+    incomplete, = (cache / "pending").iterdir()
+    accepted = run.catalog(state, root)
+    assert set(accepted) == {"a.txt"}, "completed prefix was not accepted before the oversized file"
+    run.assert_source_retained(accepted["a.txt"])
 
     (directory / "z.txt").write_text("Violet garden report.\n")
     capture(state, directory, root)
-    assert not any(path.exists() for path in partial), "incomplete unsubmitted data was not cleaned"
+    assert not incomplete.exists(), "incomplete unsubmitted capture was not cleaned"
+    assert run.catalog(state, root)["a.txt"]["version_id"] == accepted["a.txt"]["version_id"]
     assert not list((cache / "completed").glob("*/pack-*")), "accepted source bytes remained locally"
     files = run.wait_indexed(state, root)
     first = run.assert_source_retained(files["a.txt"])

@@ -17,30 +17,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var errCaptureSpoolFull = errors.New("file exceeds the available local spool limit")
+
 // Inputs have already passed discovery/ignore selection. This captures bytes,
 // not a root-wide snapshot, and performs no network operations. The caller owns
 // the returned directory, including on failure. A spool without journal.json
 // is incomplete and must never be submitted. Failure after journal publication
 // may leave a resumable capture; no remote writes have occurred either way.
-func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDir string, files []models.CaptureFile, previous map[string]localCapturedHead, packBytes, remainingBytes int64) (string, error) {
+// A successful capture contains the longest prefix of whole files that fits;
+// the returned count tells the caller where to continue after submission.
+func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDir string, files []models.CaptureFile, previous map[string]localCapturedHead, packBytes, remainingBytes int64) (string, int, error) {
 	if serverURL == "" || rootID == "" || len(files) < 1 || len(files) > 128 || packBytes < 1 || packBytes > 128<<20 {
-		return "", errors.New("invalid capture spool inputs")
+		return "", 0, errors.New("invalid capture spool inputs")
 	}
 	seen := make(map[string]bool, len(files))
 	for _, file := range files {
 		if !filepath.IsLocal(file.Path) || path.Clean(file.Path) != file.Path || file.Path == "." || seen[file.Path] || file.Source != nil {
-			return "", errors.New("capture paths must be unique root-relative paths without supplied sources")
+			return "", 0, errors.New("capture paths must be unique root-relative paths without supplied sources")
 		}
 		seen[file.Path] = true
 	}
 	sourceRoot, err := os.OpenRoot(sourceDir)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer sourceRoot.Close()
 	dir, err := os.MkdirTemp(parent, "capture-*")
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	journal := captureJournal{Format: 1, ServerURL: serverURL, RootID: rootID,
 		Request: models.CaptureVersionsRequest{CaptureID: uuid.NewString(), Files: append([]models.CaptureFile(nil), files...)},
@@ -74,7 +78,7 @@ func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDi
 	buffer := make([]byte, 64<<10)
 	for i := range journal.Request.Files {
 		if err := ctx.Err(); err != nil {
-			return dir, err
+			return dir, 0, err
 		}
 		file := &journal.Request.Files[i]
 		if file.Deleted {
@@ -112,6 +116,11 @@ func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDi
 					return err
 				}
 			}
+			// Check the whole file before copying any of it. Verified remote
+			// prefixes need no spool space; discovery sizes may be stale.
+			if remaining > remainingBytes {
+				return fmt.Errorf("%w: needs %d new bytes, %d available; raise PUFFERFS_CAPTURE_SPOOL_BYTES or resolve retained captures", errCaptureSpoolFull, remaining, remainingBytes)
+			}
 			for remaining > 0 {
 				if pack == nil {
 					packName = fmt.Sprintf("pack-%06d", len(journal.Packs))
@@ -122,9 +131,6 @@ func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDi
 					packSize, packDigest = 0, sha256.New()
 				}
 				length := min(remaining, packBytes-packSize)
-				if length > remainingBytes {
-					return errors.New("capture exceeds the local spool limit; raise PUFFERFS_CAPTURE_SPOOL_BYTES")
-				}
 				// Copy the fixed observed extent. Later appends belong to a new
 				// capture; truncation produces an error, never a shorter success.
 				n, err := io.CopyBuffer(io.MultiWriter(pack, packDigest, digest), io.LimitReader(captureContextReader{ctx, source}, length), buffer)
@@ -154,29 +160,33 @@ func createCaptureSpool(ctx context.Context, parent, serverURL, rootID, sourceDi
 			}
 			return nil
 		}()
+		if errors.Is(err, errCaptureSpoolFull) && i > 0 {
+			journal.Request.Files = journal.Request.Files[:i]
+			break
+		}
 		if err != nil {
-			return dir, fmt.Errorf("capturing %s: %w", file.Path, err)
+			return dir, 0, fmt.Errorf("capturing %s: %w", file.Path, err)
 		}
 	}
 	if err = finishPack(); err != nil {
-		return dir, err
+		return dir, 0, err
 	}
 	if err = ctx.Err(); err != nil {
-		return dir, err
+		return dir, 0, err
 	}
 	// Publish the journal last, after every referenced pack is durable.
 	if err = saveCaptureJournal(dir, journal); err != nil {
-		return dir, err
+		return dir, 0, err
 	}
 	parentDir, err := os.Open(parent)
 	if err != nil {
-		return dir, err
+		return dir, 0, err
 	}
 	defer parentDir.Close()
 	if err = parentDir.Sync(); err != nil {
-		return dir, err
+		return dir, 0, err
 	}
-	return dir, nil
+	return dir, len(journal.Request.Files), nil
 }
 
 type captureContextReader struct {

@@ -724,6 +724,22 @@ and API restarts. Source expiry waits for the ordinary signed-upload deadline,
 so allow more than 15 minutes. No database writes manufacture application state.
 The separate `cloud-index` scenario covers real AWS and GPU compatibility.
 
+### Capture spool capacity
+
+Run `bash scripts/test-e2e-capture-spool.sh` with real Gemini and Turbopuffer
+credentials. The production CLI uses an 8 MiB spool budget to sync more than
+10 MiB of synthetic input through separate API, consumer, transform and index
+processes. It checks byte-based batch boundaries, exact remaining capacity,
+empty files, upload failure and journal replay, append reuse beyond the budget,
+replacement, deletion, unchanged retries, single-file overflow, conflict
+retention, authorization, retained S3 bytes, read/search and process restarts.
+
+This uses production migrations, real Postgres, LocalStack S3/SQS, a TCP fault
+proxy and real Turbopuffer. Native text uses CPU indexing with vectors disabled;
+AWS-specific behavior, GPU execution and model-based transformation are outside
+this scenario. Cleanup requires real Gemini credentials and deletes only the
+isolated run's resources.
+
 ### Capture manifest packing
 
 Run `scripts/test-e2e-manifest-packs.sh` with the usual real provider credentials.
