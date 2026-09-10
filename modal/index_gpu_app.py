@@ -16,7 +16,7 @@ if not 1 <= MAX_INPUTS <= 16:
 if not 1 <= BATCH_SIZE <= 128:
     raise ValueError("PUFFERFS_EMBED_BATCH_SIZE must be 1..128")
 
-gpu_image = (index_image.pip_install("sentence-transformers>=3", "torch>=2", "einops>=0.7")
+gpu_image = (index_image.pip_install_from_requirements("requirements-embedding.txt")
              .run_function(cache_model)
              .env({"PUFFERFS_INDEX_INPUTS_PER_CONTAINER": str(MAX_INPUTS),
                    "PUFFERFS_EMBED_BATCH_SIZE": str(BATCH_SIZE),

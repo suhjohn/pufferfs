@@ -31,8 +31,9 @@ COPY modal/ ./
 COPY tests/e2e/ /e2e/
 
 FROM worker-base AS vector-deps
+COPY modal/requirements-embedding.txt ./
 RUN pip install --no-cache-dir 'torch>=2' --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir 'sentence-transformers>=3' 'einops>=0.7'
+    && pip install --no-cache-dir -r requirements-embedding.txt
 # The same immutable model/code revisions as the deployed bulk index role.
 COPY modal/nomic_model.py ./nomic_model.py
 RUN python -c 'from nomic_model import cache_model; cache_model()'
