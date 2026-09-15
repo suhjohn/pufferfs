@@ -1,5 +1,11 @@
 # Worker throughput and S3 cache batching
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 This is a chronological implementation and measurement ledger. Compatibility
 notes and migration runs below describe earlier snapshots; current behavior is
 defined by the [fresh-schema audit](fresh-schema-audit.md). Old source manifests,

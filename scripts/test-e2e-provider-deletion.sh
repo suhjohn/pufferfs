@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler provider-relay provider-manifest-relay || true
+    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler provider-relay provider-manifest-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project for cleanup." >&2
       cleanup_failed=1
@@ -25,7 +25,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 --scale collector=2 postgres aws api api-ready transform provider-relay provider-manifest-relay index-cpu index-vector query reconciler collector
+"${compose[@]}" up -d --wait --scale api=2 --scale collector=2 postgres aws api api-ready transform provider-relay provider-manifest-relay index reconciler collector
 runner_started=1
 "${compose[@]}" up -d --no-deps transform-consumer index-consumer
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/provider_deletion.py

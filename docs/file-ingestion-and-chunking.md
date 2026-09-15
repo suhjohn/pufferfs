@@ -54,12 +54,13 @@ Each extraction stores compressed ordered JSONL chunks in S3:
 The collector validates provider results before publication. Missing or invalid
 results retry only the affected requests.
 
-The index worker reads chunks, reuses compatible cached vectors or runs Nomic,
-then persists replayable index mutation packs in S3. It applies those mutations
-to Turbopuffer and advances the file catalog only after all batches succeed.
-Postgres contains metadata and references, never vector bodies.
+The CPU index worker reads chunks and persists replayable text mutation packs
+in S3. Turbopuffer generates Qwen3-Embedding-8B vectors for vector-enabled roots
+as it applies those writes. The worker advances the file catalog only after all
+batches succeed. Postgres contains metadata and references; vectors live only
+in Turbopuffer.
 
-Original source packs, chunks and vectors have independent safe retention:
+Original source packs and derived artifacts have independent safe retention:
 current published/captured versions and retry/append dependencies remain reachable.
 Root deletion and obsolete artifacts are cleaned by the scheduled reconciler.
 

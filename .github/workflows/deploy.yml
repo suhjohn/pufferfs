@@ -71,21 +71,14 @@ jobs:
       PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER: ${{ vars.PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER || '1' }}
       PUFFERFS_MODAL_INDEX_MAX_CONTAINERS: ${{ vars.PUFFERFS_MODAL_INDEX_MAX_CONTAINERS || '16' }}
       PUFFERFS_INDEX_INPUTS_PER_CONTAINER: ${{ vars.PUFFERFS_INDEX_INPUTS_PER_CONTAINER || '1' }}
-      PUFFERFS_EMBED_BATCH_SIZE: ${{ vars.PUFFERFS_EMBED_BATCH_SIZE || '64' }}
-      PUFFERFS_MODAL_EMBED_GPU: ${{ vars.PUFFERFS_MODAL_EMBED_GPU || 'L4' }}
-      PUFFERFS_MODAL_EMBED_CPU: ${{ vars.PUFFERFS_MODAL_EMBED_CPU || '1' }}
-      PUFFERFS_MODAL_EMBED_MEMORY_MIB: ${{ vars.PUFFERFS_MODAL_EMBED_MEMORY_MIB || '6144' }}
       PUFFERFS_COLLECTOR_WORKERS: ${{ vars.PUFFERFS_COLLECTOR_WORKERS || '1' }}
-      PUFFERFS_MODAL_QUERY_EMBED_GPU: ${{ vars.PUFFERFS_MODAL_QUERY_EMBED_GPU || 'L4' }}
       MODAL_OIDC_PROVIDER_ARN: ${{ vars.MODAL_OIDC_PROVIDER_ARN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TURBOPUFFER_REGION: ${{ vars.TURBOPUFFER_REGION }}
       TURBOPUFFER_API_URL: ${{ vars.TURBOPUFFER_API_URL }}
       PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
-      MODAL_QUERY_EMBED_ENDPOINT: ${{ vars.MODAL_QUERY_EMBED_ENDPOINT || secrets.MODAL_QUERY_EMBED_ENDPOINT }}
       MODAL_TRANSFORM_ENDPOINT: ${{ vars.MODAL_TRANSFORM_ENDPOINT || secrets.MODAL_TRANSFORM_ENDPOINT }}
       MODAL_FILE_INDEX_ENDPOINT: ${{ vars.MODAL_FILE_INDEX_ENDPOINT || secrets.MODAL_FILE_INDEX_ENDPOINT }}
-      MODAL_FILE_CPU_INDEX_ENDPOINT: ${{ vars.MODAL_FILE_CPU_INDEX_ENDPOINT || secrets.MODAL_FILE_CPU_INDEX_ENDPOINT }}
       FRONTEND_URL: ${{ vars.FRONTEND_URL }}
       COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
       API_DOMAIN: ${{ vars.API_DOMAIN }}
@@ -225,7 +218,7 @@ jobs:
           python3 -m pip install 'modal>=1.1.2,<2'
           python3 scripts/deploy/configure-modal.py
           cd modal
-          for role in transform_app index_cpu_app index_gpu_app query_app collector_app reconciliation_app; do
+          for role in transform_app index_app collector_app reconciliation_app; do
             python3 -m modal deploy "${role}.py" --env "$MODAL_ENVIRONMENT"
           done
 

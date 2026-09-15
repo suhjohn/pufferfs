@@ -1,5 +1,11 @@
 # Capacity tuning: measured production profile
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 The selected profile is **one index consumer, K=32, up to eight A10 workers,
 four file inputs per worker and embedding batches of 32**. GPU workers request
 two vCPUs and 6 GiB. The 20-minute production window kept GPUs 88.89% busy and

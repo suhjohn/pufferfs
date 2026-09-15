@@ -3,7 +3,7 @@
 Requires real AWS IAM-user credentials (STS federation), Modal authentication,
 provider keys, and a TLS-verified DATABASE_URL whose role can create databases
 and roles. Creates a disposable database/login, bucket, four FIFO queues, and
-two temporary Modal secrets/apps. Only the host keeps provisioning credentials;
+two temporary Modal secrets and one CPU index app. Only the host keeps provisioning credentials;
 runtime workers receive a dedicated DB login and resource-scoped STS session.
 
 Run: uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_index.py
@@ -36,19 +36,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("cloud-index", "worker-throughput"), default="cloud-index")
     parser.add_argument("--containers", "--workers", dest="containers", type=int, choices=range(1, 17), default=1,
-                        help="Maximum bulk embedding containers; consumers remain one replica per stage")
+                        help="Maximum CPU index containers; consumers remain one replica per stage")
     parser.add_argument("--inputs", type=int, choices=range(1, 17), default=1,
                         help="Concurrent inputs per index container")
     parser.add_argument("--consumer-concurrency", type=int, choices=range(1, 65),
                         help="Index jobs admitted by the single consumer; defaults to containers times inputs")
-    parser.add_argument("--batch-size", type=int, choices=range(1, 129), default=64,
-                        help="Texts per encoder batch")
-    parser.add_argument("--gpu", default=os.getenv("PUFFERFS_MODAL_EMBED_GPU", "L4"),
-                        help="Modal accelerator, or none for the same bulk encoder on CPU")
-    parser.add_argument("--cpu", type=float, default=1,
-                        help="Physical CPU cores requested by each bulk encoder")
-    parser.add_argument("--memory-mib", type=int, default=6144,
-                        help="Memory requested by each bulk encoder")
     parser.add_argument("--records-per-file", type=int, choices=range(1, 769),
                         help="Override record count in each throughput fixture for a bounded sweep")
     parser.add_argument("--repeats", type=int, choices=range(1, 17), default=1,
@@ -58,8 +50,6 @@ def main():
     parser.add_argument("--shards", type=int, choices=(1, 2), default=2,
                         help="Exercise single- or multiple-namespace root routing")
     args = parser.parse_args()
-    if not 0.125 <= args.cpu <= 64 or not 1024 <= args.memory_mib <= 131072:
-        parser.error("CPU must be 0.125..64 physical cores and memory 1024..131072 MiB")
     concurrency = args.consumer_concurrency or args.containers * args.inputs
     if concurrency > 64:
         parser.error("The single index consumer supports at most 64 admitted jobs")
@@ -90,8 +80,7 @@ def main():
     print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region,
         "consumer_replicas_per_stage": 1, "index_consumer_concurrency": concurrency,
         "index_containers": args.containers, "index_inputs": args.inputs,
-        "embed_batch_size": args.batch_size, "repeats": args.repeats, "shards": args.shards,
-        "gpu": args.gpu, "cpu_physical_cores": args.cpu, "memory_mib": args.memory_mib,
+        "repeats": args.repeats, "shards": args.shards,
         "records_per_file": args.records_per_file}), flush=True)
     recovery = Path(tempfile.mkdtemp(prefix=identifier + "-"))
     state_path = recovery / "resources.json"
@@ -192,8 +181,7 @@ def main():
             "TURBOPUFFER_API_KEY": os.environ["TURBOPUFFER_API_KEY"],
             "TURBOPUFFER_API_URL": os.environ.get("TURBOPUFFER_API_URL") or f"https://{os.environ.get('TURBOPUFFER_REGION', 'gcp-us-central1')}.turbopuffer.com",
             "PUFFERFS_SQS_TRANSFORM_QUEUE_URL": urls["transform"], "PUFFERFS_SQS_INDEX_QUEUE_URL": urls["index"],
-            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards),
-            "PUFFERFS_EMBEDDING_DEVICE": "cpu" if args.gpu == "none" else "cuda"}
+            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards)}
         worker_name, auth_name = identifier + "-worker", identifier + "-auth"
         for name, values in ((worker_name, worker_env), (auth_name, {"PUFFERFS_MODAL_ENDPOINT_AUTH_KEY": auth_key})):
             modal.Secret.objects.create(name, values)
@@ -202,48 +190,41 @@ def main():
         # Isolated application and URL names: no stable production label is
         # reused even while the temporary application is running.
         os.environ.update(PUFFERFS_WORKER_SECRET_NAME=worker_name, PUFFERFS_MODAL_ENDPOINT_SECRET_NAME=auth_name,
-            PUFFERFS_INDEX_GPU_APP_NAME=identifier + "-index", PUFFERFS_INDEX_GPU_ENDPOINT_LABEL=identifier + "-index",
-            PUFFERFS_QUERY_APP_NAME=identifier + "-query", PUFFERFS_QUERY_ENDPOINT_LABEL=identifier + "-query",
+            PUFFERFS_INDEX_APP_NAME=identifier + "-index", PUFFERFS_INDEX_ENDPOINT_LABEL=identifier + "-index",
             PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.containers),
-            PUFFERFS_MODAL_EMBED_GPU=args.gpu, PUFFERFS_MODAL_EMBED_CPU=str(args.cpu),
-            PUFFERFS_MODAL_EMBED_MEMORY_MIB=str(args.memory_mib),
-            PUFFERFS_INDEX_INPUTS_PER_CONTAINER=str(args.inputs), PUFFERFS_EMBED_BATCH_SIZE=str(args.batch_size),
-            PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS="0", PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS="1")
+            PUFFERFS_INDEX_INPUTS_PER_CONTAINER=str(args.inputs))
         sys.path.insert(0, str(REPOSITORY / "modal"))
         os.chdir(REPOSITORY / "modal")
-        import index_gpu_app
-        import query_app
+        import index_app
 
         with ExitStack() as apps:
             apps.enter_context(modal.enable_output())
-            apps.enter_context(index_gpu_app.app.run())
-            apps.enter_context(query_app.app.run())
+            apps.enter_context(index_app.app.run())
             runtime = dict(os.environ, **worker_env)
             runtime.update(DATABASE_URL=database_url, PUFFERFS_WORKER_DATABASE_URL=worker_database_url,
                 PUFFERFS_DB_MAX_CONNS="2", PUFFERFS_WORKER_DB_MAX_CONNS="2",
                 PUFFERFS_CLOUD_INDEX_CONCURRENCY=str(concurrency),
                 PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats),
                 PUFFERFS_E2E_THROUGHPUT_RECORDS=str(args.records_per_file or ""))
-            runtime.update(MODAL_FILE_INDEX_ENDPOINT=index_gpu_app.Indexer().index.get_web_url(),
-                MODAL_QUERY_EMBED_ENDPOINT=query_app.QueryEmbedder().embed_query_endpoint.get_web_url(),
+            runtime.update(MODAL_FILE_INDEX_ENDPOINT=index_app.index.get_web_url(),
                 MODAL_SECRET_KEY=auth_key, PUFFERFS_ADMIN_KEY=secrets.token_urlsafe(36), JWT_SECRET=secrets.token_urlsafe(36),
                 PUFFERFS_CLOUD_DB_PASSWORD=password, COMPOSE_PROJECT_NAME=identifier)
             state["runtime"] = {key: runtime[key] for key in (*worker_env, "PUFFERFS_WORKER_DATABASE_URL",
                 "PUFFERFS_DB_MAX_CONNS", "PUFFERFS_WORKER_DB_MAX_CONNS", "PUFFERFS_CLOUD_INDEX_CONCURRENCY",
-                "PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "PUFFERFS_EMBED_BATCH_SIZE", "PUFFERFS_E2E_THROUGHPUT_REPEATS",
-                "MODAL_SECRET_KEY", "PUFFERFS_ADMIN_KEY", "JWT_SECRET", "MODAL_FILE_INDEX_ENDPOINT", "MODAL_QUERY_EMBED_ENDPOINT")}
+                "PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "PUFFERFS_E2E_THROUGHPUT_REPEATS",
+                "MODAL_SECRET_KEY", "PUFFERFS_ADMIN_KEY", "JWT_SECRET", "MODAL_FILE_INDEX_ENDPOINT")}
             save()
-            print(json.dumps({"bulk_app": index_gpu_app.app.app_id, "query_app": query_app.app.app_id}), flush=True)
+            print(json.dumps({"index_app": index_app.app.app_id}), flush=True)
             try:
                 compose("build", "api", "transform", "e2e")
                 state["compose_started"] = True
                 save()
-                compose("up", "-d", "--wait", "api", "api-ready", "transform", "index-cpu",
+                compose("up", "-d", "--wait", "api", "api-ready", "transform",
                         "reconciler", "transform-consumer", "index-consumer")
                 compose("run", "--rm", "--no-deps", "e2e", args.scenario)
             finally:
                 if state["compose_started"]:
-                    compose("stop", "transform-consumer", "index-consumer", "transform", "index-cpu", "reconciler", check=False)
+                    compose("stop", "transform-consumer", "index-consumer", "transform", "reconciler", check=False)
                     state["application_cleaned"] = compose("run", "--rm", "--no-deps", "e2e", "cleanup", check=False) == 0
                     save()
                     log_path = REPOSITORY / "tests/e2e/artifacts" / f"{identifier}.log"

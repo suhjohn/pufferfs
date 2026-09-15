@@ -3,7 +3,7 @@
 This is a deployment diagnostic, not an end-to-end test or a permission grant.
 It creates a temporary CPU Function, never deploys/replaces an application, never
 reads source bodies and never receives queue messages. No secret values print.
-S3 write/abort/delete and bulk GPU execution still need staging E2E validation.
+S3 write/abort/delete and native embedding indexing still need staging E2E validation.
 """
 
 import os

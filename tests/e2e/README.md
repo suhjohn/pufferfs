@@ -1,5 +1,11 @@
 # Production-path end-to-end tests
 
+Current vector tests use real Turbopuffer native `qwen/qwen3-embedding-8b`
+(4096 dimensions). No Nomic/query process or model image exists. Dated results
+below describe their original runs; they are not evidence for the native-Qwen
+change. See `docs/native-embeddings-assessment.md` for the new verification record.
+
+
 All PufferFS application roles run in separate Docker Compose containers. The
 test driver starts the real CLI and calls public HTTP endpoints. It does not
 import application code, monkeypatch providers, seed work tables or invoke
@@ -21,14 +27,13 @@ test driver -> CLI -> API --capture metadata--> Postgres
                 |      |                       index SQS FIFO + DLQ
                 |      |                           |
                 |      |                     index consumer
-                |      |                      /          \
-                |      |                CPU/no-vector   Nomic worker
-                |      |                      \          /
-                |      |                      real Turbopuffer
+                |      |                           |
+                |      |                     CPU index worker
+                |      |                           |
+                |      |                real Turbopuffer --> native embedding provider
                 |      |                            |
                 |      +<--published version----- Postgres
                 |      |
-                |      +--query--> query embedder (separate Nomic process)
                 |      +--search/read----------------> Turbopuffer
                 |
                 +--presigned PUT/multipart--> S3 source packs
@@ -38,7 +43,7 @@ Application SQS traffic uses a separate fault-proxy port. Bootstrap and the
 test driver's queue assertions connect directly to the emulator.
 Only the test driver controls faults; production requests/bodies are unchanged.
 
-workers/collector/index <--> S3 source, chunk, vector and mutation artifacts
+workers/collector/index <--> S3 source, chunk and text mutation artifacts
 reconciler (60s) <--> Postgres delivery ledger --repair send--> SQS
 reconciler --bounded cleanup--> S3 / Turbopuffer
 ```
@@ -48,12 +53,10 @@ reconciler --bounded cleanup--> S3 / Turbopuffer
 | Local agent | `e2e` runs built `pufferfs` | Synthetic filesystem; HTTP registration + signed S3 uploads |
 | API | `api` | Production Go image, real auth/migrations/catalog/read/search |
 | Transform delivery consumer | `transform-consumer` | Actual Go worker claims SQS receipts; invokes HTTP transform worker |
-| Index delivery consumer | `index-consumer` | Actual Go worker claims index SQS; selects CPU or Nomic endpoint |
+| Index delivery consumer | `index-consumer` | Actual Go worker claims index SQS; invokes the CPU index endpoint |
 | Transformation worker | `transform` | Same `transform_app.transform_file` entrypoint; LibreOffice/FFmpeg and actual Google SDK |
 | Batch collectors | `collector` | Production collector invocation every 60 seconds; recovery suite scales to two processes |
-| No-vector index worker | `index-cpu` | Same authenticated production entrypoint, actual Turbopuffer SDK |
-| Bulk embedding/index worker | `index-vector` | Same Indexer class and pinned Nomic revisions; CPU device locally |
-| Query embedding worker | `query` | Same QueryEmbedder class, separate process/model |
+| Index worker | `index` | Same authenticated CPU entrypoint; native embeddings for vector roots |
 | Reconciliation worker | `reconciler` | Same production function every 60 seconds |
 | Database | `postgres` | Postgres 17; production migrations run by Go startup |
 | Object store / queues | `aws` | LocalStack S3 and independent SQS FIFO queues + DLQs |
@@ -62,7 +65,7 @@ reconciler --bounded cleanup--> S3 / Turbopuffer
 Compose starts containers. The two Go consumers claim SQS messages and invoke
 worker HTTP endpoints. Postgres records ownership, versions and recovery state;
 it is not an execution queue. Modal's `.local()` adapter runs the same decorated
-functions/classes inside these containers, without creating a Modal deployment.
+functions inside these containers, without creating a Modal deployment.
 The scheduled-role adapter logs failed invocations and continues its 60-second
 schedule. Only successful invocations refresh the health heartbeat.
 
@@ -105,7 +108,7 @@ a second-batch connection failure, retry of only missing IDs through the other
 API, mixed stages, concurrent captures, scheduled repair after API restarts,
 and exact search/read/tombstones after processing. SQL/SQS inspection is
 read-only except for returning inspected SQS receipts to normal visibility.
-The external search provider is real; faulted AWS SQS, GPU execution and
+The external search provider is real; faulted AWS SQS, native embedding capacity and
 Gemini extraction are not covered by this local native-text scenario.
 
 The focused native transformation handoff suite runs with
@@ -117,8 +120,8 @@ messages, no immediate delivery-ledger reads, committed chunks during a queue
 outage, scheduled repair while transformation processes are stopped, and
 search/read after restarts, updates and deletes. Like other local native
 scenarios it uses LocalStack and CPU indexing without vectors; it does not
-exercise Gemini extraction or GPU indexing. The cloud throughput suite covers
-the same native handoff followed by real GPU indexing separately.
+exercise Gemini extraction or native embedding indexing. The cloud throughput suite covers
+the same native handoff followed by real native embedding indexing separately.
 
 1. Disconnect application SQS delivery, then capture 12 files through the CLI.
    Confirm all versions are accepted with unconfirmed delivery and zero worker
@@ -169,7 +172,7 @@ the same native handoff followed by real GPU indexing separately.
    source hashes/ranges, contiguous chunks, mutation acknowledgements, PDF page
    reads, real FTS, root authorization and authenticated worker endpoints.
    Generated images and converted audio must not exist in S3.
-6. Exercise a separate vector-enabled root with real Nomic embeddings and real
+6. Exercise a separate vector-enabled root with real native Qwen embeddings and real
    vector/hybrid search; verify the no-vector root produced no embeddings.
    Then create/remove actual folder deny rules against the already published
    native root. Bare user IDs, `user:<id>`, roles and `*` must hide matching
@@ -401,9 +404,6 @@ main verification took 270.51 seconds. These are run observations, not productio
 throughput guarantees. Application code has no knowledge of the fixtures,
 personal directory paths or test scenarios.
 
-Test-driver files are copied after the vector dependency/model cache layers so
-editing an assertion does not reinstall PyTorch or download model weights.
-
 ## Explicit gaps from production
 
 - LocalStack is an AWS-compatible emulator, not AWS IAM, regional latency,
@@ -416,20 +416,11 @@ editing an assertion does not reinstall PyTorch or download model weights.
   Scheduled adapters run serially and do not emulate Modal's hard invocation
   timeouts or overlapping-input backlog. This does not prove deployed IAM,
   network policies or GPU concurrency.
-- The real Nomic model runs CPU float32 here; production defaults to CUDA/half.
-  Real-provider vector/hybrid ranking scenarios pass. Performance and exact GPU
-  numerics are not proven.
-- Worker-secret assertions cover transform, both index endpoints and the
-  standalone query endpoint, including malformed/non-string credentials.
-  The production role itself enforces its configured work permits (four
-  transform/index inputs in the base Compose file); the local adapter adds no
-  invocation semaphore that could conceal a missing role limit. The GPU role
-  serializes model encoding while overlapping job IO, protecting Nomic's
-  mutable model cache. Query calls retain one input per container. Modal's
-  `.local()` initializes classes lazily without a startup lock, so Compose
-  serializes the first successful class invocation before allowing overlap.
-  This adds first-invocation serialization beyond production's initialization
-  boundary and must not be treated as a production cold-start measurement.
+- Turbopuffer and its Qwen embedding provider are real. Compose does not
+  establish production latency, billing, rate-limit capacity or autoscaling.
+- Worker-secret assertions cover transformation and the single index endpoint,
+  including malformed/non-string credentials. Production handlers enforce their
+  configured work permits; the local adapter adds no extra semaphore.
 - This is **not yet a replacement for every previous assertion**. Provider
   lost-response/partial-retry and long/alternate media scenarios are implemented;
   their results must be tracked separately from earlier suite passes. Path ACL
@@ -448,11 +439,7 @@ limits, incomplete-capture cleanup, accepted-pack release, 70 successive CLI
 captures with 64-receipt pruning, append reuse after
 cleanup, retained-source/read/search checks, cross-tenant root/key/completion/
 source-reference forgery, pending/conflicted captures under spool pressure, and
-concurrent authenticated Nomic queries. It also sets the ordinary embedding-cache
-retention policy to 120 seconds and waits for the production 60-second scheduled
-reconciler: two real Nomic publications reuse a cache pack, cold-pack expiry
-removes its S3 bytes/locators while search and mutation artifacts remain intact,
-then another publication re-encodes the cache miss into a new pack. The obsolete
+public authenticated queries. The obsolete
 extraction policy is also set to 120 seconds: a replaced version's chunks and
 mutations must disappear while current artifacts, all source bytes, append reuse
 and public reads remain valid. No database
@@ -471,7 +458,7 @@ the active API key. It requires HTTP 403 with no catalog/proof/pack binding, the
 restores access and requires the same capture to index and read successfully.
 Fresh-image run `8edecb6117ea47bdbdb67a3742c7ce22` passed all nine cases in
 40.26 seconds and cleanup in 4.17 seconds, exiting 0. The standalone phase used
-native text/CPU indexing and real Turbopuffer; it does not prove GPU/media
+native text/CPU indexing and real Turbopuffer; it does not prove native embedding/media
 behavior or revoke already-issued S3 URLs. The retention suite includes these
 scenarios. It uses the same production
 processes, migrations and real search provider. It does
@@ -483,12 +470,6 @@ not a latest-code uninterrupted suite pass. Receipt pruning passed in run
 `53d912786fa847d48aa340c5052b0423`; the expanded pending/conflict, embedding-cache
 and obsolete-extraction scenarios passed in fresh run
 `97ebd39610b74bfea94e876b9189fc1c` (331.52 seconds plus successful cleanup).
-
-`python3 tests/e2e/cloud_query.py` is the separate real-Modal check described in
-the deployment guide. It starts/stops a temporary app, not a production rollout.
-Compose uses CPU float32; the cloud query role defaults to CUDA/float16 and logs
-the actual device/dtype at model initialization. A cloud query pass does not
-establish bulk GPU indexing, IAM permissions, autoscaling or production traffic.
 
 ### Expanded non-media formats
 
@@ -509,90 +490,29 @@ Every file goes through CLI capture, the actual renderer/parser, real Gemini
 where appropriate, durable chunks/mutations and public FTS. Assertions compare
 original hashes, exact spreadsheet cells/addresses, extracted content, page/frame
 anchors and public page reads. These are vector-disabled roots, so the suite
-does not start Nomic/query pools. The media suite likewise uses only CPU index
-publication; the corpus/index-recovery suites cover local Nomic separately.
+uses the shared CPU worker without native embedding. The corpus/index-recovery
+suites exercise native vector search separately.
 
-### Real AWS and bulk GPU
+### Real AWS and native embeddings
 
 `uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_index.py`
-uses `compose.e2e-cloud.yml`: CLI, API, transform and consumers in Compose; actual
-Modal GPU bulk/query deployments; actual cloud Postgres, S3 and SQS; real search.
-See [cloud provisioning and cleanup requirements](../../docs/production-deployment.md).
-It provisions temporary resources and credentials, rather than inheriting a
-production queue/database into the test. The test checks scoped AWS credentials,
-130 distinct vectors over several packed GPU batches, mutations and all search
-modes, then an append with cached-vector reuse. Public multipart APIs exercise
-real upload/resume/completion; root deletion exercises listing/abort/deletion.
-The cloud runner accepts `--shards 1` and `--shards 2` (default). Vector-ranking
-assertions capture eight additional text files through the CLI, obtain real query
-embeddings, and compare public single/selected/all-root results with read-only
-provider queries. They check nearest-first distances and global top-k across
-populated roots, uncaptured roots, and every configured shard. No synthetic
-vectors or provider responses are injected.
-This is a separate opt-in cloud run, not an automatic GitHub PR provisioning job.
-It cannot prove the deployed ECS task principal, cloud failure domains, physical
-deletion in versioned buckets, or production migration/cutover.
+uses `compose.e2e-cloud.yml`: CLI/API/transform/consumers in Compose, a real Modal
+CPU index app, isolated cloud Postgres/S3/SQS, and real Turbopuffer embeddings.
+See [provisioning and cleanup](../../docs/production-deployment.md). It checks
+scoped AWS credentials, text-only durable mutations, native 4096-dimensional
+vectors, FTS/vector/hybrid search, appends, exact reads and multipart cleanup.
 
-Run `eb6c0db4478041579561c8a4eb15ddfc` passed this actual-cloud path in 183.14
-seconds and API cleanup in 1.84 seconds, with both GPU roles on CUDA/float16.
-Temporary cloud and Compose resources were removed; production was unchanged.
+`--shards 1` or `--shards 2` exercises root routing; reference-ranking assertions
+use native provider queries over CLI-created data. `--scenario worker-throughput`
+checks initial and forced reindex publication. `--containers`, `--inputs`,
+`--consumer-concurrency`, `--records-per-file` and `--repeats` bound the workload.
+There are no GPU, encoder batch, or query-pool options. The optional
+`--worker-database-port 6432` selects an existing pooler, never creates one.
 
-### Throughput and cache-directory upgrade
-
-The cloud runner accepts `--scenario worker-throughput --containers 1` for cold
-and forced warm-cache publication of four synthetic JSONL files (968 chunks).
-It checks exact retained bytes/line reads, FTS/vector/hybrid results, one attempt
-per job, completed extraction/work state, acknowledged mutation batches, five S3
-vector packs, absence of the removed locator table and cache identity reuse.
-The runner keeps one consumer replica per stage. `--containers N --inputs I`
-admits N × I index jobs through that consumer, or an explicit
-`--consumer-concurrency K` (maximum 64). `--workers` remains an alias for the
-container limit. `--batch-size B` selects encoder microbatches. `--repeats R`
-generates R copies of the four-file workload with distinct contents and supplied
-expectations, so a small fixture does not silently underfill a larger pool.
-
-For a CPU/GPU batch comparison, `--gpu none --cpu 2 --memory-mib 6144` runs the
-same bulk embedding entrypoint on a real Modal CPU allocation. `--gpu A10 --cpu 1`
-selects an A10 allocation. CPU is measured in physical cores. Both retain the
-pinned Nomic model, using the production CPU float32 / CUDA float16 paths.
-`--records-per-file 64` bounds each of the four fixtures to 64 records while
-retaining exact read/search, cold/warm cache and durable-publication assertions.
-Each cloud run provisions a fresh organization/database, so identical fixture
-contents across batch sizes still require fresh encoding. The report includes
-`encoder_vectors_per_second` separately from whole-worker and capture timings.
-
-`--worker-database-port 6432` uses an **existing** transaction pooler for workers;
-API/consumer processes retain the original direct port. This creates no pooler
-and changes no database settings. Cloud fixtures share the provisioning server's
-connection/CPU budget; establish sufficient spare capacity before running them.
-The runner uses two connections per Go/Python process, matching production.
-
-`python3 scripts/worker-throughput-report.py LOG...` summarizes only work IDs
-from successfully validated phases. Its chunks/s uses worker invocation time,
-not queue/startup-inclusive wall time; phase timings are inclusive. Reports include
-worker regions and application statement counts with connection probes excluded.
-See the
-[measurement and rollout notes](../../docs/worker-throughput.md).
-
-`bash scripts/test-e2e-retention.sh embedding-retention` runs the existing cache
-retention workflow alone with real 120-second expiry and scheduled reconciliation:
-cache reuse, cleared directory, deleted S3 bytes, preserved search/mutation
-artifacts and later re-encoding. It does not run the broader authorization or
-source-retention scenarios. Cloud logs are saved per project under `artifacts/`;
-cloud databases share the provisioning cluster's total connection budget, so
-run cloud scenarios sequentially when its spare capacity is limited.
-
-`bash scripts/test-e2e-retention.sh embedding-io` delays actual embedding-cache
-GET and PUT requests through an external S3 relay. Scheduled 120-second expiry
-must retire/delete the pack while the worker's network call remains in flight.
-Releasing the GET returns a real S3 404 and the worker re-encodes; releasing the
-PUT writes real bytes after retirement, preserves the directory tombstone and
-schedules those late bytes for deletion. Both cases verify one work attempt,
-durable vector mutations, exact CLI-captured source reads and all search modes.
-The scenario uses the ordinary SDK setting `AWS_MAX_ATTEMPTS=10` so network
-retries outlast the shortened TTL. It shares the documented Compose differences
-(CPU Nomic execution, local Postgres and LocalStack) and injects no production
-faults or clock/database mutations.
+`python3 scripts/worker-throughput-report.py LOG...` summarizes only validated
+phases, including preparation/provider-write/publication timing and mutation
+bytes. Cache throughput/retention tests and their external S3 relay are removed;
+source/obsolete artifact retention and index recovery still have separate suites.
 
 ### Multiple API servers and request query counts
 
@@ -638,7 +558,7 @@ passed separately in `34b7b3baa4aa4856b5b6790250246c8f` (37.87 seconds, cleanup
 folder-denial cases at the actual manifest-upload response boundary. These
 are native-text/no-vector runs with real Turbopuffer, local Postgres/LocalStack
 and test-only query instrumentation; they do not verify browser JWT revocation,
-cloud failure domains or GPU/media behavior.
+cloud failure domains or native embedding/media behavior.
 
 Final read-path run `7b5d5e530739481ca0f2e96acbb233b0` also passed three distinct
 authorized roots in selected/all-root queries with unchanged identity/access
@@ -679,7 +599,7 @@ must remain unchanged throughout reads and updates. Provider content and
 credentials are not logged by the relay; synthetic publication IDs and request
 hashes are available for assertions. Index workers continue writing directly to
 real Turbopuffer. This adds a test-only network hop to the local no-vector topology;
-it does not emulate search, require production fault hooks, or validate media/GPU
+it does not emulate search, require production fault hooks, or validate media/native embedding
 processing. Final run evidence is recorded in `docs/api-simplification.md`.
 
 `api_groups.py` adds concurrent platform-admin group provisioning and membership
@@ -722,7 +642,7 @@ batch limit, multi-extent append, capture races, replay identity, empty/deleted
 files, source provenance, capture revocations during network IO, source expiry
 and API restarts. Source expiry waits for the ordinary signed-upload deadline,
 so allow more than 15 minutes. No database writes manufacture application state.
-The separate `cloud-index` scenario covers real AWS and GPU compatibility.
+The separate `cloud-index` scenario covers real AWS and native embedding compatibility.
 
 ### Capture spool capacity
 
@@ -736,7 +656,7 @@ retention, authorization, retained S3 bytes, read/search and process restarts.
 
 This uses production migrations, real Postgres, LocalStack S3/SQS, a TCP fault
 proxy and real Turbopuffer. Native text uses CPU indexing with vectors disabled;
-AWS-specific behavior, GPU execution and model-based transformation are outside
+AWS-specific behavior, native embedding capacity and model-based transformation are outside
 this scenario. Cleanup requires real Gemini credentials and deletes only the
 isolated run's resources.
 
@@ -755,9 +675,9 @@ retained-byte re-upload, and reads/search after both API processes restart.
 The test uses production roles and migrations, real Postgres and real
 Turbopuffer. LocalStack supplies S3/SQS and the network relay supplies explicit
 transport faults; these differ from AWS. Native text uses CPU indexing with
-vectors disabled; GPU/provider-media execution is outside this scenario.
+vectors disabled; Native embedding/provider-media execution is outside this scenario.
 `cloud_index.py --scenario cloud-index --workers 1` separately exercises real
-AWS S3 range reads, multipart/append and GPU indexing. Previous source formats are intentionally unsupported.
+AWS S3 range reads, multipart/append and native embedding indexing. Previous source formats are intentionally unsupported.
 
 ### Mutation acknowledgment and full artifact replay
 
@@ -773,7 +693,7 @@ The test compares repeated payload hashes, verifies every source line and FTS
 through both APIs, then repeats reads after both API processes restart.
 Cleanup removes the isolated root and objects. This uses real Postgres,
 LocalStack S3/SQS, native CPU indexing without vectors, and real Turbopuffer.
-GPU/cache/search-mode coverage is separate in the cloud throughput and index
+Native embedding/search-mode coverage is separate in the cloud throughput and index
 recovery suites. No old worker checkout or partial-checkpoint path is supported.
 
 `bash scripts/test-e2e-index-renewal.sh` holds the second real provider response

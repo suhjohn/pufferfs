@@ -25,7 +25,6 @@ import (
 type Server struct {
 	db          *DB
 	s3          *storage.Client
-	modal       *ModalClient
 	tp          *TPClient
 	queue       *queue.SQSQueue
 	billing     *StripeClient
@@ -40,11 +39,10 @@ type Server struct {
 }
 
 // New creates a new Server with all dependencies.
-func New(db *DB, s3 *storage.Client, modal *ModalClient, tp *TPClient) *Server {
+func New(db *DB, s3 *storage.Client, tp *TPClient) *Server {
 	s := &Server{
 		db:         db,
 		s3:         s3,
-		modal:      modal,
 		tp:         tp,
 		emailLogin: true,
 		analytics:  productanalytics.Noop{},
@@ -1988,27 +1986,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var needsEmbedding bool
-	if req.Mode == "vector" || req.Mode == "hybrid" {
-		for _, root := range selection.roots {
-			if !root.VectorDisabled && len(namespaces[root.ID]) > 0 {
-				needsEmbedding = true
-				break
-			}
-		}
-	}
-
-	var embedding []float64
-	if needsEmbedding {
-		var embedErr error
-		embedding, embedErr = s.modal.EmbedQuery(req.Query)
-		if embedErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "embedding query: " + embedErr.Error()})
-			return
-		}
-	}
-
-	allResults, stats, err := s.querySearchRoots(r.Context(), id, &req, selection.roots, namespaces, embedding, queryLimit)
+	allResults, stats, err := s.querySearchRoots(r.Context(), id, &req, selection.roots, namespaces, queryLimit)
 	if err != nil {
 		writeQueryError(w, err)
 		return
@@ -2135,11 +2113,11 @@ type queryStats struct {
 	rawResultCount int
 }
 
-func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string][]models.RootIndexNamespace, embedding []float64, queryLimit int) ([]models.QueryResult, queryStats, error) {
+func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string][]models.RootIndexNamespace, queryLimit int) ([]models.QueryResult, queryStats, error) {
 	stats := queryStats{}
 	results := make([]models.QueryResult, 0)
 	var searches []namespaceSearch
-	fts, ann := []any{"content", "BM25", req.Query}, []any{"vector", "ANN", embedding}
+	fts, ann := []any{"content", "BM25", req.Query}, []any{"content", "ANN", []any{"Embed", req.Query}}
 	for _, root := range roots {
 		rankings := []any{fts}
 		if req.Mode == "vector" {

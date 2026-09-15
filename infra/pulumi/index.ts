@@ -40,8 +40,6 @@ const processing = {
   endpoints: {
     MODAL_TRANSFORM_ENDPOINT: "modalTransformEndpoint",
     MODAL_FILE_INDEX_ENDPOINT: "modalFileIndexEndpoint",
-    MODAL_FILE_CPU_INDEX_ENDPOINT: "modalFileCpuIndexEndpoint",
-    MODAL_QUERY_EMBED_ENDPOINT: "modalQueryEmbedEndpoint",
   },
 };
 const alarmTopicArn = cfg.get("alarmTopicArn");
@@ -479,8 +477,8 @@ const modalRole = new aws.iam.Role(name("modal-worker-role"), {
       Condition: {
         StringEquals: { "oidc.modal.com:aud": "oidc.modal.com" },
         StringLike: { "oidc.modal.com:sub": [
-          "pufferfs-transform", "pufferfs-batch-collector", "pufferfs-index-cpu",
-          "pufferfs-index-gpu", "pufferfs-reconciliation", "pufferfs-worker-audit",
+          "pufferfs-transform", "pufferfs-batch-collector", "pufferfs-index",
+          "pufferfs-reconciliation", "pufferfs-worker-audit",
         ].map(app => `modal:workspace_id:${modalWorkspaceId}:environment_name:${modalEnvironment}:app_name:${app}:function_name:*:container_id:*`) },
       },
     }],
@@ -758,6 +756,7 @@ function logConfig(streamPrefix: string) {
 function appTaskDefinition(
   resourceName: string,
   containerName: string,
+  role: "api" | "consumer",
   extraEnv: { name: string; value: pulumi.Input<string> }[],
   portMappings?: { containerPort: number; hostPort?: number; protocol?: string }[],
 ) {
@@ -777,8 +776,10 @@ function appTaskDefinition(
             name: containerName,
             image,
             essential: true,
-            environment: [...env, ...extraEnv],
-            secrets: secretDefs,
+            environment: [...env.filter(item => role === "consumer" || !(item.name in processing.endpoints)), ...extraEnv],
+            secrets: secretDefs.filter(item => role === "consumer"
+              ? ["DATABASE_URL", "MODAL_SECRET_KEY"].includes(item.name)
+              : item.name !== "MODAL_SECRET_KEY"),
             portMappings,
             logConfiguration: logConfig(containerName),
           },
@@ -866,6 +867,7 @@ if (apiDomain && apiHttpsReady && apiCert) {
 const apiTask = appTaskDefinition(
   "api-task",
   "api",
+  "api",
   [],
   [{ containerPort, hostPort: containerPort, protocol: "tcp" }],
 );
@@ -899,7 +901,7 @@ const workerServices = Object.entries(processing.workers).map(([stage, defaultCo
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 64) {
     throw new Error(`invalid ${serviceName} concurrency: ${concurrency}`);
   }
-  const task = appTaskDefinition(`${serviceName}-task`, serviceName, [
+  const task = appTaskDefinition(`${serviceName}-task`, serviceName, "consumer", [
     { name: "PUFFERFS_PROCESS", value: "worker" },
     { name: "PUFFERFS_WORKER_STAGE", value: stage },
     { name: "PUFFERFS_WORKER_CONCURRENCY", value: concurrency.toString() },

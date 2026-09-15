@@ -17,13 +17,10 @@ x-environment: &environment
   PUFFERFS_SQS_TRANSFORM_QUEUE_URL: http://aws:4566/queue/us-east-1/000000000000/file-transform.fifo
   PUFFERFS_SQS_INDEX_QUEUE_URL: http://aws:4566/queue/us-east-1/000000000000/file-index.fifo
   PUFFERFS_TP_NAMESPACE_SHARDS: '2'
-  PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS: ${PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS:-2592000}
   PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS: ${PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS:-2592000}
   PUFFERFS_SOURCE_RETENTION_SECONDS: ${PUFFERFS_SOURCE_RETENTION_SECONDS:-2592000}
   MODAL_TRANSFORM_ENDPOINT: http://transform:8080/
-  MODAL_FILE_CPU_INDEX_ENDPOINT: http://index-cpu:8080/
-  MODAL_FILE_INDEX_ENDPOINT: http://index-vector:8080/
-  MODAL_QUERY_EMBED_ENDPOINT: http://query:8080/
+  MODAL_FILE_INDEX_ENDPOINT: http://index:8080/
   MODAL_SECRET_KEY: e2e-worker-only
   PUFFERFS_MODAL_ENDPOINT_AUTH_KEY: e2e-worker-only
   PUFFERFS_ADMIN_KEY: e2e-admin-only
@@ -155,8 +152,7 @@ services:
       PUFFERFS_WORKER_STAGE: index
       PUFFERFS_WORKER_CONCURRENCY: '4'
     depends_on:
-      index-cpu: {condition: service_healthy}
-      index-vector: {condition: service_healthy}
+      index: {condition: service_healthy}
 
   transform:
     <<: *worker
@@ -177,39 +173,9 @@ services:
       timeout: 5s
       retries: 4
 
-  index-cpu:
+  index:
     <<: *worker
-    command: [index-cpu]
-
-  index-vector:
-    <<: *worker
-    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-vector
-    build:
-      context: .
-      dockerfile: tests/e2e/Dockerfile
-      target: vector
-    environment:
-      <<: *worker-environment
-      PUFFERFS_EMBEDDING_DEVICE: cpu
-      OMP_NUM_THREADS: '2'
-      HF_HUB_OFFLINE: '1'
-      TRANSFORMERS_OFFLINE: '1'
-    command: [index-vector]
-
-  query:
-    <<: *worker
-    image: ${COMPOSE_PROJECT_NAME:-pufferfs-e2e}-vector
-    build:
-      context: .
-      dockerfile: tests/e2e/Dockerfile
-      target: vector
-    environment:
-      <<: *environment
-      PUFFERFS_EMBEDDING_DEVICE: cpu
-      OMP_NUM_THREADS: '2'
-      HF_HUB_OFFLINE: '1'
-      TRANSFORMERS_OFFLINE: '1'
-    command: [query]
+    command: [index]
 
   reconciler:
     <<: *worker
@@ -242,7 +208,6 @@ services:
       index-consumer: {condition: service_started}
       collector: {condition: service_started}
       reconciler: {condition: service_started}
-      query: {condition: service_healthy}
 
 volumes:
   e2e-state:

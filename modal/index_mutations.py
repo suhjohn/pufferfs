@@ -1,6 +1,5 @@
 """Build version-isolated index rows. External publication lives in the worker."""
 
-import base64
 import json
 import posixpath
 
@@ -20,7 +19,7 @@ def deletion_mutation(job):
     ]], "delete_by_filter_allow_partial": True}
 
 
-def index_row(job, chunk, vector=None):
+def index_row(job, chunk):
     ordinal = chunk["chunk_index"]
     if type(ordinal) is not int or ordinal < 0:
         raise ValueError("invalid chunk ordinal")
@@ -39,8 +38,6 @@ def index_row(job, chunk, vector=None):
     for key in ("page_number", "line_start", "line_end"):
         if key in chunk["location"]:
             row[key] = chunk["location"][key]
-    if vector is not None:
-        row["vector"] = base64.b64encode(vector).decode("ascii")
     return row
 
 

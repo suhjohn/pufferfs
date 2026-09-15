@@ -14,7 +14,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler || true
+    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
     # Keep the real provider cleanup report if it fails. Preserve disposable
     # containers/state in that case so cleanup can be retried, not guessed.
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
@@ -34,7 +34,7 @@ trap finish EXIT
 "${compose[@]}" build
 # Start the API and HTTP workers without consumers or scheduled maintenance.
 # Only reconciliation will repair the intentionally failed initial SQS send.
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index-cpu index-vector query
+"${compose[@]}" up -d --wait postgres aws api api-ready transform index
 runner_started=1
 "${compose[@]}" run --rm --no-deps e2e handoff-outage
 "${compose[@]}" up -d --no-deps reconciler
@@ -70,9 +70,9 @@ fi
 "${compose[@]}" run --rm --no-deps e2e verify
 # Actual network unavailability. Consumers keep polling and must not ack failed
 # handoffs; the CLI must still capture, and readers retain the published version.
-"${compose[@]}" stop transform index-cpu
+"${compose[@]}" stop transform index
 "${compose[@]}" run --rm --no-deps e2e outage
-"${compose[@]}" up -d --wait transform index-cpu
+"${compose[@]}" up -d --wait transform index
 "${compose[@]}" restart api transform-consumer index-consumer
 "${compose[@]}" run --rm --no-deps api-ready
 "${compose[@]}" run --rm --no-deps e2e resumed

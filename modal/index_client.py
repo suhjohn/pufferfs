@@ -1,4 +1,7 @@
-"""Shared index schema and provider connection, without embedding dependencies."""
+"""Turbopuffer schema and native Qwen embedding contract."""
+
+EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
+EMBEDDING_DIMENSIONS = 4096
 
 SCHEMA = {
     **{name: {"type": "string"} for name in (
@@ -8,6 +11,17 @@ SCHEMA = {
     **{name: {"type": "uint"} for name in ("chunk_index", "version_sequence", "extraction_sequence", "page_number", "line_start", "line_end")},
     "content": {"type": "string", "full_text_search": True},
 }
+
+
+def write_options(vector_disabled):
+    schema = dict(SCHEMA)
+    if vector_disabled:
+        return {"schema": schema}
+    schema["content"] = {**SCHEMA["content"], "embed": {
+        "model": EMBEDDING_MODEL, "attribute": "vector",
+        "dims": EMBEDDING_DIMENSIONS, "dtype": "f32",
+    }}
+    return {"schema": schema, "distance_metric": "cosine_distance"}
 
 
 def turbopuffer_client(*, timeout=120, max_retries=4):

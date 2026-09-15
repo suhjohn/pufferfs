@@ -97,12 +97,12 @@ def lost_capture():
     assert not file["indexed_version_id"]
     assert raw_rows(event["namespace"], row["extraction_id"]), "held write did not reach real Turbopuffer"
     assert not search(state, state["root"], "Orchid"), "unacknowledged write became publicly visible"
-    vectors = run.embedding_locations(state["org"])
-    assert len(vectors) == 1 and vectors[0]["dimensions"] == 768
-    state.update(lost_version=file["version_id"], lost_work=row, lost_event=event, vectors=vectors,
-                 stamps=[object_stamp(key) for key in [row["mutation_ref"], vectors[0]["object_key"]]])
+    records = list(run.chunks(row["mutation_ref"]))
+    assert all("vector" not in item for record in records for item in record["write"]["upsert_rows"])
+    state.update(lost_version=file["version_id"], lost_work=row, lost_event=event,
+                 stamps=[object_stamp(row["mutation_ref"])])
     run.save(state)
-    print("Real Nomic vectors and mutation are durable; Turbopuffer accepted the write, but publication remains unacknowledged.")
+    print("Text mutation is durable; native Turbopuffer write succeeded, but publication remains unacknowledged.")
 
 
 def release():
@@ -120,19 +120,18 @@ def database_recovered():
     state = json.loads(run.STATE.read_text())
     run.eventually("API database readiness after Postgres restart",
         lambda: run.request("GET", "/readyz", statuses=(200, 503)).get("status") == "ready", 90)
-    vectors = run.embedding_locations(state["org"])
     directory = Path("/state/lost-index-response")
     source = (directory / "record.txt").read_text()
     path = directory / "reconnected.txt"
     path.write_text(source)
     run.cli(state, "sync", str(directory), "--id", state["root"])
     files = run.wait_indexed(state)
-    assert run.embedding_locations(state["org"]) == vectors, "reconnection lost the durable cache"
+    run.assert_index_vectors(state, state["root"], dimensions=4096)
     run.assert_source_retained(files[path.name])
     result = run.request("POST", f"/roots/{state['root']}/read",
         {"path": path.name, "lines": {"start": 1, "end": 1}}, key=state["key"])
     assert result["lines"][0]["content"] == source.rstrip("\n")
-    print("After an actual Postgres restart, existing worker pools reconnected and reused the S3 vector cache; exact read passed.")
+    print("After an actual Postgres restart, existing worker pools reconnected and published native vectors; exact read passed.")
 
 
 def lost_recovered():
@@ -141,7 +140,7 @@ def lost_recovered():
     row = work(state["root"], state["lost_version"])
     assert row["attempt_count"] == 2 and row["attempt_token"] != state["lost_work"]["attempt_token"]
     assert row["mutation_ref"] == state["lost_work"]["mutation_ref"] and row["acknowledged_batches"] == 1
-    assert [object_stamp(stamp["key"]) for stamp in state["stamps"]] == state["stamps"], "crash recovery rewrote vectors or mutations"
+    assert [object_stamp(stamp["key"]) for stamp in state["stamps"]] == state["stamps"], "crash recovery rewrote durable mutations"
     events = [event for event in relay("GET", "/status")["events"]
               if event["namespace"] == state["lost_event"]["namespace"] and event.get("upstream_status") == 200]
     print(json.dumps({"replayed_index_requests": events}), flush=True)
@@ -151,7 +150,7 @@ def lost_recovered():
     for mode in ("fts", "vector", "hybrid"):
         assert search(state, state["root"], "observatory telescope", mode)
     run.wait_queue_empty("index")
-    print("A new worker attempt replayed identical index payload bytes after the normal lease; vector/mutation objects were unchanged and all search modes work.")
+    print("A new worker attempt replayed identical text mutation bytes after the normal lease; all search modes work.")
 
 
 def consumer_capture():

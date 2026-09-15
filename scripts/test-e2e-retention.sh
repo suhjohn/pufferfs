@@ -5,14 +5,10 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${TURBOPUFFER_API_KEY:?Real provider credentials required}"
 # Ordinary configurable cache policy; wait for real elapsed time and the
 # unchanged production maintenance schedule, never edit timestamps in SQL.
-export PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS=120
 export PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS=120
 export PUFFERFS_SOURCE_RETENTION_SECONDS=120
 project="pufferfs-retention-${GITHUB_RUN_ID:-local}-$$"
 compose=(docker compose --env-file /dev/null --profile test -p "$project" -f compose.e2e.yml)
-if [[ "${1:-}" == "embedding-io" ]]; then
-  compose+=(-f compose.e2e-embedding-io.yml)
-fi
 mkdir -p tests/e2e/artifacts
 runner_started=0
 finish() {
@@ -20,7 +16,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler || true
+    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project for recovery." >&2
       cleanup_failed=1
@@ -34,7 +30,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index-cpu index-vector query reconciler
+"${compose[@]}" up -d --wait postgres aws api api-ready transform index reconciler
 runner_started=1
 "${compose[@]}" up -d transform-consumer index-consumer
 "${compose[@]}" run --rm --no-deps e2e "${1:-retention-security}"

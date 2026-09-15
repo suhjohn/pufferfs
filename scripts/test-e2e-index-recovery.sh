@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform index-cpu index-vector reconciler index-relay worker-redirect || true
+    "${compose[@]}" stop transform-consumer index-consumer transform index reconciler index-relay worker-redirect || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -26,16 +26,16 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index-cpu index-vector worker-redirect query reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index worker-redirect reconciler
 runner_started=1
 "${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_recovery.py)
 "${driver[@]}" lost-capture
-# Kill the actual embedding/index process after real provider acceptance but
+# Kill the actual index process after real provider acceptance but
 # before it receives the response. Do not mutate leases, receipts or DB rows.
-"${compose[@]}" kill -s SIGKILL index-vector
+"${compose[@]}" kill -s SIGKILL index
 "${driver[@]}" release
-"${compose[@]}" up -d --no-deps --wait index-vector
+"${compose[@]}" up -d --no-deps --wait index
 "${driver[@]}" lost-recovered
 # Leave worker processes alive so this exercises their existing pooled sockets,
 # rather than testing only fresh-process database connections.
@@ -53,8 +53,8 @@ driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_re
 # This phase does not claim recurring stale-row cleanup is being verified.
 "${compose[@]}" stop reconciler
 "${driver[@]}" stale-capture
-"${compose[@]}" kill -s SIGKILL index-cpu
-"${compose[@]}" up -d --no-deps --wait index-cpu
+"${compose[@]}" kill -s SIGKILL index
+"${compose[@]}" up -d --no-deps --wait index
 "${driver[@]}" stale-current
 "${driver[@]}" stale-released
 "${driver[@]}" root-deleted

@@ -343,7 +343,8 @@ The sync model understands:
 - Unchanged files.
 
 Moves and renames are captured as a deletion at the old path and a new file
-at the destination. Unchanged content can reuse cached embeddings.
+at the destination. Vector-enabled writes use Turbopuffer native Qwen embeddings;
+unchanged chunks in a new extraction are sent again.
 
 ## Search
 

@@ -1,5 +1,11 @@
 # Current-format ingestion audit
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 This audit covers the API server, transformation workers, collector workers,
 index workers, scheduled reconciler, and local CLI. Their hosting, triggers,
 queues and handoffs are shown in the [role diagram](provider-batch-manifests.md#roles-and-deployment).

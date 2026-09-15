@@ -20,7 +20,8 @@ import (
 // FileConsumer is an ECS role. It holds a bounded number of SQS receipts while
 // Modal processes work; it never relays source bytes, text chunks or vectors.
 type FileConsumer struct {
-	server      *Server
+	db          *DB
+	modal       *ModalClient
 	queue       *queue.SQSQueue
 	stage       string
 	concurrency int
@@ -28,14 +29,14 @@ type FileConsumer struct {
 
 var errFileWorkBusy = errors.New("file work already has an active attempt")
 
-func NewFileConsumer(s *Server, q *queue.SQSQueue, stage string, concurrency int) (*FileConsumer, error) {
+func NewFileConsumer(db *DB, modal *ModalClient, q *queue.SQSQueue, stage string, concurrency int) (*FileConsumer, error) {
 	if stage != queue.StageTransform && stage != queue.StageIndex {
 		return nil, fmt.Errorf("file consumer stage must be transform or index")
 	}
-	if s == nil || s.db == nil || s.modal == nil || q == nil {
+	if db == nil || modal == nil || q == nil {
 		return nil, fmt.Errorf("file consumer dependencies are required")
 	}
-	return &FileConsumer{server: s, queue: q, stage: stage, concurrency: min(max(1, concurrency), 64)}, nil
+	return &FileConsumer{db: db, modal: modal, queue: q, stage: stage, concurrency: min(max(1, concurrency), 64)}, nil
 }
 
 func (c *FileConsumer) Run(ctx context.Context) error {
@@ -130,17 +131,16 @@ func (c *FileConsumer) Process(ctx context.Context, msg queue.JobMessage) error 
 		return fmt.Errorf("invalid file work message")
 	}
 	var status string
-	var noVector bool
 	var err error
 	for {
 		var leased bool
-		err = c.server.db.pool.QueryRow(ctx, `SELECT w.status,r.vector_disabled,
+		err = c.db.pool.QueryRow(ctx, `SELECT w.status,
 		COALESCE(w.status='running' AND w.lease_until>NOW()
 		    AND v.id=f.captured_version_id AND r.deleting_at IS NULL,FALSE)
 		FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
 		JOIN file_catalog f ON f.id=v.file_id JOIN roots r ON r.id=f.root_id
 		WHERE w.id=$1 AND w.stage=$2 AND r.org_id=$3 AND f.root_id=$4 AND f.id=$5 AND v.id=$6 AND e.id=$7`,
-			msg.WorkID, c.stage, msg.OrgID, msg.RootID, msg.FileID, msg.VersionID, msg.ExtractionID).Scan(&status, &noVector, &leased)
+			msg.WorkID, c.stage, msg.OrgID, msg.RootID, msg.FileID, msg.VersionID, msg.ExtractionID).Scan(&status, &leased)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // root/work was removed
 		}
@@ -151,7 +151,7 @@ func (c *FileConsumer) Process(ctx context.Context, msg queue.JobMessage) error 
 			return nil
 		}
 		if !leased {
-			err = c.server.modal.ProcessFileWork(ctx, msg.WorkID, c.stage, uuid.NewString(), noVector)
+			err = c.modal.ProcessFileWork(ctx, msg.WorkID, c.stage, uuid.NewString())
 			if !errors.Is(err, errFileWorkBusy) {
 				break
 			}
@@ -174,13 +174,10 @@ func fileWorkDurable(status, stage string) bool {
 	return status == "complete" || status == "superseded" || (stage == queue.StageTransform && status == "waiting_provider")
 }
 
-func (m *ModalClient) ProcessFileWork(ctx context.Context, id, stage, token string, noVector bool) error {
+func (m *ModalClient) ProcessFileWork(ctx context.Context, id, stage, token string) error {
 	endpoint := m.transformURL
 	if stage == queue.StageIndex {
 		endpoint = m.fileIndexURL
-		if noVector {
-			endpoint = m.fileCPUIndexURL
-		}
 	}
 	if endpoint == "" || m.secretKey == "" {
 		return fmt.Errorf("Modal %s endpoint/authentication is not configured", stage)

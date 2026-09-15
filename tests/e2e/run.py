@@ -36,7 +36,7 @@ s3 = boto3.client("s3")
 sqs = boto3.client("sqs")
 
 
-def request(method, path, payload=None, *, key=None, statuses=(200,), server=None, cookie=None):
+def request(method, path, payload=None, *, key=None, statuses=(200,), server=None, cookie=None, with_status=False):
     data = None if payload is None else json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
     if cookie is not None:
@@ -51,23 +51,14 @@ def request(method, path, payload=None, *, key=None, statuses=(200,), server=Non
     with response:
         body = response.read()
         assert response.status in statuses, f"{method} {path}: HTTP {response.status}"
-        return json.loads(body) if body else None
+        result = json.loads(body) if body else None
+        return (response.status, result) if with_status else result
 
 
 def sql(query, args=()):
     with psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row,
                          options="-c default_transaction_read_only=on -c statement_timeout=15000") as conn:
         return conn.execute(query, args).fetchall()
-
-
-def embedding_locations(org):
-    """Read-only expansion of durable pack directories for vector assertions."""
-    return sql("""SELECT DISTINCT ON (p.model_revision,h.hash) p.org_id,p.model_revision,
-        h.hash AS content_hash,p.object_key,(h.slot-1)*p.dimensions::bigint*4 AS byte_offset,
-        p.dimensions*4 AS byte_length,p.dimensions
-        FROM embedding_packs p,unnest(p.content_hashes) WITH ORDINALITY AS h(hash,slot)
-        WHERE p.org_id=%s AND p.retired_at IS NULL AND h.hash IS NOT NULL
-        ORDER BY p.model_revision,h.hash,p.object_key""", (org,))
 
 
 def vector_bytes(value, dimensions):
@@ -81,6 +72,52 @@ def vector_bytes(value, dimensions):
     assert all(math.isfinite(number) for number, in struct.iter_unpack("<f", packed))
     return packed
 
+
+
+def assert_index_vectors(state, root, *, dimensions):
+    """Inspect provider state created only through CLI/API capture and workers."""
+    namespaces = sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root,))
+    extractions = sql("""SELECT e.id,e.chunk_count FROM file_catalog f
+        JOIN file_extractions e ON e.id=f.indexed_extraction_id
+        WHERE f.root_id=%s AND NOT f.deleted""", (root,))
+    ids = [row["id"] for row in extractions]
+    seen = 0
+    for entry in namespaces:
+        namespace = entry["namespace"]
+        status, metadata = request("GET", f"/v2/namespaces/{namespace}/metadata",
+            key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"],
+            statuses=(200, 404), with_status=True)
+        if status == 404:
+            continue  # Empty allocated shards need not exist; the total below must still match.
+        schema = metadata["schema"]
+        if dimensions is None:
+            assert not schema["content"].get("embed") and "vector" not in schema
+        else:
+            assert schema["content"]["embed"]["model"] == "qwen/qwen3-embedding-8b"
+        after = None
+        while True:
+            filters = [["extraction_id", "In", ids]]
+            if after is not None:
+                filters.append(["id", "Gt", after])
+            response = request("POST", f"/v2/namespaces/{namespace}/query",
+                {"rank_by": ["id", "asc"], "limit": 128,
+                 "filters": ["And", filters], "include_attributes": True},
+                key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"])
+            rows = response["rows"]
+            for row in rows:
+                if dimensions is None:
+                    assert row.get("vector") is None
+                else:
+                    vector_bytes(row["vector"], dimensions)
+                assert hashlib.sha256(row["content"].encode()).hexdigest() == row["content_hash"]
+            seen += len(rows)
+            if len(rows) < 128:
+                break
+            after = rows[-1]["id"]
+    assert seen == sum(row["chunk_count"] for row in extractions)
+    assert not s3.list_objects_v2(Bucket=BUCKET, Prefix=f"embeddings/{state['org']}/").get("Contents")
+    assert sql("SELECT to_regclass('embedding_packs') AS name")[0]["name"] is None
+    return seen
 
 def save(state):
     STATE.write_text(json.dumps(state))
@@ -462,7 +499,7 @@ def native_capture():
             assert error.code == 404
             error.close()
     for name in ("sync_jobs", "sync_generations", "sync_job_shards", "root_states",
-                 "embedding_cache", "embedding_locations", "content_proofs"):
+                 "embedding_cache", "embedding_locations", "embedding_packs", "content_proofs"):
         assert sql("SELECT to_regclass(%s) AS table_name", (name,))[0]["table_name"] is None
     current = subprocess.run(["pufferfs", "root", "current", "--json"], cwd=directory,
         env=dict(os.environ, PUFFERFS_API_KEY=state["key"]), capture_output=True, text=True, timeout=30)
@@ -525,7 +562,7 @@ def native_transformed():
     assert all(w["status"] == "pending" and w["attempt_count"] == 0 for w in index_work)
     inspect_sqs_deliveries(index_work, "index")
     assert not sql("SELECT id FROM provider_batches LIMIT 1"), "native input submitted Gemini work"
-    assert not sql("SELECT org_id FROM embedding_packs LIMIT 1"), "transformation generated vectors"
+    assert not s3.list_objects_v2(Bucket=BUCKET, Prefix="embeddings/").get("Contents"), "transformation stored vectors"
     assert not sql("SELECT id FROM file_work WHERE mutation_ref<>'' LIMIT 1"), "transformation created index mutations"
     # Also drain the preceding handoff-recovery root before stopping this role.
     wait_queue_empty("transform")
@@ -680,12 +717,11 @@ def native_replay():
 
 
 def worker_authentication():
-    # Ordinary HTTP requests to separately running production roles. Use a
-    # valid query body so a missing query guard cannot fail for unrelated input.
-    payload = {"texts": ["Untrusted request"], "work_id": "untrusted", "attempt_token": "untrusted"}
+    # Ordinary HTTP requests to separately running production roles.
+    payload = {"work_id": "untrusted", "attempt_token": "untrusted"}
     credentials = [{}, *({"secret_key": value} for value in
         ("", "incorrect", None, 123, [], {}, "incorrect-\u00e9", "incorrect-\ud800"))]
-    for endpoint in ("transform", "index-cpu", "index-vector", "query"):
+    for endpoint in ("transform", "index"):
         for credential in credentials:
             req = urllib.request.Request(f"http://{endpoint}:8080/", method="POST",
                 data=json.dumps(payload | credential).encode(), headers={"Content-Type": "application/json"})
@@ -694,7 +730,7 @@ def worker_authentication():
                     raise AssertionError(f"unauthenticated {endpoint} accepted a request")
             except urllib.error.HTTPError as error:
                 assert error.code == 401, f"unauthenticated {endpoint} returned HTTP {error.code}"
-    print("Transform, both index roles and query reject missing, invalid and malformed credentials.", flush=True)
+    print("Transform and index roles reject missing, invalid and malformed credentials.", flush=True)
 
 
 def native_published():
@@ -791,7 +827,7 @@ def verify():
     # No rendered pages or converted clips in durable object storage.
     objects = [item for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET) for item in page.get("Contents", [])]
     assert not any(item["Key"].lower().endswith((".png", ".jpg", ".wav", ".mp4", ".pdf")) for item in objects)
-    assert not embedding_locations(state["org"]), "no-vector root embedded content"
+    assert_index_vectors(state, state["root"], dimensions=None)
     vector_dir = Path("/state/vector")
     vector_dir.mkdir()
     (vector_dir / "astronomy.txt").write_text("An observatory uses a telescope to study stars and galaxies.\n")
@@ -804,7 +840,7 @@ def verify():
         result = request("POST", "/query", {"root_id": state["vector_root"], "query": "astronomy telescope stars",
                          "mode": mode, "top_k": 1}, key=state["key"])
         assert result["results"][0]["file_path"] == "astronomy.txt"
-    assert [row for row in embedding_locations(state["org"]) if row["dimensions"] == 768]
+    assert_index_vectors(state, state["vector_root"], dimensions=4096)
     state["before"] = files
     save(state)
     authorization()
@@ -1142,12 +1178,6 @@ if __name__ == "__main__":
                  "malformed-published": malformed_published,
                  "verify": verify, "authorization": authorization,
                  "outage": outage, "resumed": resumed, "cleanup": cleanup}
-    if phase == "embedding-retention":
-        from retention_security import check_embedding_retention
-        functions[phase] = lambda: check_embedding_retention(provision())
-    if phase == "embedding-io":
-        from embedding_io import verify as verify_embedding_io
-        functions[phase] = verify_embedding_io
     if phase == "retention-security":
         from retention_security import verify as verify_retention_security
         functions[phase] = verify_retention_security

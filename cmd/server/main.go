@@ -42,14 +42,11 @@ func main() {
 		log.Fatalf("creating S3 client: %v", err)
 	}
 
-	// Modal
-	modalClient := server.NewModalClient()
-
 	// Turbopuffer
 	tpClient := server.NewTPClient(cfg.Turbopuffer.APIKey, cfg.Turbopuffer.Region)
 
 	// Server
-	srv := server.New(db, s3Client, modalClient, tpClient)
+	srv := server.New(db, s3Client, tpClient)
 	posthogEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("POSTHOG_ENABLED")), "true")
 	posthogKey := strings.TrimSpace(os.Getenv("POSTHOG_KEY"))
 	analyticsClient := productanalytics.New(productanalytics.Config{

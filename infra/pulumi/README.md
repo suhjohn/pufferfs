@@ -24,9 +24,8 @@ jobs (maximum 64). Independent `sync-file-transform.fifo` and
 `sync-file-index.fifo` queues have DLQs and queue-age alarms. Their logical
 resource names preserve the implemented per-file deployment identity.
 
-Provide `modalTransformEndpoint`, `modalFileIndexEndpoint`,
-`modalFileCpuIndexEndpoint` and `modalQueryEmbedEndpoint`.
-Deploy the six Modal apps separately; this stack does not deploy them or
+Provide `modalTransformEndpoint` and `modalFileIndexEndpoint`.
+Deploy the four Modal apps separately; this stack does not deploy them or
 provision their credentials. Postgres is metadata/recovery storage, not a queue.
 
 An upgrade from the old stack removes chunk/commit queues and services, NATS
@@ -79,10 +78,8 @@ pulumi config set --secret pufferfs:adminKeyHash <sha256-admin-key-hash>
 Set Modal endpoints:
 
 ```sh
-pulumi config set pufferfs:modalChunkEndpoint https://...chunk-file-endpoint.modal.run
-pulumi config set pufferfs:modalEmbedEndpoint https://...embed-chunks-endpoint.modal.run
-pulumi config set pufferfs:modalQueryEmbedEndpoint https://...embed-query-endpoint.modal.run
-pulumi config set pufferfs:modalIndexShardEndpoint https://...index-shard-endpoint.modal.run
+pulumi config set pufferfs:modalTransformEndpoint https://...pufferfs-transform-file.modal.run
+pulumi config set pufferfs:modalFileIndexEndpoint https://...pufferfs-file-index.modal.run
 ```
 
 Advertise CLI release compatibility from `GET /cli/version`:

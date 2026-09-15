@@ -30,19 +30,6 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY modal/ ./
 COPY tests/e2e/ /e2e/
 
-FROM worker-base AS vector-deps
-COPY modal/requirements-embedding.txt ./
-RUN pip install --no-cache-dir 'torch>=2' --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements-embedding.txt
-# The same immutable model/code revisions as the deployed bulk index role.
-COPY modal/nomic_model.py ./nomic_model.py
-RUN python -c 'from nomic_model import cache_model; cache_model()'
-
-FROM vector-deps AS vector
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-COPY modal/ ./
-COPY tests/e2e/ /e2e/
-
 FROM worker-base AS runner-deps
 RUN apt-get update && apt-get install -y --no-install-recommends libopencore-amrnb0 \
     nodejs \

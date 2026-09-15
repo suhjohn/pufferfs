@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index-cpu index-vector reconciler || true
+    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -25,10 +25,10 @@ finish() {
   exit "$result"
 }
 trap finish EXIT
-# These roots are vector-disabled; do not start the unrelated query/vector
-# pools. Corpus and index-recovery suites cover the real Nomic path separately.
+# These roots are vector-disabled; the shared CPU index worker omits native
+# embedding. Corpus and index-recovery suites cover native vector search.
 "${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index-cpu collector reconciler
+"${compose[@]}" up -d --wait postgres aws api api-ready transform index collector reconciler
 runner_started=1
 "${compose[@]}" up -d --no-deps transform-consumer index-consumer
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/media.py 2>&1 |

@@ -163,10 +163,11 @@ cleanup of source/extraction/mutation prefixes and index namespaces. Historical
 prefixes remain on the cleanup list for upgrades. Local source files are never
 deleted by PufferFS root deletion.
 
-Original packs, derived artifacts and vector caches have separate retention
-policies. Current heads, append dependencies, retry state, active leases and
+Original packs and derived artifacts have separate retention policies. Current heads, append dependencies, retry state, active leases and
 provider submissions protect reachable data from premature cleanup.
-Postgres stores vector locators, not vector bodies.
+Vectors are generated and stored by Turbopuffer; Postgres has no embedding
+cache. Native embedding sends chunk/query text to the configured inference
+provider. See [Turbopuffer subprocessors](https://turbopuffer.com/docs/security/subprocessors).
 
 S3 versioning, backups, provider operational records and already-exported logs
 need their own retention policy; API deletion alone is not evidence of physical

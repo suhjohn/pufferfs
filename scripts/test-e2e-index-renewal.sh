@@ -11,7 +11,7 @@ finish() {
   result=$?
   trap - EXIT
   "${compose[@]}" start --wait postgres || true
-  "${compose[@]}" stop transform-consumer index-consumer transform index-cpu reconciler index-relay || true
+  "${compose[@]}" stop transform-consumer index-consumer transform index reconciler index-relay || true
   if [[ "$runner_started" == 1 ]] && ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
     echo "Cleanup failed; retained project $project for recovery." >&2
     exit 1
@@ -22,12 +22,12 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-cpu reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index reconciler
 runner_started=1
 "${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_renewal.py)
 "${driver[@]}" capture
-started=$(docker inspect --format '{{.State.StartedAt}}' "$("${compose[@]}" ps -q index-cpu)")
+started=$(docker inspect --format '{{.State.StartedAt}}' "$("${compose[@]}" ps -q index)")
 "${compose[@]}" stop postgres
 # The production heartbeat period is 60s and pool acquisition timeout is 30s.
 # Keep the real provider response held while both deadlines actually elapse.
@@ -36,4 +36,4 @@ sleep 50
 "${compose[@]}" start --wait postgres
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_checkpoints.py release
 "${driver[@]}" verify
-test "$started" = "$(docker inspect --format '{{.State.StartedAt}}' "$("${compose[@]}" ps -q index-cpu)")"
+test "$started" = "$(docker inspect --format '{{.State.StartedAt}}' "$("${compose[@]}" ps -q index)")"

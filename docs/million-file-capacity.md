@@ -1,5 +1,11 @@
 # Baseline capacity assessment: one million 100-page files
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 **Historical baseline, before the S3 batch-manifest redesign.** The user’s actual
 workload is one million mixed-format files averaging 100 pages. The numerical
 example below intentionally isolates the all-provider, exactly-100-input case;

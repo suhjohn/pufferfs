@@ -1,10 +1,7 @@
-"""Actual CLI/SQS/Modal GPU publication; read-only assertions on cloud artifacts."""
+"""Actual CLI/SQS/Modal CPU publication with native embeddings; read-only assertions on cloud artifacts."""
 
-import hashlib
-import math
 import os
 from pathlib import Path
-import struct
 import urllib.request
 import uuid
 
@@ -22,14 +19,14 @@ def verify():
     state = run.provision()
     directory = Path("/state/cloud-index")
     directory.mkdir()
-    # Distinct generic records force multiple 64-vector GPU microbatches in one S3 pack.
+    # Distinct generic records exercise a multi-document native embedding write.
     path = directory / "measurements.jsonl"
     import json
 
     def record(number, text):
         # Each complete record fits one 6,000-byte chunk, but two do not.
-        # Tiny JSONL records legitimately coalesce and cannot exercise several
-        # 64-vector batches. The append has the same boundary requirement.
+        # Tiny JSONL records coalesce; these records exercise separate embeddings.
+        # The append has the same boundary requirement.
         line = json.dumps({"record": number, "text": text +
             " Calibration tracks temperature, humidity, exposure and instrument alignment." * 50}) + "\n"
         assert 3000 < len(line.encode()) < 6000
@@ -38,7 +35,7 @@ def verify():
     with path.open("w") as output:
         for number in range(130):
             output.write(record(number, "Orchid telescope measurement " + str(number)))
-    state["root"] = run.new_root(state, "cloud GPU publication", directory, False)
+    state["root"] = run.new_root(state, "cloud native publication", directory, False)
     empty_root = run.new_root(state, "uncaptured vector root", directory / "uncaptured", False)
     run.save(state)
     run.cli(state, "sync", str(directory), "--id", state["root"])
@@ -53,26 +50,8 @@ def verify():
     assert len(mutations) == extraction["mutation_batch_count"]
     published = [row for mutation in mutations for row in mutation["write"]["upsert_rows"]]
     assert len(published) == 130
-    vectors = run.embedding_locations(state["org"])
-    assert len(vectors) == 130 and len({v["object_key"] for v in vectors}) == 1
-    assert run.sql("SELECT to_regclass('embedding_locations') AS table_name")[0]["table_name"] is None
-    stamps = {}
-    packed_vectors = {}
-    for key in {v["object_key"] for v in vectors}:
-        with run.s3.get_object(Bucket=run.BUCKET, Key=key)["Body"] as source:
-            data = source.read()
-        stamps[key] = hashlib.sha256(data).hexdigest()
-        for locator in vectors:
-            if locator["object_key"] == key:
-                offset = locator["byte_offset"]
-                packed_vectors[locator["content_hash"]] = data[offset:offset + locator["byte_length"]]
-        assert len(data) % (768 * 4) == 0
-        for offset in range(0, len(data), 768 * 4):
-            vector = struct.unpack_from("<768f", data, offset)
-            assert all(math.isfinite(value) for value in vector)
-            assert abs(sum(value * value for value in vector) - 1) < 0.02
-    for row in published:
-        assert run.vector_bytes(row["vector"], 768) == packed_vectors[row["content_hash"]]
+    assert all("vector" not in row for row in published)
+    assert run.assert_index_vectors(state, state["root"], dimensions=4096) == 130
     for mode in ("fts", "vector", "hybrid"):
         for selector, count in (({"root_id": state["root"]}, 1),
                                 ({"root_ids": [empty_root, state["root"], empty_root]}, 2), ({"all_roots": True}, 2)):
@@ -85,12 +64,7 @@ def verify():
     updated = run.wait_indexed(state)
     manifest = run.assert_source_retained(updated[path.name])
     assert manifest["extents"][:len(initial["extents"])] == initial["extents"]
-    current = run.embedding_locations(state["org"])
-    assert len(current) == 131
-    assert all(row in current for row in vectors), "append replaced cached vector locators"
-    for key, digest in stamps.items():
-        with run.s3.get_object(Bucket=run.BUCKET, Key=key)["Body"] as source:
-            assert hashlib.sha256(source.read()).hexdigest() == digest
+    assert run.assert_index_vectors(state, state["root"], dimensions=4096) == 131
     read = run.request("POST", f"/roots/{state['root']}/read", {"path": path.name, "lines": {"start": 131, "end": 131}}, key=state["key"])
     assert "Violet rainfall update" in read["lines"][0]["content"]
 
@@ -127,7 +101,7 @@ def verify():
 
     run.eventually("scheduled root cleanup to abort the abandoned AWS upload", multipart_cleaned, timeout=180)
     assert not run.s3.list_objects_v2(Bucket=run.BUCKET, Prefix=f"sources/{state['org']}/{state['root']}/").get("Contents")
-    print("Actual AWS multipart init/resume/upload/complete/abort/delete and SQS -> Modal GPU -> S3 vectors/mutations -> search/read passed; append reused 130 cached vectors.", flush=True)
+    print("Actual AWS multipart init/resume/upload/complete/abort/delete and SQS -> Modal CPU -> durable text mutations -> native vector search/read passed, including append publication.", flush=True)
 
 
 def verify_vector_ranking(state, empty_root):
@@ -150,11 +124,6 @@ def verify_vector_ranking(state, empty_root):
     run.cli(state, "sync", str(directory), "--id", root)
     run.wait_indexed(state, root)
     query = "telescope"
-    request = urllib.request.Request(os.environ["MODAL_QUERY_EMBED_ENDPOINT"],
-        data=json.dumps({"secret_key": os.environ["MODAL_SECRET_KEY"], "texts": [query]}).encode(),
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=180) as response:
-        vector, = json.load(response)["embeddings"]
     expected = {}
     for root_id in (state["root"], root):
         namespaces = run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root_id,))
@@ -166,7 +135,7 @@ def verify_vector_ranking(state, empty_root):
             # Read-only assertions against the real provider; every document was
             # created through CLI capture and the ordinary publication pipeline.
             rows = run.request("POST", f"/v2/namespaces/{namespace['namespace']}/query",
-                {"rank_by": ["vector", "ANN", vector], "limit": 200,
+                {"rank_by": ["content", "ANN", ["Embed", query]], "limit": 200,
                  "filters": ["extraction_id", "In", publications],
                  "include_attributes": ["file_path", "chunk_index"]},
                 key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"], statuses=(200, 404))

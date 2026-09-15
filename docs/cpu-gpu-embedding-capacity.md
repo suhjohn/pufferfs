@@ -1,5 +1,11 @@
 # CPU versus A10 embedding capacity
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 On September 8, 2026 PDT, the current Nomic/PyTorch implementation encoded the
 same cold synthetic corpus at **0.65–0.71 vectors/s on CPU** and **74.8–77.0
 vectors/s on one A10**. CPU batching alone did not close the cost gap. Retain the

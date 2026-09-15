@@ -1,3 +1,6 @@
+> Historical design. Current search uses Turbopuffer native Qwen query embedding;
+> there is no once-per-request local embedding pool. See docs/architecture-and-functionality.md.
+
 # Multi-Root Query Plan
 
 ## Goal

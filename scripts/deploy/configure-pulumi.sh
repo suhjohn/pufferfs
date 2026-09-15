@@ -33,13 +33,12 @@ for key in \
   TURBOPUFFER_API_KEY \
   MODAL_SECRET_KEY \
   MODAL_WORKSPACE_ID \
-  MODAL_ENVIRONMENT \
-  MODAL_QUERY_EMBED_ENDPOINT
+  MODAL_ENVIRONMENT
 do
   require_env "$key"
 done
 
-for key in MODAL_TRANSFORM_ENDPOINT MODAL_FILE_INDEX_ENDPOINT MODAL_FILE_CPU_INDEX_ENDPOINT; do
+for key in MODAL_TRANSFORM_ENDPOINT MODAL_FILE_INDEX_ENDPOINT; do
   require_env "$key"
 done
 
@@ -70,10 +69,8 @@ pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
 pulumi config set --secret pufferfs:modalSecretKey "$MODAL_SECRET_KEY"
 
-pulumi config set pufferfs:modalQueryEmbedEndpoint "$MODAL_QUERY_EMBED_ENDPOINT"
 pulumi config set pufferfs:modalTransformEndpoint "$MODAL_TRANSFORM_ENDPOINT"
 pulumi config set pufferfs:modalFileIndexEndpoint "$MODAL_FILE_INDEX_ENDPOINT"
-pulumi config set pufferfs:modalFileCpuIndexEndpoint "$MODAL_FILE_CPU_INDEX_ENDPOINT"
 pulumi config set pufferfs:modalWorkspaceId "$MODAL_WORKSPACE_ID"
 pulumi config set pufferfs:modalEnvironment "$MODAL_ENVIRONMENT"
 set_config_if_present pufferfs:modalOidcProviderArn "${MODAL_OIDC_PROVIDER_ARN:-}"

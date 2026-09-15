@@ -1,4 +1,4 @@
-# Native preparation/API/consumers run in Compose; GPU index and query run on
+# Native preparation/API/consumers run in Compose; the CPU index worker runs on
 # real Modal. Postgres, S3 and SQS are isolated cloud resources provisioned by
 # tests/e2e/cloud_index.py. No emulator endpoints or production queues here.
 x-environment: &environment
@@ -6,7 +6,6 @@ x-environment: &environment
   PUFFERFS_DB_MAX_CONNS: ${PUFFERFS_DB_MAX_CONNS:-2}
   PUFFERFS_WORKER_DB_MAX_CONNS: ${PUFFERFS_WORKER_DB_MAX_CONNS:-2}
   PUFFERFS_INDEX_INPUTS_PER_CONTAINER: ${PUFFERFS_INDEX_INPUTS_PER_CONTAINER:-1}
-  PUFFERFS_EMBED_BATCH_SIZE: ${PUFFERFS_EMBED_BATCH_SIZE:-64}
   AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Scoped temporary credentials required}
   AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Scoped temporary credentials required}
   AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:?Scoped temporary credentials required}
@@ -19,9 +18,7 @@ x-environment: &environment
   PUFFERFS_SQS_INDEX_QUEUE_URL: ${PUFFERFS_SQS_INDEX_QUEUE_URL:?}
   PUFFERFS_TP_NAMESPACE_SHARDS: ${PUFFERFS_TP_NAMESPACE_SHARDS:-2}
   MODAL_TRANSFORM_ENDPOINT: http://transform:8080/
-  MODAL_FILE_CPU_INDEX_ENDPOINT: http://index-cpu:8080/
   MODAL_FILE_INDEX_ENDPOINT: ${MODAL_FILE_INDEX_ENDPOINT:?}
-  MODAL_QUERY_EMBED_ENDPOINT: ${MODAL_QUERY_EMBED_ENDPOINT:?}
   MODAL_SECRET_KEY: ${MODAL_SECRET_KEY:?}
   PUFFERFS_MODAL_ENDPOINT_AUTH_KEY: ${MODAL_SECRET_KEY:?}
   PUFFERFS_ADMIN_KEY: ${PUFFERFS_ADMIN_KEY:?}
@@ -62,9 +59,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 24
-  index-cpu:
-    <<: *worker
-    command: [index-cpu]
   reconciler:
     <<: *worker
     command: [reconciler]

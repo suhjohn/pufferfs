@@ -1,8 +1,7 @@
 """Prepare durable index mutations; never issue Turbopuffer writes here."""
 
-from itertools import islice
+import hashlib
 
-from embedding_artifacts import MAX_ROWS, embedding_vectors
 from file_runtime import database
 from index_mutations import deletion_mutation, index_row, mutation_batches
 from source_io import iter_chunks, write_chunks
@@ -10,7 +9,7 @@ from source_io import iter_chunks, write_chunks
 MUTATION_RECORD_BYTES = 8 * 1024 * 1024
 
 
-def prepare_mutations(job, namespace, encode, s3, bucket, *, connect=database):
+def prepare_mutations(job, namespace, s3, bucket, *, connect=database):
     if job["stage"] != "index":
         raise ValueError("only index work can prepare mutations")
     if job["mutation_ref"]:
@@ -24,18 +23,13 @@ def prepare_mutations(job, namespace, encode, s3, bucket, *, connect=database):
         source = iter_chunks(s3, bucket, job["chunks_ref"])
         seen = 0
         try:
-            while batch := list(islice(source, MAX_ROWS)):
-                # The index worker renews its lease in the background. The
-                # mutation registration below fences ownership before publish;
-                # do not write a heartbeat for every embedding/cache batch.
-                for chunk in batch:
-                    if chunk["chunk_index"] != seen:
-                        raise ValueError("noncontiguous extraction chunk ordinals")
-                    seen += 1
-                vectors = ([None] * len(batch) if job["vector_disabled"] else
-                           embedding_vectors(job["org_id"], batch, encode, s3, bucket, connect=connect))
-                for chunk, vector in zip(batch, vectors):
-                    yield index_row(job, chunk, vector)
+            for chunk in source:
+                if chunk["chunk_index"] != seen:
+                    raise ValueError("noncontiguous extraction chunk ordinals")
+                if hashlib.sha256(chunk["content"].encode("utf-8")).hexdigest() != chunk["content_hash"]:
+                    raise ValueError("chunk content hash mismatch")
+                seen += 1
+                yield index_row(job, chunk)
         finally:
             source.close()
         if seen != job["chunk_count"]:

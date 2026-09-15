@@ -37,6 +37,8 @@ def publish_mutations(job, namespace, mutation_ref, total, apply_write, s3, buck
             elif set(mutation) != {"upsert_rows"}:
                 raise ValueError("invalid version-isolated mutation")
             for row in mutation.get("upsert_rows", []):
+                if "vector" in row:
+                    raise ValueError("index mutations must contain text, not supplied vectors")
                 expected = stable_id(job["org_id"], job["root_id"], job["file_id"], job["extraction_id"], str(row["chunk_index"]))
                 if (row["id"] != expected or row["extraction_id"] != job["extraction_id"]
                         or row["version_id"] != job["version_id"] or row["file_id"] != job["file_id"]

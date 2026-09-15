@@ -10,7 +10,7 @@ runner_started=0
 finish() {
   result=$?
   trap - EXIT
-  "${compose[@]}" stop transform-consumer index-consumer transform index-cpu reconciler || true
+  "${compose[@]}" stop transform-consumer index-consumer transform index reconciler || true
   if [[ "$runner_started" == 1 ]] && ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
     echo "Cleanup failed; retained project $project for recovery." >&2
     exit 1
@@ -21,7 +21,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-cpu
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index
 runner_started=1
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/capture_handoff.py)
 "${driver[@]}" capture

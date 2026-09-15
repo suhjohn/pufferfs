@@ -1,7 +1,7 @@
 """CLI-to-publication benchmark with synthetic, checked contents.
 
 No application imports or direct work invocation. Run with the isolated cloud
-runner so the encoder is the real deployed GPU role and providers are real.
+runner so the CPU index role and native embedding provider are real.
 """
 
 import json
@@ -19,12 +19,12 @@ def verify():
     expected = {}
     repeats = int(os.environ.get("PUFFERFS_E2E_THROUGHPUT_REPEATS", "1"))
     assert 1 <= repeats <= 16
-    fixtures = ((8, 1), (64, 1), (128, 1), (768, 2)) * repeats
+    fixtures = (8, 64, 128, 768) * repeats
     if os.environ.get("PUFFERFS_E2E_THROUGHPUT_RECORDS"):
         records = int(os.environ["PUFFERFS_E2E_THROUGHPUT_RECORDS"])
         assert 1 <= records <= 768
-        fixtures = ((records, (records + 511) // 512),) * len(fixtures)
-    for ordinal, (records, _) in enumerate(fixtures):
+        fixtures = (records,) * len(fixtures)
+    for ordinal, records in enumerate(fixtures):
         lines = []
         for number in range(records):
             # Mix natural language, numeric logs and UTF-8 in one corpus. Each
@@ -39,8 +39,7 @@ def verify():
         expected[path.name] = lines
     state["root"] = run.new_root(state, "Worker throughput", directory, False)
     run.save(state)
-    cached = None
-    for label, flags in (("cold-cache", ()), ("warm-cache", ("--force",))):
+    for label, flags in (("initial", ()), ("reindex", ("--force",))):
         started = time.monotonic()
         run.cli(state, "sync", str(directory), "--id", state["root"], *flags)
         files = run.wait_indexed(state)
@@ -57,21 +56,8 @@ def verify():
             assert row["extraction_status"] == row["work_status"] == "complete"
             if row["stage"] == "index":
                 assert row["mutation_ref"] and row["acknowledged_batches"] == row["mutation_batch_count"]
-        locations = run.embedding_locations(state["org"])
-        assert len(locations) == sum(map(len, expected.values()))
-        assert len({row["object_key"] for row in locations}) == sum(packs for _, packs in fixtures)
-        assert run.sql("SELECT to_regclass('embedding_locations') AS table_name")[0]["table_name"] is None
-        if cached is not None:
-            assert locations == cached, "force reindex did not preserve cached vector locations"
-        cached = locations
-        packs = {}
-        for key in {location["object_key"] for location in locations}:
-            with run.s3.get_object(Bucket=run.BUCKET, Key=key)["Body"] as body:
-                packs[key] = body.read()
-        vectors = {location["content_hash"]: packs[location["object_key"]][
-            location["byte_offset"]:location["byte_offset"] + location["byte_length"]]
-            for location in locations}
-        mutation_bytes = mutation_records = vector_json_bytes = 0
+        assert run.assert_index_vectors(state, state["root"], dimensions=4096) == sum(map(len, expected.values()))
+        mutation_bytes = mutation_records = 0
         for row in rows:
             if row["stage"] != "index":
                 continue
@@ -81,9 +67,8 @@ def verify():
             for record in records:
                 mutation_bytes += len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode())
                 for published in record["write"]["upsert_rows"]:
-                    vector = published["vector"]
-                    assert run.vector_bytes(vector, 768) == vectors[published["content_hash"]]
-                    vector_json_bytes += len(json.dumps(vector, separators=(",", ":")).encode())
+                    assert "vector" not in published
+                    assert published["content"] in expected[published["file_path"]]
         for path, lines in expected.items():
             run.assert_source_retained(files[path])
             read = run.request("POST", f"/roots/{state['root']}/read",
@@ -99,7 +84,6 @@ def verify():
                   "source_bytes": sum(len(line.encode()) for lines in expected.values() for line in lines),
                   "files": len(expected), "chunks": sum(map(len, expected.values())),
                   "mutation_records": mutation_records, "mutation_json_bytes": mutation_bytes,
-                  "vector_json_bytes": vector_json_bytes,
                   "capture_to_publication_seconds": round(elapsed, 3), "work": rows}
         with Path("/artifacts/worker-throughput.jsonl").open("a") as output:
             output.write(json.dumps(result) + "\n")

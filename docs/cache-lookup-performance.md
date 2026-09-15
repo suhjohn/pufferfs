@@ -1,5 +1,11 @@
 # Cached indexing slowdown, September 11, 2026
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 The live index workers were spending most of their time on database access
 while reusing existing embeddings. A sample of the last 100 completed/error
 metrics contained 26,249 cache hits, no recorded cache misses or encoding calls,

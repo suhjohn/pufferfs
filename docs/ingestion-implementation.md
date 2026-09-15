@@ -1,5 +1,11 @@
 # Ingestion replacement implementation ledger
 
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
+
 This tracks implementation of the approved ingestion replacement specification.
 The target is SQS-backed, independently operated transformation/collector/index
 roles, immutable S3 sources and outputs, and per-file publication. Postgres is

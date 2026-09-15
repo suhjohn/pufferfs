@@ -14,7 +14,7 @@ image = (
     .add_local_file("worker_metrics.py", "/root/worker_metrics.py", copy=True)
     .add_local_file("file_reconciliation.py", "/root/file_reconciliation.py", copy=True)
 )
-for module in ("aws_clients", "root_cleanup", "index_cleanup", "index_client", "index_routing", "source_io", "embedding_cleanup", "artifact_cleanup", "source_cleanup"):
+for module in ("aws_clients", "root_cleanup", "index_cleanup", "index_client", "index_routing", "source_io", "artifact_cleanup", "source_cleanup"):
     image = image.add_local_file(f"{module}.py", f"/root/{module}.py", copy=True)
 secret = modal.Secret.from_name(os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"))
 
@@ -28,7 +28,6 @@ def reconcile():
     from file_reconciliation import reconcile_file_work
     from index_cleanup import cleanup_index
     from root_cleanup import cleanup_deleted_roots
-    from embedding_cleanup import cleanup_embeddings
     from artifact_cleanup import cleanup_obsolete_extractions
     from source_cleanup import cleanup_source_packs
     from index_client import SCHEMA, turbopuffer_client
@@ -50,7 +49,6 @@ def reconcile():
 
                 result["root_cleanup"] = cleanup_deleted_roots(s3, os.environ["AWS_BUCKET_NAME"], apply)
                 result["index_cleanup"] = cleanup_index(s3, os.environ["AWS_BUCKET_NAME"], apply)
-                result["embedding_cleanup"] = cleanup_embeddings(s3, os.environ["AWS_BUCKET_NAME"])
                 result["artifact_cleanup"] = cleanup_obsolete_extractions(s3, os.environ["AWS_BUCKET_NAME"])
                 result["source_cleanup"] = cleanup_source_packs(s3, os.environ["AWS_BUCKET_NAME"])
         print(result, flush=True)

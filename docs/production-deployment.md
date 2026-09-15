@@ -4,94 +4,52 @@ This repository uses four deployment surfaces:
 
 - GitHub Actions for CI, release, and manual component deployments.
 - Pulumi for AWS infrastructure, backend image builds, and ECS task definitions.
-- Modal for independently deployed transformation, collection, indexing, query and reconciliation roles.
+- Modal for independently deployed transformation, collection, indexing and reconciliation roles.
 - S3 + CloudFront for the static web app and installer script.
 
-This checkout contains only current-format per-file processing. The schema
-replaces old provider/embedding ledgers and removes generation inventory; it
-does not convert previous artifact formats. Deploy matching API/consumer and
-Modal roles against the current schema. Existing captures require an explicit
-cutover decision before replacement; see the [audit](fresh-schema-audit.md).
-There is no mixed-format reader or recapture-audit compatibility command.
+## Native embedding deployment
 
-The backend/all workflow deploys `transform_app.py`, `collector_app.py`,
-`index_cpu_app.py`, `index_gpu_app.py`, `query_app.py`, and
-`reconciliation_app.py` as separate apps after the API applies migrations.
-The query embedder receives only endpoint authentication. Keep any existing
-endpoint alive until every caller has switched; deleted source code does not
-stop an already deployed application.
+Deploy matching API/consumers and four Modal apps: `transform_app.py`,
+`index_app.py`, `collector_app.py`, and `reconciliation_app.py`. The CPU index
+worker sends text to Turbopuffer, using `qwen/qwen3-embedding-8b` with 4096 float32
+dimensions. The API uses native query embedding. Vector-disabled roots use the
+same worker without embedding. No separate GPU or query app is deployed.
 
-Pulumi now removes the old chunk/commit queues and NATS/EFS/service-discovery
-resources on upgrade. Review its preview and retain recoverable data before an
-approved deployment. No production deployment was performed by code retirement.
+Migration 047 removes `embedding_packs`. For a populated old deployment, stop
+old ingestion workers first, retire the authorized old data, then deploy the
+new schema and roles. Old mutation artifacts contain supplied Nomic vectors
+and cannot be replayed by the new worker. Changing the model alone does not
+backfill an existing index. No mixed-model compatibility path is provided.
+Deleting source files for old Modal app definitions does not stop their deployed
+instances; explicitly retire those apps and remove obsolete endpoint variables.
 
-`python3 tests/e2e/cloud_query.py` starts a temporary, uniquely named Modal app
-with the actual query definition, exercises invalid credentials and concurrent
-synthetic HTTP queries, and stops the app on exit. It requires Modal credentials
-and `MODAL_SECRET_KEY` matching the configured endpoint-auth secret. It does not
-deploy, change the production API endpoint or ingest personal files.
+The deployment uses `MODAL_TRANSFORM_ENDPOINT` and `MODAL_FILE_INDEX_ENDPOINT`.
+The index app/label default to `pufferfs-index` / `pufferfs-file-index`. Optional
+`PUFFERFS_INDEX_APP_NAME` and `PUFFERFS_INDEX_ENDPOINT_LABEL` allow isolated cloud
+runs. The role requests two CPUs and 4 GiB RAM; it has no GPU dependency.
+Retain Modal OIDC/IAM, the worker and endpoint-auth secrets, S3 and both SQS queues
+for remaining roles. The API has no Modal RPC dependency; consumers use the
+shared endpoint-auth secret.
 
 `uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_index.py`
-exercises actual AWS S3/SQS and independently running Modal bulk/query GPU apps
-with the production CLI/API/consumer processes in Docker Compose. It provisions
-a disposable database/login on the configured Postgres server (requires
-CREATE ROLE and CREATE DATABASE), an isolated bucket and FIFO queues, and
-temporary Modal secrets. The host needs IAM-user credentials capable of STS
-federation and resource provisioning; runtime workers receive only a dedicated
-database login and two-hour AWS credentials scoped to that run's bucket/queues.
-Set `AWS_REGION` explicitly. `DATABASE_URL` must retain `sslmode=verify-full`.
-If the database router needs a suffix on connection usernames, set
-`PUFFERFS_CLOUD_DB_LOGIN_SUFFIX` explicitly (for example `.BRANCH_ID` on
-PlanetScale). It is appended to the generated login, not the SQL role name;
-the script checks that login before provisioning AWS or Modal resources.
-No production app, endpoint, queue or IAM policy is replaced. The scenario checks
-multiple GPU embedding batches, durable vectors/mutations, vector/FTS/hybrid
-search, append-cache reuse and public multipart upload/resume/completion/cleanup.
-This does not prove the deployed ECS role's permissions or historical cutover.
-On cleanup failure, the script prints the location of a protected recovery file
-and retains resources needed for recovery; it does not drop an uncleaned catalog.
+provisions a disposable Postgres database/login, isolated S3 bucket/SQS queues,
+and temporary Modal CPU index app. Production CLI/API/consumers run in Compose.
+It requires real provider credentials, Modal authentication, IAM-user credentials
+capable of scoped STS federation, and a database login capable of creating roles
+and databases. Use `sslmode=verify-full`, an installed CA bundle, and explicit
+`PUFFERFS_CLOUD_DB_LOGIN_SUFFIX` when the database router requires it. No
+production deployment or resources are replaced by this test. On cleanup
+failure, protected recovery state is retained.
 
-Worker images set `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt`. Binary
-libpq's bundled OpenSSL can otherwise miss the container trust store even when
-Python's TLS connections succeed. A read-only real-database check reproduced
-that failure and succeeded with the installed CA bundle, without disabling
-hostname/certificate verification. This follows PostgreSQL's documented
-[system trust-store configuration](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT).
-Use a deliberately configured CA bundle for private certificate authorities;
-do not work around trust failures by setting `sslmode=disable` or `require`.
+Workers use `/etc/ssl/certs/ca-certificates.crt` for TLS trust. Do not disable
+certificate/hostname checks. `scripts/deploy/audit-worker-cloud.py` remains a
+read-only check of the actual Modal worker principal's STS/S3/SQS access;
+write/delete permissions still need a real workflow test.
 
-The bulk role also accepts `PUFFERFS_INDEX_GPU_APP_NAME`,
-`PUFFERFS_INDEX_GPU_ENDPOINT_LABEL` and `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS`.
-Defaults preserve the production names and 16-container limit; isolated cloud
-validation supplies unique names and a one-container limit. Each bulk container
-has two CPUs and 4 GiB RAM in addition to its configured GPU.
-
-The API applies the schema before updated ingestion workers and reconciliation
-start. The current schema includes pack-based embedding directories (041), S3
-provider manifests (045), and removal of generation/backfill state (046). Query
-embedding does not depend on those tables. Review the ordinary 30-day
-source/cache/artifact retention settings when configuring the reconciler.
-Its external Modal principal needs S3 delete,
-listing and multipart-abort permissions for the documented artifact prefixes.
-An ECS task-role policy does not establish those permissions for Modal.
-The Compose suite verifies fresh-database builds; it does not by itself validate
-a populated production upgrade, AWS bucket versioning/physical erasure, or the
-external worker principal's effective IAM permissions. No rollout is implied by
-a successful local suite.
-
-`python3 scripts/deploy/audit-worker-cloud.py` checks STS identity, S3 object/
-multipart listing and configured SQS attributes from a temporary Modal CPU
-Function using `PUFFERFS_WORKER_SECRET_NAME` (default `pufferfs-workers`). It is
-a read-only deployment diagnostic, not a full E2E suite: it never reads source
-bodies, receives messages, creates queues or changes IAM. Missing secrets or
-queue configuration fail explicitly. Write/abort/delete permissions and the
-complete GPU index path still require a staging production-path run.
-
-The 2026-09-05 audit found the default worker secret missing in `main`. A
-separate diagnostic against the existing legacy secret confirmed S3 listings
-but found both new queue URL variables absent. Do not silently use the legacy
-secret as the new worker deployment configuration; provision the intended
-principal and queues explicitly. See the implementation ledger for exact evidence.
+Source, provider, obsolete artifact and index cleanup still run independently.
+The Compose suite verifies fresh migrations and separate processes against
+real external providers. It does not establish populated upgrade correctness,
+production IAM, or physical erasure of versioned bucket history.
 
 ## Branch and PR Gates
 
@@ -150,8 +108,6 @@ STRIPE_SECRET_KEY
 STRIPE_WEBHOOK_SECRET
 MODAL_TRANSFORM_ENDPOINT
 MODAL_FILE_INDEX_ENDPOINT
-MODAL_FILE_CPU_INDEX_ENDPOINT
-MODAL_QUERY_EMBED_ENDPOINT
 ```
 
 Modal endpoints may be stored as variables instead of secrets.
@@ -211,8 +167,6 @@ Required Modal endpoint variables, unless stored as secrets:
 ```text
 MODAL_TRANSFORM_ENDPOINT
 MODAL_FILE_INDEX_ENDPOINT
-MODAL_FILE_CPU_INDEX_ENDPOINT
-MODAL_QUERY_EMBED_ENDPOINT
 ```
 
 The workflow creates/updates `pufferfs-workers` with the database/provider
@@ -224,8 +178,8 @@ queues. Pulumi creates the Modal OIDC provider unless
 `MODAL_OIDC_PROVIDER_ARN` selects an existing account-wide provider.
 
 The workflow also updates `pufferfs-endpoint-auth` with
-`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, matching the API/consumer
-`MODAL_SECRET_KEY`. The query deployment uses this secret.
+`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, matching the consumers’
+`MODAL_SECRET_KEY`. Transformation and index endpoints use this secret.
 
 Size connections and execution together. `PUFFERFS_DB_MAX_CONNS` bounds each
 API/consumer pool (default 4). `PUFFERFS_TRANSFORM_MAX_CONTAINERS` and
@@ -241,7 +195,7 @@ environment secret `PUFFERFS_WORKER_DATABASE_URL` to a transaction-pooled
 endpoint. Deployment installs it as `DATABASE_URL` in the worker secret, covering
 transformation, indexing, collection and reconciliation. The API and ECS
 consumers retain the direct `DATABASE_URL` for startup migrations and their
-session advisory lock. Query embedding has no database connection.
+session advisory lock.
 Secret updates reach newly started containers. For otherwise unchanged apps,
 use `modal app rollover APP --env main --strategy rolling` to refresh their
 configuration, then verify the new containers use the pooled endpoint before
@@ -261,8 +215,9 @@ For example, four containers with `PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER=4`
 give the transform consumer 16 outstanding job slots. This overlaps storage
 and provider IO within each existing 2-vCPU/4-GiB worker. Keep the total at most
 64, and measure memory and throughput with representative file formats.
-Bulk GPU workers still process one file at a time because their encoder already
-batches texts and consumes substantial device memory.
+Index concurrency is controlled independently by `PUFFERFS_INDEX_INPUTS_PER_CONTAINER`
+and `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS`. Measure native-provider rate limits
+and memory before increasing either setting.
 
 The Compose suites route Python workers through a real transaction-mode
 PgBouncer process capped at four server connections, while the API, consumers

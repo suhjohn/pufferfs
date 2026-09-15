@@ -16,7 +16,7 @@ services:
       timeout: 5s
       retries: 30
   index-relay: *search-relay
-  index-cpu:
+  index:
     environment:
       TURBOPUFFER_API_URL: http://index-relay:8080
     depends_on:

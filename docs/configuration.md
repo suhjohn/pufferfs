@@ -169,31 +169,27 @@ Source capture tuning uses plain integer byte values:
 | Variable | Role |
 | --- | --- |
 | `MODAL_TRANSFORM_ENDPOINT` | Consumer → CPU transformation worker |
-| `MODAL_FILE_INDEX_ENDPOINT` | Consumer → GPU index worker |
-| `MODAL_FILE_CPU_INDEX_ENDPOINT` | Consumer → no-vector index worker |
-| `MODAL_QUERY_EMBED_ENDPOINT` | API → separate query embedder |
-| `MODAL_SECRET_KEY` | API/consumer caller authentication |
+| `MODAL_FILE_INDEX_ENDPOINT` | Consumer → shared CPU index worker |
+| `MODAL_SECRET_KEY` | Consumer caller authentication |
 | `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` | Modal auth secret; default `pufferfs-endpoint-auth` |
-| `PUFFERFS_WORKER_SECRET_NAME` | Modal worker credentials; default `pufferfs-workers` |
-| `PUFFERFS_MODAL_WORKER_CLOUD` | Optional deployment-time cloud for transformation and bulk GPU workers (for example `aws`); combine with region to keep workers near database/object storage. Unset uses Modal placement. |
-| `PUFFERFS_MODAL_WORKER_REGION` | Optional deployment-time placement for transformation and bulk GPU workers; unset uses Modal placement. Choose near database/object storage. |
-| `PUFFERFS_MODAL_EMBED_GPU` | Bulk GPU; default L4 |
-| `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | Bulk pool limit; default 16 |
-| `PUFFERFS_INDEX_INPUTS_PER_CONTAINER` | Concurrent jobs inside each CPU/GPU index container; 1–16, default 1 |
-| `PUFFERFS_EMBED_BATCH_SIZE` | Texts per bulk model batch; 1–128, default 64. Choose within the GPU's measured memory capacity. |
-| `PUFFERFS_MODAL_QUERY_EMBED_GPU` | Query GPU; default L4. Set `none` for the same model on CPU. The selected device is embedded in the query image. |
-| `PUFFERFS_MODAL_QUERY_EMBED_MIN_CONTAINERS` | Warm query workers; default 1 |
-| `PUFFERFS_MODAL_QUERY_EMBED_MAX_CONTAINERS` | Query pool limit; default 2 |
+| `PUFFERFS_WORKER_SECRET_NAME` | Worker credentials; default `pufferfs-workers` |
+| `PUFFERFS_MODAL_WORKER_CLOUD` / `PUFFERFS_MODAL_WORKER_REGION` | Optional transform/index placement near database and object storage |
+| `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | CPU index pool limit; default 16 |
+| `PUFFERFS_INDEX_INPUTS_PER_CONTAINER` | Jobs per index container; 1–16, default 1 |
+| `PUFFERFS_INDEX_APP_NAME` / `PUFFERFS_INDEX_ENDPOINT_LABEL` | Explicit deployment names; default `pufferfs-index` / `pufferfs-file-index` |
 
 Worker credentials include `DATABASE_URL`, S3 credentials/bucket, both SQS
 URLs, `GEMINI_API_KEY` and `TURBOPUFFER_API_KEY`. Include `AWS_SESSION_TOKEN`
-with temporary credentials. The query app receives only the endpoint-auth
-secret containing `PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, equal to the caller's
-`MODAL_SECRET_KEY`.
+with temporary credentials. Endpoint auth contains
+`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, equal to `MODAL_SECRET_KEY`.
 
-Pinned Nomic model/code revisions live in `modal/nomic_model.py`. Workers
-persist vector bodies in S3; Postgres stores bounded pack directories. Documents/media use
-Gemini 3.5 Flash-Lite Batch without provider roulette or native-PDF-text bypass.
+Vector-enabled roots use Turbopuffer native `qwen/qwen3-embedding-8b`, 4096
+float32 dimensions, configured in `modal/index_client.py`. Workers write text;
+Turbopuffer generates document vectors. The API queries `content` with `Embed`
+so query inference uses the namespace's model. No model-serving pool, local
+model download, vector cache or embedding hardware/batch settings remain.
+Vector-disabled roots omit `embed` and support FTS. Gemini document/media
+extraction remains separate.
 
 ### Transactional email (AWS SES, optional)
 
@@ -235,35 +231,18 @@ requests inside one Modal container (1–16, default 1). The deployment workflow
 sets the transform consumer's slots to `PUFFERFS_TRANSFORM_MAX_CONTAINERS`
 times this input limit, rejecting totals above 64. Each invocation owns its AWS
 clients and temporary files; short database transactions share the worker pool.
-`PUFFERFS_INDEX_INPUTS_PER_CONTAINER` independently controls CPU/GPU index
+`PUFFERFS_INDEX_INPUTS_PER_CONTAINER` independently controls CPU index
 input concurrency. The workflow sets the index consumer's slots to
 `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` times this input limit, also capped at 64.
 These products size **one consumer replica per stage**. With additional consumer
 replicas, divide the aggregate admission budget between replicas; multiplying
 consumer replicas without adjusting slots also multiplies downstream admission.
-CPU and GPU index pools currently share these settings and the consumer's slots.
-
-Concurrent index requests own their S3/search clients. GPU requests share one
-model; an encoder-only lock protects mutable model caches and bounds concurrent
-GPU allocations while other requests perform IO. Each synchronous worker also
-retains a process-local work permit until execution and cleanup finish. An HTTP
-cancellation can release a Modal ASGI input while its handler thread continues;
-the permit keeps that abandoned work inside the same configured limit. Query
-encoding similarly retains a model lock. These guards complement native Modal
-input scheduling. `PUFFERFS_EMBED_BATCH_SIZE` controls texts per model batch,
-separately from concurrent file inputs. Worker
-metrics distinguish `encode_wait` from `encode_run`; `encode` includes both.
-They include invocation start time and container identity to measure actual
-overlap. None of these settings increases database connection limits.
-
-The bulk embedding deployment accepts `PUFFERFS_MODAL_EMBED_GPU=none` to run
-the same pinned model on CPU; the separate no-vector index role is unchanged.
-`PUFFERFS_MODAL_EMBED_CPU` requests physical CPU cores (default one), and
-`PUFFERFS_MODAL_EMBED_MEMORY_MIB` requests memory (default 6144 MiB). These are
-Modal resource requests, not hard limits. CPU encoding uses float32 and CUDA
-encoding uses float16. Changing hardware does not change the model revision,
-vector dimensions or cache identity. Use the cloud throughput runner to compare
-batch sizes and actual memory use before choosing a CPU allocation.
+Concurrent index requests own their S3/search clients. Each synchronous worker
+retains a process-local work permit until execution and cleanup finish, even
+if an HTTP cancellation releases the Modal input first. Worker metrics record
+preparation, provider write, publication, database and source IO timings. These
+bounds control file work; Turbopuffer's model quota independently limits native
+inference across writes and queries.
 
 ### Billing (Stripe)
 
@@ -568,27 +547,10 @@ timeouts may extend it). Partial/error passes retry after five minutes;
 successful tombstones repeat daily for late writes. Metadata remains for audit,
 and root deletion takes over cleanup if the catalog is removed.
 
-Migration 041 replaces the old embedding cache tables with bounded hash
-directories on `embedding_packs`, up to 512 vectors per immutable S3 object.
-It does not convert old vector locators. Cache misses are re-encoded normally.
-See [current schema and compatibility removal](fresh-schema-audit.md).
-
-Migration 037 tracks organization-shared embedding-cache packs independently of
-tenant rows. The scheduled reconciler retires at most 100 cold packs per pass,
-using `PUFFERFS_EMBEDDING_CACHE_RETENTION_SECONDS` (default 30 days, minimum 60
-seconds). Any cache hit refreshes the whole pack. Readers and writers lock the
-pack row through bounded S3 IO; retirement atomically removes its lookup entries
-and permanently fences that identity before a batched S3 deletion. New uploads
-are registered before S3 IO, use single-use identities, and are collectible even
-if upload/locator publication is interrupted. Tombstones survive tenant deletion
-and repeat acknowledged deletes daily to catch late writes; they are not a
-claim of physical erasure in versioned buckets. A cold cache miss is re-encoded.
-Published mutation artifacts contain their vectors and remain replayable without
-the cache. Failed batch-delete entries retry after five minutes. This requires
-the reconciler's S3 DeleteObject permission for the `embeddings/` prefix, not
-new permissions for clients. The pre-039 Compose retention suite passed cache
-reuse, actual scheduled expiry, preserved search/mutations, and re-encoding after
-eviction. It does not yet verify deletion races with paused cache readers/writers.
+Migration 047 drops `embedding_packs`. Stop old model-serving workers and remove
+their authorized S3 cache data before applying it. New immutable mutation packs
+contain text and metadata; retries can invoke native embedding again. Source
+and extraction/mutation retention remain independent of Turbopuffer storage.
 
 Migration 045 replaces the provider ledger without an emptiness gate, data
 conversion, or rolling compatibility path. The resulting schema keeps one `provider_batches`

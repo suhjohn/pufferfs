@@ -291,88 +291,11 @@ def check_obsolete_artifacts(state):
     print("Obsolete chunks/mutations were removed after real retention elapsed; current artifacts, historical sources, append reuse and public reads remained valid.")
 
 
-def check_embedding_retention(state):
-    directory = Path("/state/embedding-retention")
-    directory.mkdir()
-    text = "Orchid observatory telescope measurements.\n"
-    (directory / "first.txt").write_text(text)
-    root = run.new_root(state, "embedding retention", directory, False)
-    run.cli(state, "sync", str(directory), "--id", root)
-    run.wait_indexed(state, root)
-    first = run.embedding_locations(state["org"])
-    assert len(first) == 1
-    key = first[0]["object_key"]
-    run.s3.head_object(Bucket=run.BUCKET, Key=key)
-    (directory / "second.txt").write_text(text)
-    run.cli(state, "sync", str(directory), "--id", root)
-    run.wait_indexed(state, root)
-    assert run.embedding_locations(state["org"]) == first
-    assert len(run.sql("SELECT object_key FROM embedding_packs WHERE org_id=%s AND retired_at IS NULL", (state["org"],))) == 1
-    mutations = run.sql("""SELECT w.id,w.mutation_ref,w.attempt_count,w.acknowledged_batches
-        FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
-        JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
-        WHERE f.root_id=%s AND w.stage='index' ORDER BY w.id""", (root,))
-    assert len(mutations) == 2 and all(row["mutation_ref"] for row in mutations)
-    stamps = {row["mutation_ref"]: run.s3.head_object(Bucket=run.BUCKET, Key=row["mutation_ref"])["ETag"] for row in mutations}
-    def retired():
-        row, = run.sql("SELECT retired_at,deleted_at FROM embedding_packs WHERE object_key=%s", (key,))
-        return row["retired_at"] is not None and row["deleted_at"] is not None
-    run.eventually("scheduled expiry of the cold shared embedding pack", retired, 240)
-    assert not run.embedding_locations(state["org"])
-    assert run.sql("SELECT content_hashes FROM embedding_packs WHERE object_key=%s", (key,)) == [{"content_hashes": []}]
-    try:
-        run.s3.head_object(Bucket=run.BUCKET, Key=key)
-    except run.s3.exceptions.ClientError as error:
-        assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
-    else:
-        raise AssertionError("retired embedding bytes remain in S3")
-    for mode in ("fts", "vector"):
-        result = run.request("POST", "/query", {"root_id": root, "query": "telescope", "mode": mode, "top_k": 5}, key=state["key"])
-        assert {hit["file_path"] for hit in result["results"]} == {"first.txt", "second.txt"}
-    for ref, etag in stamps.items():
-        assert run.s3.head_object(Bucket=run.BUCKET, Key=ref)["ETag"] == etag
-        for record in run.chunks(ref):
-            rows = record["write"]["upsert_rows"]
-            assert rows
-            for row in rows:
-                run.vector_bytes(row["vector"], 768)
-    (directory / "third.txt").write_text(text)
-    run.cli(state, "sync", str(directory), "--id", root)
-    files = run.wait_indexed(state, root)
-    replacement, = run.embedding_locations(state["org"])
-    assert replacement["object_key"] != key and replacement["content_hash"] == first[0]["content_hash"]
-    assert run.sql("""SELECT id,mutation_ref,attempt_count,acknowledged_batches FROM file_work
-        WHERE id=ANY(%s) ORDER BY id""", ([row["id"] for row in mutations],)) == mutations
-    for file in files.values():
-        run.assert_source_retained(file)
-    print("Two publications reused one vector pack; real scheduled cache expiry removed it without changing searchable results or replay artifacts, and a later cache miss published using a new pack.")
-
-
-def check_query_concurrency():
-    # More simultaneous callers than the per-container input limit; each must
-    # receive a valid vector through the actual standalone query HTTP role.
-    texts = ["Observatory " + "telescope " * n for n in (1, 17, 3, 25, 2, 31, 5, 13)]
-
-    def query(text):
-        body = {"secret_key": os.environ["PUFFERFS_MODAL_ENDPOINT_AUTH_KEY"], "texts": [text]}
-        request = urllib.request.Request("http://query:8080/", data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=180) as response:
-            vectors = json.load(response)["embeddings"]
-        assert len(vectors) == 1 and len(vectors[0]) == 768
-        assert abs(sum(value * value for value in vectors[0]) - 1) < 0.02
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        list(executor.map(query, texts))
-    print("Concurrent HTTP queries returned normalized Nomic vectors from the separate query role.")
-
-
 def verify():
     from source_retention import begin_retention, check_packed_isolation, finish_retention
     from capture_permissions import check_capture_revocations
     state = json.loads(run.STATE.read_text()) if run.STATE.exists() else run.provision()
     run.worker_authentication()
-    check_query_concurrency()
     begin_retention(state)
     check_local_retention(state)
     check_unaccepted_retention(state)
@@ -382,5 +305,4 @@ def verify():
     check_capture_acl_race(state)
     check_capture_revocations(state)
     check_packed_isolation(state)
-    check_embedding_retention(state)
     finish_retention(state)

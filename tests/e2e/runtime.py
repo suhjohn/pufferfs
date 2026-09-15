@@ -1,7 +1,6 @@
 """Compose process adapter, not a second implementation of worker behavior.
 
-Modal's local invocation runs the actual decorated entrypoint, including class
-initializers. No Modal deployment, remote function, stub or monkeypatch is used.
+Modal's local invocation runs the actual decorated entrypoint, as separate HTTP processes. No Modal deployment, remote function, stub or monkeypatch is used.
 """
 
 import importlib
@@ -20,9 +19,7 @@ def main():
     role = sys.argv[1]
     target = {
         "transform": ("transform_app", "transform_file"),
-        "index-cpu": ("index_cpu_app", "index"),
-        "index-vector": ("index_gpu_app", "Indexer"),
-        "query": ("query_app", "QueryEmbedder"),
+        "index": ("index_app", "index"),
         "collector": ("collector_app", "collect"),
         "reconciler": ("reconciliation_app", "reconcile"),
     }[role]
@@ -45,39 +42,16 @@ def main():
             stopped.wait(max(0, 60 - (time.monotonic() - started)))
         return
 
-    if role == "index-vector":
-        instance = entry()
-        entry = instance.index
-    elif role == "query":
-        instance = entry()
-        entry = instance.embed_query_endpoint
-
     from fastapi import FastAPI
     import uvicorn
 
     app = FastAPI()
-    # The actual role owns its execution limit, including abandoned HTTP
-    # handlers. Do not add a test-only gate that could conceal a missing limit.
-    startup = threading.Lock()
-    initialized = role not in {"index-vector", "query"}
-
     @app.get("/healthz")
     def health():
         return {"role": role}
 
     @app.post("/")
     def execute(item: dict):
-        nonlocal initialized
-        # Modal initializes a class before dispatching concurrent inputs.
-        # Its local adapter initializes lazily without a startup lock.
-        # Serialize the first successful local invocation to preserve that
-        # boundary without inspecting private SDK state or bypassing entry.
-        if not initialized:
-            with startup:
-                if not initialized:
-                    result = entry.local(item)
-                    initialized = True
-                    return result
         return entry.local(item)
 
     uvicorn.run(app, host="0.0.0.0", port=8080, access_log=False)

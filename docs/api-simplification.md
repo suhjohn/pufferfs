@@ -1,4 +1,10 @@
 > Active scope: optimize only the critical sync → transformation → index flow.
+
+> Historical implementation/measurement record. Nomic serving and the vector
+> cache described below were retired by the native-Qwen change. Current roles
+> and operations are documented in [architecture](architecture-and-functionality.md)
+> and [deployment](production-deployment.md). Old commands are not current runbooks.
+
 > The broader API audit below is historical work and is paused.
 
 # API and workflow simplification audit

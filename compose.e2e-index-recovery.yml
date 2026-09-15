@@ -9,10 +9,10 @@ services:
       target: worker
     entrypoint: [python, /e2e/worker_redirect.py]
     environment:
-      E2E_WORKER_UPSTREAM: http://index-vector:8080/
+      E2E_WORKER_UPSTREAM: http://index:8080/
       E2E_WORKER_REDIRECTS: '12'
     depends_on:
-      index-vector: {condition: service_healthy}
+      index: {condition: service_healthy}
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
       interval: 2s
@@ -40,12 +40,7 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-  index-cpu:
-    environment:
-      TURBOPUFFER_API_URL: http://index-relay:8080
-    depends_on:
-      index-relay: {condition: service_healthy}
-  index-vector:
+  index:
     environment:
       TURBOPUFFER_API_URL: http://index-relay:8080
     depends_on:

@@ -6,12 +6,12 @@ from file_runtime import claim_work, database, fail_attempt, heartbeat
 from index_prepare import prepare_mutations
 from index_routing import namespace_for_path
 from index_publish import publish_mutations
-from index_client import SCHEMA, turbopuffer_client
+from index_client import write_options, turbopuffer_client
 from worker_metrics import profile_work, timed, count
 
 
 @profile_work("index")
-def index_file(work, token, encode, s3, bucket, tp, *, cpu_only=False, connect=database):
+def index_file(work, token, s3, bucket, tp, *, connect=database):
     job = claim_work(work, "index", token, connect=connect)
     if job["status"] != "running":
         return {"status": job["status"]}
@@ -32,17 +32,13 @@ def index_file(work, token, encode, s3, bucket, tp, *, cpu_only=False, connect=d
     thread = threading.Thread(target=renew, daemon=True)
     thread.start()
     try:
-        if cpu_only and not job["vector_disabled"]:
-            raise ValueError("vector-enabled root delivered to CPU index deployment")
         # The claim supplies routing and replay progress for this attempt.
         namespace = namespace_for_path(job["namespaces"], job["file_path"])
         with timed("prepare_mutations"):
-            ref, batches = prepare_mutations(job, namespace, encode, s3, bucket, connect=connect)
+            ref, batches = prepare_mutations(job, namespace, s3, bucket, connect=connect)
 
         def apply(namespace, mutation):
-            options = {"schema": SCHEMA}
-            if not job["vector_disabled"]:
-                options["distance_metric"] = "cosine_distance"
+            options = write_options(job["vector_disabled"])
             for attempt in range(100):
                 if stopped.is_set():
                     raise RuntimeError("index lease renewal failed")
