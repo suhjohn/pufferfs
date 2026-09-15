@@ -126,12 +126,19 @@ def database_recovered():
     path.write_text(source)
     run.cli(state, "sync", str(directory), "--id", state["root"])
     files = run.wait_indexed(state)
+    def cleaned():
+        return run.sql("""SELECT count(*) AS pending FROM file_catalog
+            WHERE root_id=%s AND index_cleanup_due_at<NOW()+INTERVAL '1 hour'""",
+            (state["root"],))[0]["pending"] == 0
+    run.eventually("scheduled cleanup of the published native-vector files", cleaned, 180)
     run.assert_index_vectors(state, state["root"], dimensions=4096)
     run.assert_source_retained(files[path.name])
     result = run.request("POST", f"/roots/{state['root']}/read",
         {"path": path.name, "lines": {"start": 1, "end": 1}}, key=state["key"])
     assert result["lines"][0]["content"] == source.rstrip("\n")
-    print("After an actual Postgres restart, existing worker pools reconnected and published native vectors; exact read passed.")
+    for mode in ("fts", "vector", "hybrid"):
+        assert search(state, state["root"], "observatory telescope", mode)
+    print("After Postgres restart and scheduled cleanup, native vectors/schema, all searches and exact reads remain valid.")
 
 
 def lost_recovered():

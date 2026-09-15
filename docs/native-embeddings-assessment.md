@@ -9,7 +9,7 @@ expressions directly to Turbopuffer.
 
 [Native embedding documentation](https://turbopuffer.com/docs/embedding)
 explains the schema, supported model, pricing, query expressions and migration
-limits. Checked September 14, 2026: Qwen 8B is listed at $0.07 per million tokens.
+limits. Checked September 15, 2026: Qwen 8B is listed at $0.07 per million tokens.
 This is inference pricing, separate from search/storage charges. Availability
 was verified with real writes and searches using the repository credentials.
 
@@ -73,9 +73,10 @@ are explicitly labeled and are not measurements of the new implementation.
 
 ## Authorized reset and verification record
 
-The reset is restricted to the verified sole-owner workspaces of
-`john.sangwon.suh@gmail.com` and `john@rivendell-labs.com`. Account identities and
-local original files are retained. No other tenant's content is included.
+The reset is restricted to the two explicitly authorized, verified sole-owner
+workspaces. The exact ownership and deletion inventory is retained privately.
+Account identities and local original files are retained. No other tenant’s
+content is included.
 
 Completed before deployment:
 
@@ -91,9 +92,38 @@ Completed before deployment:
   recorded cleanup was already complete, but this reset cannot independently
   confirm deletion versus lack of access. No fresh deletion is claimed for them.
 
-Validation in progress: full corpus and index-recovery Docker Compose suites,
-using real Turbopuffer/Qwen and Gemini providers. Initial lost-response replay and
-all public search modes passed. A test assertion was corrected to allow absent
-empty shards while still requiring the full expected published chunk count.
-Go build, Python compilation, shell syntax, Pulumi TypeScript and web build pass.
-Deployment and final end-to-end results will be recorded after completion.
+## Deployment and tests
+
+Commit `8b36d16` deployed the backend, infrastructure, four Modal applications,
+frontend and installer through a
+[successful production workflow](https://github.com/suhjohn/pufferfs/actions/runs/34939860522).
+Both API replicas and both consumers are running. The API has no Modal
+credentials/endpoints; consumers receive only database and worker-auth secrets.
+Migration 047 is applied, and the three retired index/query applications are
+stopped. No new CLI release was published; live checks use released CLI v0.8.1.
+
+- Go, Python compilation, shell syntax, Pulumi TypeScript, web build and GitHub
+  build checks passed.
+- The complete index-recovery Compose suite passed all 14 phases, including
+  cleanup, in run `b6c2c34d18cb437e9bda0b1a64e6f6eb`. It uses separate production
+  roles, real Postgres, S3/SQS-compatible services and real Turbopuffer/Qwen.
+  Coverage includes lost responses, worker crashes, database restart, consumer
+  disconnects, bounded execution, stale writes, root deletion and recurring cleanup.
+- Live CLI/API verification passed capture, model/dimension inspection, vector,
+  hybrid and full-text search, exact read, update, deletion, authentication and
+  no-vector behavior. All temporary verification roots were removed.
+- A live search returned HTTP 500 after maintenance. A focused check reproduced
+  loss of the native `embed` schema setting after five successful update cycles.
+  The reconciler was re-sending the base schema without `embed`. Cleanup now
+  sends deletion commands without schema updates; the recovery suite adds an
+  assertion after scheduled cleanup. Validation of this correction is running.
+- Full corpus Compose validation is still running. GitHub E2E jobs are waiting
+  on the repository’s protected `e2e` environment and are not claimed as passed.
+
+A test assertion was corrected to allow absent empty shards while still
+requiring the full expected published chunk count. Earlier runs used that old
+assertion or were interrupted during harness editing; only the complete current
+recovery run above is reported as a suite pass.
+
+These checks do not establish production capacity, native-provider rate-limit
+behavior, billed-token savings or corpus-wide retrieval quality.

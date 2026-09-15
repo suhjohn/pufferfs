@@ -30,7 +30,7 @@ def reconcile():
     from root_cleanup import cleanup_deleted_roots
     from artifact_cleanup import cleanup_obsolete_extractions
     from source_cleanup import cleanup_source_packs
-    from index_client import SCHEMA, turbopuffer_client
+    from index_client import turbopuffer_client
 
     # Bounded network operations; the next schedule repairs an interrupted send.
     sqs = client("sqs", config=Config(connect_timeout=10, read_timeout=20,
@@ -40,11 +40,10 @@ def reconcile():
         with closing(client("s3", config=Config(connect_timeout=10, read_timeout=20,
                                                       retries={"total_max_attempts": 2}))) as s3:
             with turbopuffer_client(timeout=20, max_retries=0) as tp:
-                def apply(namespace, mutation, vector_disabled):
-                    options = {"schema": SCHEMA}
-                    if not vector_disabled:
-                        options["distance_metric"] = "cosine_distance"
-                    response = tp.namespace(namespace).write(**mutation, **options)
+                def apply(namespace, mutation, _vector_disabled):
+                    # Re-sending a text schema without embed removes native
+                    # embedding configuration. Deletions must preserve schema.
+                    response = tp.namespace(namespace).write(**mutation)
                     return getattr(response, "rows_remaining", None)
 
                 result["root_cleanup"] = cleanup_deleted_roots(s3, os.environ["AWS_BUCKET_NAME"], apply)
