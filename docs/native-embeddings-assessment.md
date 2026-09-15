@@ -78,7 +78,7 @@ workspaces. The exact ownership and deletion inventory is retained privately.
 Account identities and local original files are retained. No other tenant’s
 content is included.
 
-Completed before deployment:
+Reset operations (old workers stopped before cache and table removal):
 
 - Paused both production consumers and stopped all six old Modal applications.
 - Deleted two roots through the authenticated public API: 23,501 S3 objects removed.
@@ -87,6 +87,7 @@ Completed before deployment:
 - Deleted and verified absence of eight old search namespaces.
 - Removed three completed Gemini batch jobs and their database records.
 - Removed 241 authorized index dead-letter messages; no unrelated messages were removed.
+- Cleared local PufferFS caches for both deleted roots and the temporary verification roots.
 - Retained metadata-only root deletion tombstones for protection against late writes.
 - Twelve historical Gemini file IDs returned ambiguous 403 responses. Their
   recorded cleanup was already complete, but this reset cannot independently
@@ -97,6 +98,8 @@ Completed before deployment:
 Commit `8b36d16` deployed the backend, infrastructure, four Modal applications,
 frontend and installer through a
 [successful production workflow](https://github.com/suhjohn/pufferfs/actions/runs/34939860522).
+Commit `e5b7c1d` then corrected maintenance schema handling through a
+[successful backend deployment](https://github.com/suhjohn/pufferfs/actions/runs/34941169825).
 Both API replicas and both consumers are running. The API has no Modal
 credentials/endpoints; consumers receive only database and worker-auth secrets.
 Migration 047 is applied, and the three retired index/query applications are
@@ -105,25 +108,39 @@ stopped. No new CLI release was published; live checks use released CLI v0.8.1.
 - Go, Python compilation, shell syntax, Pulumi TypeScript, web build and GitHub
   build checks passed.
 - The complete index-recovery Compose suite passed all 14 phases, including
-  cleanup, in run `b6c2c34d18cb437e9bda0b1a64e6f6eb`. It uses separate production
+  cleanup, in run `85682438ef2349a1b3b192842dde3e01`. It uses separate production
   roles, real Postgres, S3/SQS-compatible services and real Turbopuffer/Qwen.
   Coverage includes lost responses, worker crashes, database restart, consumer
   disconnects, bounded execution, stale writes, root deletion and recurring cleanup.
 - Live CLI/API verification passed capture, model/dimension inspection, vector,
-  hybrid and full-text search, exact read, update, deletion, authentication and
+  hybrid and full-text search, exact read, update, deletion, invalid-credential rejection and
   no-vector behavior. All temporary verification roots were removed.
 - A live search returned HTTP 500 after maintenance. A focused check reproduced
   loss of the native `embed` schema setting after five successful update cycles.
   The reconciler was re-sending the base schema without `embed`. Cleanup now
   sends deletion commands without schema updates; the recovery suite adds an
-  assertion after scheduled cleanup. Validation of this correction is running.
-- Full corpus Compose validation is still running. GitHub E2E jobs are waiting
-  on the repository’s protected `e2e` environment and are not claimed as passed.
+  assertion after scheduled cleanup. The corrected full recovery suite passed.
+  Production also passed five update cycles followed by scheduled cleanup,
+  physical stale-row deletion, native schema/vector inspection and all searches.
+- Full corpus run `14d88bd3da2b4c3e880e743d51a9fddc` completed capture, delivery
+  recovery, append-following, multipart recovery and 1,043 index jobs. Gemini
+  batch items returned code 7, “The caller does not have permission,” while five
+  inspected input uploads remained ACTIVE. The run was stopped and its cleanup
+  passed; the full corpus suite is **not** a pass. The reconciler was upgraded
+  during this run before the vector portion. No provider was mocked or replaced.
+- GitHub E2E jobs remain gated by the repository’s protected `e2e` environment
+  and are not claimed as passed.
 
 A test assertion was corrected to allow absent empty shards while still
 requiring the full expected published chunk count. Earlier runs used that old
 assertion or were interrupted during harness editing; only the complete current
 recovery run above is reported as a suite pass.
+
+The final audit found zero roots/provider-batch records in the authorized
+workspaces, no embedding table, all 29 authorized storage prefixes empty, all
+eight old namespaces absent, and both work queues and both dead-letter queues
+empty. The two account memberships remain intact. Four CPU Modal apps are
+deployed; the retired CPU/GPU index and query apps remain stopped.
 
 These checks do not establish production capacity, native-provider rate-limit
 behavior, billed-token savings or corpus-wide retrieval quality.
