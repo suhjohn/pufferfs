@@ -39,6 +39,9 @@ and [deployment roles and queues](provider-batch-manifests.md#roles-and-deployme
 
 ## Local validation before deployment
 
+These are the earlier local-run results, including their failures and limits.
+The later full release matrix passed; see [release verification](#release-verification).
+
 The standalone provider probe, partial/whole-batch vision fallback and
 root-deletion/submission-discovery E2Es passed. Deletion
 recovered the accepted job, acknowledged deletion of the one JSONL upload and
@@ -147,3 +150,27 @@ explicitly requested. This applies to net charges across all workspace apps,
 after applicable credits, and excludes storage charges. The existing $2,500
 usage limit was preserved. See [Modal budgets](https://modal.com/docs/guide/budgets).
 The separate $1 authorization covered the synthetic DeepSeek tests.
+
+## Release verification
+
+[v0.8.2](https://github.com/suhjohn/pufferfs/releases/tag/v0.8.2) was published
+from `6f69ff2be54a5031dbd8152f2237d7d36f59a07b`. All eight suites passed in the
+[release run](https://github.com/suhjohn/pufferfs/actions/runs/35054568664):
+
+| Suite | Recorded phases, including cleanup | Result |
+| --- | ---: | --- |
+| Corpus | 15 | Passed |
+| Index recovery | 14 | Passed |
+| Retention/security | 2 | Passed |
+| Provider recovery | 13 | Passed |
+| Media | 2 | Passed |
+| Partial vision fallback | 6 | Passed |
+| Cancelled-batch vision fallback | 6 | Passed |
+| Format variants | 2 | Passed |
+
+The downloaded `results.jsonl` files contain 60 passing phases and no failed
+phases. They are retained under `/tmp/pufferfs-release-v0.8.2/` on the validating
+workstation; GitHub artifacts use the workflow's seven-day retention.
+These fresh Compose runs cover the stages that the earlier local runs did not
+reach. They use real model/search providers and LocalStack S3/SQS, not deployed
+ECS/Modal scheduling. The separate production smoke result is recorded above.

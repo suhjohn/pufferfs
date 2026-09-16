@@ -5,6 +5,11 @@ Current vector tests use real Turbopuffer native `qwen/qwen3-embedding-8b`
 below describe their original runs; they are not evidence for the native-Qwen
 change. See `docs/native-embeddings-assessment.md` for the new verification record.
 
+The September 16, 2026 UTC [v0.8.2 release matrix](https://github.com/suhjohn/pufferfs/actions/runs/35054568664)
+passed all eight suites on commit `6f69ff2`, including cleanup. Its 60 recorded
+phases passed with real providers. See the
+[inline-media and fallback verification](../../docs/inline-media-and-vision-fallback.md#release-verification)
+for the suite breakdown and separate production smoke result.
 
 All PufferFS application roles run in separate Docker Compose containers. The
 test driver starts the real CLI and calls public HTTP endpoints. It does not
@@ -71,10 +76,11 @@ schedule. Only successful invocations refresh the health heartbeat.
 
 ## Run
 
-Requires Docker Compose, enough memory for two real Nomic processes plus Office,
-and dedicated `GEMINI_API_KEY` / `TURBOPUFFER_API_KEY` credentials. Internet is
-required for building pinned Nomic weights and for actual Gemini/Turbopuffer
-requests. This is intentionally not a free offline suite.
+Requires Docker Compose, enough memory for the CPU workers and Office, and
+dedicated `GEMINI_API_KEY` / `TURBOPUFFER_API_KEY` credentials. The vision suites
+also require the configured DeepSeek endpoint and `MODAL_PROXY_TOKEN`.
+Internet access is required for dependencies and actual provider requests.
+This is intentionally not a free offline suite.
 
 ```sh
 set -a; source .env; set +a
@@ -204,8 +210,9 @@ the same native handoff followed by real native embedding indexing separately.
 Missing credentials, timeouts and failed cleanup are failures, not skips. The
 default per-phase wait is 3,600 seconds (`PUFFERFS_E2E_TIMEOUT_SECONDS`). Gemini
 Batch completion is asynchronous and may exceed this; a timeout is not proof
-of a code defect. The scheduled collector deletes our tracked page/clip and
-JSONL uploads after their durable consumers release them. Generated Gemini
+of a code defect. The scheduled collector deletes tracked JSONL uploads after
+their durable consumers release them; older manifests also retain cleanup
+identities for separately uploaded pages/clips. Generated Gemini
 batch-result files are different: Google's documented retention is six weeks,
 and deleting the batch does not prove its result bytes are erased. Generated
 images are never persisted in PufferFS S3.
@@ -224,22 +231,39 @@ docker compose --env-file /dev/null --profile test -p PRINTED_PROJECT -f compose
 Never use an arbitrary project name or remove volumes before external cleanup.
 A hard host/CI kill cannot run an EXIT trap; provider-side test-account retention
 and manual cleanup are still necessary. Do not upload `run.json` or the private
-state volume. CI/release call `e2e.yml`: six isolated suite jobs, at most two
+state volume. CI/release call `e2e.yml`: eight isolated suite jobs, at most two
 concurrently, each with separate artifacts and a 120-minute timeout.
 Configure its `e2e` GitHub environment
 with required reviewers and dedicated provider secrets before enabling it for
 PRs. Never approve untrusted PR code to receive those secrets.
+
+GitHub uses the same Compose scripts that run locally; it does not deploy the
+test roles to ECS or Modal. `ci.yml` invokes the full matrix after builds for
+pull requests and pushes to `main`. `release.yml` invokes it again for `v*`
+tags and waits for it before publishing CLI binaries. `e2e.yml` can also be
+started manually. Production deployment is a separate manual workflow.
+
+| Matrix suite | Local command |
+| --- | --- |
+| corpus | `bash scripts/test-e2e.sh` |
+| index-recovery | `bash scripts/test-e2e-index-recovery.sh` |
+| retention-security | `bash scripts/test-e2e-retention.sh` |
+| provider-recovery | `bash scripts/test-e2e-provider-recovery.sh` |
+| media | `bash scripts/test-e2e-media.sh` |
+| vision-fallback | `PUFFERFS_E2E_VISION_CASE=partial bash scripts/test-e2e-vision-fallback.sh` |
+| vision-cancel | `PUFFERFS_E2E_VISION_CASE=cancel bash scripts/test-e2e-vision-fallback.sh` |
+| format-variants | `bash scripts/test-e2e-formats.sh` |
 
 ## In-flight index recovery suite
 
 `bash scripts/test-e2e-index-recovery.sh` adds the optional
 `compose.e2e-index-recovery.yml` topology, with fresh disposable resources and
 the same production CLI/API/consumer/index entrypoints, with two API processes.
-It uses a small real Nomic vector root and native-text CPU roots; it submits no
-Gemini jobs.
+It uses a small vector root with real Turbopuffer native Qwen embeddings and
+full-text-only roots, all through the CPU index worker; it submits no Gemini jobs.
 
 ```text
-index consumer --POST / 303 result polls--> worker redirect relay --> Nomic index worker
+index consumer --POST / 303 result polls--> worker redirect relay --> CPU index worker
 index worker --original write--> test relay --same bytes, HTTPS--> Turbopuffer
 test driver --arm/release----------^
 API --read/search, bypassing relay------------------------------> Turbopuffer
@@ -252,10 +276,10 @@ progress, never credentials or content. Its controls are test-only. It cannot
 fabricate a successful provider response: writes reach the real provider.
 
 1. Hold a successful real index response before the worker can receive it.
-   Assert that vectors/mutations are durable but publication is unacknowledged.
-   Kill the actual Nomic worker, release the orphaned response, restart and wait
+   Assert that text mutations are durable but publication is unacknowledged.
+   Kill the actual index worker, release the orphaned response, restart and wait
    for ordinary lease/SQS recovery. Require a new attempt, identical replayed
-   decompressed JSON bytes, unchanged S3 vector/mutation objects, working search
+   decompressed JSON bytes, unchanged S3 mutation objects, working search
    and no DLQ. Gzip timestamps are recorded separately; compression framing is
    not the mutation identity. The original compressed bytes are forwarded intact.
 2. Hold a second-version write before forwarding it; capture a third version
@@ -284,7 +308,7 @@ fabricate a successful provider response: writes reach the real provider.
    records that the real Go consumer followed more than ten HTTP redirects.
 
 The worker redirect relay synthesizes only the HTTP polling protocol. It
-forwards the original authenticated job to the real Nomic/index process and
+forwards the original authenticated job to the real CPU index process and
 returns that process's response. Its twelve short result redirects exercise
 the redirect-count boundary without reproducing Modal's 150-second polling
 interval. The original provider request survives a disconnected poller. Neither
@@ -415,7 +439,7 @@ personal directory paths or test scenarios.
 - Compose replaces ECS and Modal scheduling/autoscaling, not application roles.
   Scheduled adapters run serially and do not emulate Modal's hard invocation
   timeouts or overlapping-input backlog. This does not prove deployed IAM,
-  network policies or GPU concurrency.
+  network policies or production worker concurrency.
 - Turbopuffer and its Qwen embedding provider are real. Compose does not
   establish production latency, billing, rate-limit capacity or autoscaling.
 - Worker-secret assertions cover transformation and the single index endpoint,
@@ -428,7 +452,6 @@ personal directory paths or test scenarios.
   in the new retention run. Additional capture-revocation scenarios are included
   below. XLSB/MSG and remaining visual/Office variants have a dedicated suite;
   see its recorded result rather than assuming a pass from coverage alone.
-  expanded media remains unverified.
 - A build/readiness pass is not an E2E pass. Only successful recorded phases prove
   those scenarios; never reuse retired unit-test counts as current evidence.
 

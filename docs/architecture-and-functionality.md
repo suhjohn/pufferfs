@@ -8,11 +8,14 @@ embeddings with `qwen/qwen3-embedding-8b`, 4096 float32 dimensions.
 
 ## Deployment topology
 
+The web console's static assets are served by S3 and CloudFront. The browser
+and CLI call the API through an AWS application load balancer (ALB).
+
 ```text
 [CLI / local agent - user machine]
     | capture metadata                    | immutable source packs
     v                                     v
-[API server - ECS] --------------------> [S3]
+[API server - ECS] -- verify sources --> [S3]
     | catalog / permissions               ^
     v                                     | sources, chunks, manifests,
 [Postgres]                                | replayable text mutations
@@ -75,6 +78,7 @@ DLQ means dead-letter queue: messages whose delivery attempts are exhausted.
 
 | Role | Hosting / trigger | Input → output / handoff |
 | --- | --- | --- |
+| Web console | Static S3/CloudFront assets; browser interaction | User actions → authenticated API requests |
 | Local agent | User machine; sync/watch | Files → S3 packs and API version registration |
 | API server | ECS; authenticated HTTP | Capture metadata → Postgres and transform SQS; queries → Turbopuffer |
 | Transform consumer | ECS; polls transform SQS | Receipts → bounded worker HTTP calls; renews visibility and acknowledges durable results |
@@ -136,7 +140,8 @@ sync / follow
         --> enqueue index work
 
       Documents / images / audio / video:
-        --> render pages/frames or prepare audio clips
+        --> documents/images: render PNG pages or image frames
+        --> audio/video: prepare audio clips (no video visual indexing)
         --> embed media bytes in JSONL
         --> upload one JSONL per batch of at most 64 inputs
         --> submit Gemini batch
