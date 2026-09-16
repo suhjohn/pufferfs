@@ -33,7 +33,7 @@ def client():
         http_options={"timeout": 60000, "retry_options": {"attempts": 1}})
 
 
-def capture(state, name, pages, mode):
+def capture(state, name, pages, mode, **fault_config):
     directory = Path("/state") / name
     directory.mkdir()
     with pymupdf.open() as document:
@@ -41,7 +41,7 @@ def capture(state, name, pages, mode):
             document.new_page().insert_text((72, 72), text, fontsize=24)
         document.save(directory / "document.pdf")
     root = run.new_root(state, name, directory, True)
-    fault_id = relay("POST", "/fault", {"mode": mode})["fault_id"]
+    fault_id = relay("POST", "/fault", {"mode": mode, **fault_config})["fault_id"]
     state.update(root=root, fault_id=fault_id, expected_pages=pages)
     run.save(state)
     run.cli(state, "sync", str(directory), "--id", root, "--no-vector")
@@ -74,7 +74,7 @@ def lost_capture():
     assert extraction["prepared_request_count"] is None
     assert not run.sql("SELECT id FROM file_work WHERE extraction_id=%s AND stage='index'", (inputs[0]["extraction_id"],))
     reservation_counts(1, 64)
-    state.update(lost_event=event, lost_inputs=inputs)
+    state.update(lost_event=event, lost_inputs=inputs, lost_input_ref=batch["input_ref"])
     run.save(state)
     print("Gemini accepted 64 pages with one input manifest and one batch row; response held before the final page or count seal.", flush=True)
 
@@ -121,11 +121,11 @@ def lost_recovered():
     state = json.loads(run.STATE.read_text())
     verify_pages(state)
     event = state["lost_event"]
-    batch, = run.sql("SELECT status,provider_job_id FROM provider_batches WHERE id=%s", (event["batch_id"],))
-    assert batch == {"status": "complete", "provider_job_id": event["provider_job_id"]}
+    batch, = run.sql("SELECT status,provider_job_id,input_ref FROM provider_batches WHERE id=%s", (event["batch_id"],))
+    assert batch == {"status": "complete", "provider_job_id": event["provider_job_id"], "input_ref": state["lost_input_ref"]}
     after = requests(event["batch_id"])
     for before, current in zip(state["lost_inputs"], after, strict=True):
-        assert current["input_file_id"] == before["input_file_id"] and current["attempt_count"] == 1
+        assert current["request_key"] == before["request_key"] and current["attempt_count"] == 1
     batches = run.sql("""SELECT id,request_count AS count FROM provider_batches WHERE extraction_id=%s""", (after[0]["extraction_id"],))
     assert sorted(row["count"] for row in batches) == [1, 64]
     reservation_counts(2, 65)
@@ -143,21 +143,14 @@ def lost_recovered():
 def partial_capture():
     state = json.loads(run.STATE.read_text())
     pages = ["Orchid observatory " + word + "." for word in ("sapphire", "citrine", "indigo", "vermilion")]
-    event = capture(state, "e2e-partial-provider-retry", pages, "hold_request")
+    event = capture(state, "e2e-partial-provider-retry", pages, "corrupt_inputs", ordinals=[1, 3])
     inputs = requests(event["batch_id"])
     assert len(inputs) == len(pages)
-    # Invalidate alternate, exact run-owned uploads after the real request
-    # envelope is durable and in flight. The provider itself must produce the
-    # per-request errors: we do not edit requests or synthesize responses.
-    removed = [item["input_file_id"] for item in inputs if item["ordinal"] % 2]
-    expirations = {}
-    with client() as provider:
-        for name in removed:
-            upload = provider.files.get(name=name)
-            assert upload.expiration_time is not None
-            expirations[name] = upload.expiration_time.isoformat()
-            provider.files.delete(name=name)
-    state.update(partial_event=event, partial_inputs=inputs, removed_inputs=removed, removed_expirations=expirations)
+    # The external relay damages PNG signatures inside the uploaded JSONL.
+    # Source bytes remain intact; real Gemini must produce the item errors.
+    corrupted = event["corrupted_keys"]
+    assert corrupted == [inputs[n]["request_key"] for n in [1, 3]]
+    state.update(partial_event=event, partial_inputs=inputs, corrupted_keys=corrupted)
     run.save(state)
     release()
     event = held(state["fault_id"], "response_released")
@@ -176,8 +169,8 @@ def partial_capture():
         assert remote.dest and remote.dest.file_name
         output = [json.loads(line) for line in provider.files.download(file=remote.dest.file_name).splitlines() if line.strip()]
     successful = {row["key"] for row in output if row.get("response") and not row.get("error")}
-    assert successful == {item["request_key"] for item in inputs if item["input_file_id"] not in removed}
-    print("Real Gemini produced alternating successes and failures for deleted inputs; collector has not yet processed them.", flush=True)
+    assert successful == {item["request_key"] for item in inputs if item["request_key"] not in corrupted}
+    print("Real Gemini produced alternating successes and failures for corrupted inline images; collector has not yet processed them.", flush=True)
 
 
 def partial_collected():
@@ -202,11 +195,12 @@ def partial_recovered():
     after = run.provider_records(batch)
     assert len(after) == 4 and all(row["status"] == "complete" for row in after)
     for before, current in zip(state["partial_inputs"], after, strict=True):
-        if before["input_file_id"] in state["removed_inputs"]:
-            assert current["attempt_count"] == 2 and current["input_file_id"] != before["input_file_id"]
+        assert current["request_key"] == before["request_key"]
+        if before["request_key"] in state["corrupted_keys"]:
+            assert current["attempt_count"] == 2
         else:
             success = next(row for row in state["successes"] if row["request_key"] == current["request_key"])
-            assert current["attempt_count"] == 1 and current["input_file_id"] == before["input_file_id"]
+            assert current["attempt_count"] == 1
             assert current["result_ref"] == success["result_ref"] and current["batch_id"] == before["batch_id"]
     assert [stamp(item["key"]) for item in state["success_stamps"]] == state["success_stamps"]
     assert batch["attempt_count"] == 2 and batch["provider_job_id"]
@@ -217,7 +211,7 @@ def partial_recovered():
     jobs = {latest["provider_job_id"], earlier["provider_job_id"]}
     assert len([event for event in relay("GET", "/status")["events"] if event.get("provider_job_id") in jobs]) == 2
     reservation_counts(3, 69)
-    run.provider_cleanup(externally_deleted=state["removed_expirations"])
+    run.provider_cleanup()
     print("Only failed pages were regenerated; successful result objects are unchanged, source order and public search are correct.", flush=True)
 
 
@@ -229,10 +223,10 @@ def manifest_relay(method, path, payload=None):
         return json.load(response)
 
 
-def manifest_held(fault_id):
+def manifest_held(fault_id, timeout=600):
     return run.eventually("S3 manifest response held", lambda:
         next((event for event in manifest_relay("GET", "/status")["events"]
-              if event["fault_id"] == fault_id and event["state"] == "response_held"), None), 600)
+              if event["fault_id"] == fault_id and event["state"] == "response_held"), None), timeout)
 
 
 def manifest_capture():
@@ -252,7 +246,8 @@ def manifest_capture():
     assert event["upstream_status"] == 200
     assert not run.sql("SELECT id FROM provider_batches"), "worker committed a batch before its S3 PUT completed"
     manifest = run.provider_manifest(event["key"])
-    assert len(manifest["requests"]) == 17 and len(manifest["uploads"]) == 18
+    assert len(manifest["requests"]) == 17 and len(manifest["uploads"]) == 1
+    assert all("input_file_id" not in r and "input_uri" not in r for r in manifest["requests"])
     assert not relay("GET", "/status")["events"], "uncommitted manifest submitted paid work"
     state.update(orphan_manifest=event["key"], orphan_uploads=manifest["uploads"])
     run.save(state)
@@ -287,9 +282,9 @@ def result_arm():
     run.save(state)
 
 
-def result_held():
+def result_held(timeout=600):
     state = json.loads(run.STATE.read_text())
-    event = manifest_held(state["result_fault"])
+    event = manifest_held(state["result_fault"], timeout=timeout)
     assert event["upstream_status"] == 200
     batch, = run.sql("SELECT * FROM provider_batches WHERE id=%s", (state["partial_event"]["batch_id"],))
     assert batch["status"] == "submitted" and not batch["output_ref"]

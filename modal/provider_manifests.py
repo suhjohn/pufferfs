@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from file_runtime import stable_id
-from gemini_contract import batch_request
+from gemini_contract import validate_input
 
 MAX_BATCH_REQUESTS = 64
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
@@ -68,7 +68,7 @@ def validate_requests(batch, requests):
                 or request["request_key"] != stable_id(batch["extraction_id"], str(ordinal))
                 or request["status"] not in {"pending", "complete", "failed"}):
             raise ValueError("provider manifest request identity mismatch")
-        batch_request(request["request_key"], request["mime_type"], request["input_uri"], request["location"])
+        validate_input(request["request_key"], request["mime_type"], request["location"])
         if request["status"] == "complete":
             prefix = f"extractions/{batch['org_id']}/{batch['root_id']}/{batch['extraction_id']}/provider/{batch['id']}/"
             if not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}\.jsonl\.gz", request["result_ref"]):

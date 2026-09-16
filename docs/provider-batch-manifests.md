@@ -1,8 +1,9 @@
 # Provider batch manifests
 
-This describes the local redesign, not the deployed system. No production
-schema update, deployment, or million-file import has been performed. The
-schema intentionally has no conversion path from the previous provider ledger.
+This describes the repository implementation. The inline-media and optional
+vision-fallback changes are local and have not been deployed; see the
+[validation report](inline-media-and-vision-fallback.md). The schema
+intentionally has no conversion path from the previous provider ledger.
 See the [compatibility-removal audit](fresh-schema-audit.md) for subsequent
 removal of the emptiness gate and adjacent migration paths.
 
@@ -25,17 +26,18 @@ flowchart LR
     TC -->|HTTP invocation| T[Transformation workers]
     T -->|read source; publish input manifest| S
     T -->|batch row and submission marker| P
-    T -->|temporary uploads; paid batch create| G[Gemini]
+    T -->|JSONL with inline media; paid batch create| G[Gemini]
     D[Scheduled collector dispatcher] -->|start invocations| C[Collector workers]
     C -->|claim batch or assembly leases| P
     C -->|status, results, upload deletion| G
+    C -->|inline failed images, when configured| V[Modal DeepSeek shared endpoint]
     C -->|input/result/cleanup manifests and text artifacts| S
     C -->|commit pointers; publish index work| P
     C -->|index work IDs| IQ[Index SQS FIFO]
     IQ -->|receive receipts| IC[Index consumers]
     IC -->|HTTP invocation| I[Index workers]
-    I -->|text, vectors, mutation artifacts| S
-    I -->|index mutations| TP[Turbopuffer]
+    I -->|read text; store mutation artifacts| S
+    I -->|text mutations; native embedding generation| TP[Turbopuffer]
     I -->|publish indexed head| P
     R[Reconciler] -->|repair unsent work| TQ
     R -->|repair unsent work| IQ
@@ -49,9 +51,9 @@ flowchart LR
 | Transform consumers | Server processes; SQS receive | Receipts → transform endpoint calls and acknowledgements |
 | Transformation workers | Modal CPU endpoint; HTTP | Immutable source → uploads, S3 input manifest, batch coordination |
 | Collector dispatcher | Modal scheduled function; every minute | Configured worker count → independent collector invocations |
-| Collector workers | Modal CPU functions; dispatcher invocation | Due batches/assemblies → S3 results/checkpoints and index SQS messages |
+| Collector workers | Modal CPU functions; dispatcher invocation | Due batches/assemblies → S3 results/checkpoints and index SQS messages; optional vision endpoint for failed images |
 | Index consumers | Server processes; SQS receive | Receipts → index endpoint calls and acknowledgements |
-| Index workers | Modal CPU/GPU endpoint; HTTP | Extracted chunks → Turbopuffer data and published catalog head |
+| Index workers | Modal CPU endpoint; HTTP | Extracted chunks → Turbopuffer native embeddings and published catalog head |
 | Reconciler | Separate Modal scheduled role | Committed unsent work → repaired SQS delivery |
 
 Consumers receive queue receipts; the hosting platform starts endpoint workers.
@@ -71,8 +73,10 @@ pointers. Retry attempts reuse the same row. There are no `provider_requests`, `
 
 S3 stores:
 
-- **Input manifest:** up to 64 ordered request mappings and up to 65 upload
-  identities/expiry timestamps (inputs plus the JSONL envelope). Includes a
+- **Input manifest:** up to 64 ordered request mappings and one JSONL upload
+  identity/expiry timestamp. Media bytes are embedded in the JSONL, not in this
+  metadata manifest. Older manifests with up to 65 uploads remain readable for
+  in-flight recovery and cleanup. Includes a
   pointer to the previous input manifest when inputs are regenerated.
 - **Result manifest:** the complete range's success/failure state and references
   to packed text artifacts, including successes retained from earlier attempts.
@@ -96,9 +100,12 @@ one provider input or one searchable chunk.
 ## Preparation, submission and recovery
 
 1. Read and verify the captured source. Render/decode a bounded input range.
-2. Upload inputs with bounded concurrency (default 4, configurable 1–16).
-   Only the in-flight temporary files are retained on local disk. No database
-   writes occur per input; the transformation work lease renews by elapsed time.
+2. Serialize each page/clip as base64 inline media into a temporary JSONL file.
+   Memory retains one media input at a time; each input is capped at 20 MiB and
+   the complete JSONL at 1900 MiB, below Google's 2 GB batch-file limit. No
+   separate media uploads, readiness polling or upload-concurrency setting
+   remain. No database writes occur per input; the transformation lease renews
+   by elapsed time.
 3. Upload the JSONL envelope and PUT one immutable input manifest.
 4. Check the live transformation lease and insert one batch row referencing it.
 5. Check current source ownership and atomically commit the paid-submission
@@ -130,6 +137,14 @@ manifest before changing the batch status. A subsequent attempt regenerates
 only incomplete inputs, in one batch, retaining successful artifact references.
 There are at most three inference attempts. Lost preparation attempts do not
 consume the paid-inference retry budget.
+
+With the optional vision fallback configured, the collector first tries failed
+image inputs on Modal's DeepSeek endpoint. It uses the retained source, the same
+OCR prompt and page/frame anchors, then publishes successes together with the
+Gemini successes. Result mappings record `result_provider` and `result_model`.
+Audio and unresolved submissions keep their existing Gemini recovery behavior.
+This is implemented locally; deployment requires the new collector code and
+the [vision configuration](configuration.md#image-extraction-fallback).
 
 Collectors claim work using `FOR UPDATE SKIP LOCKED` and renewable five-minute
 leases. Every input/result/cleanup pointer update checks the live token and
@@ -167,7 +182,7 @@ For exactly one million files with exactly 100 provider inputs each, no retries:
 | New result-manifest PUTs | 0 | 2 million |
 | New cleanup-checkpoint PUTs, one successful pass | 0 | 2 million |
 | New metadata GETs on the successful path | 0 | 8 million |
-| Provider input uploads | 100 million | 100 million |
+| Separate provider media uploads | 100 million | 0 |
 | Provider JSONL uploads / paid jobs | 2 million each | 2 million each |
 
 Existing packed text/result/source/vector/mutation objects and their traffic are
@@ -190,7 +205,9 @@ increase provider account quotas.
 The recovery suite uses two API processes, two collector processes, one
 transformation endpoint process, real Postgres, S3/SQS-compatible services and
 real Gemini/Turbopuffer. External network relays delay actual S3 and Gemini
-responses; no database workflow state or provider results are fabricated.
+responses and can corrupt selected inline PNG bytes during JSONL upload;
+Google generates the resulting item errors. No database workflow state or
+provider results are fabricated.
 It covers uncommitted input publication, lost accepted submission, a 65-page
 file crossing the batch boundary, interrupted result publication, partial
 inference retry, public page read/search and S3 cleanup checkpoints. The broader

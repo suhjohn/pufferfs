@@ -25,6 +25,12 @@ jobs:
             script: scripts/test-e2e-provider-recovery.sh
           - suite: media
             script: scripts/test-e2e-media.sh
+          - suite: vision-fallback
+            script: scripts/test-e2e-vision-fallback.sh
+            vision_case: partial
+          - suite: vision-cancel
+            script: scripts/test-e2e-vision-fallback.sh
+            vision_case: cancel
           - suite: format-variants
             script: scripts/test-e2e-formats.sh
     # Configure required reviewers on this environment. Never expose paid
@@ -34,6 +40,10 @@ jobs:
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
+      MODAL_PROXY_TOKEN: ${{ matrix.vision_case && secrets.MODAL_PROXY_TOKEN || '' }}
+      PUFFERFS_VISION_BASE_URL: ${{ vars.PUFFERFS_VISION_BASE_URL }}
+      PUFFERFS_VISION_MODEL: ${{ vars.PUFFERFS_VISION_MODEL }}
+      PUFFERFS_E2E_VISION_CASE: ${{ matrix.vision_case || 'partial' }}
     steps:
       - uses: actions/checkout@v6
       - name: Production-role Docker Compose end-to-end suite (${{ matrix.suite }})

@@ -5,7 +5,7 @@ from itertools import islice
 
 from file_runtime import database
 from provider_manifests import MAX_BATCH_REQUESTS
-from provider_refresh import prepared_inputs, upload_inputs, persist_inputs, refresh_batch_inputs
+from provider_refresh import prepared_inputs, prepare_inputs, persist_inputs, refresh_batch_inputs
 from provider_runtime import claim_batch, batch_lease
 from provider_submission import batch_identity, finish_preparation, reserve_batch, submit_batch
 
@@ -32,13 +32,13 @@ def prepare_provider(job, path, client, s3, bucket, *, connect=database):
             count += batch["request_count"]
     with closing(prepared_inputs(path, job["revision"], range(count, 1 << 63))) as inputs:
         while True:
-            requests, uploads = upload_inputs(client, islice(inputs, MAX_BATCH_REQUESTS), job["extraction_id"], 1)
-            if not requests:
-                break
-            if [item["ordinal"] for item in requests] != list(range(count, count + len(requests))):
-                raise ValueError("prepared provider inputs are not contiguous")
-            batch = batch_identity(job, count, len(requests))
-            ref = persist_inputs(batch, requests, uploads, client, s3, bucket)
+            with prepare_inputs(islice(inputs, MAX_BATCH_REQUESTS), job["extraction_id"], 1) as (requests, envelope):
+                if not requests:
+                    break
+                if [item["ordinal"] for item in requests] != list(range(count, count + len(requests))):
+                    raise ValueError("prepared provider inputs are not contiguous")
+                batch = batch_identity(job, count, len(requests))
+                ref = persist_inputs(batch, requests, envelope, client, s3, bucket)
             batch = reserve_batch(job, batch, ref, connect=connect)
             with batch_lease(batch, connect=connect):
                 submit_batch(batch, client, s3, bucket, connect=connect)

@@ -2,6 +2,7 @@
 
 import json
 import math
+import base64
 
 from extraction import chunk_record, text_chunks
 
@@ -27,29 +28,40 @@ MEDIA_PROMPT = (
 )
 
 
-def batch_request(key: str, mime_type: str, file_uri: str, location: dict) -> dict:
-    if not key or not file_uri or mime_type not in {"image/png", "audio/wav"}:
+def validate_input(key: str, mime_type: str, location: dict):
+    if not key or mime_type not in {"image/png", "audio/wav"}:
         raise ValueError("invalid prepared provider input")
+    if mime_type == "audio/wav":
+        duration = location["end_seconds"] - location["start_seconds"]
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("invalid audio clip duration")
+
+
+def batch_request(key: str, mime_type: str, data: bytes, location: dict) -> dict:
+    validate_input(key, mime_type, location)
+    if not data:
+        raise ValueError("empty prepared provider input")
     audio = mime_type == "audio/wav"
     prompt = VISUAL_PROMPT
     config = {"maxOutputTokens": 16384}
     if audio:
         duration = location["end_seconds"] - location["start_seconds"]
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError("invalid audio clip duration")
-        prompt = MEDIA_PROMPT + f" This clip is exactly {duration:g} seconds long."
+        # Use the same boundary as result validation; rounding can otherwise
+        # tell the model to end beyond the actual audio duration.
+        prompt = MEDIA_PROMPT + f" This clip is exactly {duration} seconds long."
         config["responseMimeType"] = "application/json"
         config["responseSchema"] = {
             "type": "OBJECT", "required": ["segments"], "properties": {"segments": {
                 "type": "ARRAY", "items": {"type": "OBJECT",
                     "required": ["start_seconds", "end_seconds", "speaker", "text"],
-                    "properties": {"start_seconds": {"type": "NUMBER"}, "end_seconds": {"type": "NUMBER"},
+                    "properties": {"start_seconds": {"type": "NUMBER", "minimum": 0, "maximum": duration},
+                                   "end_seconds": {"type": "NUMBER", "minimum": 0, "maximum": duration},
                                    "speaker": {"type": "STRING"}, "text": {"type": "STRING"}}},
             }},
         }
     return {"key": key, "request": {"contents": [{"role": "user", "parts": [
         {"text": prompt},
-        {"fileData": {"mimeType": mime_type, "fileUri": file_uri}},
+        {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(data).decode("ascii")}},
     ]}], "generationConfig": config}}
 
 

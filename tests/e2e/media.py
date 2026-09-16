@@ -25,6 +25,10 @@ def verify():
             JOIN file_catalog f ON f.indexed_extraction_id=e.id WHERE f.id=%s""", (file["file_id"],))
         records = list(run.chunks(row["chunks_ref"]))
         batches = run.sql("SELECT * FROM provider_batches WHERE extraction_id=%s ORDER BY ordinal_start", (row["id"],))
+        for batch in batches:
+            manifest = run.provider_manifest(batch["input_ref"])
+            assert len(manifest["uploads"]) == 1
+            assert all("input_file_id" not in r and "input_uri" not in r for r in manifest["requests"])
         requests = [dict(item, provider_job_id=batch["provider_job_id"])
                     for batch in batches for item in run.provider_records(batch)]
         observation = {"path": path, "source_hash": file["content_hash"],

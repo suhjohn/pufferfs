@@ -11,6 +11,7 @@ from provider_manifests import read_manifest, write_manifest
 from provider_retry import MAX_REQUEST_ATTEMPTS
 from gemini_contract import result_chunks
 from source_io import iter_chunks, write_chunks
+from vision_fallback import fallback_results
 
 ASSEMBLY_MEMORY_BYTES = 64 * 1024 * 1024
 
@@ -70,6 +71,13 @@ def collect_batch(batch, client, s3, bucket, *, connect=database):
                 failures.add(key)
                 continue
             successes.add(key)
+            request.update(result_provider="gemini", result_model=batch["model"])
+            for chunk in chunks:
+                yield dict(chunk, request_key=key)
+        for request, chunks in fallback_results(batch, requests, s3, bucket, connect=connect):
+            key = request["request_key"]
+            successes.add(key)
+            failures.discard(key)
             for chunk in chunks:
                 yield dict(chunk, request_key=key)
 

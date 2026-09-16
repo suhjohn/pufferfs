@@ -1,0 +1,10 @@
+services:
+  collector:
+    environment:
+      MODAL_PROXY_TOKEN: ${MODAL_PROXY_TOKEN:?Set MODAL_PROXY_TOKEN for real vision E2E}
+      PUFFERFS_VISION_BASE_URL: ${PUFFERFS_VISION_BASE_URL:?Set PUFFERFS_VISION_BASE_URL}
+      PUFFERFS_VISION_MODEL: ${PUFFERFS_VISION_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
+  e2e:
+    environment:
+      PUFFERFS_VISION_MODEL: ${PUFFERFS_VISION_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
+      PUFFERFS_E2E_VISION_CASE: ${PUFFERFS_E2E_VISION_CASE:-partial}

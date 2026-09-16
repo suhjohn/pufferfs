@@ -16,7 +16,7 @@ def capture():
     assert not event.get("provider_job_id")
     batch, = run.sql("SELECT * FROM provider_batches WHERE id=%s", (event["batch_id"],))
     assert batch["submission_started_at"] and batch["provider_job_id"] is None
-    state.update(discovery_event=event, discovery_inputs=run.provider_records(batch))
+    state.update(discovery_event=event, discovery_inputs=run.provider_records(batch), discovery_input_ref=batch["input_ref"])
     run.save(state)
 
 
@@ -60,7 +60,8 @@ def verify():
     batch, = run.sql("SELECT * FROM provider_batches WHERE id=%s", (event["batch_id"],))
     assert batch["status"] == "complete" and batch["provider_job_id"] == event["provider_job_id"]
     assert batch["reconciliation_cursor"] == ""
-    assert [r["input_file_id"] for r in run.provider_records(batch)] == [r["input_file_id"] for r in state["discovery_inputs"]]
+    assert batch["input_ref"] == state["discovery_input_ref"]
+    assert [r["request_key"] for r in run.provider_records(batch)] == [r["request_key"] for r in state["discovery_inputs"]]
     traffic = recovery.relay("GET", "/status")
     assert len(traffic["events"]) == 1
     assert all(item["page_size"] == "100" and item["count"] <= 100 for item in traffic["listings"])

@@ -560,9 +560,10 @@ live in immutable, checksummed S3 manifests under `maintenance/provider/`.
 Workers require S3 GetObject/PutObject access to that prefix. It deliberately
 survives root prefix erasure so external upload cleanup can finish afterward.
 
-`PUFFERFS_PROVIDER_UPLOAD_CONCURRENCY` controls outstanding uploads within one
-transformation worker (default 4, range 1–16). It does not change the 64-input
-batch size or the number of worker containers. `PUFFERFS_COLLECTOR_WORKERS`
+Each batch embeds up to 64 page images or audio clips directly in one JSONL
+upload. The worker serializes one input at a time, capped at 20 MiB per input
+and 1900 MiB for the encoded JSONL. There are no separate media uploads or
+upload-concurrency setting. `PUFFERFS_COLLECTOR_WORKERS`
 is set when deploying the collector application (default 1, range 1–16). It
 controls both the maximum concurrent collector containers and the invocations
 started by the minute dispatcher. The value is embedded in the deployed image
@@ -580,6 +581,34 @@ one Postgres pointer update. An acknowledged deletion or provider 404 records
 recorded retention deadline records a distinct `expired_at`; no physical-erasure
 claim is implied. Generated batch-result files remain provider-managed.
 See [batch manifests, recovery, topology and bounded-call accounting](provider-batch-manifests.md).
+
+### Image extraction fallback
+
+Set `PUFFERFS_VISION_BASE_URL` to an authenticated Modal Shared Endpoint's HTTPS
+OpenAI-compatible base URL (including `/v1`) to enable image fallback. Set
+`MODAL_PROXY_TOKEN` to the combined `wk-<id>.ws-<secret>` proxy credential and optionally
+`PUFFERFS_VISION_MODEL` (default `deepseek-ai/DeepSeek-V4.1-Flash`). These are
+collector runtime settings; the deploy workflow copies the URL/model repository
+variables and `MODAL_PROXY_TOKEN` repository secret into the worker secret.
+An empty base URL leaves fallback disabled.
+
+After a Gemini batch reaches a terminal state, the collector regenerates only
+failed image inputs from the verified retained source and sends inline image
+bytes to Modal. Completed Gemini pages are preserved. Modal results retain the
+same page/frame anchors and record provider/model provenance in the result
+manifest. Audio stays on Gemini. This does not bypass an unresolved Gemini
+submission or a failure to retrieve its status/results: those retain the
+existing recovery path.
+
+Each collector allows four simultaneous fallback requests, with 60-second HTTP
+timeouts and a five-minute scheduling budget. Unfinished/failed pages retain
+the normal three-attempt batch retry policy. A crash before result publication
+can repeat synchronous Modal inference; there is no exactly-once billing claim.
+The dedicated E2E suite is `scripts/test-e2e-vision-fallback.sh`; it needs real
+Gemini, Modal and Turbopuffer credentials and uses synthetic fixtures only.
+The default case corrupts two images at the upload network boundary; setting
+`PUFFERFS_E2E_VISION_CASE=cancel` instead cancels the run-owned Google batch and
+checks whole-batch fallback. This variable is used only by the E2E driver.
 
 Extraction registration assigns immutable sequences. Index artifacts must carry
 their exact extraction sequence. Retry replays the complete mutation artifact;

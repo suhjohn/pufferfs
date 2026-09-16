@@ -30,6 +30,11 @@ def main():
     for name in ("TURBOPUFFER_API_URL", "TURBOPUFFER_REGION", "PUFFERFS_TP_NAMESPACE_SHARDS"):
         if os.environ.get(name):
             values[name] = os.environ[name]
+    if os.environ.get("PUFFERFS_VISION_BASE_URL"):
+        if not os.environ.get("MODAL_PROXY_TOKEN"):
+            raise RuntimeError("Missing MODAL_PROXY_TOKEN for vision fallback")
+        values.update({name: os.environ[name] for name in
+            ("PUFFERFS_VISION_BASE_URL", "MODAL_PROXY_TOKEN", "PUFFERFS_VISION_MODEL") if os.environ.get(name)})
     for name, contents in (
         (os.getenv("PUFFERFS_WORKER_SECRET_NAME", "pufferfs-workers"), values),
         (os.getenv("PUFFERFS_MODAL_ENDPOINT_SECRET_NAME", "pufferfs-endpoint-auth"),

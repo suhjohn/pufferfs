@@ -74,6 +74,9 @@ jobs:
       PUFFERFS_COLLECTOR_WORKERS: ${{ vars.PUFFERFS_COLLECTOR_WORKERS || '1' }}
       MODAL_OIDC_PROVIDER_ARN: ${{ vars.MODAL_OIDC_PROVIDER_ARN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      MODAL_PROXY_TOKEN: ${{ secrets.MODAL_PROXY_TOKEN }}
+      PUFFERFS_VISION_BASE_URL: ${{ vars.PUFFERFS_VISION_BASE_URL }}
+      PUFFERFS_VISION_MODEL: ${{ vars.PUFFERFS_VISION_MODEL }}
       TURBOPUFFER_REGION: ${{ vars.TURBOPUFFER_REGION }}
       TURBOPUFFER_API_URL: ${{ vars.TURBOPUFFER_API_URL }}
       PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
@@ -218,7 +221,9 @@ jobs:
           python3 -m pip install 'modal>=1.1.2,<2'
           python3 scripts/deploy/configure-modal.py
           cd modal
-          for role in transform_app index_app collector_app reconciliation_app; do
+          # Upgrade manifest readers before transformation starts writing the
+          # inline-media input shape. New readers also accept existing uploads.
+          for role in collector_app transform_app index_app reconciliation_app; do
             python3 -m modal deploy "${role}.py" --env "$MODAL_ENVIRONMENT"
           done
 

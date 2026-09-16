@@ -1,6 +1,8 @@
 """Real Gemini traffic with a bounded, externally controlled submission delay.
 
-No application imports, database access, fake provider results or body edits.
+No application imports, database access or fake provider results. The optional
+upload fault corrupts selected image bytes at the network boundary; Google
+still produces the actual per-item failures.
 Only batch identities, hashes and transport progress are exposed by control IO.
 """
 
@@ -58,12 +60,15 @@ async def arm(request: Request):
     if len(body) > 1024:
         raise HTTPException(413)
     config = json.loads(body)
-    if config.get("mode") not in {"hold_request", "hold_response"}:
+    if config.get("mode") not in {"hold_request", "hold_response", "corrupt_inputs"}:
+        raise HTTPException(400)
+    ordinals = config.get("ordinals", [])
+    if not isinstance(ordinals, list) or any(type(n) is not int or n < 0 for n in ordinals):
         raise HTTPException(400)
     if fault is not None and not fault["gate"].is_set():
         raise HTTPException(409, "release the previous fault first")
     fault = {"id": uuid.uuid4().hex, "mode": config["mode"],
-             "claimed": False, "gate": asyncio.Event()}
+             "claimed": False, "gate": asyncio.Event(), "ordinals": ordinals, "corrupted_keys": []}
     return {"fault_id": fault["id"]}
 
 
@@ -77,9 +82,8 @@ async def release(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE"])
 async def forward(path: str, request: Request):
-    # The SDK's normal upload-resume URLs point directly to Google. Only its
-    # control requests and result downloads need to pass this fixed-origin
-    # relay. Never permit callers to select another upstream origin.
+    # Upload URLs are rewritten only for the armed corruption fault. Every
+    # forwarded request still goes to this fixed Google origin.
     if not path.startswith(("v1beta/", "upload/v1beta/", "download/v1beta/")):
         raise HTTPException(404)
     body = bytearray()
@@ -88,6 +92,19 @@ async def forward(path: str, request: Request):
         if len(body) > 16 << 20:
             raise HTTPException(413)
     selected, event = None, None
+    if (fault is not None and fault["mode"] == "corrupt_inputs" and not fault["claimed"]
+            and "upload" in request.headers.get("x-goog-upload-command", "")):
+        rows = [json.loads(line) for line in body.splitlines() if line.strip()]
+        if not rows or max(fault["ordinals"], default=-1) >= len(rows):
+            raise HTTPException(400, "upload fault requires one complete JSONL upload")
+        for ordinal in fault["ordinals"]:
+            media = rows[ordinal]["request"]["contents"][0]["parts"][1]["inlineData"]
+            assert media["mimeType"] == "image/png"
+            media["data"] = "AAAAAAAA" + media["data"][8:]
+            fault["corrupted_keys"].append(rows[ordinal]["key"])
+        replacement = b"".join((json.dumps(row, separators=(",", ":")) + "\n").encode() for row in rows)
+        assert len(replacement) == len(body), "corruption must preserve resumable upload length"
+        body = bytearray(replacement)
     if request.method == "POST" and path.endswith(":batchGenerateContent"):
         batch = json.loads(body)["batch"]
         if fault is not None and not fault["claimed"]:
@@ -96,9 +113,11 @@ async def forward(path: str, request: Request):
         event = {"id": uuid.uuid4().hex, "batch_id": batch.get("display_name", batch.get("displayName")),
                  "wire_sha256": hashlib.sha256(body).hexdigest(), "state": "received",
                  "fault_id": selected["id"] if selected else None}
+        if selected and selected["mode"] == "corrupt_inputs":
+            event["corrupted_keys"] = selected["corrupted_keys"]
         events.append(event)
     try:
-        if selected and selected["mode"] == "hold_request":
+        if selected and selected["mode"] in {"hold_request", "corrupt_inputs"}:
             event["state"] = "request_held"
             await asyncio.wait_for(selected["gate"].wait(), timeout=1200)
         headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_HEADERS}
@@ -122,6 +141,12 @@ async def forward(path: str, request: Request):
             event["state"] = "response_released"
         headers = {key: value for key, value in response.headers.items()
                    if key.lower() not in HOP_HEADERS | {"content-encoding"}}
+        if (fault is not None and fault["mode"] == "corrupt_inputs" and not fault["claimed"]
+                and "x-goog-upload-url" in headers):
+            upload_url = headers["x-goog-upload-url"]
+            if not upload_url.startswith(UPSTREAM + "/upload/v1beta/"):
+                raise ValueError("unexpected Google upload origin")
+            headers["x-goog-upload-url"] = str(request.base_url).rstrip("/") + upload_url[len(UPSTREAM):]
         return Response(response.content, status_code=response.status_code, headers=headers)
     except Exception as error:
         if event is not None:

@@ -18,7 +18,7 @@ def verify():
     batch, = run.sql("SELECT * FROM provider_batches WHERE id=%s", (event["batch_id"],))
     assert batch["submission_started_at"] and batch["provider_job_id"] is None
     uploads = run.provider_uploads(batch)
-    assert len(uploads) == 3
+    assert len(uploads) == 1
     run.request("DELETE", f"/roots/{state['root']}", key=state["key"])
     for peer in servers():
         run.request("GET", f"/roots/{state['root']}/captured-files", key=state["key"], server=peer, statuses=(404,))

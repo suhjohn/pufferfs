@@ -28,6 +28,7 @@ cpu_image = (
     .add_local_file("provider_refresh.py", "/root/provider_refresh.py", copy=True)
     .add_local_file("provider_cleanup.py", "/root/provider_cleanup.py", copy=True)
     .add_local_file("batch_collector.py", "/root/batch_collector.py", copy=True)
+    .add_local_file("vision_fallback.py", "/root/vision_fallback.py", copy=True)
     .add_local_file("file_runtime.py", "/root/file_runtime.py", copy=True)
     .add_local_file("worker_metrics.py", "/root/worker_metrics.py", copy=True)
     .add_local_file("transform_worker.py", "/root/transform_worker.py", copy=True)

@@ -44,6 +44,7 @@ jobs:
           bash -n scripts/test-e2e.sh
           bash -n scripts/test-e2e-index-recovery.sh
           bash -n scripts/test-e2e-media.sh
+          bash -n scripts/test-e2e-vision-fallback.sh
           docker compose --env-file /dev/null -f compose.e2e.yml config --quiet
           docker compose --env-file /dev/null -f compose.e2e.yml -f compose.e2e-index-recovery.yml config --quiet
 
