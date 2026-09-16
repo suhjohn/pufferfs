@@ -37,7 +37,7 @@ Audio uses Gemini. Status retrieval failures and ambiguous submissions retain
 the existing recovery path. See [configuration and limits](configuration.md#image-extraction-fallback)
 and [deployment roles and queues](provider-batch-manifests.md#roles-and-deployment).
 
-## Validation and deployment
+## Local validation before deployment
 
 The standalone provider probe, partial/whole-batch vision fallback and
 root-deletion/submission-discovery E2Es passed. Deletion
@@ -113,10 +113,37 @@ contract; the rerun passed.
 Modal's endpoint Usage page reported $0.01 during verification, below the
 approved $1 test cap.
 
-The authenticated Modal shared endpoint has been created, and local ignored
-`.env` has the configuration. Production PufferFS workers have not been
-deployed with this change. The deploy workflow now supports the required
-endpoint URL/model variables and proxy-token secret. No CLI behavior or package
-version changed.
-Deploy the collector before transformation workers: it accepts both old and
-new input manifests. The deployment workflow now follows that order.
+## Production rollout
+
+Commit `6f69ff2be54a5031dbd8152f2237d7d36f59a07b` was deployed to production
+on September 16, 2026 UTC. The [full deployment run](https://github.com/suhjohn/pufferfs/actions/runs/35056127649)
+passed for the API, queue consumers, all four Modal roles, frontend, installer
+and release mirror. The collector was deployed before transformation workers
+because it accepts both old and new input manifests. Production has the
+authenticated shared-endpoint URL/model and proxy-token configuration.
+The public API health check passed. The CLI protocol is unchanged.
+
+The live rollout exposed two previous-version collector containers still
+handling inputs during Modal's rolling deployment. Their logs showed
+`KeyError` while reading the new manifest shape. The new container's source
+hash and credential presence were verified; it completed the same provider
+batch on attempt one after the stale containers were stopped. A collector
+rollover then ensured only the current deployment remained. The workflow now
+uses Modal's `recreate` strategy for the collector before deploying the other
+roles. Interrupted collection resumes through the existing durable leases.
+See [Modal deployment strategies](https://modal.com/docs/guide/managing-deployments).
+
+The production CLI smoke check passed after this recovery. It captured a
+synthetic one-page PDF, cancelled only that root's Gemini job, verified the
+provider's cancellation error, and observed publication on the original
+inference attempt. Public page read and full-text search returned all expected
+inventory terms and values; provider input cleanup completed. The synthetic
+root was then deleted through the CLI. Evidence is in
+`/tmp/pufferfs-live-vision-release/state.json` and
+`/tmp/pufferfs-live-vision-verify.log` on the validating workstation.
+
+The Modal `suhjohn` workspace has a saved **$100 monthly spend limit**, as
+explicitly requested. This applies to net charges across all workspace apps,
+after applicable credits, and excludes storage charges. The existing $2,500
+usage limit was preserved. See [Modal budgets](https://modal.com/docs/guide/budgets).
+The separate $1 authorization covered the synthetic DeepSeek tests.

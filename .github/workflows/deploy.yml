@@ -218,12 +218,14 @@ jobs:
           set -euo pipefail
           : "${MODAL_TOKEN_ID:?Set MODAL_TOKEN_ID}"
           : "${MODAL_TOKEN_SECRET:?Set MODAL_TOKEN_SECRET}"
-          python3 -m pip install 'modal>=1.1.2,<2'
+          python3 -m pip install 'modal>=1.5.5,<2'
           python3 scripts/deploy/configure-modal.py
           cd modal
-          # Upgrade manifest readers before transformation starts writing the
-          # inline-media input shape. New readers also accept existing uploads.
-          for role in collector_app transform_app index_app reconciliation_app; do
+          # Retire old manifest readers before transformation starts writing
+          # new manifests. Interrupted collection resumes through durable leases;
+          # rolling deployment can keep old collectors serving new inputs.
+          python3 -m modal deploy collector_app.py --env "$MODAL_ENVIRONMENT" --strategy recreate
+          for role in transform_app index_app reconciliation_app; do
             python3 -m modal deploy "${role}.py" --env "$MODAL_ENVIRONMENT"
           done
 

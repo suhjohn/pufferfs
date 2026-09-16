@@ -1,8 +1,8 @@
 # Provider batch manifests
 
 This describes the repository implementation. The inline-media and optional
-vision-fallback changes are local and have not been deployed; see the
-[validation report](inline-media-and-vision-fallback.md). The schema
+vision-fallback changes were deployed to production on September 16, 2026 UTC;
+see the [validation report](inline-media-and-vision-fallback.md). The schema
 intentionally has no conversion path from the previous provider ledger.
 See the [compatibility-removal audit](fresh-schema-audit.md) for subsequent
 removal of the emptiness gate and adjacent migration paths.
@@ -143,8 +143,8 @@ image inputs on Modal's DeepSeek endpoint. It uses the retained source, the same
 OCR prompt and page/frame anchors, then publishes successes together with the
 Gemini successes. Result mappings record `result_provider` and `result_model`.
 Audio and unresolved submissions keep their existing Gemini recovery behavior.
-This is implemented locally; deployment requires the new collector code and
-the [vision configuration](configuration.md#image-extraction-fallback).
+The production collector has this enabled. Other deployments require the
+[vision configuration](configuration.md#image-extraction-fallback).
 
 Collectors claim work using `FOR UPDATE SKIP LOCKED` and renewable five-minute
 leases. Every input/result/cleanup pointer update checks the live token and

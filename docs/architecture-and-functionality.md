@@ -8,35 +8,67 @@ embeddings with `qwen/qwen3-embedding-8b`, 4096 float32 dimensions.
 
 ## Deployment topology
 
-```mermaid
-flowchart TD
-    A[Local agent: user machine] -->|immutable source packs| S3[(S3)]
-    A -->|capture metadata| API[API server: ECS]
-    API -->|catalog and permissions| DB[(Postgres)]
-    API -->|work IDs| TQ[Transform SQS FIFO + DLQ]
-    TQ -->|receipts| TC[Transform consumer: ECS]
-    TC -->|authenticated HTTP| TW[Transform worker: Modal CPU]
-    S3 -->|source ranges| TW
-    TW -->|native chunks| S3
-    TW -->|document/media batches| G[Gemini]
-    D[Collector dispatcher: Modal schedule] -->|spawn| C[Collectors: Modal CPU]
-    G -->|results| C
-    C -->|chunks| S3
-    TW -->|ready work IDs| IQ[Index SQS FIFO + DLQ]
-    C -->|ready work IDs| IQ
-    IQ -->|receipts| IC[Index consumer: ECS]
-    IC -->|authenticated HTTP| IW[Index worker: Modal CPU]
-    S3 -->|chunks / mutation replay| IW
-    IW -->|durable text mutations| S3
-    IW -->|text writes / deletes| TP[Turbopuffer]
-    TP -->|native document/query inference| Q[Managed Qwen embedding provider]
-    IW -->|acknowledged publication| DB
-    API -->|FTS / ANN Embed / hybrid queries| TP
-    R[Reconciler: Modal schedule] -->|repair delivery| TQ
-    R -->|repair delivery| IQ
-    R -->|leases / cleanup ledger| DB
-    R -->|artifact cleanup| S3
-    R -->|stale row cleanup| TP
+```text
+[CLI / local agent - user machine]
+    | capture metadata                    | immutable source packs
+    v                                     v
+[API server - ECS] --------------------> [S3]
+    | catalog / permissions               ^
+    v                                     | sources, chunks, manifests,
+[Postgres]                                | replayable text mutations
+    ^                                     |
+    | durable state / leases              |
+    +-- [Transformation workers] ---------+
+    +-- [Collector workers] --------------+
+    +-- [Index workers] ------------------+
+    +-- [Reconciler] ---------------------+
+
+WORK DISPATCH
+[API]
+    | enqueue work IDs
+    v
+[Transform SQS FIFO + DLQ] --> [Transform consumer - ECS]
+                                      | authenticated HTTP
+                                      v
+                             [Transform worker - Modal CPU]
+                                |                 |
+                    native text |                 | inline media in JSONL
+                                |                 v
+                                |          [Gemini Batch API]
+                                |                 ^
+                                |                 | poll results
+                                |          [Collectors - Modal CPU]
+                                |                 ^
+                                |                 | spawn invocations
+                                |          [Collector dispatcher]
+                                |          Modal, every minute
+                                |
+                                |          [Collectors]
+                                |             |     |
+                                |             |     +--> [DeepSeek V4.1 Flash]
+                                |             |          Modal shared endpoint
+                                |             |          failed images only
+                                v             v
+                            [Index SQS FIFO + DLQ]
+                                      |
+                                      v
+                             [Index consumer - ECS]
+                                      | authenticated HTTP
+                                      v
+                             [Index worker - Modal CPU]
+                                      | text + metadata writes
+                                      v
+                             [Turbopuffer]
+                              - full-text index
+                              - native Qwen embeddings
+                              - vector index
+
+[API] -- authorized search / published reads --> [Turbopuffer]
+
+[Reconciler - Modal CPU, every minute]
+    --> repairs delivery to both SQS queues
+    --> cleans obsolete Turbopuffer rows and S3 artifacts
+    --> records progress in Postgres
 ```
 
 DLQ means dead-letter queue: messages whose delivery attempts are exhausted.
@@ -48,7 +80,7 @@ DLQ means dead-letter queue: messages whose delivery attempts are exhausted.
 | Transform consumer | ECS; polls transform SQS | Receipts → bounded worker HTTP calls; renews visibility and acknowledges durable results |
 | Transform worker | Modal CPU; HTTP | S3 originals → native chunks or Gemini batches; ready extractions → index SQS |
 | Collector dispatcher | Modal CPU; minute schedule | Configured count → spawned collector invocations |
-| Collectors | Modal CPU; dispatcher | Leased Gemini work → S3 text, durable batch state, index SQS and provider cleanup |
+| Collectors | Modal CPU; dispatcher | Leased Gemini work and optional DeepSeek image recovery → S3 text, durable batch state, index SQS and provider cleanup |
 | Index consumer | ECS; polls index SQS | Receipts → one authenticated index endpoint |
 | Index worker | Modal CPU; HTTP | S3 chunks → durable text mutations → Turbopuffer → Postgres publication |
 | Reconciler | Modal CPU; minute schedule | Durable records → repaired delivery and source/artifact/index cleanup |
@@ -58,6 +90,8 @@ Workers claim a Postgres lease before processing. Modal starts/scales worker
 containers and invokes scheduled functions. The collector dispatcher starts
 collectors explicitly. Four Modal applications contain these CPU roles:
 `transform_app`, `collector_app`, `index_app`, `reconciliation_app`.
+DeepSeek is a separate managed inference endpoint. The production collector has
+its optional image fallback configured; see the [rollout and validation record](inline-media-and-vision-fallback.md).
 
 ## Durable publication
 
@@ -81,6 +115,124 @@ Vector-enabled schemas embed `content` into `vector`. Queries use
 Vector-disabled roots omit native embedding, using the same CPU worker and FTS.
 The API no longer calls an embedding service or holds query vectors. Namespace
 fan-out and publication retries can issue multiple native inference requests.
+
+## Workflows
+
+### Capture and extraction
+
+```text
+sync / follow
+  --> detect changed files
+  --> upload immutable source packs to S3
+  --> API validates access and registers captured versions
+  --> Postgres records transformation work
+  --> API enqueues IDs in Transform SQS
+  --> ECS consumer invokes transformation worker
+  --> worker claims ownership and verifies captured source
+
+      Text / structured formats:
+        --> extract chunks directly
+        --> store chunks in S3
+        --> enqueue index work
+
+      Documents / images / audio / video:
+        --> render pages/frames or prepare audio clips
+        --> embed media bytes in JSONL
+        --> upload one JSONL per batch of at most 64 inputs
+        --> submit Gemini batch
+        --> persist batch identity and manifests
+        --> collector takes over
+```
+
+Capture returns after durable acceptance. Extraction and indexing continue
+asynchronously; `sync wait` waits for publication.
+
+### Collection and image fallback
+
+```text
+minute dispatcher
+  --> spawn collectors
+  --> claim due provider batches in Postgres
+  --> inspect Gemini status
+
+      Still running:
+        --> schedule a later check
+
+      Terminal result:
+        --> preserve successful Gemini items
+        --> recover failed image items through DeepSeek
+        --> preserve original page/frame order
+        --> persist results; assemble complete extracted text
+        --> enqueue index work
+        --> clean tracked Gemini input uploads
+```
+
+Audio remains on Gemini. Remaining failed items use the bounded inference retry
+path. Slow nonterminal jobs, ambiguous submissions and status/output retrieval
+failures do not trigger vision fallback.
+
+### Indexing and publication
+
+```text
+Index SQS
+  --> ECS index consumer
+  --> Modal index worker claims work
+  --> read extracted chunks from S3
+  --> persist replayable text mutations in S3
+  --> write text and metadata to Turbopuffer
+  --> Turbopuffer generates native document embeddings when enabled
+  --> publish catalog head in Postgres after all writes succeed
+```
+
+### Search and read
+
+```text
+CLI / web --> API --> validate permissions and root selection
+
+Search:
+  --> Turbopuffer full-text, vector or hybrid query
+      vector query text --> native query embedding
+  --> validate candidates against current published catalog heads
+  --> return authorized results
+
+Read:
+  --> select and pin one published extraction
+  --> retrieve requested text/pages/rows
+  --> return content and locations
+```
+
+### Updates, failures and restarts
+
+```text
+Changed file --> new captured version --> extract --> index --> publish
+
+Worker interruption:
+  --> SQS redelivery or expired Postgres lease
+  --> another worker resumes durable work
+  --> reuse recorded provider jobs/results or index mutations
+
+Missed queue send:
+  --> reconciler finds durable unsent work
+  --> enqueue again
+
+Late result from an older version:
+  --> ownership checks reject publication
+  --> stale search rows stay hidden
+  --> reconciler removes obsolete data
+```
+
+Retries can repeat provider inference before a durable result is published;
+the system does not promise exactly-once billing.
+
+### Deletion
+
+```text
+Delete file/root
+  --> API records deletion and hides it from normal retrieval
+  --> in-flight work loses publication authority
+  --> cleanup removes index rows and eligible S3 data
+  --> provider cleanup continues from durable records
+```
 
 ## Operations and verification
 
