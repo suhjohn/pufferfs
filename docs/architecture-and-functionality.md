@@ -1,8 +1,8 @@
 # Architecture and functionality
 
-This describes the simplified code in this checkout. Production remains on the
-v0.8.2 topology until the coordinated deployment in
-[production-deployment.md](production-deployment.md). Verification is recorded in
+This describes the production topology deployed from `535f66c` on September 18,
+2026 UTC. The CLI release remains v0.8.2. Deployment instructions are in
+[production-deployment.md](production-deployment.md); verification is recorded in
 [simplification-implementation.md](simplification-implementation.md).
 
 ## Deployment topology

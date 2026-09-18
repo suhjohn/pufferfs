@@ -1,9 +1,8 @@
 # System simplification implementation
 
-Implemented and verified locally, retaining source packing and verified append
-reuse for upload efficiency.
-Production remains on v0.8.2. The updated
-architecture document describes this checkout, not a completed deployment.
+Deployed to production from `535f66c` on September 18, 2026 UTC, retaining source
+packing and verified append reuse for upload efficiency. The CLI release remains
+v0.8.2; the backend now runs the simplified topology below.
 
 ## Target
 
@@ -49,8 +48,7 @@ All 19 E2E scripts passed, including both vision cases: 20 suite variants.
 After restoring source packing and append reuse, all three affected suites were
 rerun successfully: capture/recovery, the full corpus, and retention/security.
 The release/manual GitHub matrix now contains 15 suites, including base64
-redaction through capture, search/read, updates and restarts. GitHub Actions and
-the production rollout were not run during this task. All local PufferFS test
+redaction through capture, search/read, updates and restarts. These local results preceded the production rollout recorded below. All local PufferFS test
 projects were cleaned up after their external-resource cleanup succeeded.
 
 | Verification | Result |
@@ -105,8 +103,8 @@ the partial-failure and cancellation vision suites also passed separately.
 - One worker row replaces transform/index rows. The phase's attempt count resets
   when extraction hands off to publication. Saved chunk content plus row format
   determine replay; no new mutation/cleanup artifact is written.
-- The migration refuses active multi-namespace roots. A configured database
-  inventory was empty; this does not establish the deployed database's shape.
+- The migration refuses active multi-namespace roots. The production preflight
+  found zero incompatible roots; migrations 048–050 then completed successfully.
 - New worker deployments retain bounded concurrency, renewable ownership and
   version-fenced publication. Removing them would permit stale/partial content
   to become visible. Original source extents/journals remain compatible.
@@ -114,11 +112,36 @@ the partial-failure and cancellation vision suites also passed separately.
   `maintenance/root-deletions/` objects after 30 days of object age. An already
   old object can expire after deployment. Back up referenced legacy artifacts
   as well as Postgres if an old-version rollback must remain possible.
-- Old writers must stop before migrations 048–050. No production deployment,
-  IAM removal, release or spend-limit change has been performed by this task.
-- The cutover script checks other IAM roles before removing a stack-owned
-  Modal OIDC provider. Its AWS operations and the ECS rollout remain unrun.
+- Old writers were stopped before migrations 048–050. This deployment did not
+  publish a CLI release or change provider spend limits.
+- The cutover script checked other IAM roles before removing the stack-owned
+  Modal OIDC provider. The AWS infrastructure update and ECS rollout succeeded.
 - The default deployment keeps one ingestion and one background ECS task
   running, each with 2 vCPUs and 4 GiB memory. They are billed by AWS separately
   from the existing $100/month Modal workspace limit. Concurrency and task
   sizing are configurable; no cloud cost or throughput benchmark was run.
+
+## Production verification — September 18, 2026 UTC
+
+[Full deployment](https://github.com/suhjohn/pufferfs/actions/runs/35312124279)
+and [CI](https://github.com/suhjohn/pufferfs/actions/runs/35309905229) passed
+for `535f66c`. Both API tasks and the ingestion/background tasks use that
+revision. Worker health checks passed, old ECS consumers are inactive, and
+Postgres reports migration 50.
+
+An isolated private synthetic root containing a 257-chunk text file and one
+embedded image data URL completed capture and indexing in 12.21 seconds. Both
+files published on their first attempt. All 257 lines matched indexed reads;
+the image payload became `[base64 image]`; FTS, vector and hybrid search passed.
+The root, its namespace and four storage objects were deleted afterward. This
+is a smoke test, not a throughput estimate for an existing corpus.
+
+The final local marker E2E (`543f14d277f5434893b00dc08fd3bc6d`) also passed
+capture, restart, update/delete and cleanup against real providers. The entire
+paid E2E matrix was not rerun for this final marker-only change.
+
+The production preflight found 2,731 pending index jobs already at five attempts.
+The new scheduler preserves their attempt counts and reports exhausted jobs as
+failed; deployment does not reset or re-extract them. Existing extracted text
+needs a new extraction to receive the base64 marker. No full-corpus reindex was
+launched during deployment.
