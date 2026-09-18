@@ -107,10 +107,10 @@ pufferfs root delete handbook --yes
 PufferFS depends on a few external systems:
 
 - PostgreSQL for tenants, permissions, versioned file catalogs and recovery metadata.
-- S3 for immutable originals, text chunks, vector packs and replayable mutations.
-- Turbopuffer for hybrid search namespaces.
-- Separate Modal transformation, collector, index, query and reconciliation apps.
-- Two required SQS FIFO queues, with independent transform/index consumers and DLQs.
+- S3 for immutable originals and canonical text chunks.
+- Turbopuffer for hybrid search and native embeddings.
+- Separate API, ingestion and background container services, with durable Postgres work.
+- An optional Modal vision endpoint for image extraction fallback.
 - Gemini 3.5 Flash-Lite Batch for document/image parsing and media transcription.
 - Email-code and Google OAuth for hosted web login.
 - AWS SES for transactional login-code and invite email.
@@ -126,7 +126,7 @@ Use PufferFS in one of two ways:
   [pufferfs.com](https://pufferfs.com). Install the CLI, run `pufferfs init`,
   and sync/query roots without operating the backend.
 - **Self-hosted**: run the Go API server with PostgreSQL, S3-compatible object
-  storage, Turbopuffer, Modal endpoints, and both SQS consumers. The web
+  storage, Turbopuffer, Gemini, and ingestion/background workers. The web
   console, installer, and workers can be deployed alongside the API when needed.
 
 Self-hosted production setup is documented in
@@ -137,10 +137,9 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 
 - `cmd/pufferfs`: CLI for sync, query, root management, services, and upgrades.
 - `cmd/server`: API server.
-- `cmd/worker`: SQS transform/index consumer.
-- `internal/server`: handlers, DB access, capture/catalog, Modal, Turbopuffer,
+- `internal/server`: handlers, DB access, capture/catalog, Turbopuffer,
   billing, and cleanup.
-- `modal`: independently deployed processing roles.
+- `workers`: ingestion and background runtime roles.
 - `web`: web console and docs site.
 - `infra/pulumi`: AWS production infrastructure.
 
@@ -148,7 +147,7 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 
 | Type | Strategy |
 | --- | --- |
-| Text/code/JSONL | Bounded byte-preserving line chunks |
+| Text/code/JSONL | Bounded line chunks; explicit base64 data-URL payloads redacted, original source retained |
 | PDF, Word, presentations | Local page images → Gemini Batch Markdown |
 | Spreadsheets | Sheet/cell-preserving extraction |
 | Images | Frame/page images → Gemini Batch Markdown |

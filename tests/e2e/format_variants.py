@@ -44,7 +44,7 @@ def verify_file(state, directory, path, file, expected):
     run.assert_source_retained(file)
     with (directory / path).open("rb") as source:
         assert "sha256:" + hashlib.file_digest(source, "sha256").hexdigest() == file["content_hash"]
-    row, = run.sql("""SELECT e.id,e.chunks_ref,e.chunk_count,w.mutation_ref,w.acknowledged_batches,w.mutation_batch_count
+    row, = run.sql("""SELECT e.id,e.chunks_ref,e.chunk_count,w.status AS work_status
         FROM file_extractions e JOIN file_catalog f ON f.indexed_extraction_id=e.id
         JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE f.id=%s""", (file["file_id"],))
     records = list(run.chunks(row["chunks_ref"]))
@@ -55,7 +55,7 @@ def verify_file(state, directory, path, file, expected):
         assert hashlib.sha256(chunk["content"].encode()).hexdigest() == chunk["content_hash"], path
     content = "\n".join(chunk["content"] for chunk in records).lower()
     assert all(term in content for term in expected["terms"]), f"missing content: {path}: {content[:1500]}"
-    assert row["mutation_ref"] and row["acknowledged_batches"] == row["mutation_batch_count"], path
+    assert row["work_status"] == "complete", path
     if "sheets" in expected:
         sheets = {}
         for chunk in records:

@@ -939,7 +939,7 @@ func (db *DB) createRoot(ctx context.Context, orgID, name, sourcePath, scope, ow
 	if actor != nil {
 		userID, keyID = actor.UserID, actor.APIKeyID
 	}
-	names := rootIndexNamespaceNames(orgID, root.ID, rootIndexNamespaceShardCount())
+	namespace := rootIndexNamespaceName(orgID, root.ID)
 	var problem string
 	err := db.pool.QueryRow(ctx, `WITH actor AS (
         SELECT m.role,COALESCE(k.scopes,ARRAY[]::text[]) AS scopes
@@ -965,11 +965,10 @@ func (db *DB) createRoot(ctx context.Context, orgID, name, sourcePath, scope, ow
         SELECT $1,$2,$3,$4,$5,NULLIF($6,''),$7,$8,$8 FROM permission WHERE problem=''
         RETURNING id,org_id,created_at
     ), namespaces AS (
-        INSERT INTO root_index_namespaces(id,org_id,root_id,namespace,shard_index,shard_count,created_at)
-        SELECT gen_random_uuid()::text,r.org_id,r.id,n.name,n.ordinal-1,cardinality($11::text[]),r.created_at
-        FROM created r CROSS JOIN unnest($11::text[]) WITH ORDINALITY AS n(name,ordinal)
+        INSERT INTO root_index_namespaces(id,org_id,root_id,namespace,created_at)
+        SELECT gen_random_uuid()::text,r.org_id,r.id,$11,r.created_at FROM created r
     ) SELECT problem FROM permission`,
-		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.VectorDisabled, now, userID, keyID, names).Scan(&problem)
+		root.ID, root.OrgID, root.Name, root.SourcePath, root.Scope, root.OwnerUserID, root.VectorDisabled, now, userID, keyID, namespace).Scan(&problem)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
@@ -1273,14 +1272,14 @@ func rootPermissionAllowed(permissions []string, action string) bool {
 	return false
 }
 
-const rootIndexNamespaceSelectColumns = `id, org_id, root_id, namespace, shard_index, shard_count, created_at, retired_at`
+const rootIndexNamespaceSelectColumns = `id, org_id, root_id, namespace, created_at, retired_at`
 
 func scanRootIndexNamespaces(rows pgx.Rows) ([]models.RootIndexNamespace, error) {
 	defer rows.Close()
 	var namespaces []models.RootIndexNamespace
 	for rows.Next() {
 		var ns models.RootIndexNamespace
-		if err := rows.Scan(&ns.ID, &ns.OrgID, &ns.RootID, &ns.Namespace, &ns.ShardIndex, &ns.ShardCount, &ns.CreatedAt, &ns.RetiredAt); err != nil {
+		if err := rows.Scan(&ns.ID, &ns.OrgID, &ns.RootID, &ns.Namespace, &ns.CreatedAt, &ns.RetiredAt); err != nil {
 			return nil, err
 		}
 		namespaces = append(namespaces, ns)
@@ -1293,7 +1292,7 @@ func (db *DB) ListRootIndexNamespaces(ctx context.Context, orgID, rootID string)
 		`SELECT `+rootIndexNamespaceSelectColumns+`
 		 FROM root_index_namespaces
 		 WHERE org_id = $1 AND root_id = $2 AND retired_at IS NULL
-		 ORDER BY shard_index`,
+		 ORDER BY namespace`,
 		orgID, rootID,
 	)
 	if err != nil {

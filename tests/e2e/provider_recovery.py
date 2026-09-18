@@ -1,4 +1,4 @@
-"""Provider recovery through actual CLI capture, SQS, workers and Gemini."""
+"""Provider recovery through actual CLI capture, workers and Gemini."""
 
 import json
 import os
@@ -159,7 +159,7 @@ def partial_capture():
     run.save(state)
     run.eventually("durable provider handoff", lambda: run.sql("""SELECT id FROM file_work
         WHERE extraction_id=%s AND stage='transform' AND status='waiting_provider'""", (inputs[0]["extraction_id"],)))
-    run.wait_queue_empty("transform")
+    run.wait_work_idle("transform")
     reservation_counts(3, 69)
     with client() as provider:
         def terminal():
@@ -181,7 +181,9 @@ def partial_collected():
         return rows if len(rows) == 4 and all(row["status"] in {"complete", "failed"} for row in rows) else None
     rows = run.eventually("partial result persistence before the next scheduled retry", collected, 600)
     successes = [row for row in rows if row["status"] == "complete"]
-    assert [row["ordinal"] for row in successes] == [0, 2]
+    assert [row["ordinal"] for row in successes] == [0, 2], [
+        {key: row.get(key) for key in ("ordinal", "status", "attempt_count", "error", "result_provider")}
+        for row in rows]
     state.update(successes=successes, success_stamps=[stamp(ref) for ref in sorted({row["result_ref"] for row in successes})])
     run.save(state)
     print("Successful page artifacts are durable before failed pages retry.", flush=True)

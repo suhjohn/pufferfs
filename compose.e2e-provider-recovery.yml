@@ -25,14 +25,14 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-  transform:
+  ingestion:
     environment:
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
       AWS_ENDPOINT_URL_S3: http://provider-manifest-relay:8080
     depends_on:
       provider-relay: {condition: service_healthy}
       provider-manifest-relay: {condition: service_healthy}
-  collector:
+  background:
     environment:
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
       AWS_ENDPOINT_URL_S3: http://provider-manifest-relay:8080

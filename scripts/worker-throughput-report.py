@@ -16,23 +16,22 @@ def report(path):
     jobs, phases = {}, []
     for line in Path(path).read_text().splitlines():
         line = re.sub(r"\x1b\[[0-9;]*m", "", line)
-        start = line.find('{"event":')
-        if start < 0:
-            continue
-        try:
-            row, _ = json.JSONDecoder().raw_decode(line[start:])
-        except json.JSONDecodeError:
-            continue
-        if row.get("event") == "file_work_metrics" and row["status"] == "complete":
-            jobs[row["work_id"]] = row
-        elif row.get("event") == "worker_throughput":
-            phases.append(row)
+        # Concurrent process output can put adjacent JSON records on one line.
+        for match in re.finditer(r'\{"event":', line):
+            try:
+                row, _ = json.JSONDecoder().raw_decode(line[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if row.get("event") == "file_work_metrics" and row["status"] == "complete":
+                jobs[(row["work_id"], row["stage"])] = row
+            elif row.get("event") == "worker_throughput":
+                phases.append(row)
     if not phases:
         raise ValueError(f"No validated benchmark phase in {path}")
     for phase in phases:
         for stage in ("transform", "index"):
-            work = [row for row in phase["work"] if row["stage"] == stage]
-            measured = [jobs[row["work_id"]] for row in work]
+            work = phase["work"]
+            measured = [jobs[(row["work_id"], stage)] for row in work]
             durations = sorted(row["total_seconds"] for row in measured)
             totals, counts = {}, {}
             for row in measured:
@@ -60,6 +59,7 @@ def report(path):
                     "chunks_per_wall_second": round(count / (last - first), 2),
                     "observed_peak_inputs_by_container": peaks}
             print(json.dumps({"log": str(path), "run_id": phase["run_id"], "phase": phase["phase"],
+                **{key: phase[key] for key in ("concurrency", "embedding_batch_documents", "vector_disabled") if key in phase},
                 **overlap,
                 "stage": stage, "files": len(work), "chunks": count,
                 "worker_seconds": round(sum(durations), 3),
@@ -70,9 +70,6 @@ def report(path):
                 "application_db_statements": counts.get("db_statements", 0) - counts.get("db_health_checks", 0),
                 "counts": counts,
                 "inclusive_phase_seconds": {k: round(v, 3) for k, v in totals.items()},
-                "mutation_payload": {k: phase[k] for k in
-                    ("mutation_records", "mutation_json_bytes") if k in phase}
-                    if stage == "index" else {},
                 "capture_to_publication_seconds": phase["capture_to_publication_seconds"]}))
 
 

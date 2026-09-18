@@ -12,7 +12,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/pufferfs/pufferfs/internal/auth"
-	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
 
@@ -31,8 +30,7 @@ type CapturedFileVersion struct {
 type RegisteredFileVersion = models.RegisteredFileVersion
 
 type registeredCapture struct {
-	versions   []RegisteredFileVersion
-	deliveries []queue.JobMessage
+	versions []RegisteredFileVersion
 }
 
 var ErrFileVersionConflict = errors.New("captured file version changed")
@@ -46,8 +44,8 @@ func (e *retiredSourcePacksError) Error() string {
 
 var errSourceExtentUnavailable = errors.New("source extent is unavailable, outside its object, or not authorized for this file")
 
-// RegisterFileVersions atomically advances captured heads and records the SQS
-// handoffs that must be published. It never waits for or advances indexing.
+// RegisterFileVersions atomically advances captured heads and registers durable
+// database work. It never waits for extraction or publication.
 // Repeating an identical capture is idempotent even after a later capture.
 func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity, rootID, captureID, revision string, files []CapturedFileVersion) (*registeredCapture, error) {
 	if identity == nil || identity.OrgID == "" || identity.UserID == "" || captureID == "" || revision == "" || len(files) == 0 || len(files) > 128 {
@@ -110,11 +108,9 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 	rows, err := tx.Query(ctx, `SELECT f.id,f.path,COALESCE(f.captured_version_id,''),
 		COALESCE(v.id,''),COALESCE(v.sequence,0),COALESCE(v.content_hash,''),
 		COALESCE(v.size_bytes,0),COALESCE(v.source_manifest_ref,''),COALESCE(v.deleted,false),
-		COALESCE(v.previous_version_id,''),COALESCE(first.revision,''),COALESCE(first.needs_delivery,false)
+		COALESCE(v.previous_version_id,''),COALESCE(first.revision,'')
 		FROM file_catalog f LEFT JOIN file_versions v ON v.file_id=f.id AND v.capture_id=$3
-		LEFT JOIN LATERAL (SELECT e.revision,w.status='pending' AND w.enqueued_at IS NULL AS needs_delivery
-			FROM file_extractions e LEFT JOIN file_work w ON w.extraction_id=e.id
-				AND w.stage=CASE WHEN v.deleted THEN 'index' ELSE 'transform' END
+		LEFT JOIN LATERAL (SELECT e.revision FROM file_extractions e
 			WHERE e.version_id=v.id ORDER BY e.sequence LIMIT 1) first ON true
 		WHERE f.root_id=$1 AND f.path=ANY($2::text[]) ORDER BY f.path FOR UPDATE OF f`, rootID, paths, captureID)
 	if err != nil {
@@ -123,7 +119,6 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 	type capturedHead struct {
 		fileID, head, versionID, revision string
 		sequence                          int64
-		needsDelivery                     bool
 		file                              CapturedFileVersion
 	}
 	heads := make(map[string]capturedHead, len(files))
@@ -131,7 +126,7 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 		var h capturedHead
 		if err = rows.Scan(&h.fileID, &h.file.Path, &h.head, &h.versionID, &h.sequence,
 			&h.file.ContentHash, &h.file.Size, &h.file.SourceManifestRef, &h.file.Deleted,
-			&h.file.PreviousVersionID, &h.revision, &h.needsDelivery); err != nil {
+			&h.file.PreviousVersionID, &h.revision); err != nil {
 			break
 		}
 		heads[h.file.Path] = h
@@ -179,10 +174,6 @@ func (db *DB) RegisterFileVersions(ctx context.Context, identity *auth.Identity,
 		workID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(extractionID+":"+stage)).String()
 		result.versions[i] = RegisteredFileVersion{FileID: h.fileID, VersionID: versionID, Sequence: h.sequence,
 			ExtractionID: extractionID, WorkID: workID, Stage: stage}
-		if h.versionID == "" || h.needsDelivery {
-			result.deliveries = append(result.deliveries, queue.JobMessage{JobID: workID, WorkID: workID,
-				OrgID: orgID, RootID: rootID, FileID: h.fileID, VersionID: versionID, ExtractionID: extractionID, Stage: stage})
-		}
 		if h.versionID == "" {
 			writes = append(writes, captureWrite{CapturedFileVersion: f, RegisteredFileVersion: result.versions[i], Revision: fileRevision, Slot: i})
 		}
@@ -251,13 +242,6 @@ func writeCapturedVersions(ctx context.Context, tx pgx.Tx, captureID string, wri
 		result[slot].Sequence = sequence
 	}
 	return rows.Err()
-}
-
-// MarkFileWorkEnqueued records only confirmed SQS sends. A crash
-// before this update causes harmless redelivery, rather than lost work.
-func (db *DB) MarkFileWorkEnqueued(ctx context.Context, ids []string) error {
-	_, err := db.pool.Exec(ctx, `UPDATE file_work SET enqueued_at=NOW() WHERE id=ANY($1::text[]) AND enqueued_at IS NULL`, ids)
-	return err
 }
 
 func validSHA256(value string) bool {

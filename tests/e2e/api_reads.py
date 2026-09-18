@@ -19,7 +19,7 @@ def relay(method, path, body=None):
 
 
 def read_calls():
-    patterns = ("SELECT f.indexed_extraction_id, (%", "SELECT id, org_id, root_id, namespace%",
+    patterns = ("SELECT f.indexed_extraction_id,n.namespace%", "SELECT id, org_id, root_id, namespace%",
                 "%FROM root_acls%UNION ALL SELECT%FROM file_content_proofs%",
                 "SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at%FROM root_acls%")
     return [run.sql("SELECT COALESCE(sum(calls),0)::bigint AS n FROM pg_stat_statements WHERE query LIKE %s",

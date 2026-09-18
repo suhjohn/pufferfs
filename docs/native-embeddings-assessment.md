@@ -1,5 +1,9 @@
 # Native Qwen embeddings: migration and removal inventory
 
+> Historical design/results. The current implementation is described in
+> [Architecture](architecture-and-functionality.md); these measurements and
+> commands describe the revision recorded below, not the simplified runtime.
+
 ## Decision
 
 Use Turbopuffer native `qwen/qwen3-embedding-8b` embeddings with 4096 float32

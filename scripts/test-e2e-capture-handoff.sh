@@ -4,13 +4,13 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${GEMINI_API_KEY:?Required for real provider cleanup}"
 : "${TURBOPUFFER_API_KEY:?Required for real search}"
 project="pufferfs-capture-handoff-$$"
-compose=(docker compose --env-file /dev/null --profile test -p "$project" -f compose.e2e.yml -f compose.e2e-api.yml -f compose.e2e-capture-handoff.yml)
+compose=(docker compose --env-file /dev/null --profile test -p "$project" -f compose.e2e.yml -f compose.e2e-api.yml)
 mkdir -p tests/e2e/artifacts
 runner_started=0
 finish() {
   result=$?
   trap - EXIT
-  "${compose[@]}" stop transform-consumer index-consumer transform index reconciler || true
+  "${compose[@]}" stop ingestion background || true
   if [[ "$runner_started" == 1 ]] && ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
     echo "Cleanup failed; retained project $project for recovery." >&2
     exit 1
@@ -20,15 +20,13 @@ finish() {
   exit "$result"
 }
 trap finish EXIT
-"${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index
+"${compose[@]}" build
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready
 runner_started=1
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/capture_handoff.py)
 "${driver[@]}" capture
 "${compose[@]}" restart api
 "${compose[@]}" run --rm --no-deps api-ready
-"${compose[@]}" up -d --no-deps --wait reconciler
 "${driver[@]}" recovered
-"${compose[@]}" stop reconciler
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
+"${compose[@]}" up -d --wait --scale api=2 --scale ingestion=2 --scale background=2 ingestion background
 "${driver[@]}" verify

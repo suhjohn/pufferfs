@@ -14,7 +14,6 @@ import (
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
 	appconfig "github.com/pufferfs/pufferfs/internal/config"
-	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/server"
 	"github.com/pufferfs/pufferfs/internal/storage"
 )
@@ -60,12 +59,6 @@ func main() {
 	} else if posthogEnabled {
 		log.Println("POSTHOG_ENABLED is set but POSTHOG_KEY is missing; analytics disabled")
 	}
-
-	q, err := queue.NewFromEnv(context.Background())
-	if err != nil {
-		log.Fatalf("connecting to SQS: %v", err)
-	}
-	srv.SetQueue(q)
 
 	// JWT secret
 	jwtSecret := []byte(os.Getenv("JWT_SECRET"))

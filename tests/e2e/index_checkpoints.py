@@ -30,23 +30,22 @@ def capture():
     assert event['upstream_status'] == 200
     file = run.catalog(state,root)['record.txt']
     row = work(root,file['version_id'])
-    records = list(run.chunks(row['mutation_ref']))
-    assert len(records) == row['mutation_batch_count'] == 3
-    assert [len(r['write']['upsert_rows']) for r in records] == [512,512,1]
+    records = list(run.chunks(row['chunks_ref']))
+    assert len(records) == 1025
+    assert [r['chunk_index'] for r in records] == list(range(1025))
     assert row['status'] == 'running' and row['attempt_count'] == 1
-    assert row['acknowledged_batches'] == file['processing']['acknowledged_batches'] == 0
     assert not file['indexed_version_id']
-    events = [e for e in relay('GET','/status')['events'] if e['namespace']==event['namespace']]
+    events = [e for e in relay('GET','/status')['events'] if e['namespace']==event['namespace'] and e['operation']=='write']
     assert len(events) == 2 and all(e.get('upstream_status') == 200 for e in events)
     assert events[0]['state'] == 'response_released' and events[1]['state'] == 'response_held'
     for peer in servers():
         assert not run.request('POST','/query',{'root_id':root,'query':'calibration','mode':'fts'},key=state['key'],server=peer)['results']
     case = {'root':root,'version':file['version_id'],'work':row,
         'namespace':event['namespace'],'initial_hashes':[e['payload_sha256'] for e in events],
-        'stamp':object_stamp(row['mutation_ref'])}
+        'stamp':object_stamp(row['chunks_ref'])}
     state.setdefault('checkpoint_cases',[]).append(case)
     run.save(state)
-    print(f"Three-batch artifact durable; two provider writes accepted, acknowledgment=0, nothing published.",flush=True)
+    print(f"Canonical chunks durable; two provider writes accepted, nothing published.",flush=True)
 
 
 def verify_reads(state,case):
@@ -70,17 +69,16 @@ def recovered():
     row = work(case['root'],case['version'])
     assert row['status'] == 'complete' and row['attempt_count'] == 2
     assert row['attempt_token'] != case['work']['attempt_token']
-    assert row['acknowledged_batches'] == row['mutation_batch_count'] == 3
-    assert row['mutation_ref'] == case['work']['mutation_ref'] and object_stamp(row['mutation_ref']) == case['stamp']
-    events = [e for e in relay('GET','/status')['events'] if e['namespace']==case['namespace'] and e.get('upstream_status') == 200]
+    assert row['chunks_ref'] == case['work']['chunks_ref'] and object_stamp(row['chunks_ref']) == case['stamp']
+    events = [e for e in relay('GET','/status')['events'] if e['namespace']==case['namespace'] and e['operation']=='write' and e.get('upstream_status') == 200]
     replayed = events[2:]
     assert len(events) == 5
     repeated = case['initial_hashes']
     assert [e['payload_sha256'] for e in replayed[:len(repeated)]] == repeated
     assert len({e['payload_sha256'] for e in events}) == 3
     verify_reads(state,case)
-    run.wait_queue_empty('index')
-    print(f"Recovered full artifact: replayed {len(replayed)} batches, exact bytes and all 1025 lines verified on both APIs.",flush=True)
+    run.wait_work_idle('index')
+    print(f"Recovered from canonical chunks: replayed {len(replayed)} batches, exact bytes and all 1025 lines verified on both APIs.",flush=True)
 
 
 def restarted():

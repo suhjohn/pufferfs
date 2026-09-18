@@ -1,15 +1,12 @@
-"""Provision an isolated cloud E2E, never replace a production deployment.
+"""Isolated cloud storage/database E2E with production roles in Compose.
 
-Requires real AWS IAM-user credentials (STS federation), Modal authentication,
-provider keys, and a TLS-verified DATABASE_URL whose role can create databases
-and roles. Creates a disposable database/login, bucket, four FIFO queues, and
-two temporary Modal secrets and one CPU index app. Only the host keeps provisioning credentials;
-runtime workers receive a dedicated DB login and resource-scoped STS session.
-
-Run: uv run --with boto3 --with 'psycopg[binary]' --with modal tests/e2e/cloud_index.py
+Requires AWS IAM-user credentials (STS federation), provider keys, and a TLS
+verified DATABASE_URL able to create databases/roles. Provisions a disposable
+DB/login and bucket. Container roles receive a scoped temporary AWS session.
+This checks real AWS storage and managed Postgres, not ECS scheduling or IAM.
+Run: uv run --with boto3 --with 'psycopg[binary]' tests/e2e/cloud_index.py
 """
 
-from contextlib import ExitStack
 import argparse
 import json
 import os
@@ -24,7 +21,6 @@ import uuid
 
 import boto3
 from botocore.config import Config
-import modal
 import psycopg
 from psycopg import sql
 
@@ -35,24 +31,15 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", choices=("cloud-index", "worker-throughput"), default="cloud-index")
-    parser.add_argument("--containers", "--workers", dest="containers", type=int, choices=range(1, 17), default=1,
-                        help="Maximum CPU index containers; consumers remain one replica per stage")
-    parser.add_argument("--inputs", type=int, choices=range(1, 17), default=1,
-                        help="Concurrent inputs per index container")
-    parser.add_argument("--consumer-concurrency", type=int, choices=range(1, 65),
-                        help="Index jobs admitted by the single consumer; defaults to containers times inputs")
+    parser.add_argument("--workers", type=int, choices=range(1, 17), default=1)
+    parser.add_argument("--concurrency", type=int, choices=range(1, 65), default=4)
     parser.add_argument("--records-per-file", type=int, choices=range(1, 769),
                         help="Override record count in each throughput fixture for a bounded sweep")
     parser.add_argument("--repeats", type=int, choices=range(1, 17), default=1,
                         help="Copies of the synthetic throughput workload, with distinct contents")
     parser.add_argument("--worker-database-port", type=int, choices=(5432, 6432),
                         help="Optional existing transaction-pooler port for worker connections")
-    parser.add_argument("--shards", type=int, choices=(1, 2), default=2,
-                        help="Exercise single- or multiple-namespace root routing")
     args = parser.parse_args()
-    concurrency = args.consumer_concurrency or args.containers * args.inputs
-    if concurrency > 64:
-        parser.error("The single index consumer supports at most 64 admitted jobs")
     for name in ("DATABASE_URL", "GEMINI_API_KEY", "TURBOPUFFER_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         if not os.environ.get(name):
             raise RuntimeError(f"{name} is required")
@@ -71,21 +58,20 @@ def main():
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
     credentials = boto3.Session(region_name=region)
     config = Config(connect_timeout=10, read_timeout=30, retries={"total_max_attempts": 2})
-    s3, sqs, sts = (credentials.client(service, config=config) for service in ("s3", "sqs", "sts"))
-    if any(not client.meta.endpoint_url.endswith(".amazonaws.com") for client in (s3, sqs, sts)):
+    s3, sts = (credentials.client(service, config=config) for service in ("s3", "sts"))
+    if any(not client.meta.endpoint_url.endswith(".amazonaws.com") for client in (s3, sts)):
         raise RuntimeError("Cloud E2E refuses emulator endpoints")
     identity = sts.get_caller_identity()
     if ":user/" not in identity["Arn"]:
         raise RuntimeError("STS federation requires an IAM-user provisioning identity")
     print(json.dumps({"cloud_run": identifier, "account": identity["Account"], "region": region,
-        "consumer_replicas_per_stage": 1, "index_consumer_concurrency": concurrency,
-        "index_containers": args.containers, "index_inputs": args.inputs,
-        "repeats": args.repeats, "shards": args.shards,
+        "workers_per_role": args.workers, "concurrency": args.concurrency,
+        "repeats": args.repeats,
         "records_per_file": args.records_per_file}), flush=True)
     recovery = Path(tempfile.mkdtemp(prefix=identifier + "-"))
     state_path = recovery / "resources.json"
     state = {"identifier": identifier, "database": None, "role": None, "bucket": None,
-             "queues": [], "secrets": [], "compose_started": False, "application_cleaned": False}
+             "compose_started": False, "application_cleaned": False}
     runtime = None
 
     def save():
@@ -154,88 +140,49 @@ def main():
         s3.put_bucket_policy(Bucket=identifier, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
             "Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": [f"arn:aws:s3:::{identifier}", f"arn:aws:s3:::{identifier}/*"],
             "Condition": {"Bool": {"aws:SecureTransport": "false"}}}]}))
-        urls, arns = {}, []
-        for stage in ("transform", "index"):
-            dlq = sqs.create_queue(QueueName=f"{identifier}-{stage}-dlq.fifo", Attributes={"FifoQueue": "true"})["QueueUrl"]
-            state["queues"].append(dlq)
-            save()
-            arn = sqs.get_queue_attributes(QueueUrl=dlq, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"]
-            url = sqs.create_queue(QueueName=f"{identifier}-{stage}.fifo", Attributes={
-                "FifoQueue": "true", "ContentBasedDeduplication": "false", "DeduplicationScope": "messageGroup",
-                "FifoThroughputLimit": "perMessageGroupId", "VisibilityTimeout": "300", "ReceiveMessageWaitTimeSeconds": "20",
-                "MessageRetentionPeriod": "1209600", "RedrivePolicy": json.dumps({"deadLetterTargetArn": arn, "maxReceiveCount": "5"}),
-            })["QueueUrl"]
-            state["queues"].append(url)
-            save()
-            urls[stage] = url
-            arns.append(sqs.get_queue_attributes(QueueUrl=url, AttributeNames=["QueueArn"])["Attributes"]["QueueArn"])
         policy = {"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts", "s3:ListBucket", "s3:ListBucketMultipartUploads"],
-             "Resource": [f"arn:aws:s3:::{identifier}", f"arn:aws:s3:::{identifier}/*"]},
-            {"Effect": "Allow", "Action": ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"], "Resource": arns}]}
+             "Resource": [f"arn:aws:s3:::{identifier}", f"arn:aws:s3:::{identifier}/*"]}]}
         temporary = sts.get_federation_token(Name=identifier, Policy=json.dumps(policy), DurationSeconds=7200)["Credentials"]
-        auth_key = secrets.token_urlsafe(36)
         worker_env = {"DATABASE_URL": worker_database_url, "AWS_REGION": region, "AWS_DEFAULT_REGION": region,
             "AWS_BUCKET_NAME": identifier, "AWS_ACCESS_KEY_ID": temporary["AccessKeyId"],
             "AWS_SECRET_ACCESS_KEY": temporary["SecretAccessKey"], "AWS_SESSION_TOKEN": temporary["SessionToken"],
             "TURBOPUFFER_API_KEY": os.environ["TURBOPUFFER_API_KEY"],
             "TURBOPUFFER_API_URL": os.environ.get("TURBOPUFFER_API_URL") or f"https://{os.environ.get('TURBOPUFFER_REGION', 'gcp-us-central1')}.turbopuffer.com",
-            "PUFFERFS_SQS_TRANSFORM_QUEUE_URL": urls["transform"], "PUFFERFS_SQS_INDEX_QUEUE_URL": urls["index"],
-            "PUFFERFS_TP_NAMESPACE_SHARDS": str(args.shards)}
-        worker_name, auth_name = identifier + "-worker", identifier + "-auth"
-        for name, values in ((worker_name, worker_env), (auth_name, {"PUFFERFS_MODAL_ENDPOINT_AUTH_KEY": auth_key})):
-            modal.Secret.objects.create(name, values)
-            state["secrets"].append(name)
+            "PUFFERFS_WORKER_CONCURRENCY": str(args.concurrency)}
+        runtime = dict(os.environ, **worker_env)
+        runtime.update(DATABASE_URL=database_url, PUFFERFS_WORKER_DATABASE_URL=worker_database_url,
+            PUFFERFS_DB_MAX_CONNS="2", PUFFERFS_WORKER_DB_MAX_CONNS="2",
+            PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats),
+            PUFFERFS_E2E_THROUGHPUT_RECORDS=str(args.records_per_file or ""),
+            PUFFERFS_ADMIN_KEY=secrets.token_urlsafe(36), JWT_SECRET=secrets.token_urlsafe(36),
+            PUFFERFS_CLOUD_DB_PASSWORD=password, COMPOSE_PROJECT_NAME=identifier)
+        state["runtime"] = {key: runtime[key] for key in (*worker_env, "PUFFERFS_WORKER_DATABASE_URL",
+            "PUFFERFS_DB_MAX_CONNS", "PUFFERFS_WORKER_DB_MAX_CONNS", "PUFFERFS_E2E_THROUGHPUT_REPEATS",
+            "PUFFERFS_ADMIN_KEY", "JWT_SECRET")}
+        save()
+        try:
+            compose("build")
+            state["compose_started"] = True
             save()
-        # Isolated application and URL names: no stable production label is
-        # reused even while the temporary application is running.
-        os.environ.update(PUFFERFS_WORKER_SECRET_NAME=worker_name, PUFFERFS_MODAL_ENDPOINT_SECRET_NAME=auth_name,
-            PUFFERFS_INDEX_APP_NAME=identifier + "-index", PUFFERFS_INDEX_ENDPOINT_LABEL=identifier + "-index",
-            PUFFERFS_MODAL_INDEX_MAX_CONTAINERS=str(args.containers),
-            PUFFERFS_INDEX_INPUTS_PER_CONTAINER=str(args.inputs))
-        sys.path.insert(0, str(REPOSITORY / "modal"))
-        os.chdir(REPOSITORY / "modal")
-        import index_app
-
-        with ExitStack() as apps:
-            apps.enter_context(modal.enable_output())
-            apps.enter_context(index_app.app.run())
-            runtime = dict(os.environ, **worker_env)
-            runtime.update(DATABASE_URL=database_url, PUFFERFS_WORKER_DATABASE_URL=worker_database_url,
-                PUFFERFS_DB_MAX_CONNS="2", PUFFERFS_WORKER_DB_MAX_CONNS="2",
-                PUFFERFS_CLOUD_INDEX_CONCURRENCY=str(concurrency),
-                PUFFERFS_E2E_THROUGHPUT_REPEATS=str(args.repeats),
-                PUFFERFS_E2E_THROUGHPUT_RECORDS=str(args.records_per_file or ""))
-            runtime.update(MODAL_FILE_INDEX_ENDPOINT=index_app.index.get_web_url(),
-                MODAL_SECRET_KEY=auth_key, PUFFERFS_ADMIN_KEY=secrets.token_urlsafe(36), JWT_SECRET=secrets.token_urlsafe(36),
-                PUFFERFS_CLOUD_DB_PASSWORD=password, COMPOSE_PROJECT_NAME=identifier)
-            state["runtime"] = {key: runtime[key] for key in (*worker_env, "PUFFERFS_WORKER_DATABASE_URL",
-                "PUFFERFS_DB_MAX_CONNS", "PUFFERFS_WORKER_DB_MAX_CONNS", "PUFFERFS_CLOUD_INDEX_CONCURRENCY",
-                "PUFFERFS_INDEX_INPUTS_PER_CONTAINER", "PUFFERFS_E2E_THROUGHPUT_REPEATS",
-                "MODAL_SECRET_KEY", "PUFFERFS_ADMIN_KEY", "JWT_SECRET", "MODAL_FILE_INDEX_ENDPOINT")}
-            save()
-            print(json.dumps({"index_app": index_app.app.app_id}), flush=True)
-            try:
-                compose("build", "api", "transform", "e2e")
-                state["compose_started"] = True
+            compose("up", "-d", "--wait", "--scale", f"ingestion={args.workers}",
+                    "--scale", f"background={args.workers}", "api", "api-ready", "ingestion", "background")
+            compose("run", "--rm", "--no-deps", "e2e", args.scenario)
+        finally:
+            if state["compose_started"]:
+                compose("stop", "ingestion", "background", check=False)
+                state["application_cleaned"] = compose("run", "--rm", "--no-deps", "e2e", "cleanup", check=False) == 0
                 save()
-                compose("up", "-d", "--wait", "api", "api-ready", "transform",
-                        "reconciler", "transform-consumer", "index-consumer")
-                compose("run", "--rm", "--no-deps", "e2e", args.scenario)
-            finally:
-                if state["compose_started"]:
-                    compose("stop", "transform-consumer", "index-consumer", "transform", "reconciler", check=False)
-                    state["application_cleaned"] = compose("run", "--rm", "--no-deps", "e2e", "cleanup", check=False) == 0
-                    save()
-                    log_path = REPOSITORY / "tests/e2e/artifacts" / f"{identifier}.log"
-                    with log_path.open("w") as output:
-                        compose("logs", "--no-color", check=False, log=output)
-                    for line in log_path.read_text().splitlines():
-                        if '"event":"file_work_metrics"' in line:
-                            print(line, flush=True)
-                    if not state["application_cleaned"]:
-                        raise RuntimeError("Application cleanup failed; cloud resources retained for recovery")
-                    compose("down", "--volumes", "--remove-orphans")
+                log_path = REPOSITORY / "tests/e2e/artifacts" / f"{identifier}.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("w") as output:
+                    compose("logs", "--no-color", check=False, log=output)
+                for line in log_path.read_text().splitlines():
+                    if '\"event\":\"file_work_metrics\"' in line:
+                        print(line, flush=True)
+                if not state["application_cleaned"]:
+                    raise RuntimeError("Application cleanup failed; cloud resources retained for recovery")
+                compose("down", "--volumes", "--remove-orphans")
     except BaseException as error:
         failure = error
         print(json.dumps({"cloud_e2e": "failed", "error_type": type(error).__name__}), flush=True)
@@ -252,10 +199,6 @@ def main():
                 except Exception as error:
                     errors.append(name)
                     print(json.dumps({"cleanup": name, "error_type": type(error).__name__}), flush=True)
-            for name in state["secrets"]:
-                remove("Modal secret " + name, lambda name=name: modal.Secret.objects.delete(name, allow_missing=True))
-            for url in state["queues"]:
-                remove("SQS queue", lambda url=url: sqs.delete_queue(QueueUrl=url))
             if state["bucket"]:
                 def bucket_cleanup():
                     for page in s3.get_paginator("list_multipart_uploads").paginate(Bucket=identifier):
@@ -275,7 +218,7 @@ def main():
                     if state["role"]:
                         admin.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role_name)))
             remove("isolated database/login", database_cleanup)
-        for client in (s3, sqs, sts):
+        for client in (s3, sts):
             client.close()
         if errors:
             print(f"Recovery required; protected resource/credential file: {state_path}", flush=True)

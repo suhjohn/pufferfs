@@ -12,7 +12,7 @@ services:
       - ./tests/e2e/manifest-faults.json:/config/faults.json:ro
     depends_on:
       manifest-relay: {condition: service_healthy}
-  transform:
+  ingestion:
     environment:
       AWS_ENDPOINT_URL: http://manifest-relay:8080
     depends_on:

@@ -21,22 +21,18 @@ type fileReadSnapshot struct {
 
 func (s *Server) loadFileReadSnapshot(ctx context.Context, root *models.RootMetadata, path string) (fileReadSnapshot, error) {
 	snapshot := fileReadSnapshot{path: path}
-	var namespaces []models.RootIndexNamespace
-	err := s.db.pool.QueryRow(ctx, `SELECT f.indexed_extraction_id, (
-		SELECT jsonb_agg(to_jsonb(n) ORDER BY n.shard_index) FROM root_index_namespaces n
-		WHERE n.org_id=r.org_id AND n.root_id=r.id AND n.retired_at IS NULL)
-		FROM roots r JOIN file_catalog f ON f.root_id=r.id AND f.path=$3
-		WHERE r.org_id=$1 AND r.id=$2 AND r.deleting_at IS NULL
-		AND NOT f.deleted AND f.indexed_extraction_id IS NOT NULL`, root.OrgID, root.ID, path).Scan(&snapshot.extraction, &namespaces)
+	err := s.db.pool.QueryRow(ctx, `SELECT f.indexed_extraction_id,n.namespace
+        FROM roots r JOIN file_catalog f ON f.root_id=r.id AND f.path=$3
+        JOIN root_index_namespaces n ON n.root_id=r.id AND n.org_id=r.org_id AND n.retired_at IS NULL
+        WHERE r.org_id=$1 AND r.id=$2 AND r.deleting_at IS NULL
+        AND NOT f.deleted AND f.indexed_extraction_id IS NOT NULL`, root.OrgID, root.ID, path).Scan(&snapshot.extraction, &snapshot.namespace)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return snapshot, errQueryRootNotFound
 	}
 	if err != nil {
 		return snapshot, err
 	}
-	namespace, err := rootIndexNamespaceForPath(namespaces, path)
-	snapshot.namespace = namespace.Namespace
-	return snapshot, err
+	return snapshot, nil
 }
 
 func (snapshot fileReadSnapshot) filters(extra any) any {

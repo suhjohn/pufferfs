@@ -1,4 +1,4 @@
-"""Actual CLI/SQS/Modal CPU publication with native embeddings; read-only assertions on cloud artifacts."""
+"""Actual CLI/container publication with native embeddings; read-only assertions on cloud artifacts."""
 
 import os
 from pathlib import Path
@@ -41,16 +41,11 @@ def verify():
     run.cli(state, "sync", str(directory), "--id", state["root"])
     files = run.wait_indexed(state)
     initial = run.assert_source_retained(files[path.name])
-    extraction, = run.sql("""SELECT e.chunk_count,w.mutation_ref,w.acknowledged_batches,w.mutation_batch_count
+    extraction, = run.sql("""SELECT e.chunk_count,e.chunks_ref,w.status
         FROM file_catalog f JOIN file_extractions e ON e.id=f.indexed_extraction_id
-        JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE f.id=%s""", (files[path.name]["file_id"],))
-    assert extraction["chunk_count"] == 130 and extraction["mutation_ref"]
-    assert extraction["acknowledged_batches"] == extraction["mutation_batch_count"] > 0
-    mutations = list(run.chunks(extraction["mutation_ref"]))
-    assert len(mutations) == extraction["mutation_batch_count"]
-    published = [row for mutation in mutations for row in mutation["write"]["upsert_rows"]]
-    assert len(published) == 130
-    assert all("vector" not in row for row in published)
+        JOIN file_work w ON w.extraction_id=e.id WHERE f.id=%s""", (files[path.name]["file_id"],))
+    assert extraction["chunk_count"] == 130 and extraction["status"] == "complete"
+    assert len(list(run.chunks(extraction["chunks_ref"]))) == 130
     assert run.assert_index_vectors(state, state["root"], dimensions=4096) == 130
     for mode in ("fts", "vector", "hybrid"):
         for selector, count in (({"root_id": state["root"]}, 1),
@@ -101,7 +96,7 @@ def verify():
 
     run.eventually("scheduled root cleanup to abort the abandoned AWS upload", multipart_cleaned, timeout=180)
     assert not run.s3.list_objects_v2(Bucket=run.BUCKET, Prefix=f"sources/{state['org']}/{state['root']}/").get("Contents")
-    print("Actual AWS multipart init/resume/upload/complete/abort/delete and SQS -> Modal CPU -> durable text mutations -> native vector search/read passed, including append publication.", flush=True)
+    print("Actual AWS multipart init/resume/upload/complete/abort/delete and Postgres -> workers -> canonical chunks -> native vector search/read passed, including append publication.", flush=True)
 
 
 def verify_vector_ranking(state, empty_root):

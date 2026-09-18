@@ -59,7 +59,7 @@ def verify():
     state = json.loads(run.STATE.read_text())
     peers = servers()
     for redundant, unique in (("idx_api_keys_hash", "api_keys_key_hash_key"),
-                              ("idx_root_index_namespaces_root", "root_index_namespaces_root_id_shard_index_key")):
+                              ("idx_root_index_namespaces_root", "root_index_namespaces_active_root")):
         observed = run.sql("SELECT to_regclass(%s) IS NULL AS removed,EXISTS(SELECT 1 FROM pg_index WHERE indexrelid=to_regclass(%s) AND indisunique AND indisvalid) AS retained", (redundant, unique))[0]
         assert observed == {"removed": True, "retained": True}
     org, user = state["org"], state["users"][1]

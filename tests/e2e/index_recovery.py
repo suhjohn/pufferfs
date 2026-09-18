@@ -36,21 +36,18 @@ def held(fault_id, state):
 
 
 def work(root, version):
-    rows = run.sql("""SELECT w.id,w.status,w.attempt_count,w.attempt_token,w.mutation_ref,
-        w.mutation_batch_count,w.acknowledged_batches,w.extraction_id
+    rows = run.sql("""SELECT w.id,w.status,w.attempt_count,w.attempt_token,e.chunks_ref,w.extraction_id
         FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
         JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
-        WHERE f.root_id=%s AND v.id=%s AND w.stage='index'""", (root, version))
+        WHERE f.root_id=%s AND v.id=%s""", (root, version))
     assert len(rows) == 1
     return rows[0]
 
 
 def published(state, root, version, timeout=900):
-    queue = run.sqs.get_queue_url(QueueName="file-index-dlq.fifo")["QueueUrl"]
     def ready():
-        attributes = run.sqs.get_queue_attributes(QueueUrl=queue,
-            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"])["Attributes"]
-        assert not any(int(value) for value in attributes.values()), "index work reached DLQ before crash recovery"
+        rows = work(root, version)
+        assert rows["status"] != "failed", "publication exhausted its retry budget"
         file = run.catalog(state, root)["record.txt"]
         return file if file["indexed_version_id"] == version and file["processing"]["status"] == "complete" else None
     return run.eventually("exact captured version publication after index crash", ready, timeout)
@@ -80,7 +77,6 @@ def raw_rows(namespace, extraction):
 
 def lost_capture():
     state = run.provision()
-    run.worker_authentication()
     directory = Path("/state/lost-index-response")
     directory.mkdir()
     (directory / "record.txt").write_text("Orchid observatory telescope studies distant galaxies.\n")
@@ -93,27 +89,20 @@ def lost_capture():
     file = run.catalog(state)["record.txt"]
     row = work(state["root"], file["version_id"])
     assert row["status"] == "running" and row["attempt_count"] == 1
-    assert row["mutation_ref"] and row["mutation_batch_count"] == 1 and row["acknowledged_batches"] == 0
+    assert row["chunks_ref"]
     assert not file["indexed_version_id"]
     assert raw_rows(event["namespace"], row["extraction_id"]), "held write did not reach real Turbopuffer"
     assert not search(state, state["root"], "Orchid"), "unacknowledged write became publicly visible"
-    records = list(run.chunks(row["mutation_ref"]))
-    assert all("vector" not in item for record in records for item in record["write"]["upsert_rows"])
+    records = list(run.chunks(row["chunks_ref"]))
+    assert all("vector" not in record and isinstance(record["content"], str) for record in records)
     state.update(lost_version=file["version_id"], lost_work=row, lost_event=event,
-                 stamps=[object_stamp(row["mutation_ref"])])
+                 stamps=[object_stamp(row["chunks_ref"])])
     run.save(state)
-    print("Text mutation is durable; native Turbopuffer write succeeded, but publication remains unacknowledged.")
+    print("Canonical chunks are durable; Turbopuffer write succeeded, but publication remains unacknowledged.")
 
 
 def release():
     relay("POST", "/release")
-
-
-def redirect_calls():
-    request = urllib.request.Request("http://worker-redirect:8080/status",
-        headers={"X-E2E-Control": "e2e-worker-redirect-only"})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        return json.load(response)["calls"]
 
 
 def database_recovered():
@@ -146,112 +135,60 @@ def lost_recovered():
     published(state, state["root"], state["lost_version"])
     row = work(state["root"], state["lost_version"])
     assert row["attempt_count"] == 2 and row["attempt_token"] != state["lost_work"]["attempt_token"]
-    assert row["mutation_ref"] == state["lost_work"]["mutation_ref"] and row["acknowledged_batches"] == 1
-    assert [object_stamp(stamp["key"]) for stamp in state["stamps"]] == state["stamps"], "crash recovery rewrote durable mutations"
+    assert row["chunks_ref"] == state["lost_work"]["chunks_ref"] and row["status"] == "complete"
+    assert [object_stamp(stamp["key"]) for stamp in state["stamps"]] == state["stamps"], "crash recovery rewrote canonical chunks"
     events = [event for event in relay("GET", "/status")["events"]
-              if event["namespace"] == state["lost_event"]["namespace"] and event.get("upstream_status") == 200]
+              if event["namespace"] == state["lost_event"]["namespace"] and event.get("upstream_status") == 200 and event["operation"] == "write"]
     print(json.dumps({"replayed_index_requests": events}), flush=True)
     # The Python 3.12 SDK's gzip header includes the current timestamp. Compare
     # exact decompressed JSON bytes, without parsing/reserializing mutations.
     assert len(events) >= 2 and all(event["payload_sha256"] == state["lost_event"]["payload_sha256"] for event in events)
     for mode in ("fts", "vector", "hybrid"):
         assert search(state, state["root"], "observatory telescope", mode)
-    run.wait_queue_empty("index")
-    print("A new worker attempt replayed identical text mutation bytes after the normal lease; all search modes work.")
+    run.wait_work_idle("index")
+    print("A new worker attempt replayed identical provider request bytes after the normal lease; all search modes work.")
 
 
-def consumer_capture():
+def admission_capture():
     state = json.loads(run.STATE.read_text())
-    run.wait_queue_empty("index")
-    directory = Path("/state/consumer-disconnect")
+    directory = Path("/state/admission")
     directory.mkdir()
-    root = run.new_root(state, "Consumer disconnect admission", directory, False)
-    slots = int(os.environ["PUFFERFS_INDEX_INPUTS_PER_CONTAINER"])
+    root = run.new_root(state, "Bounded publication", directory, True)
+    slots = int(os.environ["PUFFERFS_WORKER_CONCURRENCY"])
     expected = {f"observation-{i}.txt": f"Orchid telescope calibration observation {i}.\n" for i in range(slots * 2)}
-    for name, content in list(expected.items())[:slots]:
+    for name, content in expected.items():
         (directory / name).write_text(content)
-    state["consumer_disconnect"] = {"root": root, "directory": str(directory),
-        "expected": expected, "slots": slots, "fault": arm(root, "hold_response", count=len(expected))}
+    case = {"root":root,"expected":expected,"slots":slots,"fault":arm(root,"hold_response",count=len(expected))}
+    state["admission"] = case
     run.save(state)
     run.cli(state, "sync", str(directory), "--id", root)
     def full():
-        events = [e for e in relay("GET", "/status")["events"]
-                  if e["fault_id"] == state["consumer_disconnect"]["fault"] and e["state"] == "response_held"]
-        assert all(e["upstream_status"] == 200 for e in events)
-        return len(events) == slots
-    run.eventually("all consumer slots held at the real index provider", full, 90)
-    print("Every consumer slot is held after real index acceptance; terminating it cannot abandon an additional empty queue poll.")
+        events = [e for e in relay("GET", "/status")["events"] if e["fault_id"]==case["fault"] and e["state"]=="response_held"]
+        return len(events)==slots
+    run.eventually("configured publication slots occupied", full, 120)
 
 
-def consumer_enqueue():
+def admission_bounded():
     state = json.loads(run.STATE.read_text())
-    fixture = state["consumer_disconnect"]
-    for name, content in fixture["expected"].items():
-        (Path(fixture["directory"]) / name).write_text(content)
-    run.cli(state, "sync", fixture["directory"], "--id", fixture["root"])
-    def enqueued():
-        rows = run.sql("""SELECT w.id,w.enqueued_at FROM file_work w
-            JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
-            JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s
-            AND f.captured_version_id=v.id AND w.stage='index'""", (fixture["root"],))
-        return rows if len(rows) == len(fixture["expected"]) and all(r["enqueued_at"] for r in rows) else None
-    fixture["work_ids"] = [r["id"] for r in run.eventually("all replacement index handoffs", enqueued, 90)]
-    run.save(state)
-
-
-def consumer_bounded():
-    state = json.loads(run.STATE.read_text())
-    fixture = state["consumer_disconnect"]
-
-    def index_states():
-        return run.sql("""SELECT w.status,COUNT(*) AS count FROM file_work w
-            JOIN file_extractions e ON e.id=w.extraction_id
-            JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
-            WHERE f.root_id=%s AND w.stage='index' AND v.id=f.captured_version_id
-            GROUP BY w.status""", (fixture["root"],))
-
-    def bounded():
-        statuses = {r["status"]: r["count"] for r in index_states()}
-        slots = fixture["slots"]
-        assert statuses.get("running", 0) <= slots, "disconnected handlers exceeded the role's work permits"
-        events = [e for e in relay("GET", "/status")["events"]
-                  if e["fault_id"] == fixture["fault"] and e["state"] == "response_held"]
-        attributes = run.sqs.get_queue_attributes(QueueUrl=os.environ["PUFFERFS_SQS_INDEX_QUEUE_URL"],
-            AttributeNames=["ApproximateNumberOfMessagesNotVisible"])["Attributes"]
-        polled = {c["work_id"] for c in redirect_calls()
-                  if c["last_poll"] >= int(os.environ["E2E_WORKER_REDIRECTS"])}
-        # The terminated caller's receipts remain temporarily invisible. All
-        # replacement receipts must also be claimed, not merely still queued.
-        return (statuses == {"running": slots, "pending": slots} and len(events) == slots
-                and int(attributes["ApproximateNumberOfMessagesNotVisible"]) == slots * 2
-                and set(fixture["work_ids"]) <= polled)
-
-    run.eventually("all replacement receipts admitted alongside disconnected handlers", bounded, 45)
-    # Keep the real upstream responses held while the replacement consumer has
-    # time to send its requests. The role itself must bound execution;
-    # the Compose adapter has no additional invocation semaphore.
+    case = state["admission"]
     for _ in range(5):
+        rows = run.sql("""SELECT w.status,count(*) AS n FROM file_work w
+            JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
+            JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s AND w.stage='index' GROUP BY w.status""", (case["root"],))
+        counts = {r["status"]:r["n"] for r in rows}
+        assert counts.get("running",0)==case["slots"] and counts.get("pending",0)==case["slots"]
         time.sleep(2)
-        assert bounded()
     release()
-    files = run.wait_indexed(state, fixture["root"])
-    assert set(files) == set(fixture["expected"])
-    calls = redirect_calls()
-    required_polls = int(os.environ["E2E_WORKER_REDIRECTS"])
-    for file in files.values():
-        current = work(fixture["root"], file["version_id"])
-        assert current["attempt_count"] == 1
-        assert any(c["work_id"] == current["id"] and c["last_poll"] >= required_polls for c in calls), \
-            "the actual consumer did not follow the complete result-polling redirect chain"
-    for name, content in fixture["expected"].items():
-        run.assert_source_retained(files[name])
-        result = json.loads(run.cli(state, "read", name, "--root", fixture["root"], "--lines", "1:1", "--json"))
-        assert result["lines"][0]["content"] == content.rstrip("\n")
-    for mode in ("fts", "vector", "hybrid"):
-        results = search(state, fixture["root"], "Orchid telescope calibration", mode)
-        assert results and all(hit["root_id"] == fixture["root"] for hit in results)
-    run.wait_queue_empty("index")
-    print("Terminating the consumer left its handlers alive, but role permits bounded replacement work; every file published and passed CLI read and search.")
+    files = run.wait_indexed(state,case["root"])
+    assert set(files)==set(case["expected"])
+    for name,content in case["expected"].items():
+        result = json.loads(run.cli(state,"read",name,"--root",case["root"],"--lines","1:1","--json"))
+        assert result["lines"][0]["content"]==content.rstrip("\n")
+    print("Database claims remained bounded while real provider responses were held; every file then published.",flush=True)
+
+
+def pause_deletions():
+    relay("POST", "/deletions", {"paused": True})
 
 
 def live_superseded():
@@ -283,16 +220,16 @@ def live_superseded():
         event = held(fault,"response_held")
         assert event["upstream_status"] == 200
         before = work(root,old)
-        assert before["status"] == "running" and before["acknowledged_batches"] == 0
-        stamp = object_stamp(before["mutation_ref"])
+        assert before["status"] == "running"
+        stamp = object_stamp(before["chunks_ref"])
         latest = capture(None if deleted else "Current vermilion calibration notes.\n",old,peers[1])
         assert run.catalog(state,root)["record.txt"]["indexed_version_id"] == initial
         release()  # The original worker remains alive and receives the real acknowledgment.
         published(state,root,latest)
         after = work(root,old)
-        assert after["status"] == "superseded" and after["acknowledged_batches"] == 1
+        assert after["status"] == "superseded"
         assert after["attempt_count"] == 1 and after["attempt_token"] == before["attempt_token"]
-        assert object_stamp(after["mutation_ref"]) == stamp
+        assert object_stamp(after["chunks_ref"]) == stamp
         for peer in peers:
             assert not run.request("POST","/query",{"root_id":root,"query":"citrine","mode":"fts"},
                 key=state["key"],server=peer)["results"]
@@ -300,7 +237,7 @@ def live_superseded():
                 key=state["key"],server=peer,statuses=(404,) if deleted else (200,))
             if not deleted:
                 assert result["lines"][0]["content"] == "Current vermilion calibration notes."
-        print(f"Live index acknowledgment fenced by a newer {'tombstone' if deleted else 'capture'} from the second API; one attempt, durable mutation unchanged.",flush=True)
+        print(f"Live index acknowledgment fenced by a newer {'tombstone' if deleted else 'capture'} from the second API; one attempt, canonical chunks unchanged.",flush=True)
 
 
 def stale_capture():
@@ -322,7 +259,7 @@ def stale_capture():
     event = held(state["stale_fault"], "request_held")
     second = run.catalog(state, root)["record.txt"]["version_id"]
     row = work(root, second)
-    assert row["status"] == "running" and row["acknowledged_batches"] == 0 and row["mutation_ref"]
+    assert row["status"] == "running" and row["chunks_ref"]
     assert search(state, root, "sapphire") and not search(state, root, "citrine")
     path.write_text("Current vermilion observatory notes.\n")
     run.cli(state, "sync", str(directory), "--id", root, "--no-vector")
@@ -336,8 +273,8 @@ def stale_capture():
 def stale_current():
     state = json.loads(run.STATE.read_text())
     published(state, state["stale_root"], state["current_version"])
-    row = work(state["stale_root"], state["stale_version"])
-    assert row["status"] == "superseded" and row["acknowledged_batches"] == 0
+    run.eventually("expired old work to be superseded",
+        lambda: work(state["stale_root"], state["stale_version"])["status"] == "superseded", timeout=360)
     assert search(state, state["stale_root"], "vermilion")
     assert held(state["stale_fault"], "request_held")
     print("After the worker crash, the third version published and the old attempt was superseded; the old network write remains held.")
@@ -356,8 +293,8 @@ def stale_released():
         result = run.request("POST", f"/roots/{state['stale_root']}/read",
             {"path": "record.txt", "lines": {"start": 1, "end": 1}}, key=state["key"])
         assert result["lines"][0]["content"] == "Current vermilion observatory notes."
-    row = work(state["stale_root"], state["stale_version"])
-    assert row["status"] == "superseded" and row["acknowledged_batches"] == 0
+    run.eventually("expired old work to be superseded",
+        lambda: work(state["stale_root"], state["stale_version"])["status"] == "superseded", timeout=360)
     print("Real Turbopuffer accepted stale rows after newer publication; reads/search still expose only the current version.")
 
 
@@ -376,7 +313,7 @@ def root_deleted():
     event = held(fault_id, "request_held")
     version = run.catalog(state, root)["record.txt"]["version_id"]
     row = work(root, version)
-    assert row["status"] == "running" and row["acknowledged_batches"] == 0
+    assert row["status"] == "running"
     assert search(state, root, "indigo") and not search(state, root, "violet")
     state.update(deleted_root=root, deleted_work=row, deleted_fault=fault_id, deleted_event=event)
     run.save(state)
@@ -404,10 +341,11 @@ def root_deleted():
 
 
 def root_cleaned():
+    relay("POST", "/deletions", {"paused": False})
     state = json.loads(run.STATE.read_text())
     root = state["deleted_root"]
     def checked():
-        targets = run.sql("""SELECT kind,target,mutation_ref,last_checked_at FROM root_cleanup_targets
+        targets = run.sql("""SELECT kind,target,last_checked_at FROM root_cleanup_targets
             WHERE root_id=%s""", (root,))
         return targets if targets and all(t["last_checked_at"] for t in targets) else None
     targets = run.eventually("scheduled root cleanup after the late write", checked, 300)
@@ -418,13 +356,10 @@ def root_cleaned():
         rows = []
     assert not rows, "scheduled cleanup left late physical rows"
     for target in targets:
-        if target["kind"] == "namespace":
-            assert target["mutation_ref"]
-            run.s3.head_object(Bucket=run.BUCKET, Key=target["mutation_ref"])
-        else:
+        if target["kind"] != "namespace":
             assert not run.s3.list_objects_v2(Bucket=run.BUCKET, Prefix=target["target"]).get("Contents")
     assert not run.sql("SELECT id FROM roots WHERE id=%s", (root,))
-    run.wait_queue_empty("index")
+    run.wait_work_idle("index")
     print("The real scheduled reconciler removed late index rows using durable deletion artifacts; tombstones survived catalog deletion.")
 
 
@@ -432,8 +367,8 @@ if __name__ == "__main__":
     phase = sys.argv[1]
     phases = {"lost-capture": lost_capture, "release": release, "lost-recovered": lost_recovered,
               "database-recovered": database_recovered, "live-superseded": live_superseded,
-              "consumer-capture": consumer_capture, "consumer-enqueue": consumer_enqueue,
-              "consumer-bounded": consumer_bounded,
+              "admission-capture": admission_capture, "admission-bounded": admission_bounded,
+              "pause-deletions": pause_deletions,
               "stale-capture": stale_capture, "stale-current": stale_current, "stale-released": stale_released,
               "root-deleted": root_deleted, "root-cleaned": root_cleaned}
     started, status = time.monotonic(), "failed"

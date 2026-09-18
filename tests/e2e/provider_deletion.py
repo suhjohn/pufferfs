@@ -39,7 +39,7 @@ def verify():
         remote = provider.batches.get(name=current["provider_job_id"])
         assert remote.state.name in {"JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}
     run.provider_cleanup()
-    run.wait_queue_empty("transform")
+    run.wait_work_idle("transform")
     assert not run.sql("SELECT id FROM file_work WHERE extraction_id=%s", (batch["extraction_id"],))
     for kind in ("sources", "extractions", "mutations"):
         assert not run.s3.list_objects_v2(Bucket=run.BUCKET, Prefix=f"{kind}/{state['org']}/{state['root']}/").get("Contents")

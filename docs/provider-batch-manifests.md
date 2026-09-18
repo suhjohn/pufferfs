@@ -1,5 +1,9 @@
 # Provider batch manifests
 
+> Historical design/results. The current implementation is described in
+> [Architecture](architecture-and-functionality.md); these measurements and
+> commands describe the revision recorded below, not the simplified runtime.
+
 This describes the repository implementation. The inline-media and optional
 vision-fallback changes were deployed to production on September 16, 2026 UTC;
 see the [validation report](inline-media-and-vision-fallback.md). The schema

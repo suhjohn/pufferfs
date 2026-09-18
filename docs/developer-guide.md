@@ -153,7 +153,7 @@ pufferfs sync wait --root workspace
 pufferfs sync wait --root /path/to/workspace --include "docs/**" --exclude "docs/archive/**"
 ```
 
-The agent discovers files, captures stable bytes into immutable packs, uploads
+The agent discovers files, captures new source bytes into immutable packs, uploads
 through signed URLs, then registers versions. Indexing continues asynchronously.
 Current captured/indexed heads are separate; unrelated files need not wait for
 one another. Subset sync leaves unselected files untouched. Append capture
@@ -563,8 +563,7 @@ Capture acceptance is not indexing completion. Search/read expose only each
 file's published extraction; a replacement leaves its prior publication visible
 until the new index mutation finishes. Deletes publish tombstones.
 
-SQS owns execution delivery and retries; Postgres records catalog/ownership and
-recovery state. S3 holds immutable sources and derived artifacts. The API never
+Postgres records the catalog, durable pending work, ownership and retry state. S3 holds immutable sources and derived artifacts. The API never
 runs transformation or bulk indexing in-process. See the
 [deployment diagram](architecture-and-functionality.md).
 
@@ -598,7 +597,7 @@ If a sync fails repeatedly:
 
 - Run a normal `pufferfs sync` once to see the direct error.
 - Check upload size limits for very large files.
-- Check server-side Modal, Turbopuffer, object storage, and queue configuration.
+- Check server-side worker, Turbopuffer, object storage, and database configuration.
 - Check service logs if running as a background service.
 
 ## Upgrade Behavior

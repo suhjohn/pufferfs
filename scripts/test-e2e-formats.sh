@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
+    "${compose[@]}" stop ingestion background || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project for recovery." >&2
       cleanup_failed=1
@@ -26,10 +26,10 @@ finish() {
 }
 trap finish EXIT
 # All fixtures use ordinary vector-disabled roots. The production native CPU
-# index role and real search provider still publish every file; native embedding coverage is separate.
-"${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index collector reconciler
+# background role and real search provider still publish every file; native embedding coverage is separate.
+"${compose[@]}" build api ingestion e2e
+"${compose[@]}" up -d --wait postgres aws api api-ready ingestion background
 runner_started=1
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
+"${compose[@]}" up -d --no-deps ingestion background
 "${compose[@]}" run --rm --no-deps e2e format-variants 2>&1 |
   python3 -u tests/e2e/redact.py | tee tests/e2e/artifacts/formats-results.log

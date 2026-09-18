@@ -41,14 +41,7 @@ jobs:
       - name: Check shell and Compose configuration
         run: |
           sh -n scripts/install.sh
-          bash -n scripts/test-e2e.sh
-          bash -n scripts/test-e2e-index-recovery.sh
-          bash -n scripts/test-e2e-media.sh
-          bash -n scripts/test-e2e-vision-fallback.sh
+          for script in scripts/test-e2e*.sh scripts/deploy/*.sh; do bash -n "$script"; done
+          python3 -m compileall -q workers tests/e2e scripts
           docker compose --env-file /dev/null -f compose.e2e.yml config --quiet
           docker compose --env-file /dev/null -f compose.e2e.yml -f compose.e2e-index-recovery.yml config --quiet
-
-  e2e:
-    needs: build
-    uses: ./.github/workflows/e2e.yml
-    secrets: inherit

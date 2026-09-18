@@ -14,7 +14,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler provider-relay provider-manifest-relay || true
+    "${compose[@]}" stop ingestion background provider-relay provider-manifest-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project." >&2
       cleanup_failed=1
@@ -28,15 +28,14 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform provider-relay provider-manifest-relay index reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion provider-relay provider-manifest-relay
 runner_started=1
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e)
 "${driver[@]}" /e2e/vision_fallback.py capture
 "${driver[@]}" /e2e/provider_recovery.py result-arm
-"${compose[@]}" up -d --no-deps --wait --scale collector=2 collector
+"${compose[@]}" up -d --no-deps --wait --scale background=2 background
 "${driver[@]}" /e2e/vision_fallback.py result-held
-"${compose[@]}" kill -s SIGKILL collector
+"${compose[@]}" kill -s SIGKILL background
 "${driver[@]}" /e2e/provider_recovery.py manifest-release
-"${compose[@]}" up -d --no-deps --wait --scale collector=2 collector
+"${compose[@]}" up -d --no-deps --wait --scale background=2 background
 "${driver[@]}" /e2e/vision_fallback.py verify

@@ -1,9 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${PUFFERFS_REPO:-suhjohn/pufferfs}"
-MANIFEST_URL="${PUFFERFS_MANIFEST_URL:-https://api.pufferfs.com/cli/version}"
-RELEASE_INDEX_URL="${PUFFERFS_RELEASE_INDEX_URL:-https://pufferfs.com/releases/latest.txt}"
+MANIFEST_URL="${PUFFERFS_MANIFEST_URL:-https://pufferfs.com/releases/manifest.json}"
 DOWNLOAD_BASE_URL="${PUFFERFS_DOWNLOAD_BASE_URL:-https://pufferfs.com/releases}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
@@ -32,33 +30,15 @@ case "$ARCH" in
   *) fail "unsupported architecture: $ARCH" ;;
 esac
 
-latest_from_release_index() {
-  curl -fsSL "$RELEASE_INDEX_URL" 2>/dev/null |
-    sed -n 's/^[[:space:]]*\(v\{0,1\}[0-9][^[:space:]]*\)[[:space:]]*$/\1/p' |
-    head -n 1
-}
-
 latest_from_manifest() {
   curl -fsSL "$MANIFEST_URL" 2>/dev/null |
     sed -n 's/.*"latest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
     head -n 1
 }
 
-latest_from_github() {
-  curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-    head -n 1
-}
-
 VERSION="${PUFFERFS_VERSION:-}"
-if [ -z "$VERSION" ]; then
-  VERSION="$(latest_from_release_index || true)"
-fi
 if [ -z "$VERSION" ] || [ "$VERSION" = "dev" ]; then
   VERSION="$(latest_from_manifest || true)"
-fi
-if [ -z "$VERSION" ] || [ "$VERSION" = "dev" ]; then
-  VERSION="$(latest_from_github || true)"
 fi
 [ -n "$VERSION" ] || fail "could not determine latest release version"
 

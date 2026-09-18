@@ -31,7 +31,7 @@ on:
         required: false
         type: string
       cli_release_version:
-        description: Optional CLI release version to mirror, for example v0.2.0; defaults to PUFFERFS_CLI_LATEST_VERSION
+        description: Optional CLI release version to mirror, for example v0.2.0; defaults to the latest GitHub release
         required: false
         type: string
 
@@ -56,23 +56,17 @@ jobs:
       PROJECT_NAME: ${{ vars.PROJECT_NAME || 'pufferfs' }}
       AVAILABILITY_ZONES: '["us-west-2a","us-west-2b"]'
       IMAGE_TAG: ${{ inputs.image_tag || github.sha }}
-      CLI_RELEASE_VERSION: ${{ inputs.cli_release_version || vars.PUFFERFS_CLI_LATEST_VERSION }}
+      CLI_RELEASE_VERSION: ${{ inputs.cli_release_version }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      PUFFERFS_WORKER_DATABASE_URL: ${{ secrets.PUFFERFS_WORKER_DATABASE_URL }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
-      MODAL_SECRET_KEY: ${{ secrets.MODAL_SECRET_KEY }}
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       MODAL_WORKSPACE_ID: ${{ vars.MODAL_WORKSPACE_ID }}
       MODAL_ENVIRONMENT: ${{ vars.MODAL_ENVIRONMENT }}
+      PUFFERFS_INGESTION_CONCURRENCY: ${{ vars.PUFFERFS_INGESTION_CONCURRENCY || '4' }}
+      PUFFERFS_BACKGROUND_CONCURRENCY: ${{ vars.PUFFERFS_BACKGROUND_CONCURRENCY || '4' }}
       PUFFERFS_DB_MAX_CONNS: ${{ vars.PUFFERFS_DB_MAX_CONNS || '4' }}
-      PUFFERFS_TRANSFORM_MAX_CONTAINERS: ${{ vars.PUFFERFS_TRANSFORM_MAX_CONTAINERS || '16' }}
-      PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER: ${{ vars.PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER || '1' }}
-      PUFFERFS_MODAL_INDEX_MAX_CONTAINERS: ${{ vars.PUFFERFS_MODAL_INDEX_MAX_CONTAINERS || '16' }}
-      PUFFERFS_INDEX_INPUTS_PER_CONTAINER: ${{ vars.PUFFERFS_INDEX_INPUTS_PER_CONTAINER || '1' }}
-      PUFFERFS_COLLECTOR_WORKERS: ${{ vars.PUFFERFS_COLLECTOR_WORKERS || '1' }}
-      MODAL_OIDC_PROVIDER_ARN: ${{ vars.MODAL_OIDC_PROVIDER_ARN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       MODAL_PROXY_TOKEN: ${{ secrets.MODAL_PROXY_TOKEN }}
       PUFFERFS_VISION_BASE_URL: ${{ vars.PUFFERFS_VISION_BASE_URL }}
@@ -80,8 +74,6 @@ jobs:
       TURBOPUFFER_REGION: ${{ vars.TURBOPUFFER_REGION }}
       TURBOPUFFER_API_URL: ${{ vars.TURBOPUFFER_API_URL }}
       PUFFERFS_ADMIN_KEY_HASH: ${{ secrets.PUFFERFS_ADMIN_KEY_HASH }}
-      MODAL_TRANSFORM_ENDPOINT: ${{ vars.MODAL_TRANSFORM_ENDPOINT || secrets.MODAL_TRANSFORM_ENDPOINT }}
-      MODAL_FILE_INDEX_ENDPOINT: ${{ vars.MODAL_FILE_INDEX_ENDPOINT || secrets.MODAL_FILE_INDEX_ENDPOINT }}
       FRONTEND_URL: ${{ vars.FRONTEND_URL }}
       COOKIE_DOMAIN: ${{ vars.COOKIE_DOMAIN }}
       API_DOMAIN: ${{ vars.API_DOMAIN }}
@@ -112,9 +104,7 @@ jobs:
       STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
       STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
       STRIPE_PRICE_ID: ${{ vars.STRIPE_PRICE_ID }}
-      PUFFERFS_CLI_LATEST_VERSION: ${{ vars.PUFFERFS_CLI_LATEST_VERSION }}
       PUFFERFS_CLI_MIN_VERSION: ${{ vars.PUFFERFS_CLI_MIN_VERSION }}
-      PUFFERFS_CLI_DOWNLOAD_BASE_URL: ${{ vars.PUFFERFS_CLI_DOWNLOAD_BASE_URL }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -139,10 +129,6 @@ jobs:
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         run: |
           set -euo pipefail
-          : "${MODAL_TOKEN_ID:?Set MODAL_TOKEN_ID}"
-          : "${MODAL_TOKEN_SECRET:?Set MODAL_TOKEN_SECRET}"
-          : "${MODAL_WORKSPACE_ID:?Set MODAL_WORKSPACE_ID}"
-          : "${MODAL_ENVIRONMENT:?Set MODAL_ENVIRONMENT}"
           : "${GEMINI_API_KEY:?Set GEMINI_API_KEY}"
 
       - name: Set up Go
@@ -190,6 +176,18 @@ jobs:
           pulumi stack select "$PULUMI_STACK" || pulumi stack init "$PULUMI_STACK" --secrets-provider passphrase
           ../../scripts/deploy/configure-pulumi.sh
 
+      - name: Publish CLI release manifest before backend cutover
+        if: ${{ inputs.component == 'cli-release' || inputs.component == 'installer' || inputs.component == 'backend' || inputs.component == 'all' }}
+        working-directory: infra/pulumi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if pulumi stack output webBucketName >/dev/null 2>&1; then
+            ../../scripts/deploy/publish-cli-manifest.sh
+          else
+            echo "PUBLISH_INITIAL_MANIFEST=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Preview backend and infrastructure
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
@@ -200,9 +198,18 @@ jobs:
       - name: Deploy backend and infrastructure
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
-        run: pulumi up --yes --refresh
+        run: |
+          ../../scripts/deploy/retire-old-workers.sh
+          pulumi up --yes --refresh
 
-      - name: Wait for API and consumers
+      - name: Publish manifest for a new stack
+        if: ${{ env.PUBLISH_INITIAL_MANIFEST == 'true' }}
+        working-directory: infra/pulumi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ../../scripts/deploy/publish-cli-manifest.sh
+
+      - name: Wait for API and workers
         if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
         working-directory: infra/pulumi
         run: |
@@ -211,23 +218,6 @@ jobs:
           API_SERVICE="$(pulumi stack output apiServiceArn)"
           mapfile -t WORKERS < <(pulumi stack output workerServiceArns --json | jq -r '.[]')
           aws ecs wait services-stable --cluster "$CLUSTER" --services "$API_SERVICE" "${WORKERS[@]}"
-
-      - name: Configure and deploy Modal roles
-        if: ${{ inputs.component == 'backend' || inputs.component == 'all' }}
-        run: |
-          set -euo pipefail
-          : "${MODAL_TOKEN_ID:?Set MODAL_TOKEN_ID}"
-          : "${MODAL_TOKEN_SECRET:?Set MODAL_TOKEN_SECRET}"
-          python3 -m pip install 'modal>=1.5.5,<2'
-          python3 scripts/deploy/configure-modal.py
-          cd modal
-          # Retire old manifest readers before transformation starts writing
-          # new manifests. Interrupted collection resumes through durable leases;
-          # rolling deployment can keep old collectors serving new inputs.
-          python3 -m modal deploy collector_app.py --env "$MODAL_ENVIRONMENT" --strategy recreate
-          for role in transform_app index_app reconciliation_app; do
-            python3 -m modal deploy "${role}.py" --env "$MODAL_ENVIRONMENT"
-          done
 
       - name: Build frontend
         if: ${{ inputs.component == 'frontend' || inputs.component == 'all' }}
@@ -266,33 +256,6 @@ jobs:
             --cache-control 'public, max-age=300'
           aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths '/install.sh'
 
-      - name: Mirror CLI release
-        if: ${{ inputs.component == 'cli-release' || inputs.component == 'all' }}
-        working-directory: infra/pulumi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          VERSION="${CLI_RELEASE_VERSION#v}"
-          [ -n "$VERSION" ] || { echo "Set cli_release_version or PUFFERFS_CLI_LATEST_VERSION." >&2; exit 1; }
-          TAG="v${VERSION}"
-          TMPDIR="$(mktemp -d)"
-          trap 'rm -rf "$TMPDIR"' EXIT
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$TMPDIR" \
-            --pattern 'checksums.txt' \
-            --pattern "pufferfs_${VERSION}_*.tar.gz"
-          test -s "$TMPDIR/checksums.txt"
-          WEB_BUCKET="$(pulumi stack output webBucketName)"
-          WEB_DISTRIBUTION="$(pulumi stack output webDistributionId)"
-          aws s3 sync "$TMPDIR/" "s3://${WEB_BUCKET}/releases/${TAG}/" \
-            --delete \
-            --cache-control 'public, max-age=31536000, immutable'
-          printf '%s\n' "$TAG" > "$TMPDIR/latest.txt"
-          aws s3 cp "$TMPDIR/latest.txt" "s3://${WEB_BUCKET}/releases/latest.txt" \
-            --content-type 'text/plain' \
-            --cache-control 'public, max-age=300'
-          aws cloudfront create-invalidation --distribution-id "$WEB_DISTRIBUTION" --paths "/releases/${TAG}/*" '/releases/latest.txt'
-
       - name: Verify deployment
         working-directory: infra/pulumi
         run: |
@@ -308,7 +271,7 @@ jobs:
             API_IP="$(getent ahostsv4 "$API_ALB" | awk 'NR == 1 { print $1 }')"
             [ -n "$API_IP" ] || { echo "Could not resolve API ALB: $API_ALB" >&2; exit 1; }
             curl -fsS --max-time 15 --resolve "${API_HOST}:443:${API_IP}" "${API_URL}/health"
-            curl -fsS --max-time 15 --resolve "${API_HOST}:443:${API_IP}" "${API_URL}/cli/version" >/dev/null
+            curl -fsSL --max-time 15 --resolve "${API_HOST}:443:${API_IP}" "${API_URL}/cli/version" >/dev/null
           }
 
           verify_frontend() {
@@ -320,7 +283,8 @@ jobs:
           }
 
           verify_cli_release() {
-            RELEASE_TAG="$(curl -fsS --max-time 15 "${WEB_URL}/releases/latest.txt")"
+            RELEASE_VERSION="$(curl -fsS --max-time 15 "${WEB_URL}/releases/manifest.json" | jq -r .latest)"
+            RELEASE_TAG="v${RELEASE_VERSION}"
             [ -n "$RELEASE_TAG" ] || { echo "Missing CLI release tag" >&2; exit 1; }
             curl -fsSI --max-time 15 "${WEB_URL}/releases/${RELEASE_TAG}/checksums.txt" >/dev/null
           }

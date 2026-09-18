@@ -1,0 +1,31 @@
+services:
+  release-server:
+    image: python:3.12-alpine
+    working_dir: /fixture
+    command: [python, -m, http.server, '8000']
+    volumes: ["${PUFFERFS_E2E_RELEASE_FIXTURE:?}:/fixture:ro"]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/manifest.json', timeout=3)"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  client:
+    image: alpine:3.22
+    volumes: ["${PUFFERFS_E2E_RELEASE_FIXTURE:?}:/fixture:ro"]
+    environment:
+      PUFFERFS_MANIFEST_URL: http://release-server:8000/manifest.json
+      PUFFERFS_DOWNLOAD_BASE_URL: ${PUFFERFS_E2E_RELEASE_BASE:?}
+      INSTALL_DIR: /tmp/installed
+      PUFFERFS_NO_UPDATE_CHECK: '1'
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache curl ca-certificates >/dev/null
+        sh /fixture/install.sh
+        /tmp/installed/pufferfs --version | grep -F "$$(cat /fixture/expected-version)"
+        mkdir /tmp/upgrade
+        cp /fixture/pufferfs-current /tmp/upgrade/pufferfs
+        /tmp/upgrade/pufferfs upgrade --manifest-url "$$PUFFERFS_MANIFEST_URL" --force --restart-services=false
+        /tmp/upgrade/pufferfs --version | grep -F "$$(cat /fixture/expected-version)"
+        echo 'Real installer and current CLI upgrade consumed the generated manifest and verified published archives.'

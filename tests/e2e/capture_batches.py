@@ -64,7 +64,7 @@ def durable(root, body, response):
     for file,result in zip(body["files"],response["versions"]):
         row=stored[file["path"]]
         assert row["id"]==result["version_id"] and row["sequence"]==result["sequence"]
-        assert all(row[key]==result[key] for key in ("file_id","extraction_id","work_id","stage"))
+        assert all(row[key]==result[key] for key in ("file_id","extraction_id","work_id"))
         assert row["deleted"]==file.get("deleted",False)
         assert row["extents"]==len(file.get("source",{}).get("extents",[]))
         if file.get("deleted"):

@@ -27,18 +27,7 @@ set_secret_if_present() {
   fi
 }
 
-for key in \
-  DATABASE_URL \
-  JWT_SECRET \
-  TURBOPUFFER_API_KEY \
-  MODAL_SECRET_KEY \
-  MODAL_WORKSPACE_ID \
-  MODAL_ENVIRONMENT
-do
-  require_env "$key"
-done
-
-for key in MODAL_TRANSFORM_ENDPOINT MODAL_FILE_INDEX_ENDPOINT; do
+for key in DATABASE_URL JWT_SECRET TURBOPUFFER_API_KEY GEMINI_API_KEY; do
   require_env "$key"
 done
 
@@ -67,34 +56,15 @@ pulumi config set pufferfs:imageTag "${IMAGE_TAG:-${GITHUB_SHA:-prod}}"
 pulumi config set --secret pufferfs:databaseUrl "$DATABASE_URL"
 pulumi config set --secret pufferfs:jwtSecret "$JWT_SECRET"
 pulumi config set --secret pufferfs:turbopufferApiKey "$TURBOPUFFER_API_KEY"
-pulumi config set --secret pufferfs:modalSecretKey "$MODAL_SECRET_KEY"
-
-pulumi config set pufferfs:modalTransformEndpoint "$MODAL_TRANSFORM_ENDPOINT"
-pulumi config set pufferfs:modalFileIndexEndpoint "$MODAL_FILE_INDEX_ENDPOINT"
-pulumi config set pufferfs:modalWorkspaceId "$MODAL_WORKSPACE_ID"
-pulumi config set pufferfs:modalEnvironment "$MODAL_ENVIRONMENT"
-set_config_if_present pufferfs:modalOidcProviderArn "${MODAL_OIDC_PROVIDER_ARN:-}"
+pulumi config set --secret pufferfs:geminiApiKey "$GEMINI_API_KEY"
+set_secret_if_present pufferfs:visionProxyToken "${MODAL_PROXY_TOKEN:-}"
+set_config_if_present pufferfs:visionBaseUrl "${PUFFERFS_VISION_BASE_URL:-}"
+set_config_if_present pufferfs:visionModel "${PUFFERFS_VISION_MODEL:-}"
+set_config_if_present pufferfs:turbopufferRegion "${TURBOPUFFER_REGION:-}"
+set_config_if_present pufferfs:turbopufferApiUrl "${TURBOPUFFER_API_URL:-}"
+set_config_if_present pufferfs:workerIngestionConcurrency "${PUFFERFS_INGESTION_CONCURRENCY:-4}"
+set_config_if_present pufferfs:workerBackgroundConcurrency "${PUFFERFS_BACKGROUND_CONCURRENCY:-4}"
 set_config_if_present pufferfs:dbMaxConnections "${PUFFERFS_DB_MAX_CONNS:-}"
-if [[ -n "${PUFFERFS_TRANSFORM_MAX_CONTAINERS:-}" ]]; then
-  transform_inputs="${PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER:-1}"
-  if ! [[ "$PUFFERFS_TRANSFORM_MAX_CONTAINERS" =~ ^[1-9][0-9]*$ && "$transform_inputs" =~ ^[1-9][0-9]*$ ]] ||
-      (( PUFFERFS_TRANSFORM_MAX_CONTAINERS > 64 || transform_inputs > 16 || PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs > 64 )); then
-    echo "Transform capacity must be 1..16 inputs per container and at most 64 total inputs." >&2
-    exit 1
-  fi
-  pulumi config set pufferfs:workerTransformConcurrency "$((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs))"
-  echo "Transform consumer concurrency: $((PUFFERFS_TRANSFORM_MAX_CONTAINERS * transform_inputs)) (${PUFFERFS_TRANSFORM_MAX_CONTAINERS} containers x ${transform_inputs} inputs)"
-fi
-if [[ -n "${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS:-}" ]]; then
-  index_inputs="${PUFFERFS_INDEX_INPUTS_PER_CONTAINER:-1}"
-  if ! [[ "$PUFFERFS_MODAL_INDEX_MAX_CONTAINERS" =~ ^[1-9][0-9]*$ && "$index_inputs" =~ ^[1-9][0-9]*$ ]] ||
-      (( PUFFERFS_MODAL_INDEX_MAX_CONTAINERS > 64 || index_inputs > 16 || PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs > 64 )); then
-    echo "Index capacity must be 1..16 inputs per container and at most 64 total inputs." >&2
-    exit 1
-  fi
-  pulumi config set pufferfs:workerIndexConcurrency "$((PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs))"
-  echo "Index consumer concurrency: $((PUFFERFS_MODAL_INDEX_MAX_CONTAINERS * index_inputs)) (${PUFFERFS_MODAL_INDEX_MAX_CONTAINERS} containers x ${index_inputs} inputs)"
-fi
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"
 
@@ -132,6 +102,5 @@ set_secret_if_present pufferfs:posthogKey "${POSTHOG_KEY:-}"
 set_config_if_present pufferfs:posthogHost "${POSTHOG_HOST:-}"
 set_config_if_present pufferfs:alarmTopicArn "${PUFFERFS_ALARM_TOPIC_ARN:-}"
 
-set_config_if_present pufferfs:cliLatestVersion "${PUFFERFS_CLI_LATEST_VERSION:-}"
-set_config_if_present pufferfs:cliMinVersion "${PUFFERFS_CLI_MIN_VERSION:-}"
-set_config_if_present pufferfs:cliDownloadBaseUrl "${PUFFERFS_CLI_DOWNLOAD_BASE_URL:-}"
+
+set_config_if_present pufferfs:cliManifestUrl "${PUFFERFS_CLI_MANIFEST_URL:-}"

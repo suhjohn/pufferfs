@@ -1,7 +1,7 @@
 """CLI-to-publication benchmark with synthetic, checked contents.
 
-No application imports or direct work invocation. Run with the isolated cloud
-runner so the CPU index role and native embedding provider are real.
+No application imports or direct work invocation. Production worker processes
+and the real native embedding provider handle every capture.
 """
 
 import json
@@ -14,6 +14,7 @@ import run
 
 def verify():
     state = run.provision()
+    vector_disabled = os.environ.get("PUFFERFS_E2E_THROUGHPUT_NO_VECTOR", "false") == "true"
     directory = Path("/state/throughput")
     directory.mkdir()
     expected = {}
@@ -37,54 +38,52 @@ def verify():
         path = directory / f"measurements-{ordinal}.jsonl"
         path.write_text("".join(lines))
         expected[path.name] = lines
-    state["root"] = run.new_root(state, "Worker throughput", directory, False)
+    state["root"] = run.new_root(state, "Worker throughput", directory, vector_disabled)
     run.save(state)
     for label, flags in (("initial", ()), ("reindex", ("--force",))):
         started = time.monotonic()
-        run.cli(state, "sync", str(directory), "--id", state["root"], *flags)
+        capture_started = time.monotonic()
+        run.cli(state, "sync", str(directory), "--id", state["root"], *flags, *(["--no-vector"] if vector_disabled else []))
+        capture_seconds = time.monotonic() - capture_started
         files = run.wait_indexed(state)
         elapsed = time.monotonic() - started
         rows = run.sql("""SELECT f.path,e.chunk_count,w.id AS work_id,w.stage,w.attempt_count,
-            w.status AS work_status,e.status AS extraction_status,w.mutation_ref,
-            w.mutation_batch_count,w.acknowledged_batches
+            w.status AS work_status,e.status AS extraction_status,e.chunks_ref
             FROM file_catalog f JOIN file_extractions e ON e.id=f.indexed_extraction_id
             JOIN file_work w ON w.extraction_id=e.id WHERE f.root_id=%s ORDER BY f.path,w.stage""", (state["root"],))
-        assert len(rows) == 2 * len(expected)
+        assert len(rows) == len(expected)
         for row in rows:
             assert row["chunk_count"] == len(expected[row["path"]])
-            assert row["attempt_count"] == 1
+            assert row["attempt_count"] >= 1
             assert row["extraction_status"] == row["work_status"] == "complete"
-            if row["stage"] == "index":
-                assert row["mutation_ref"] and row["acknowledged_batches"] == row["mutation_batch_count"]
-        assert run.assert_index_vectors(state, state["root"], dimensions=4096) == sum(map(len, expected.values()))
-        mutation_bytes = mutation_records = 0
-        for row in rows:
-            if row["stage"] != "index":
-                continue
-            records = list(run.chunks(row["mutation_ref"]))
-            assert len(records) == row["mutation_batch_count"]
-            mutation_records += len(records)
-            for record in records:
-                mutation_bytes += len(json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode())
-                for published in record["write"]["upsert_rows"]:
-                    assert "vector" not in published
-                    assert published["content"] in expected[published["file_path"]]
+            assert row["stage"] == "index" and row["chunks_ref"]
+            chunks = list(run.chunks(row["chunks_ref"]))
+            assert len(chunks) == row["chunk_count"]
+            assert all(chunk["content"] in "".join(expected[row["path"]]) for chunk in chunks)
+        assert run.assert_index_vectors(state, state["root"], dimensions=None if vector_disabled else 4096) == sum(map(len, expected.values()))
         for path, lines in expected.items():
             run.assert_source_retained(files[path])
             read = run.request("POST", f"/roots/{state['root']}/read",
                 {"path": path, "lines": {"start": 1, "end": len(lines)}}, key=state["key"])
             assert [line["content"] for line in read["lines"]] == [line.rstrip("\n") for line in lines]
-        for mode in ("fts", "vector", "hybrid"):
+        for mode in (("fts",) if vector_disabled else ("fts", "vector", "hybrid")):
             result = run.request("POST", "/query", {"root_id": state["root"], "query": "telescope calibration",
                 "mode": mode, "top_k": 5}, key=state["key"])
             assert result["results"]
             for hit in result["results"]:
                 assert hit["content"] in "".join(expected[hit["file_path"]])
         result = {"event": "worker_throughput", "run_id": state["nonce"], "phase": label,
+                  "vector_disabled": vector_disabled, "capture_seconds": round(capture_seconds, 3),
+                  "concurrency": int(os.environ.get("PUFFERFS_E2E_THROUGHPUT_CONCURRENCY", "4")),
+                  "embedding_batch_documents": int(os.environ.get("PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", "256")),
                   "source_bytes": sum(len(line.encode()) for lines in expected.values() for line in lines),
                   "files": len(expected), "chunks": sum(map(len, expected.values())),
-                  "mutation_records": mutation_records, "mutation_json_bytes": mutation_bytes,
                   "capture_to_publication_seconds": round(elapsed, 3), "work": rows}
         with Path("/artifacts/worker-throughput.jsonl").open("a") as output:
             output.write(json.dumps(result) + "\n")
         print(json.dumps(result), flush=True)
+        from index_recovery import relay
+        names = {row["namespace"] for row in run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL",(state["root"],))}
+        observed = [e for e in relay("GET","/status")["events"] if e["namespace"] in names]
+        with Path("/artifacts/worker-throughput-network.jsonl").open("a") as output:
+            output.write(json.dumps({"run_id":state["nonce"],"phase":label,"events":observed})+"\n")

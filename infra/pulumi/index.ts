@@ -4,13 +4,6 @@ import * as pulumi from "@pulumi/pulumi";
 
 
 const cfg = new pulumi.Config();
-const requireNonBlank = (key: string): string => {
-  const value = cfg.require(key).trim();
-  if (value.length === 0) {
-    throw new Error(`pufferfs:${key} must not be blank or whitespace`);
-  }
-  return value;
-};
 const stack = pulumi.getStack();
 const project = cfg.get("projectName") ?? "pufferfs";
 const name = (suffix: string) => `${project}-${stack}-${suffix}`;
@@ -33,15 +26,6 @@ const enableBilling = cfg.getBoolean("enableBilling") ?? false;
 const frontendUrl = cfg.get("frontendUrl");
 const posthogEnabled = cfg.getBoolean("posthogEnabled") ?? false;
 const posthogHost = cfg.get("posthogHost");
-// SQS is the only execution queue; queues contain per-file references.
-const processing = {
-  queuePrefix: "file-",
-  workers: { transform: 16, index: 16 },
-  endpoints: {
-    MODAL_TRANSFORM_ENDPOINT: "modalTransformEndpoint",
-    MODAL_FILE_INDEX_ENDPOINT: "modalFileIndexEndpoint",
-  },
-};
 const alarmTopicArn = cfg.get("alarmTopicArn");
 
 const tags = {
@@ -199,6 +183,15 @@ const appImage = new docker.Image(name("app-image"), {
   },
 });
 
+const workerImage = new docker.Image(name("worker-image"), {
+  imageName: pulumi.interpolate`${appRepo.repositoryUrl}:worker-${imageTag}`,
+  build: { context: "../../", dockerfile: "../../Dockerfile.worker", platform: "linux/amd64" },
+  registry: {
+    server: appRepo.repositoryUrl.apply(url => url.split("/")[0]),
+    username: authToken.userName, password: authToken.password,
+  },
+});
+
 const bucket = new aws.s3.BucketV2(name("artifacts"), {
   bucketPrefix: regionalBucketPrefix("artifacts"),
   forceDestroy: cfg.getBoolean("forceDestroyBucket") ?? false,
@@ -249,6 +242,10 @@ new aws.s3.BucketLifecycleConfigurationV2(name("artifacts-lifecycle"), {
         daysAfterInitiation: 1,
       },
     },
+    ...["mutations/", "maintenance/root-deletions/"].map((prefix, i) => ({
+      id: `retire-legacy-mutations-${i}`, status: "Enabled",
+      filter: { prefix }, expiration: { days: 30 },
+    })),
   ],
 });
 
@@ -376,69 +373,26 @@ const logGroup = new aws.cloudwatch.LogGroup(name("logs"), {
   tags,
 });
 
-// Each pipeline stage gets an independent FIFO queue so a wedged indexing
-// workload cannot consume chunking capacity. Data shards use
-// independent groups for concurrency; commits use one group per root.
-const syncStages = Object.keys(processing.workers);
-const syncQueues = syncStages.map((stage) => {
-  const queueStage = `${processing.queuePrefix}${stage}`;
-  const dlq = new aws.sqs.Queue(name(`${queueStage}-dlq`), {
-    name: `${name(`sync-${queueStage}-dlq`)}.fifo`,
-    fifoQueue: true,
-    messageRetentionSeconds: 14 * 24 * 60 * 60,
-    tags,
+// The database owns pending work. Export bounded operational summaries instead
+// of relying on the removed SQS queue/DLQ metrics.
+for (const metric of [
+  { key: "failed", title: "FailedWork", threshold: 1 },
+  { key: "oldest_seconds", title: "OldestWorkSeconds", threshold: 1800 },
+]) {
+  const namespace = `${project}/${stack}/Work`;
+  const filter = new aws.cloudwatch.LogMetricFilter(name(`work-${metric.key}`), {
+    logGroupName: logGroup.name,
+    pattern: '{ $.event = "work_backlog" }',
+    metricTransformation: { name: metric.title, namespace, value: `$.${metric.key}` },
   });
-  // Commit-not-ready is normal while large roots finish their final shards;
-  // retain those retries through the 30-minute watchdog window.
-  const maxReceiveCount = stage === "commit" ? 400 : 5;
-  const queue = new aws.sqs.Queue(name(`${queueStage}-queue`), {
-    name: `${name(`sync-${queueStage}`)}.fifo`,
-    fifoQueue: true,
-    contentBasedDeduplication: false,
-    // Independent message groups allow concurrent file processing.
-    deduplicationScope: "messageGroup",
-    fifoThroughputLimit: "perMessageGroupId",
-    visibilityTimeoutSeconds: 5 * 60,
-    receiveWaitTimeSeconds: 20,
-    messageRetentionSeconds: 14 * 24 * 60 * 60,
-    redrivePolicy: dlq.arn.apply((arn) => JSON.stringify({
-      deadLetterTargetArn: arn,
-      maxReceiveCount,
-    })),
+  new aws.cloudwatch.MetricAlarm(name(`work-${metric.key}-alarm`), {
+    namespace, metricName: metric.title, statistic: "Maximum", period: 300,
+    evaluationPeriods: 2, threshold: metric.threshold,
+    comparisonOperator: "GreaterThanOrEqualToThreshold", treatMissingData: "missing",
+    alarmActions: alarmTopicArn ? [alarmTopicArn] : [],
+    alarmDescription: "Current file work needs attention; inspect API status and worker logs.",
     tags,
-  });
-  return { stage, queue, dlq };
-});
-
-for (const { stage, queue, dlq } of syncQueues) {
-  new aws.cloudwatch.MetricAlarm(name(`${stage}-queue-age-alarm`), {
-    alarmDescription: `PufferFS ${stage} queue has work older than 10 minutes`,
-    namespace: "AWS/SQS",
-    metricName: "ApproximateAgeOfOldestMessage",
-    statistic: "Maximum",
-    period: 60,
-    evaluationPeriods: 2,
-    threshold: 10 * 60,
-    comparisonOperator: "GreaterThanThreshold",
-    dimensions: { QueueName: queue.name },
-    treatMissingData: "notBreaching",
-    alarmActions: alarmTopicArn ? [alarmTopicArn] : undefined,
-    tags,
-  });
-  new aws.cloudwatch.MetricAlarm(name(`${stage}-dlq-alarm`), {
-    alarmDescription: `PufferFS ${stage} dead-letter queue is not empty`,
-    namespace: "AWS/SQS",
-    metricName: "ApproximateNumberOfMessagesVisible",
-    statistic: "Maximum",
-    period: 60,
-    evaluationPeriods: 1,
-    threshold: 0,
-    comparisonOperator: "GreaterThanThreshold",
-    dimensions: { QueueName: dlq.name },
-    treatMissingData: "notBreaching",
-    alarmActions: alarmTopicArn ? [alarmTopicArn] : undefined,
-    tags,
-  });
+  }, { dependsOn: [filter] });
 }
 
 const executionRole = new aws.iam.Role(name("ecs-execution-role"), {
@@ -460,48 +414,11 @@ const taskRole = new aws.iam.Role(name("ecs-task-role"), {
   tags,
 });
 
-const modalWorkspaceId = requireNonBlank("modalWorkspaceId");
-const modalEnvironment = requireNonBlank("modalEnvironment");
-const modalProviderArn = cfg.get("modalOidcProviderArn") ?? new aws.iam.OpenIdConnectProvider(name("modal-oidc"), {
-  url: "https://oidc.modal.com",
-  clientIdLists: ["oidc.modal.com"],
-  tags,
-}).arn;
-const modalRole = new aws.iam.Role(name("modal-worker-role"), {
-  assumeRolePolicy: pulumi.output(modalProviderArn).apply(arn => JSON.stringify({
-    Version: "2012-10-17",
-    Statement: [{
-      Effect: "Allow",
-      Principal: { Federated: arn },
-      Action: "sts:AssumeRoleWithWebIdentity",
-      Condition: {
-        StringEquals: { "oidc.modal.com:aud": "oidc.modal.com" },
-        StringLike: { "oidc.modal.com:sub": [
-          "pufferfs-transform", "pufferfs-batch-collector", "pufferfs-index",
-          "pufferfs-reconciliation", "pufferfs-worker-audit",
-        ].map(app => `modal:workspace_id:${modalWorkspaceId}:environment_name:${modalEnvironment}:app_name:${app}:function_name:*:container_id:*`) },
-      },
-    }],
-  })),
-  tags,
-});
-new aws.iam.RolePolicy(name("modal-worker-policy"), {
-  role: modalRole.id,
-  policy: pulumi.all([bucket.arn, ...syncQueues.map(({ queue }) => queue.arn)])
-    .apply(([bucketArn, ...queueArns]) => JSON.stringify({
-      Version: "2012-10-17",
-      Statement: [
-        { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts", "s3:ListBucket", "s3:ListBucketMultipartUploads"], Resource: [bucketArn, `${bucketArn}/*`] },
-        { Effect: "Allow", Action: ["sqs:SendMessage", "sqs:GetQueueAttributes"], Resource: queueArns },
-      ],
-    })),
-});
-
 new aws.iam.RolePolicy(name("ecs-task-policy"), {
   role: taskRole.id,
   policy: pulumi
-    .all([bucket.arn, sesSendResource ?? "", ...syncQueues.map(({ queue }) => queue.arn)])
-    .apply(([bucketArn, sesResource, ...queueArns]) => {
+    .all([bucket.arn, sesSendResource ?? ""])
+    .apply(([bucketArn, sesResource]) => {
       const statements: Record<string, unknown>[] = [
         {
           Effect: "Allow",
@@ -513,17 +430,7 @@ new aws.iam.RolePolicy(name("ecs-task-policy"), {
           Action: ["secretsmanager:GetSecretValue"],
           Resource: "*",
         },
-        {
-          Effect: "Allow",
-          Action: [
-            "sqs:SendMessage",
-            "sqs:ReceiveMessage",
-            "sqs:DeleteMessage",
-            "sqs:ChangeMessageVisibility",
-            "sqs:GetQueueAttributes",
-          ],
-          Resource: queueArns,
-        },
+
       ];
       if (sesResource) {
         statements.push({
@@ -605,8 +512,11 @@ const secretValues: Record<string, pulumi.Input<string>> = {
   DATABASE_URL: cfg.requireSecret("databaseUrl"),
   JWT_SECRET: cfg.requireSecret("jwtSecret"),
   TURBOPUFFER_API_KEY: cfg.requireSecret("turbopufferApiKey"),
-  MODAL_SECRET_KEY: cfg.requireSecret("modalSecretKey"),
+  GEMINI_API_KEY: cfg.requireSecret("geminiApiKey"),
 };
+
+const visionToken = cfg.getSecret("visionProxyToken");
+if (visionToken) secretValues.MODAL_PROXY_TOKEN = visionToken;
 
 const adminKeyHash = cfg.getSecret("adminKeyHash");
 if (adminKeyHash) {
@@ -647,35 +557,29 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "AWS_BUCKET_NAME", value: bucket.bucket },
   { name: "AWS_REGION", value: deployRegion },
   { name: "AWS_ENDPOINT_URL", value: "" },
-  ...Object.entries(processing.endpoints).map(([name, key]) => ({ name, value: requireNonBlank(key) })),
+
   { name: "ENABLE_EMAIL_LOGIN", value: enableEmailLogin ? "true" : "false" },
   { name: "ENABLE_BILLING", value: enableBilling ? "true" : "false" },
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
 ];
 
-for (const { stage, queue } of syncQueues) {
-  appEnv.push({
-    name: `PUFFERFS_SQS_${stage.toUpperCase()}_QUEUE_URL`,
-    value: queue.url,
-  });
+for (const [variable, config] of Object.entries({
+  PUFFERFS_VISION_BASE_URL: "visionBaseUrl", PUFFERFS_VISION_MODEL: "visionModel",
+  TURBOPUFFER_REGION: "turbopufferRegion", TURBOPUFFER_API_URL: "turbopufferApiUrl",
+})) {
+  const value = cfg.get(config);
+  if (value) appEnv.push({name: variable, value});
 }
 
 if (posthogHost) {
   appEnv.push({ name: "POSTHOG_HOST", value: posthogHost });
 }
 
-const cliLatestVersion = cfg.get("cliLatestVersion");
-if (cliLatestVersion) {
-  appEnv.push({ name: "PUFFERFS_CLI_LATEST_VERSION", value: cliLatestVersion });
-}
-const cliMinVersion = cfg.get("cliMinVersion");
-if (cliMinVersion) {
-  appEnv.push({ name: "PUFFERFS_CLI_MIN_VERSION", value: cliMinVersion });
-}
-const cliDownloadBaseUrl = cfg.get("cliDownloadBaseUrl");
-if (cliDownloadBaseUrl) {
-  appEnv.push({ name: "PUFFERFS_CLI_DOWNLOAD_BASE_URL", value: cliDownloadBaseUrl });
-}
+export const webUrl = useWebCustomCert
+  ? `https://${webDomain}`
+  : pulumi.interpolate`https://${webDistribution.domainName}`;
+const cliManifestUrl = cfg.get("cliManifestUrl") ?? pulumi.interpolate`${webUrl}/releases/manifest.json`;
+appEnv.push({name: "PUFFERFS_CLI_MANIFEST_URL", value: cliManifestUrl});
 
 if (frontendUrl) {
   appEnv.push({ name: "FRONTEND_URL", value: frontendUrl });
@@ -737,11 +641,6 @@ if (enableBilling) {
   }
 }
 
-const tpNamespaceShards = cfg.get("tpNamespaceShards");
-if (tpNamespaceShards) {
-  appEnv.push({ name: "PUFFERFS_TP_NAMESPACE_SHARDS", value: tpNamespaceShards });
-}
-
 function logConfig(streamPrefix: string) {
   return {
     logDriver: "awslogs",
@@ -756,7 +655,7 @@ function logConfig(streamPrefix: string) {
 function appTaskDefinition(
   resourceName: string,
   containerName: string,
-  role: "api" | "consumer",
+  role: "api" | "ingestion" | "background",
   extraEnv: { name: string; value: pulumi.Input<string> }[],
   portMappings?: { containerPort: number; hostPort?: number; protocol?: string }[],
 ) {
@@ -764,22 +663,28 @@ function appTaskDefinition(
     family: name(resourceName),
     requiresCompatibilities: ["FARGATE"],
     networkMode: "awsvpc",
-    cpu: cpu.toString(),
-    memory: memory.toString(),
+    cpu: (role === "api" ? cpu : cfg.getNumber("workerCpu") ?? 2048).toString(),
+    memory: (role === "api" ? memory : cfg.getNumber("workerMemory") ?? 4096).toString(),
     executionRoleArn: executionRole.arn,
     taskRoleArn: taskRole.arn,
     containerDefinitions: pulumi
-      .all([appImage.imageName, appEnv, secrets])
+      .all([role === "api" ? appImage.imageName : workerImage.imageName, appEnv, secrets])
       .apply(([image, env, secretDefs]) =>
         JSON.stringify([
           {
             name: containerName,
             image,
             essential: true,
-            environment: [...env.filter(item => role === "consumer" || !(item.name in processing.endpoints)), ...extraEnv],
-            secrets: secretDefs.filter(item => role === "consumer"
-              ? ["DATABASE_URL", "MODAL_SECRET_KEY"].includes(item.name)
-              : item.name !== "MODAL_SECRET_KEY"),
+            environment: [...env, ...extraEnv, { name: "PUFFERFS_BUILD_REVISION", value: imageTag }],
+            command: role === "api" ? undefined : [role],
+            stopTimeout: 120,
+            healthCheck: role === "api" ? undefined : {
+              command: ["CMD-SHELL", "python -c \"import os,time; assert time.time()-os.stat('/tmp/role-heartbeat').st_mtime < 60\""],
+              interval: 30, timeout: 5, retries: 3, startPeriod: 60,
+            },
+            secrets: secretDefs.filter(item => role !== "api"
+              ? ["DATABASE_URL", "GEMINI_API_KEY", "TURBOPUFFER_API_KEY", "MODAL_PROXY_TOKEN"].includes(item.name)
+              : !["GEMINI_API_KEY", "MODAL_PROXY_TOKEN"].includes(item.name)),
             portMappings,
             logConfiguration: logConfig(containerName),
           },
@@ -893,17 +798,15 @@ const apiService = new aws.ecs.Service(name("api"), {
   tags,
 });
 
-const workerServices = Object.entries(processing.workers).map(([stage, defaultConcurrency]) => {
+const workerServices = (["ingestion", "background"] as const).map((stage) => {
   const serviceName = `worker-${stage}`;
   const concurrency =
     cfg.getNumber(`worker${stage[0].toUpperCase()}${stage.slice(1)}Concurrency`) ??
-    defaultConcurrency;
+    4;
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 64) {
     throw new Error(`invalid ${serviceName} concurrency: ${concurrency}`);
   }
-  const task = appTaskDefinition(`${serviceName}-task`, serviceName, "consumer", [
-    { name: "PUFFERFS_PROCESS", value: "worker" },
-    { name: "PUFFERFS_WORKER_STAGE", value: stage },
+  const task = appTaskDefinition(`${serviceName}-task`, serviceName, stage, [
     { name: "PUFFERFS_WORKER_CONCURRENCY", value: concurrency.toString() },
   ]);
 
@@ -957,9 +860,6 @@ export const webCertValidation = webCert ? certValidationRecord(webCert) : undef
 
 export const webBucketName = webBucket.bucket;
 export const webDistributionId = webDistribution.id;
-export const webUrl = useWebCustomCert
-  ? `https://${webDomain}`
-  : pulumi.interpolate`https://${webDistribution.domainName}`;
 export const billingEnabled = enableBilling;
 export const emailLoginEnabled = enableEmailLogin;
 export const transactionalEmailEnabled = Boolean(transactionalEmailFrom);
@@ -975,11 +875,9 @@ export const inviteEmailIdentityNameOutput = transactionalEmailIdentityNameOutpu
 export const inviteEmailIdentityVerificationStatus = transactionalEmailIdentityVerificationStatus;
 export const inviteEmailDkimValidationRecords = transactionalEmailDkimValidationRecords;
 export const artifactBucket = bucket.bucket;
-export const modalWorkerRoleArn = modalRole.arn;
-export const modalOidcProvider = modalProviderArn;
 export const appRepositoryUrl = appRepo.repositoryUrl;
 export const ecsClusterArn = cluster.arn;
-export const syncQueueUrls = Object.fromEntries(syncQueues.map(({ stage, queue }) => [stage, queue.url]));
-export const syncDeadLetterQueueUrls = Object.fromEntries(syncQueues.map(({ stage, dlq }) => [stage, dlq.url]));
 export const apiServiceArn = apiService.id;
 export const workerServiceArns = workerServices.map((service) => service.id);
+
+export const pipelineVersion = 3;

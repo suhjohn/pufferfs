@@ -1,5 +1,9 @@
 # Baseline capacity assessment: one million 100-page files
 
+> Historical design/results. The current implementation is described in
+> [Architecture](architecture-and-functionality.md); these measurements and
+> commands describe the revision recorded below, not the simplified runtime.
+
 > Historical implementation/measurement record. Nomic serving and the vector
 > cache described below were retired by the native-Qwen change. Current roles
 > and operations are documented in [architecture](architecture-and-functionality.md)

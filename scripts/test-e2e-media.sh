@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 : "${GEMINI_API_KEY:?Set GEMINI_API_KEY for real media Batch E2E}"
-: "${TURBOPUFFER_API_KEY:?Set TURBOPUFFER_API_KEY for real media index E2E}"
+: "${TURBOPUFFER_API_KEY:?Set TURBOPUFFER_API_KEY for real media background E2E}"
 project="pufferfs-media-${GITHUB_RUN_ID:-local}-$$"
 compose=(docker compose --env-file /dev/null --profile test -p "$project" -f compose.e2e.yml)
 mkdir -p tests/e2e/artifacts
@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
+    "${compose[@]}" stop ingestion background || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -25,11 +25,11 @@ finish() {
   exit "$result"
 }
 trap finish EXIT
-# These roots are vector-disabled; the shared CPU index worker omits native
+# These roots are vector-disabled; the shared CPU background worker omits native
 # embedding. Corpus and index-recovery suites cover native vector search.
-"${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index collector reconciler
+"${compose[@]}" build api ingestion e2e
+"${compose[@]}" up -d --wait postgres aws api api-ready ingestion background
 runner_started=1
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
+"${compose[@]}" up -d --no-deps ingestion background
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/media.py 2>&1 |
   python3 -u tests/e2e/redact.py | tee tests/e2e/artifacts/media-results.log

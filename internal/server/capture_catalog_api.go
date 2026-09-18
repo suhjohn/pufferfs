@@ -50,7 +50,7 @@ func (s *Server) handleListCapturedFiles(w http.ResponseWriter, r *http.Request)
 				WHEN e.status IN ('failed','superseded','waiting_provider') THEN e.status
 				WHEN w.status='complete' THEN 'inconsistent'
 				ELSE COALESCE(w.status,'pending') END,
-			COALESCE(w.attempt_count,0),COALESCE(w.acknowledged_batches,0),w.mutation_batch_count`
+			COALESCE(w.attempt_count,0)`
 		joins = ` LEFT JOIN LATERAL (SELECT id,revision,status FROM file_extractions
 			WHERE version_id=v.id ORDER BY sequence DESC LIMIT 1) e ON TRUE
 			LEFT JOIN file_work w ON w.extraction_id=e.id
@@ -79,7 +79,7 @@ func (s *Server) handleListCapturedFiles(w http.ResponseWriter, r *http.Request)
 			p := &models.FileProcessingStatus{}
 			file.Processing = p
 			fields = append(fields, &p.ExtractionID, &p.Revision, &p.Stage, &p.Status,
-				&p.AttemptCount, &p.AcknowledgedBatches, &p.MutationBatchCount)
+				&p.AttemptCount)
 		}
 		if err = rows.Scan(fields...); err != nil {
 			writeJSON(w, 500, map[string]string{"error": "captured catalog decoding failed"})

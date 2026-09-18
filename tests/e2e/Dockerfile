@@ -19,16 +19,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libreoffice-core libreoffice-writer libreoffice-impress libreoffice-calc \
     fonts-dejavu-core ca-certificates espeak-ng \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /app/modal
-COPY modal/requirements-transform.txt modal/requirements-index.txt ./
-RUN pip install --no-cache-dir -r requirements-transform.txt -r requirements-index.txt 'modal>=0.73.0'
+WORKDIR /app/workers
+COPY workers/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt 'fastapi[standard]'
 ENV PYTHONUNBUFFERED=1
-ENTRYPOINT ["python", "/e2e/runtime.py"]
+ENTRYPOINT ["python", "/app/workers/runtime.py"]
 
 FROM worker-base AS worker
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-COPY modal/ ./
+COPY workers/ ./
 COPY tests/e2e/ /e2e/
+RUN useradd --create-home worker
+USER worker
 
 FROM worker-base AS runner-deps
 RUN apt-get update && apt-get install -y --no-install-recommends libopencore-amrnb0 \
@@ -41,7 +43,7 @@ ADD --checksum=sha256:cc015130aa8521e7f088f88898eba949ccdcbfb38df0bd129b44b7273c
 
 FROM runner-deps AS runner
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-COPY modal/ ./
+COPY workers/ ./
 COPY tests/e2e/ /e2e/
 COPY --from=cli /pufferfs /usr/local/bin/pufferfs
 WORKDIR /e2e

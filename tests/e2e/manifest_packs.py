@@ -35,7 +35,7 @@ def stamps(root):
 
 
 def verify_command(state):
-    result = subprocess.run([sys.executable,"/app/modal/source_verify.py","--org-id",state["org"],
+    result = subprocess.run([sys.executable,"/app/workers/source_verify.py","--org-id",state["org"],
         "--root-id",state["root"],"--timeout","120"],capture_output=True,text=True,timeout=150)
     assert result.returncode == 0, result.stdout[-2000:]+result.stderr[-1000:]
     summary = json.loads(result.stdout.splitlines()[-1])
@@ -77,8 +77,7 @@ def verify():
     capture(state,deleted,puts=0)
     expected[new["files"][0]["path"]] = None
     published(state,state["root"],expected)
-    for mode, error in (("flip","stored source manifest hash mismatch"),
-                        ("truncate","source manifest response length mismatch")):
+    for mode in ("flip", "truncate"):
         root = run.new_root(state,"Manifest transport integrity","/state/manifest-"+mode,True)
         payload = b"Orchid calibration transport integrity.\n"
         source = packed(state,root,[payload])[0]
@@ -91,7 +90,7 @@ def verify():
                 rows = run.sql("""SELECT w.error FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
                     JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
                     WHERE f.root_id=%s AND w.stage='transform'""",(root,))
-                return rows and error in rows[0]["error"]
+                return rows and rows[0]["error"] == "ValueError"
             run.eventually("manifest integrity rejection",failed,timeout=120)
             events = [e for e in relay()["events"] if e["key"].startswith(prefix)]
             assert events and all(e["range"] and e["mode"] == mode for e in events)
@@ -100,7 +99,7 @@ def verify():
         finally:
             relay("DELETE","/fault")
         published(state,root,{"source.txt":payload.decode()})
-        print(f"Manifest {mode}: rejected before indexing, then normal queue retry published exact source bytes.",flush=True)
+        print(f"Manifest {mode}: rejected before indexing, then durable retry published exact source bytes.",flush=True)
     run.cleanup()
     run.STATE.unlink()
     print("128-file single manifest PUT, reordered/subset replay, integrity retries and complete S3 cleanup passed.",flush=True)

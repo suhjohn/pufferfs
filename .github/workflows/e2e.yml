@@ -17,8 +17,22 @@ jobs:
         include:
           - suite: corpus
             script: scripts/test-e2e.sh
+          - suite: embedding-batches
+            script: scripts/test-e2e-embedding-batches.sh
+          - suite: base64-redaction
+            script: scripts/test-e2e-base64-redaction.sh
           - suite: index-recovery
             script: scripts/test-e2e-index-recovery.sh
+          - suite: database-scheduling
+            script: scripts/test-e2e-capture-handoff.sh
+          - suite: lease-renewal
+            script: scripts/test-e2e-index-renewal.sh
+          - suite: upgrade
+            script: scripts/test-e2e-upgrade.sh
+          - suite: api-access
+            script: scripts/test-e2e-api-access.sh
+          - suite: installer
+            script: scripts/test-e2e-installer.sh
           - suite: retention-security
             script: scripts/test-e2e-retention.sh
           - suite: provider-recovery
@@ -41,11 +55,13 @@ jobs:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TURBOPUFFER_API_KEY: ${{ secrets.TURBOPUFFER_API_KEY }}
       MODAL_PROXY_TOKEN: ${{ matrix.vision_case && secrets.MODAL_PROXY_TOKEN || '' }}
-      PUFFERFS_VISION_BASE_URL: ${{ vars.PUFFERFS_VISION_BASE_URL }}
-      PUFFERFS_VISION_MODEL: ${{ vars.PUFFERFS_VISION_MODEL }}
+      PUFFERFS_VISION_BASE_URL: ${{ matrix.vision_case && vars.PUFFERFS_VISION_BASE_URL || '' }}
+      PUFFERFS_VISION_MODEL: ${{ matrix.vision_case && vars.PUFFERFS_VISION_MODEL || '' }}
       PUFFERFS_E2E_VISION_CASE: ${{ matrix.vision_case || 'partial' }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Production-role Docker Compose end-to-end suite (${{ matrix.suite }})
         run: bash "${{ matrix.script }}"
       - name: Retain sanitized end-to-end results

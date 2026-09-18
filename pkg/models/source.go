@@ -120,13 +120,11 @@ type CapturedFileHead struct {
 // Metadata for the latest registered extraction of the current captured version.
 // Complete means that exact extraction is published, not merely transformed.
 type FileProcessingStatus struct {
-	ExtractionID        string `json:"extraction_id"`
-	Revision            string `json:"revision"`
-	Stage               string `json:"stage"`
-	Status              string `json:"status"`
-	AttemptCount        int    `json:"attempt_count"`
-	AcknowledgedBatches int    `json:"acknowledged_batches"`
-	MutationBatchCount  *int   `json:"mutation_batch_count,omitempty"`
+	ExtractionID string `json:"extraction_id"`
+	Revision     string `json:"revision"`
+	Stage        string `json:"stage"`
+	Status       string `json:"status"`
+	AttemptCount int    `json:"attempt_count"`
 }
 
 type CapturedFilesResponse struct {

@@ -14,7 +14,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
+    "${compose[@]}" stop ingestion background || true
     # Keep the real provider cleanup report if it fails. Preserve disposable
     # containers/state in that case so cleanup can be retried, not guessed.
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
@@ -32,60 +32,22 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-# Start the API and HTTP workers without consumers or scheduled maintenance.
-# Only reconciliation will repair the intentionally failed initial SQS send.
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index
+# Register durable work with all execution stopped, then resume real processes.
+"${compose[@]}" up -d --wait postgres aws api api-ready
 runner_started=1
-"${compose[@]}" run --rm --no-deps e2e handoff-outage
-"${compose[@]}" up -d --no-deps reconciler
-failed_tick=0
-for ((attempt=0; attempt<45; attempt++)); do
-  if "${compose[@]}" logs --no-color --tail=100 reconciler |
-      grep -F 'reconciler scheduled invocation failed:' >/dev/null; then
-    failed_tick=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$failed_tick" != 1 ]]; then
-  echo "Reconciler did not attempt delivery during the SQS outage." >&2
-  exit 1
-fi
-"${compose[@]}" run --rm --no-deps e2e handoff-recovered
-"${compose[@]}" up -d --no-deps --wait reconciler
 "${compose[@]}" run --rm --no-deps e2e native-capture
-"${compose[@]}" up -d transform-consumer
+"${compose[@]}" up -d --wait ingestion
 "${compose[@]}" run --rm --no-deps e2e native-transformed
 "${compose[@]}" run --rm --no-deps e2e follow-backlog
-"${compose[@]}" stop transform
-"${compose[@]}" restart transform-consumer
-"${compose[@]}" run --rm --no-deps e2e native-replay
-"${compose[@]}" stop transform-consumer
-"${compose[@]}" up -d --no-deps --wait transform
-"${compose[@]}" up -d --wait collector
-# Capture must finish with work durably in SQS while no executor can claim it.
+"${compose[@]}" stop ingestion
 "${compose[@]}" run --rm --no-deps e2e capture
 "${compose[@]}" run --rm --no-deps e2e multipart-recovery
-"${compose[@]}" up -d transform-consumer index-consumer
+"${compose[@]}" up -d --wait ingestion background
 "${compose[@]}" run --rm --no-deps e2e verify
-# Actual network unavailability. Consumers keep polling and must not ack failed
-# handoffs; the CLI must still capture, and readers retain the published version.
-"${compose[@]}" stop transform index
+"${compose[@]}" run --rm --no-deps e2e authorization
+"${compose[@]}" stop ingestion background
 "${compose[@]}" run --rm --no-deps e2e outage
-"${compose[@]}" up -d --wait transform index
-"${compose[@]}" restart api transform-consumer index-consumer
+"${compose[@]}" restart api
 "${compose[@]}" run --rm --no-deps api-ready
+"${compose[@]}" up -d --wait ingestion background
 "${compose[@]}" run --rm --no-deps e2e resumed
-# Keep intentional malformed delivery after all empty-queue/DLQ assertions.
-# It is never manually acknowledged; isolated cleanup removes the queue.
-"${compose[@]}" stop transform-consumer index-consumer
-"${compose[@]}" run --rm --no-deps e2e malformed-capture
-"${compose[@]}" up -d --no-deps transform-consumer
-"${compose[@]}" run --rm --no-deps e2e malformed-transformed
-if ! "${compose[@]}" logs --no-color transform-consumer |
-    grep -F 'not valid job JSON; left unacknowledged (receive batch size=3)' >/dev/null; then
-  echo "Malformed delivery scenario did not exercise a mixed three-message receive batch." >&2
-  exit 1
-fi
-"${compose[@]}" up -d --no-deps index-consumer
-"${compose[@]}" run --rm --no-deps e2e malformed-published

@@ -13,7 +13,7 @@ from index_recovery import relay as write_relay
 
 
 def calls():
-    patterns = ("SELECT r.id,CASE WHEN EXISTS (%", "SELECT id, org_id, root_id, namespace%",
+    patterns = ("SELECT r.id,COALESCE(CASE WHEN EXISTS (%", "SELECT id, org_id, root_id, namespace%",
                 "SELECT q.slot,r.id IS NOT NULL,f.path,%", "WITH requested AS (%FROM root_acls%")
     return [run.sql("SELECT COALESCE(sum(calls),0)::bigint AS n FROM pg_stat_statements WHERE query LIKE %s", (p,))[0]["n"] for p in patterns]
 
@@ -155,14 +155,14 @@ def stale_round(state, peers, roots, directory, namespaces):
         expected = Counter(namespaces)
         expected[held["namespace"]] += 1
         assert Counter(event["namespace"] for event in events) == expected, "a validated namespace was unnecessarily queried again"
-        assert all(event["response_rows"] > 0 for event in events), "fixture did not populate every shard"
+        assert all(event["response_rows"] > 0 for event in events), "fixture did not populate every namespace"
     finally:
         write_relay("POST", "/release")
     run.wait_indexed(state, roots[0])
     for peer in peers:
         result = run.request("POST", "/query", {"root_ids": roots, "query": "zircon", "mode": "fts"}, key=state["key"], server=peer)
         assert result["results"] and all("pending zircon" in hit["content"] for hit in result["results"])
-    print("One SQL publication read checked four populated shards; only the stale shard retried, then both APIs saw the newly published version.", flush=True)
+    print("One SQL publication read checked populated roots; only the stale namespace retried, then both APIs saw the newly published version.", flush=True)
 
 
 def revoke_during_search(state, peers, roots, names):

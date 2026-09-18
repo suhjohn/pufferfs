@@ -254,19 +254,19 @@ def check_obsolete_artifacts(state):
     capture(state, directory, root)
     first = run.wait_indexed(state, root)[path.name]
     original = run.assert_source_retained(first)
-    old, = run.sql("""SELECT e.id,e.chunks_ref,w.mutation_ref FROM file_extractions e
+    old, = run.sql("""SELECT e.id,e.chunks_ref FROM file_extractions e
         JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE e.version_id=%s""", (first["version_id"],))
     with path.open("a") as output:
         output.write("Violet telescope measurements.\n")
     capture(state, directory, root)
     current = run.wait_indexed(state, root)[path.name]
-    live, = run.sql("""SELECT e.id,e.chunks_ref,w.mutation_ref FROM file_extractions e
+    live, = run.sql("""SELECT e.id,e.chunks_ref FROM file_extractions e
         JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE e.version_id=%s""", (current["version_id"],))
     def deleted():
         row, = run.sql("SELECT artifacts_retired_at,artifacts_deleted_at FROM file_extractions WHERE id=%s", (old["id"],))
         return row["artifacts_retired_at"] is not None and row["artifacts_deleted_at"] is not None
-    run.eventually("scheduled cleanup of the superseded chunk/mutation artifacts", deleted, 300)
-    for ref in (old["chunks_ref"], old["mutation_ref"]):
+    run.eventually("scheduled cleanup of the superseded chunk artifacts", deleted, 300)
+    for ref in (old["chunks_ref"],):
         try:
             run.s3.head_object(Bucket=run.BUCKET, Key=ref)
         except run.s3.exceptions.ClientError as error:
@@ -275,7 +275,7 @@ def check_obsolete_artifacts(state):
             raise AssertionError("obsolete artifact still exists")
     row, = run.sql("SELECT artifacts_retired_at FROM file_extractions WHERE id=%s", (live["id"],))
     assert row["artifacts_retired_at"] is None
-    for ref in (live["chunks_ref"], live["mutation_ref"]):
+    for ref in (live["chunks_ref"],):
         run.s3.head_object(Bucket=run.BUCKET, Key=ref)
     # Old source bytes may still be live through append reuse. Chunk retirement
     # must not remove those packs, manifests, or their catalog/proof metadata.
@@ -288,14 +288,13 @@ def check_obsolete_artifacts(state):
     assert run.assert_source_retained(newest)["extents"][:len(original["extents"])] == original["extents"]
     result = run.request("POST", f"/roots/{root}/read", {"path": path.name, "lines": {"start": 1, "end": 3}}, key=state["key"])
     assert [line["content"] for line in result["lines"]] == path.read_text().splitlines()
-    print("Obsolete chunks/mutations were removed after real retention elapsed; current artifacts, historical sources, append reuse and public reads remained valid.")
+    print("Obsolete chunks were removed after real retention elapsed; current artifacts, historical sources, append reuse and public reads remained valid.")
 
 
 def verify():
     from source_retention import begin_retention, check_packed_isolation, finish_retention
     from capture_permissions import check_capture_revocations
     state = json.loads(run.STATE.read_text()) if run.STATE.exists() else run.provision()
-    run.worker_authentication()
     begin_retention(state)
     check_local_retention(state)
     check_unaccepted_retention(state)

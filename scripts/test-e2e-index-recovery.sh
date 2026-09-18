@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform index reconciler index-relay worker-redirect || true
+    "${compose[@]}" stop ingestion background index-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -26,37 +26,24 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready transform index-relay index worker-redirect reconciler
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion index-relay background
 runner_started=1
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_recovery.py)
 "${driver[@]}" lost-capture
-# Kill the actual index process after real provider acceptance but
-# before it receives the response. Do not mutate leases, receipts or DB rows.
-"${compose[@]}" kill -s SIGKILL index
+"${compose[@]}" kill -s SIGKILL background
 "${driver[@]}" release
-"${compose[@]}" up -d --no-deps --wait index
+"${compose[@]}" up -d --no-deps --wait background
 "${driver[@]}" lost-recovered
-# Leave worker processes alive so this exercises their existing pooled sockets,
-# rather than testing only fresh-process database connections.
 "${compose[@]}" restart postgres
 "${driver[@]}" database-recovered
-"${driver[@]}" consumer-capture
-# Close the actual caller's HTTP request while the index worker remains alive
-# behind a real held provider response. Replacement work must share its limit.
-"${compose[@]}" stop -t 10 index-consumer
-"${driver[@]}" consumer-enqueue
-"${compose[@]}" up -d --no-deps index-consumer
-"${driver[@]}" consumer-bounded
+"${driver[@]}" admission-capture
+"${driver[@]}" admission-bounded
 "${driver[@]}" live-superseded
-# Keep stale physical rows available for the publication-filter assertions.
-# This phase does not claim recurring stale-row cleanup is being verified.
-"${compose[@]}" stop reconciler
+"${driver[@]}" pause-deletions
 "${driver[@]}" stale-capture
-"${compose[@]}" kill -s SIGKILL index
-"${compose[@]}" up -d --no-deps --wait index
+"${compose[@]}" kill -s SIGKILL background
+"${compose[@]}" up -d --no-deps --wait background
 "${driver[@]}" stale-current
 "${driver[@]}" stale-released
 "${driver[@]}" root-deleted
-"${compose[@]}" up -d --no-deps --wait reconciler
 "${driver[@]}" root-cleaned

@@ -131,16 +131,14 @@ type RootMetadata struct {
 	UpdatedAt      time.Time `json:"updated_at" db:"updated_at"`
 }
 
-// RootIndexNamespace maps a logical root to one physical Turbopuffer namespace shard.
+// RootIndexNamespace maps a logical root to one physical Turbopuffer namespace.
 type RootIndexNamespace struct {
-	ID         string     `json:"id" db:"id"`
-	OrgID      string     `json:"org_id" db:"org_id"`
-	RootID     string     `json:"root_id" db:"root_id"`
-	Namespace  string     `json:"namespace" db:"namespace"`
-	ShardIndex int        `json:"shard_index" db:"shard_index"`
-	ShardCount int        `json:"shard_count" db:"shard_count"`
-	CreatedAt  time.Time  `json:"created_at" db:"created_at"`
-	RetiredAt  *time.Time `json:"retired_at,omitempty" db:"retired_at"`
+	ID        string     `json:"id" db:"id"`
+	OrgID     string     `json:"org_id" db:"org_id"`
+	RootID    string     `json:"root_id" db:"root_id"`
+	Namespace string     `json:"namespace" db:"namespace"`
+	CreatedAt time.Time  `json:"created_at" db:"created_at"`
+	RetiredAt *time.Time `json:"retired_at,omitempty" db:"retired_at"`
 }
 
 const (

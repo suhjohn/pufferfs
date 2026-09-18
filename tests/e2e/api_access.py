@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import urllib.error
 
 import run
 
@@ -12,7 +13,16 @@ import run
 def servers():
     addresses = sorted({row[4][0] for row in socket.getaddrinfo("api", 8080, type=socket.SOCK_STREAM)})
     assert len(addresses) == 2, "this scenario requires two actual API processes"
-    return ["http://" + address + ":8080" for address in addresses]
+    peers = ["http://" + address + ":8080" for address in addresses]
+    for peer in peers:
+        def ready():
+            try:
+                run.request("GET", "/healthz", server=peer)
+                return True
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                return False
+        run.eventually("each API replica to finish migrations", ready, 90)
+    return peers
 
 
 def counts():

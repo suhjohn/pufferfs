@@ -11,7 +11,7 @@ There are three configuration surfaces:
 2. **CLI environment variables** — override the config file and tune client
    behavior.
 3. **Server / worker environment variables** — for operators self-hosting the
-   API server and queue workers.
+   API server and workers.
 
 ---
 
@@ -49,7 +49,7 @@ session_token     = ""
 | `turbopuffer.api_key` / `region` | Turbopuffer credentials (advanced/direct setups). |
 | `storage.*` | S3-compatible storage endpoint and credentials. |
 
-Per-root local capture cache (identity, journals, immutable spool packs and heads) lives
+Per-root local capture cache (identity, journals, immutable spool objects and heads) lives
 under `~/.tpfs/roots/<root-id>/`. Global ignore rules live at
 `~/.tpfs/.tpfsignore` (gitignore syntax, applies to all projects for the current
 local user). Server-managed org/user ignore policy is configured through
@@ -111,9 +111,8 @@ variables. Group by concern below.
 | Variable | Meaning | Default / notes |
 | --- | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. | **Required.** |
-| `PUFFERFS_WORKER_DATABASE_URL` | Deployment-only override for the Python worker database URL, such as a transaction-pooled endpoint. Installed as `DATABASE_URL` in the Modal worker secret; API and consumer migration connections keep their original URL. | Defaults to `DATABASE_URL`. |
 | `PUFFERFS_WORKER_DB_MAX_CONNS` | Maximum PostgreSQL connections per Python worker process; 2–16, with no reserved minimum. Idle connections expire after one minute. | `2` |
-| `PUFFERFS_DB_MAX_CONNS` | Maximum PostgreSQL connections per Go API/consumer process; 1–64. Idle connections expire after one minute. | `4` |
+| `PUFFERFS_DB_MAX_CONNS` | Maximum PostgreSQL connections per Go API process; 1–64. Idle connections expire after one minute. | `4` |
 | `PORT` | HTTP listen port. | server default |
 | `LISTEN_ADDR` | Full listen address (overrides `PORT` when set). | — |
 | `MIGRATIONS_DIR` | Path to SQL migrations applied on boot. | bundled |
@@ -152,7 +151,6 @@ Source capture tuning uses plain integer byte values:
 | Variable | Meaning | Default |
 | --- | --- | --- |
 | `PUFFERFS_MULTIPART_PART_BYTES` | Preferred direct-upload part size. Values below S3's 5 MiB minimum use the default; the server raises it when needed to stay within 10,000 parts. | 16 MiB (`16<<20`) |
-| `PUFFERFS_SOURCE_RANGE_BYTES` | Target bytes in each line-aware local text/code execution range. Every completed range is assigned its own worker shard. Values below 1 MiB use the default; values above the default are capped at the execution-shard budget. | 16,318,456 bytes (about 15.6 MiB) |
 
 ### Search (Turbopuffer)
 
@@ -160,36 +158,22 @@ Source capture tuning uses plain integer byte values:
 | --- | --- | --- |
 | `TURBOPUFFER_API_KEY` | Turbopuffer API key. | required for search |
 | `TURBOPUFFER_API_URL` | Turbopuffer base URL. | provider default |
-| `PUFFERFS_TP_NAMESPACE_SHARDS` | Physical namespaces per root, set at root creation. | 1 (max 256) |
-| `PUFFERFS_TP_WRITE_BATCH_ROWS` | Rows per Turbopuffer upsert request. | 512 (max 512) |
-| `PUFFERFS_TP_WRITE_BATCH_BYTES` | Approximate maximum serialized Turbopuffer request size; row buffers reserve 64 KiB for the envelope/schema. | 8 MiB (max 8 MiB) |
 
-### Modal compute
+### Processing workers
 
-| Variable | Role |
-| --- | --- |
-| `MODAL_TRANSFORM_ENDPOINT` | Consumer → CPU transformation worker |
-| `MODAL_FILE_INDEX_ENDPOINT` | Consumer → shared CPU index worker |
-| `MODAL_SECRET_KEY` | Consumer caller authentication |
-| `PUFFERFS_MODAL_ENDPOINT_SECRET_NAME` | Modal auth secret; default `pufferfs-endpoint-auth` |
-| `PUFFERFS_WORKER_SECRET_NAME` | Worker credentials; default `pufferfs-workers` |
-| `PUFFERFS_MODAL_WORKER_CLOUD` / `PUFFERFS_MODAL_WORKER_REGION` | Optional transform/index placement near database and object storage |
-| `PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` | CPU index pool limit; default 16 |
-| `PUFFERFS_INDEX_INPUTS_PER_CONTAINER` | Jobs per index container; 1–16, default 1 |
-| `PUFFERFS_INDEX_APP_NAME` / `PUFFERFS_INDEX_ENDPOINT_LABEL` | Explicit deployment names; default `pufferfs-index` / `pufferfs-file-index` |
+Run `python workers/runtime.py ingestion` or `python workers/runtime.py background`.
+Both require `DATABASE_URL`, `AWS_BUCKET_NAME`, `GEMINI_API_KEY` and
+`TURBOPUFFER_API_KEY`. Use the standard AWS credential chain (ECS task role in
+production). `PUFFERFS_WORKER_CONCURRENCY` is 1–64, default 4 file jobs per process.
+The background process independently runs provider collection and maintenance.
+There are no worker HTTP endpoints or SQS settings.
 
-Worker credentials include `DATABASE_URL`, S3 credentials/bucket, both SQS
-URLs, `GEMINI_API_KEY` and `TURBOPUFFER_API_KEY`. Include `AWS_SESSION_TOKEN`
-with temporary credentials. Endpoint auth contains
-`PUFFERFS_MODAL_ENDPOINT_AUTH_KEY`, equal to `MODAL_SECRET_KEY`.
-
-Vector-enabled roots use Turbopuffer native `qwen/qwen3-embedding-8b`, 4096
-float32 dimensions, configured in `modal/index_client.py`. Workers write text;
-Turbopuffer generates document vectors. The API queries `content` with `Embed`
-so query inference uses the namespace's model. No model-serving pool, local
-model download, vector cache or embedding hardware/batch settings remain.
-Vector-disabled roots omit `embed` and support FTS. Gemini document/media
-extraction remains separate.
+Turbopuffer provides embeddings internally. Vector-disabled roots support FTS.
+`PUFFERFS_EMBEDDING_BATCH_DOCUMENTS` bounds documents per embedding write
+(1–256, default 256). Lower values can improve admission under the provider's
+token quota; they increase request count and do not raise that quota. Full-text
+only writes retain their separate 512-document bound.
+Provider extraction settings and optional image fallback are documented below.
 
 ### Transactional email (AWS SES, optional)
 
@@ -216,34 +200,6 @@ The older `INVITE_EMAIL_FROM`, `INVITE_EMAIL_FROM_NAME`,
 `INVITE_EMAIL_REPLY_TO`, and `INVITE_EMAIL_APP_URL` variables remain accepted as
 compatibility aliases, but new deployments should use the transactional names.
 
-### Queue and process roles
-
-Both `PUFFERFS_SQS_TRANSFORM_QUEUE_URL` and
-`PUFFERFS_SQS_INDEX_QUEUE_URL` are required at API/consumer startup.
-
-`PUFFERFS_PROCESS=worker` starts a consumer; `PUFFERFS_WORKER_STAGE` selects
-`transform` or `index`. Each process accepts
-`PUFFERFS_WORKER_CONCURRENCY` (default 4, maximum 64). Pulumi defaults to
-16 concurrent jobs per consumer service.
-
-`PUFFERFS_TRANSFORM_INPUTS_PER_CONTAINER` controls simultaneous transformation
-requests inside one Modal container (1–16, default 1). The deployment workflow
-sets the transform consumer's slots to `PUFFERFS_TRANSFORM_MAX_CONTAINERS`
-times this input limit, rejecting totals above 64. Each invocation owns its AWS
-clients and temporary files; short database transactions share the worker pool.
-`PUFFERFS_INDEX_INPUTS_PER_CONTAINER` independently controls CPU index
-input concurrency. The workflow sets the index consumer's slots to
-`PUFFERFS_MODAL_INDEX_MAX_CONTAINERS` times this input limit, also capped at 64.
-These products size **one consumer replica per stage**. With additional consumer
-replicas, divide the aggregate admission budget between replicas; multiplying
-consumer replicas without adjusting slots also multiplies downstream admission.
-Concurrent index requests own their S3/search clients. Each synchronous worker
-retains a process-local work permit until execution and cleanup finish, even
-if an HTTP cancellation releases the Modal input first. Worker metrics record
-preparation, provider write, publication, database and source IO timings. These
-bounds control file work; Turbopuffer's model quota independently limits native
-inference across writes and queries.
-
 ### Billing (Stripe)
 
 | Variable | Meaning |
@@ -261,14 +217,13 @@ inference across writes and queries.
 | `POSTHOG_KEY` | PostHog project token used by the backend capture API. This can match `VITE_POSTHOG_KEY` when web and backend events should land in one PostHog project. |
 | `POSTHOG_HOST` | Optional PostHog ingestion host. Defaults to `https://us.i.posthog.com`. |
 
-### CLI release manifest (served by `GET /cli/version`)
+### CLI release manifest
 
-| Variable | Meaning |
-| --- | --- |
-| `PUFFERFS_CLI_LATEST_VERSION` | Latest advertised CLI version. |
-| `PUFFERFS_CLI_MIN_VERSION` | Minimum supported CLI version. |
-| `PUFFERFS_CLI_DOWNLOAD_BASE_URL` | Base URL for release archives. |
-| `PUFFERFS_CLI_SHA256_<PLATFORM>` | Per-platform archive checksum, e.g. `PUFFERFS_CLI_SHA256_DARWIN_ARM64`. |
+`GET /cli/version` redirects to `PUFFERFS_CLI_MANIFEST_URL`, default
+`https://pufferfs.com/releases/manifest.json`. The installer and CLI read that
+same manifest. `scripts/deploy/release-manifest.py` derives downloads and SHA-256
+checksums from release artifacts; `PUFFERFS_CLI_MIN_VERSION` is a deployment
+input, not API runtime state. Latest version is the selected release tag.
 
 ### Web app build-time variables
 
@@ -289,7 +244,6 @@ These are baked into the static web build (Vite), not read at runtime by Go:
   use `set -a; source .env; set +a` before commands that need Modal,
   Turbopuffer, AWS, or other service credentials. Never print or commit secret
   values; report variable names and presence only.
-- **SQS is required.** Missing queue configuration fails startup.
 - **Admin key**: prefer `PUFFERFS_ADMIN_KEY_HASH` over `PUFFERFS_ADMIN_KEY` so
   the plaintext key is never present in the environment.
 - For the production AWS/Pulumi deployment and which of these belong in Secrets
@@ -311,7 +265,7 @@ This can replace newer remote contents with local contents or register deletions
 for remotely present files missing locally. It does not merge concurrent edits.
 Subset force must select every path in the rejected batch to archive it.
 
-Archived conflicts retain their original journals and pack bytes, are not marked
+Archived conflicts retain their original journals and source bytes, are not marked
 accepted, and are not automatically deleted or retried. The CLI prints the
 archive location; successful JSON output includes `conflicts_retained` when
 nonzero. Authorization failures, generic 409s, server failures and lost responses
@@ -326,7 +280,7 @@ previewed without creating it. No generation state, local hash cache, proof
 update, source upload, or version registration is written. Pending capture
 journals are neither executed nor simulated; an actual sync resumes them first.
 Renames appear as add/remove operations. Counts describe live source changes,
-not exact upload bytes after append reuse/packing. Local files may change after
+not exact upload bytes for a later actual capture. Local files may change after
 the preview; the actual capture verifies and captures its own bytes.
 
 `sync status` and `sync status --watch` show a per-file summary
@@ -340,35 +294,29 @@ nor enqueue work. Root job IDs, `sync jobs`, `--background` and `--detach` are r
 
 Local pending/completed capture spools and per-file heads live beneath the root
 cache in `~/.tpfs/roots/`, separated by server and source-directory identity.
-Accepted pack bytes are removed only after upload/registration acceptance and
-durable installation of the per-file heads. Append reuse reads those heads'
-remote extent mappings, not old local packs. Up to 64 completed journal receipts
-are retained per cache. Pending/conflicted journals and their bytes are never
-evicted; incomplete directories with no published journal are discarded on the
-next sync under its exclusive lock. These were never submit-ready captures.
+Accepted source bytes are removed locally only after upload/registration acceptance
+and durable installation of per-file heads. New source bytes share packs of up
+to 32 MiB. Appends reuse verified remote prefixes and upload only the suffix.
+Rewrites and truncations capture new bytes. Up to 64 completed receipts
+are retained. Pending/conflicted journals are never evicted automatically.
 
-`PUFFERFS_CAPTURE_SPOOL_BYTES` bounds captured spool data per server/root/source
-cache (default 2 GiB, minimum 8 MiB). Pending, conflicted and completed metadata
-count toward available capacity; new captures reserve 4 MiB for their journal.
-Sync batches at most 128 files and closes a batch before the next whole file's
-new bytes would exceed the available budget. It submits that batch, releases
-accepted pack bytes, and continues. Verified remote prefixes used by appends
-do not consume spool space. If a single file's new bytes cannot fit in an empty
-batch, sync reports the required and available byte counts before copying it;
-raise the limit or resolve retained captures, then rerun sync. Earlier accepted
-files remain durable. Cleanup does not erase originals in
-S3 and never treats an upload error as acceptance. Head metadata scales with
-tracked paths; the limit is not a cap on all CLI disk usage.
+`PUFFERFS_CAPTURE_SPOOL_BYTES` bounds captured spool data (default 2 GiB, minimum
+8 MiB). Captures contain at most 128 files and reserve space for journal metadata.
+All new bytes for a file must fit the available spool budget; verified remote
+prefixes consume no spool space. If the new bytes do not fit, sync reports
+required/available bytes; raise the budget or resolve retained captures and retry.
+Earlier accepted captures remain durable. This is not a cap on all CLI metadata.
+Multipart upload resumes acknowledged parts after interrupted connections.
 
 ### Retained source-storage verification
 
-`modal/source_verify.py` supplies the separate source-integrity check. It is an
+`workers/source_verify.py` supplies the separate source-integrity check. It is an
 operator command, **not** a deployed Modal application or a queued processing
 job. From a Python environment with `boto3` and `psycopg[binary]` installed, use
 an explicitly selected database, bucket and root:
 
 ```bash
-python modal/source_verify.py --org-id ORG_ID --root-id ROOT_ID --bucket BUCKET
+python workers/source_verify.py --org-id ORG_ID --root-id ROOT_ID --bucket BUCKET
 ```
 
 It reads `DATABASE_URL` and AWS credentials from the environment; `--bucket`
@@ -387,15 +335,10 @@ the reconstructed source to EOF. Tombstones are reported without source reads.
 Missing manifests/packs, wrong bytes, invalid metadata and failed reads prevent
 a successful summary. It does not silently repair, recapture or delete anything.
 
-Metadata pages contain at most 64 versions. Short explicit read-only database
-transactions have a 15-second statement timeout; no database transaction is
-held while downloading S3 content. Pack downloads use 64 KiB buffers and a
-private temporary disk cache capped at 256 MiB, with a 128 MiB individual-pack
-limit matching the capture API. Files/versions sharing cached packs reuse their
-GETs. Eviction can require downloading a pack again; manifests are still read
-per version. Whole-pack downloads trade extra bytes for fewer per-extent calls.
-The report includes pack GET call counts (SDK retries can add requests),
-downloaded pack bytes and verified logical source bytes so that cost is visible.
+Metadata pages contain at most 64 versions. Short read-only database transactions
+have a 15-second statement timeout. Source ranges stream through bounded memory;
+there is no whole-object disk cache. The report includes GET and downloaded-byte
+counts, plus verified logical source bytes. No database transaction spans S3 IO.
 
 Output is JSONL: a record for each version followed by a summary. Exit zero
 requires the **final** summary's status to be `verified`, a nonempty inventory,
@@ -403,7 +346,7 @@ no source failures, and matching version counts/maximum sequence at the start
 and end. A concurrent capture invalidates that summary; a missing/deleting root
 or interrupted command cannot produce a success summary. SDK/connection errors
 are reported by exception type without their potentially sensitive messages.
-Temporary packs are removed on normal exit and handled errors. Protect any
+Protect any
 saved report: it contains paths, hashes and artifact locators, not file bodies.
 
 `--timeout` defaults to 900 seconds. It is checked between database operations
@@ -424,55 +367,32 @@ is no longer sufficient evidence that it represents the requested file version.
 
 ### Per-file index maintenance
 
-The scheduled `pufferfs-reconciliation` deployment now requires `AWS_BUCKET_NAME`,
-S3 read/write access to cleanup mutation artifacts, and `TURBOPUFFER_API_KEY`
-in addition to its existing database/SQS configuration. It shares the index
-worker's `TURBOPUFFER_REGION` / optional `TURBOPUFFER_API_URL` settings. The
-API and worker roles must run the same current schema and artifact contracts.
+The background worker performs bounded cleanup with database and S3 access plus
+the search provider key. It derives obsolete-row filters from the published
+version/extraction in Postgres and rechecks that head before acknowledging
+cleanup. No cleanup mutation files are written. Successful cleanups are checked
+again later, so late writes from expired attempts can be removed.
 
-For Python workers, use either a region with the default/`{region}`-templated
-provider URL, or a fixed `TURBOPUFFER_API_URL` with `TURBOPUFFER_REGION` unset.
-The SDK reads that environment variable even when the application omits the
-region argument and rejects it alongside a fixed URL. Compose resolves one
-explicit regional URL for both Go and Python and does not forward the region
-variable separately.
-
-After handoff recovery and bounded deleted-root cleanup, it selects at most
-1,000 published files and removes index rows below each published version/revision
-cutoff. New cleanup records share one S3 pack per organization/root in that sweep;
-existing records are replayed from their saved packs. Each referenced pack is read
-once per sweep, retaining only the selected files' records, not unrelated history.
-Metadata reservations, locator installation and success checkpoints use bulk
-updates. At most eight index requests run concurrently, without holding database
-connections. This reduces serial waiting and metadata round trips, not the number
-of per-file Turbopuffer delete requests.
-Success is rechecked after one day; partial/failed operations become eligible
-after five minutes. Backlog can extend these intervals. The role retains its
-180-second timeout and a 90-second soft budget for the entire per-file maintenance
-sweep. At the budget, it stops starting index requests, waits for started requests
-and checkpoints their successes; provider timeouts still bound individual network
-operations. No new queue or always-running service is introduced.
-This does not delete source
-packs, extracted chunks, vectors, or local capture spools for live roots.
+For Python workers, use a provider region with the default/templated URL, or a
+fixed `TURBOPUFFER_API_URL` with `TURBOPUFFER_REGION` unset. Compose resolves one
+explicit URL for both Go and Python.
 
 ### Root deletion recovery and retained sources
 
 Migration 034 records permanent root-deletion targets in Postgres before root
 or organization cascades discard their namespace identities. It also
 records targets when a root is marked `deleting_at`, so an interrupted delete
-remains recoverable. These are maintenance tombstones, not the SQS work queue.
+remains recoverable. These are maintenance tombstones, independent of the file work queue.
 Root IDs and organization ownership are immutable; deleted IDs cannot be reused.
 A newly created root with the same name/path receives a new ID as before.
 
-The same `pufferfs-reconciliation` deployment sweeps up to 25 due deletion targets
-per invocation, with a separate 30-second soft budget. Index deletion records
-are packed once in `maintenance/root-deletions/` in S3 and reused on retries.
+The background maintenance loop sweeps up to 25 due deletion targets
+per invocation, with a separate 30-second soft budget. Index delete requests are derived from durable Postgres cleanup targets.
 Each index delete filters the recorded namespace by the deleted `root_id`, never
 deleting another root's rows even if the namespace was subsequently remapped.
 Sources, extraction outputs and mutation prefixes are
 cleared in pages of up to 1,000 objects, followed by up to ten multipart aborts.
-Checks between requests stop further work after the soft deadline; the existing
-180-second deployment timeout remains the hard limit.
+Checks between requests stop further work after the soft deadline; individual provider timeouts bound in-flight requests.
 
 Partial/failed targets are eligible again in five minutes. Successful targets
 become eligible again after one day to catch late writes/uploads; backlog can
@@ -482,105 +402,15 @@ has finished. Root metadata left behind by a failed API delete still requires
 that API call to be retried; the sweeper handles external artifacts, not API
 response replay or final metadata deletion.
 
-The Modal reconciliation AWS principal additionally needs `s3:DeleteObject` and
-`s3:AbortMultipartUpload` on those exact root prefixes,
-`s3:ListBucket` and `s3:ListBucketMultipartUploads` on the bucket, and S3 get/put
-access to `maintenance/root-deletions/`. Pulumi does not provision the external
-Modal principal; its credentials/policy must be verified separately before
-deployment. No new permission is needed by the ECS consumers for this sweep.
+ECS task IAM authorizes reads/writes/deletes and multipart cleanup on the artifact
+bucket. No separate Modal CPU principal remains.
 
-Migration 039 adds source-pack provenance and reachability metadata; migration
-040 defers the source-object foreign-key check until both root-deletion cascade
-paths complete. The
-reconciler uses `PUFFERFS_SOURCE_RETENTION_SECONDS` (default 30 days, minimum
-60 seconds). Captured/indexed heads and nonterminal work pin their source
-versions. Only obsolete versions whose extraction/work lifetimes have ended
-and aged out retire. A pack remains whole while any retained version references
-any byte range in it; append reuse does not extend or copy those bytes.
-
-Unreferenced packs can retire only after their retention interval and every
-recorded upload authorization have expired. Actual signed URL deadlines are
-persisted before URLs are exposed. Capture registration and retirement share
-the root lock, and retired keys can never be reauthorized. Up to 100 versions
-and packs are considered per scheduled pass, with a 15-second loop budget;
-S3 objects are deleted in a batch, and exact-key abandoned multipart sessions
-are aborted. Failed/partial targets retry after five minutes; successful
-tombstones are checked daily for late writes. Individual network timeouts can
-extend the loop budget. Source manifests, version records and extent edges
-remain audit receipts. This is not physical erasure of noncurrent S3 versions;
-versioned-bucket lifecycle policy remains a deployment gate.
-
-New upload keys belong to their authenticated uploader. On first registration
-they are bound to one capture transaction; a later capture may reuse only ranges
-present in that same file's prior version. Neither a sibling's pack location nor
-an old capture ID authorizes grafting its bytes into another path. A definitive
-`source_pack_reupload_required` response lets the CLI replace upload identities using its
-unchanged local spool, capture ID and digests. Other errors never trigger that
-reset, and remote-only append extents cannot be silently replaced.
-
-Catalog acceptance rechecks current organization membership, role, API-key
-validity/scopes, root grants, group memberships and folder denies after the
-manifest write. It holds the root and the exact authorizing rows only until the
-short catalog transaction commits. A revocation that committed during upload
-therefore prevents catalog/proof acceptance; restoring access permits retry of
-the same captured bytes. Existing presigned upload URLs remain capabilities
-until their recorded expiry; this fence does not revoke a URL already issued or
-claim instantaneous revocation of unrelated read requests.
-
-Capture registration writes source extents in the same transaction as each
-version. There is no extent backfill, incomplete-catalog state, or old-manifest
-reader. Explicit root deletion erases that root's current objects and abandoned
-multipart uploads.
-
-Migration 038 tracks retired extraction artifacts. The scheduled reconciler
-uses `PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS` (default 30 days, minimum 60
-seconds). A version is protected while either captured or indexed; pending,
-running, failed, or provider-waiting work is protected regardless of age. Only
-terminal obsolete extractions whose extraction/work timestamps have aged out
-and whose referenced provider batches are terminal can retire. Cleanup targets
-only their exact `extractions/{org}/{root}/{extraction}/` and
-`mutations/{org}/{root}/{extraction}/` prefixes, including abandoned multipart
-uploads; it never sweeps source packs/manifests or shared index-cleanup cutoff
-artifacts. Each pass handles at most five extractions, one object page and ten
-multipart uploads per prefix, with a 15-second loop budget (individual network
-timeouts may extend it). Partial/error passes retry after five minutes;
-successful tombstones repeat daily for late writes. Metadata remains for audit,
-and root deletion takes over cleanup if the catalog is removed.
-
-Migration 047 drops `embedding_packs`. Stop old model-serving workers and remove
-their authorized S3 cache data before applying it. New immutable mutation packs
-contain text and metadata; retries can invoke native embedding again. Source
-and extraction/mutation retention remain independent of Turbopuffer storage.
-
-Migration 045 replaces the provider ledger without an emptiness gate, data
-conversion, or rolling compatibility path. The resulting schema keeps one `provider_batches`
-row per contiguous range of at most 64 inputs and removes the three per-input
-provider tables. Input mappings, result/retry state and upload cleanup outcomes
-live in immutable, checksummed S3 manifests under `maintenance/provider/`.
-Workers require S3 GetObject/PutObject access to that prefix. It deliberately
-survives root prefix erasure so external upload cleanup can finish afterward.
-
-Each batch embeds up to 64 page images or audio clips directly in one JSONL
-upload. The worker serializes one input at a time, capped at 20 MiB per input
-and 1900 MiB for the encoded JSONL. There are no separate media uploads or
-upload-concurrency setting. `PUFFERFS_COLLECTOR_WORKERS`
-is set when deploying the collector application (default 1, range 1–16). It
-controls both the maximum concurrent collector containers and the invocations
-started by the minute dispatcher. The value is embedded in the deployed image
-so the remote dispatcher's module import uses the same count as its container
-cap. GitHub deployments accept the matching environment variable. Collectors
-independently claim renewable leases. Each alternates provider collection, extraction assembly
-and cleanup during a nominal 50-second work window; a long operation may extend
-the invocation, within its 900-second timeout.
-
-Uncommitted preparation batches retry as a whole. Unrecorded temporary uploads
-may expire; committed manifests retain their exact upload IDs and returned
-expiry timestamps. Cleanup writes one S3 checkpoint for up to 65 uploads and
-one Postgres pointer update. An acknowledged deletion or provider 404 records
-`deleted_at` inside the checkpoint. A 403 does not prove deletion. Passing the
-recorded retention deadline records a distinct `expired_at`; no physical-erasure
-claim is implied. Generated batch-result files remain provider-managed.
-See [batch manifests, recovery, topology and bounded-call accounting](provider-batch-manifests.md).
+`PUFFERFS_SOURCE_RETENTION_SECONDS` and
+`PUFFERFS_OBSOLETE_ARTIFACT_RETENTION_SECONDS` default to 30 days (minimum 60
+seconds). Current captured/published versions, unfinished work and live provider
+submissions pin their sources. Historical shared objects remain until no
+retained version references them. Retention also removes legacy mutation
+artifacts, but new processing stores only canonical extraction chunks.
 
 ### Image extraction fallback
 
@@ -611,7 +441,7 @@ The default case corrupts two images at the upload network boundary; setting
 checks whole-batch fallback. This variable is used only by the E2E driver.
 
 Extraction registration assigns immutable sequences. Index artifacts must carry
-their exact extraction sequence. Retry replays the complete mutation artifact;
+their exact extraction sequence. Retry regenerates all text writes from canonical chunks;
 there is no partial-checkpoint or missing-sequence compatibility path.
 
 Migration 046 removes the retired generation-sync tables and root metadata,

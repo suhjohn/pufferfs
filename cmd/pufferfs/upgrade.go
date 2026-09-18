@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	defaultManifestURL = "https://api.pufferfs.com/cli/version"
+	defaultManifestURL = "https://pufferfs.com/releases/manifest.json"
 	updateCheckTTL     = 24 * time.Hour
 )
 

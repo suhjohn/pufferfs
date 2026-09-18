@@ -3,4 +3,4 @@ runtime:
   name: nodejs
   options:
     packagemanager: npm
-description: AWS infrastructure for PufferFS API, SQS queues, and transform/index consumers.
+description: AWS infrastructure for PufferFS API, ingestion workers, and background workers.

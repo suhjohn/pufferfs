@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -172,10 +171,6 @@ func (s *Server) handleRegisterFileVersions(w http.ResponseWriter, r *http.Reque
 	if id == nil {
 		return
 	}
-	if s.queue == nil {
-		writeJSON(w, 503, map[string]string{"error": "SQS processing is unavailable"})
-		return
-	}
 	var input models.CaptureVersionsRequest
 	if !decodeCaptureRequest(w, r, &input) {
 		return
@@ -259,16 +254,12 @@ func (s *Server) handleRegisterFileVersions(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, status, body)
 		return
 	}
-	// Acceptance is durable even if SQS is temporarily unavailable. The
-	// reconciliation role republishes the unmarked delivery ledger records.
+	// Work registration and capture acceptance are one database transaction.
 	// A proof-write failure is recoverable by retrying this same capture ID;
 	// never acknowledge it while the user's captured hashes are unrecorded.
 	if err = s.db.RecordCapturedProofs(r.Context(), id.OrgID, id.UserID, rootID, registered.versions); err != nil {
 		writeJSON(w, 500, map[string]string{"error": "captured proof persistence failed; retry the same capture"})
 		return
-	}
-	if err = s.publishFileWork(r.Context(), registered.deliveries); err != nil {
-		log.Printf("file capture accepted; SQS handoff needs reconciliation: %v", err)
 	}
 	writeJSON(w, http.StatusAccepted, models.CaptureVersionsResponse{CaptureID: input.CaptureID, Versions: registered.versions})
 }

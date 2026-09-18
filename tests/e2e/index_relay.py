@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import time
 import uuid
 from urllib.parse import urlsplit
 
@@ -29,8 +30,10 @@ if (parsed.scheme != "https" or not parsed.hostname.endswith(".turbopuffer.com")
         or parsed.username or parsed.password):
     raise ValueError("relay requires a fixed real Turbopuffer HTTPS origin")
 
-events = deque(maxlen=64)
+events = deque(maxlen=4096)
 fault = None
+deletions_paused = False
+deletions_gate = asyncio.Event()
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
                "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 
@@ -59,6 +62,19 @@ async def health():
 async def status(request: Request):
     control(request)
     return {"events": list(events)}
+
+
+@app.post("/deletions")
+async def deletion_control(request: Request):
+    global deletions_paused
+    control(request)
+    config = await request.json()
+    deletions_paused = config["paused"]
+    if deletions_paused:
+        deletions_gate.clear()
+    else:
+        deletions_gate.set()
+    return {"paused": deletions_paused}
 
 
 @app.post("/fault")
@@ -104,13 +120,6 @@ async def write(namespace: str, request: Request):
         if len(body) > 16 << 20:
             raise HTTPException(413)
     operation = "query" if request.url.path.endswith("/query") else "write"
-    selected = None
-    if fault is not None and fault["remaining"] and namespace in fault["namespaces"] and operation == fault["operation"]:
-        if fault["skip"]:
-            fault["skip"] -= 1
-        else:
-            selected = fault
-            selected["remaining"] -= 1
     encoding = request.headers.get("content-encoding", "identity").lower()
     if encoding == "gzip":
         with gzip.GzipFile(fileobj=io.BytesIO(body)) as compressed:
@@ -121,8 +130,18 @@ async def write(namespace: str, request: Request):
         payload = body
     else:
         raise HTTPException(415, "unsupported index request compression")
+    is_deletion = operation == "write" and "delete_by_filter" in json.loads(payload)
+    selected = None
+    if not is_deletion:
+        if fault is not None and fault["remaining"] and namespace in fault["namespaces"] and operation == fault["operation"]:
+            if fault["skip"]:
+                fault["skip"] -= 1
+            else:
+                selected = fault
+                selected["remaining"] -= 1
     event = {"id": uuid.uuid4().hex, "namespace": namespace,
-             "operation": operation,
+             "operation": "delete" if is_deletion else operation,
+             "upsert_count": len(json.loads(payload).get("upsert_rows", [])),
              "wire_sha256": hashlib.sha256(body).hexdigest(),
              "payload_sha256": hashlib.sha256(payload).hexdigest(), "encoding": encoding,
              "gzip_mtime": int.from_bytes(body[4:8], "little") if encoding == "gzip" else None,
@@ -139,6 +158,8 @@ async def write(namespace: str, request: Request):
     events.append(event)
     del payload
     try:
+        if is_deletion and deletions_paused:
+            await asyncio.wait_for(deletions_gate.wait(), timeout=1200)
         if selected and selected["mode"] == "hold_request":
             event["state"] = "request_held"
             await asyncio.wait_for(selected["gate"].wait(), timeout=1200)
@@ -146,9 +167,16 @@ async def write(namespace: str, request: Request):
         # those bytes if its caller has since crashed, modeling an in-flight
         # write that cancellation cannot retract from an intermediate service.
         headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_HEADERS}
+        event["upstream_started_at"] = time.time()
+        started = time.monotonic()
         response = await app.state.client.post(UPSTREAM + request.url.path,
                                                content=bytes(body), headers=headers)
         event["upstream_status"] = response.status_code
+        event["upstream_seconds"] = round(time.monotonic() - started, 6)
+        event["rate_limit_headers"] = {k: v for k, v in response.headers.items() if k.lower() == "retry-after" or "ratelimit" in k.lower()}
+        if operation == "write" and response.status_code == 200:
+            result = response.json()
+            event["response_metadata"] = {key: result[key] for key in ("billing", "performance") if key in result}
         if operation == "query" and response.status_code == 200:
             rows = response.json().get("rows", [])
             event["response_rows"] = len(rows)

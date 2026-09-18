@@ -1,359 +1,132 @@
-# PufferFS Architecture and Functionality
+# Architecture and functionality
 
-PufferFS runs an API server, two queue consumers, transformation workers,
-a collector dispatcher and collectors, a CPU index worker, and a reconciler.
-They share a repository and deploy independently. Modal hosts CPU workers;
-ECS hosts the API and consumers. Turbopuffer generates document and query
-embeddings with `qwen/qwen3-embedding-8b`, 4096 float32 dimensions.
+This describes the simplified code in this checkout. Production remains on the
+v0.8.2 topology until the coordinated deployment in
+[production-deployment.md](production-deployment.md). Verification is recorded in
+[simplification-implementation.md](simplification-implementation.md).
 
 ## Deployment topology
 
-The web console's static assets are served by S3 and CloudFront. The browser
-and CLI call the API through an AWS application load balancer (ALB).
+One repository builds a Go API image, a Python worker image, a CLI, and a static
+web app. The worker image runs as two separately deployable ECS/Fargate services.
+Each service may have multiple replicas; threads within a worker process share a
+bounded database pool. External providers below are black boxes.
 
 ```text
-[Browser] <-- static assets -- [Web console: S3 + CloudFront]
-    |
-    | API requests                 [CLI / local agent]
-    |                                  |         |
-    v                                  |         | source packs
-[API: ECS behind ALB] <---- requests ---+         v
-    |          |                           [S3: originals + artifacts]
-    |          +-- catalog / access --> [DB: Postgres]
-    |
-    | enqueue work IDs
-    v
-[TQ: Transform SQS FIFO + DLQ]
-    | receive messages
-    v
-[Transform consumer: ECS]
-    | authenticated HTTP
-    v
-[Transformation worker: Modal CPU] <-- captured sources -- [S3]
-    |                           |
-    | inline-media JSONL        | native extraction ready: work IDs
-    v                           |
-[Gemini Batch API]              |
-    ^                           |
-    | poll status/results       |
-    v                           |
-[Collector: Modal CPU]          |
-    ^       |                   |
-    | spawn | failed PNGs       |
-    |       v                   |
-    |   [DeepSeek V4.1 Flash]    |
-    |    Modal shared endpoint  |
-    |       | recovered text    |
-    |       +--> Collector      |
-    |                           |
-[Collector dispatcher]          |
- Modal, every minute            |
-                                |
-[Collector] -- ready work IDs --+--> [IQ: Index SQS FIFO + DLQ]
-                                    | receive messages
-                                    v
-                                [Index consumer: ECS]
-                                    | authenticated HTTP
-                                    v
-                                [Index worker: Modal CPU]
-                                    | text + metadata
-                                    v
-[API] -- authorized search/read --> [Turbopuffer]
-                                    - full-text index
-                                    - native Qwen embeddings
-                                    - vector index
+ USER COMPUTER                         AWS / HOSTED BACKEND
+ +------------------+                  +-------------------+
+ | CLI / local agent|--capture/status-->| API server        |
+ | journal + watcher|--search/read----->| auth + catalog    |
+ +--------+---------+                  +---+------+--------+
+          | signed source upload           |      | authorized search/read
+          v                                v      v
+ +------------------+              +------------+  +----------------------+
+ | S3               |              | Postgres   |  | Turbopuffer          |
+ | originals        |              | catalog   |  | search + embeddings  |
+ | canonical chunks |              | file_work |  | [external black box] |
+ +---+----------+---+              | leases     |  +----------^-----------+
+     |          ^                 +--+------+--+             |
+     | read     | chunks              |      |               | write text
+     v          |             claim   |      | claim         |
+ +--------------+------+ <------------+      +--> +----------+-----------+
+ | Ingestion worker    |                         | Background worker    |
+ | extract / submit    |--advance file_work------>| publish / collect    |
+ +----------+----------+       (Postgres)         | cleanup              |
+            |                                    +-----+------+---------+
+            | submit                                   |      |
+            v                                          |      +--publish head--> Postgres
+ +-----------------------+ <------poll results---------+
+ | Gemini                |                             |
+ | [external black box]  |                             +--fallback image request--+
+ +-----------------------+                                                        v
+                                                        +--------------------------+
+                                                        | Vision endpoint on Modal |
+                                                        | [external black box]     |
+                                                        +--------------------------+
 
-[Reconciler: Modal CPU, every minute]
-    |-- repair work delivery ------------> TQ / IQ
-    |-- remove obsolete data ------------> S3 / Turbopuffer
-    +-- record recovery/cleanup progress -> DB
-
-Transformation / Collector / Index workers:
-    |-- source, chunks, manifests, mutations <--> S3
-    +-- leases, work state, publication      <--> DB
+ Background worker --bounded cleanup--> S3 / Turbopuffer / provider uploads
+ Web console --------authenticated HTTP------------------> API server
+ Installer / CLI ----release manifest + archives---------> S3 / CloudFront
 ```
 
-Repeated labels refer to the same role or store. DLQ means dead-letter queue:
-messages whose delivery attempts are exhausted.
-
-| Role | Hosting / trigger | Input → output / handoff |
+| Role | Hosting and trigger | Consumes → produces → handoff |
 | --- | --- | --- |
-| Web console | Static S3/CloudFront assets; browser interaction | User actions → authenticated API requests |
-| Local agent | User machine; sync/watch | Files → S3 packs and API version registration |
-| API server | ECS; authenticated HTTP | Capture metadata → Postgres and transform SQS; queries → Turbopuffer |
-| Transform consumer | ECS; polls transform SQS | Receipts → bounded worker HTTP calls; renews visibility and acknowledges durable results |
-| Transform worker | Modal CPU; HTTP | S3 originals → native chunks or Gemini batches; ready extractions → index SQS |
-| Collector dispatcher | Modal CPU; minute schedule | Configured count → spawned collector invocations |
-| Collectors | Modal CPU; dispatcher | Leased Gemini work and optional DeepSeek image recovery → S3 text, durable batch state, index SQS and provider cleanup |
-| Index consumer | ECS; polls index SQS | Receipts → one authenticated index endpoint |
-| Index worker | Modal CPU; HTTP | S3 chunks → durable text mutations → Turbopuffer → Postgres publication |
-| Reconciler | Modal CPU; minute schedule | Durable records → repaired delivery and source/artifact/index cleanup |
+| API server | ECS, HTTP requests | Authenticated capture → version and work in one Postgres transaction; authorized read/search → provider results filtered by published catalog |
+| Ingestion worker | ECS, claims due `transform` work from Postgres | Original S3 source → canonical chunks or provider submission; advances the same work row or waits for provider results |
+| Background worker | ECS, claims due `index` work; independent collection and maintenance loops | Chunks → text writes → published catalog head; provider results → chunks; durable cleanup targets → bounded deletions |
+| Local agent | User computer, explicit sync or filesystem events | Stable file bytes → immutable upload and durable capture journal → API registration |
+| Web console | Static S3/CloudFront app, browser interaction | User actions → API calls |
 
-ECS starts the consumers; they receive SQS receipts and invoke HTTP workers.
-Workers claim a Postgres lease before processing. Modal starts/scales worker
-containers and invokes scheduled functions. The collector dispatcher starts
-collectors explicitly. Four Modal applications contain these CPU roles:
-`transform_app`, `collector_app`, `index_app`, `reconciliation_app`.
-DeepSeek is a separate managed inference endpoint. The production collector has
-its optional image fallback configured; see the [rollout and validation record](inline-media-and-vision-fallback.md).
+**The queue is the Postgres `file_work` table.** Capture registration enqueues
+work atomically. Workers claim due rows with `FOR UPDATE SKIP LOCKED`, which
+lets concurrent workers take different jobs without waiting on each other.
+ECS starts worker containers; no consumer starts a worker over HTTP. The normal
+lease is five minutes, renewed every minute. A lease is temporary ownership of
+a job; expired ownership lets another process retry it. Attempts are bounded
+and failures are visible through file status and CloudWatch summaries.
 
-## Durable publication
-
-Postgres retains tenants, permissions, source references, file/version/extraction
-identities, work leases, provider-batch coordination, namespace routing and cleanup
-records. It is not the work queue. SQS carries bounded IDs, not source bodies.
-
-S3 retains original packs, source manifests, ordered extracted text, provider
-manifests and replayable text mutations. Rendered pages and converted media are
-temporary. Embedding vectors live in Turbopuffer; there is no local vector cache.
-
-Index rows have stable extraction-specific IDs. The index worker persists each
-mutation artifact before writing, then publishes the catalog head only after
-all writes succeed. An interrupted attempt replays its durable text; native
-inference may run again. Search validates candidates against published catalog
-heads; reads pin one publication across pages. Late/stale writes are hidden and
-removed by recurring cleanup. Root deletion leaves permanent cleanup identities.
-
-Vector-enabled schemas embed `content` into `vector`. Queries use
-`["content", "ANN", ["Embed", query]]`; hybrid mode retains ANN/BM25 fusion.
-Vector-disabled roots omit native embedding, using the same CPU worker and FTS.
-The API no longer calls an embedding service or holds query vectors. Namespace
-fan-out and publication retries can issue multiple native inference requests.
+The background deployment has separate execution capacity for publication,
+provider collection and cleanup. A provider poll does not occupy a publication
+slot. There is no SQS queue, Go delivery consumer, Modal CPU app, worker HTTP
+endpoint, embedding service, or saved index mutation file.
 
 ## Workflows
 
-### 1. Capture / initial sync
+### Capture and publication
 
 ```text
-Local files
-    |
-    v
-CLI: select files, detect changes, journal the capture
-    |
-    +-- immutable source packs ----------------------> S3
-    |
-    +-- capture metadata --> API: validate access and source references
-                                |
-                                +-- register versions/work --> Postgres
-                                +-- enqueue IDs ------------> Transform SQS
-                                +-- accepted response ------> CLI
+local change
+  --> verify prior prefix for append reuse
+  --> combine new source bytes into immutable journaled packs (up to 32 MiB)
+  --> signed S3 PUT or resumable multipart upload
+  --> API atomically registers version + extraction + one work row
+  --> ingestion claims work and extracts text / submits provider request
+  --> canonical chunks saved to S3
+  --> same work row advances to publication
+  --> background worker writes text to Turbopuffer [black box]
+  --> all writes succeed and lease/version are still current
+  --> publish catalog head in Postgres
+  --> search/read expose the file
 ```
 
-Acceptance means the source is durably captured. `sync wait` waits separately
-for extraction and searchable publication.
+Small files share source packs to reduce upload requests. Appends reuse the
+previous remote byte ranges only after hashing and verifying the local prefix;
+only the new suffix is uploaded. Rewrites and truncations capture new bytes.
+Multipart upload and local journals preserve crash recovery.
 
-### 2. Extraction and model fallback
+### Provider extraction and fallback
 
 ```text
-Transform SQS --> ECS consumer --> Transformation worker
-                                      |
-                                      +-- claim work --> Postgres
-                                      +-- read/verify source --> S3
-                                      |
-                  +-------------------+---------------------+
-                  |                                         |
-          Native/structured formats                 Documents/images/media
-                  |                                         |
-          Extract text/cells/records                Prepare PNGs/audio clips
-                  |                                         |
-                  |                                  Inline bytes in JSONL
-                  |                                         |
-                  |                                    Gemini Batch
-                  |                                         |
-                  |                        Dispatcher --> Collector polls
-                  |                                         |
-                  |                         +---------------+--------------+
-                  |                         |                              |
-                  |                  Successful items              Failed image items
-                  |                         |                              |
-                  |                         |                      DeepSeek on Modal
-                  |                         |                              |
-                  +-------------------------+------------------------------+
-                                            |
-                                  Persist/assemble ordered text in S3
-                                            |
-                                  Record ready work; enqueue Index SQS
+provider submission [black box]
+  --> persist submission identity and request metadata
+  --> background collection polls results
+  --> validate and save successful results
+  --> retry missing/retryable items
+  --> terminal image failure with fallback configured
+      --> vision endpoint [black box] --> validated text
+  --> assemble ordered chunks --> ordinary publication
 ```
 
-Audio/video use audio clips; video visuals are not indexed. Gemini jobs that
-are still running are polled later. Audio and remaining failures use the
-existing Gemini retry path. DeepSeek runs only after terminal image failures.
-Status/output retrieval failures and ambiguous submissions do not trigger it.
-
-### 3. Indexing and publication
+### Search and read
 
 ```text
-Index SQS --> ECS consumer --> Index worker
-                                 |
-                                 +-- claim work ----------------> Postgres
-                                 +-- read extracted chunks -----> S3
-                                 +-- save replayable mutations -> S3
-                                 |
-                                 v
-                         Turbopuffer: text + metadata
-                                 |
-                         Generate native Qwen embeddings
-                         when vector indexing is enabled
-                                 |
-                         All index writes succeed
-                                 |
-                                 v
-                         Publish catalog head in Postgres
-                                 |
-                         File becomes searchable/readable
+CLI / web --> API authenticates and resolves permitted roots
+          --> Turbopuffer [black box], one namespace per root
+          --> enforce published version + per-path access
+          --> return ranked results / requested lines or pages
 ```
 
-### 4. Search
+### Update, deletion and recovery
 
 ```text
-CLI / web: query --> API: authenticate and resolve permitted roots
-                         |
-              +----------+-----------+
-              |          |           |
-          Full-text    Vector      Hybrid
-              |          |           |
-              |          +-----------+--> Turbopuffer embeds query text
-              |                      |
-              +----------------------+--> Turbopuffer searches its indexes
-                                              |
-                                              v
-                                  API checks path permissions and
-                                  published catalog heads in Postgres
-                                              |
-                                  Rank/merge authorized current results
-                                              |
-                                              v
-                                          CLI / web
+update --> new version --> ordinary capture/publication
+                       --> prior publication stays visible until replacement succeeds
+file delete --> durable tombstone --> delete index rows --> publish tombstone
+root delete --> persist cleanup targets --> remove root --> repeat bounded cleanup
+worker crash --> lease expires --> reclaim same work --> regenerate writes from chunks
+late/stale write --> cannot publish newer head --> cleanup removes obsolete rows
 ```
 
-### 5. Read a file / page / line range
-
-```text
-CLI / web: read path + range
-    |
-    v
-API: authenticate; check root and path access
-    |
-    v
-Postgres: pin the file's published extraction
-    |
-    v
-Turbopuffer: retrieve ordered rows for that extraction
-    |
-    v
-API: assemble requested content and locations
-    |
-    v
-Return the requested published text/pages/rows
-```
-
-Reads return extracted content. Retained original source packs are a separate
-storage/authorization path.
-
-### 6. Continuous sync and updates
-
-```text
-sync --follow / local service
-    |
-    v
-Observe filesystem changes; debounce
-    |
-    v
-Capture new file versions through the same CLI/API workflow
-    |
-    v
-Transform --> Index --> Publish replacement
-                          |
-                          +--> New content becomes visible
-                          +--> Old extraction becomes eligible for cleanup
-
-Interrupted local capture --> resume its persisted journal
-Unchanged files -----------> no replacement processing
-```
-
-The previous publication remains readable while a replacement is pending.
-Captured deletions are hidden immediately instead of waiting for indexing.
-
-### 7. Delete and retain/clean data
-
-```text
-File deletion in sync / root deletion through API
-    |
-    v
-Postgres: record deletion; public retrieval hides it
-    |
-    +--> In-flight work loses publication authority
-    |
-    v
-Scheduled reconciler
-    +--> delete stale index rows from Turbopuffer
-    +--> remove eligible S3 sources/artifacts under retention policy
-    +--> keep durable cleanup identities for late writes
-
-Collector --> finish/cancel obsolete provider work
-          --> clean tracked Gemini input uploads
-```
-
-Cleanup is asynchronous. Provider-generated result files have provider-managed
-retention; deleting a root does not establish their immediate physical erasure.
-
-### 8. Failure and restart recovery
-
-```text
-Worker crashes / request response is lost
-    |
-    v
-SQS redelivery or Postgres ownership lease expires
-    |
-    v
-Another worker claims the same durable work
-    |
-    +--> provider job recorded? --> resume/discover the original job
-    +--> results recorded? -----> preserve successful items
-    +--> index mutation saved? -> replay the saved text mutation
-    |
-    v
-Publish only if the file version and work ownership are still current
-
-Missed queue send --> Reconciler --> enqueue committed work again
-Stale late write --> hidden from retrieval --> scheduled cleanup
-Exhausted SQS delivery attempts --> dead-letter queue
-```
-
-A lease is time-limited ownership of work. Retries can repeat provider inference
-before a durable result is published; billing is not exactly once.
-
-### 9. Access control
-
-```text
-Authenticated session / API key
-    |
-    v
-API resolves identity and required operation scope
-    |
-    v
-Check organization membership, role and root grants
-    |
-    v
-Apply path/folder restrictions
-    |
-    +-- allowed --> perform operation on authorized data
-    +-- denied ---> reject or hide inaccessible data
-
-Capture commit --> revalidate authority before publishing captured metadata
-```
-
-## Operations and verification
-
-[Deployment](production-deployment.md) describes the clean cutover from the
-retired Nomic stack. Old supplied-vector mutation artifacts cannot replay in the
-new worker. Migration 047 drops the old embedding pack directory after old
-writers and authorized cache objects have been retired.
-
-Compose runs the same production entrypoints as separate processes with real
-Postgres, LocalStack S3/SQS and real Gemini/Turbopuffer providers. Cloud E2E adds
-real AWS and Modal CPU execution. Read the [E2E record](../tests/e2e/README.md)
-for actual results and differences from production.
-
-See [formats](file-ingestion-and-chunking.md), [API](api-reference.md),
-[configuration](configuration.md) and [security](security-and-data-handling.md).
+Postgres publication is still necessary: external writes can succeed partially,
+and a newer version may arrive during a write. Native embeddings remove model
+orchestration, but do not make the catalog and provider one transaction.

@@ -1,7 +1,7 @@
 """Black-box scenarios. All application writes go through the CLI or HTTP API.
 
-SQL and S3 reads inspect actual durable effects. The duplicate-delivery scenario
-uses SQS's public API; it never invokes worker processing directly or mutates its DB state.
+SQL and S3 reads inspect actual durable effects. Tests never invoke worker
+processing directly or mutate database state.
 """
 
 import base64
@@ -33,7 +33,6 @@ STATE = Path("/state/run.json")
 REPORT = Path("/artifacts/results.jsonl")
 TIMEOUT = int(os.environ.get("PUFFERFS_E2E_TIMEOUT_SECONDS", "3600"))
 s3 = boto3.client("s3")
-sqs = boto3.client("sqs")
 
 
 def request(method, path, payload=None, *, key=None, statuses=(200,), server=None, cookie=None, with_status=False):
@@ -88,7 +87,7 @@ def assert_index_vectors(state, root, *, dimensions):
             key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"],
             statuses=(200, 404), with_status=True)
         if status == 404:
-            continue  # Empty allocated shards need not exist; the total below must still match.
+            continue  # Empty allocated namespaces need not exist; the total below must still match.
         schema = metadata["schema"]
         if dimensions is None:
             assert not schema["content"].get("embed") and "vector" not in schema
@@ -215,9 +214,10 @@ def multipart_recovery():
         directory.mkdir()
         path = directory / "recovery.txt"
         # An exact production-sized 32 MiB pack with two 16 MiB parts.
+        source_bytes = 32 << 20
         line = b"Captured orchid observatory log.".ljust(63, b" ") + b"\n"
         with path.open("wb") as output:
-            for _ in range(512):
+            for _ in range(source_bytes // (len(line) * 1024)):
                 output.write(line * 1024)
         with path.open("rb") as source:
             expected = "sha256:" + hashlib.file_digest(source, "sha256").hexdigest()
@@ -315,7 +315,7 @@ def multipart_recovery():
         original = versions[0]
         assert original["capture_id"] == journal["request"]["capture_id"] and original["content_hash"] == expected
         manifest = object_json(original["source_manifest_ref"])
-        assert manifest["size"] == 32 << 20 and manifest["content_hash"] == expected
+        assert manifest["size"] == source_bytes and manifest["content_hash"] == expected
         digest = hashlib.sha256()
         for extent in manifest["extents"]:
             start, length = extent["offset"], extent["length"]
@@ -326,6 +326,8 @@ def multipart_recovery():
         completed = next(p for p in Path("/root/.tpfs/roots", root).glob("file-capture-*/completed/*/journal.json")
                          if json.loads(p.read_text())["request"]["capture_id"] == original["capture_id"])
         recovered = json.loads(completed.read_text())["packs"][0]
+        if mode == "active":
+            assert len(recovered["multipart"]["parts"]) == source_bytes // (16 << 20)
         if mode == "expired":
             assert recovered["object_key"] != pack["object_key"]
             assert recovered["multipart"]["request_id"] != upload["request_id"]
@@ -371,108 +373,25 @@ def capture():
     cli(state, "sync", str(directory), "--id", state["root"], "--no-vector")
     files = catalog(state)
     assert set(files) == set(state["files"]), "CLI captured wrong paths or missed catalog pagination"
-    assert all(not file["indexed_version_id"] for file in files.values()), "consumers must be stopped during capture"
+    assert all(not file["indexed_version_id"] for file in files.values()), "workers must be stopped during capture"
     state["before"] = files
     save(state)
-    # Catalog/state is real even though neither execution consumer is running.
+    # Catalog/state is real even though execution workers are stopped.
     result = request("POST", "/query", {"query": "Orchid", "root_id": state["root"], "mode": "fts", "top_k": 10}, key=state["key"])
     assert not result.get("results"), "unindexed capture was visible"
-    pending = sqs.get_queue_attributes(QueueUrl=os.environ["PUFFERFS_SQS_TRANSFORM_QUEUE_URL"],
-                                      AttributeNames=["ApproximateNumberOfMessages"])
-    assert int(pending["Attributes"]["ApproximateNumberOfMessages"]) > 0
+    pending = work_rows(state["root"])
+    assert len(pending) == len(files) and all(row["status"] == "pending" for row in pending)
     assert sql("SELECT count(*) n FROM source_multipart_uploads")[0]["n"] > 0, "large source did not use multipart"
-    print(f"Captured {len(files)} synthetic files across 100 directories without any execution consumer.")
+    print(f"Captured {len(files)} synthetic files across 100 directories with execution workers stopped.")
 
 
 def work_rows(root, stage="transform"):
-    return sql("""SELECT w.id,w.stage,w.status,w.enqueued_at,w.attempt_count,w.extraction_id,
+    return sql("""SELECT w.id,w.stage,w.status,w.next_attempt_at,w.attempt_count,w.extraction_id,
         e.status extraction_status,e.chunks_ref,e.chunk_count,
         v.id version_id,f.id file_id,f.path,f.indexed_version_id,f.root_id,r.org_id FROM file_work w
         JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
         JOIN file_catalog f ON f.id=v.file_id JOIN roots r ON r.id=f.root_id
         WHERE f.root_id=%s AND w.stage=%s ORDER BY w.id""", (root, stage))
-
-
-def handoff_outage():
-    state = json.loads(STATE.read_text()) if STATE.exists() else provision()
-    directory = Path("/state/handoff-" + uuid.uuid4().hex[:8])
-    directory.mkdir()
-    for i in range(12):  # More than one SQS SendMessageBatch, all real file captures.
-        (directory / f"file-{i:02}.txt").write_text(f"Recoverable orchid telemetry {i}.\n")
-    state["handoff_root"] = new_root(state, directory.name, directory, True)
-    state["handoff_directory"] = str(directory)
-    save(state)
-    # The collector and execution consumers are stopped for this scenario.
-    # No cleanup targets/indexed files exist before the recovery role starts.
-    assert not sql("SELECT id FROM file_catalog WHERE indexed_version_id IS NOT NULL LIMIT 1")
-    assert not sql("SELECT root_id FROM root_cleanup_targets LIMIT 1")
-    fault("POST", "/proxies/queue-delivery", {"enabled": False})
-    cli(state, "sync", str(directory), "--id", state["handoff_root"], "--no-vector")
-    work = work_rows(state["handoff_root"])
-    assert len(work) == 12 and all(w["status"] == "pending" and w["enqueued_at"] is None and
-                                  w["attempt_count"] == 0 for w in work)
-    files = catalog(state, state["handoff_root"])
-    assert len(files) == 12 and all(not f["indexed_version_id"] for f in files.values())
-    state["handoff_work_ids"] = [w["id"] for w in work]
-    save(state)
-    print("CLI accepted all 12 captured versions while SQS delivery was disconnected.")
-
-
-def handoff_recovered():
-    state = json.loads(STATE.read_text())
-    expected = set(state["handoff_work_ids"])
-    assert all(w["enqueued_at"] is None for w in work_rows(state["handoff_root"]))
-    fault("POST", "/proxies/queue-delivery", {"enabled": True})
-    # No CLI registration retry or API call sends these jobs. Only the actual
-    # independently scheduled reconciliation container can repair the handoff.
-    def repaired():
-        work = work_rows(state["handoff_root"])
-        return work if work and all(w["enqueued_at"] is not None for w in work) else None
-    work = eventually("scheduled reconciliation to deliver the committed captures", repaired, 150)
-    assert {w["id"] for w in work} == expected
-    assert all(w["status"] == "pending" and w["attempt_count"] == 0 for w in work), "reconciliation executed work"
-    inspect_sqs_deliveries(work, "transform")
-    print("Scheduled reconciliation delivered all 12 original work IDs in small SQS messages; none executed.")
-
-
-def sqs_group_id(row):
-    identity = row["file_id"] if row["stage"] == "index" else row["id"]
-    return hashlib.sha256("".join(value + "\0" for value in
-        (row["org_id"], row["root_id"], identity, row["stage"])).encode()).hexdigest()
-
-
-def inspect_sqs_deliveries(work, stage):
-    expected = {w["id"] for w in work}
-    received, receipts = {}, []
-    url = os.environ[f"PUFFERFS_SQS_{stage.upper()}_QUEUE_URL"]
-    try:
-        for _ in range((len(expected) + 9) // 10 + 10):
-            messages = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=10, WaitTimeSeconds=1,
-                                          MessageSystemAttributeNames=["MessageGroupId"],
-                                          VisibilityTimeout=60).get("Messages", [])
-            for message in messages:
-                receipts.append(message["ReceiptHandle"])
-                body = json.loads(message["Body"])
-                if body.get("work_id") in expected:
-                    received[body["work_id"]] = message
-            if set(received) == expected:
-                break
-        assert set(received) == expected, "ledger acknowledgement has no matching SQS delivery"
-        for row in work:
-            message = received[row["id"]]
-            body = json.loads(message["Body"])
-            assert message["Attributes"]["MessageGroupId"] == sqs_group_id(row)
-            assert len(json.dumps(body).encode()) < 1024
-            assert body == {**{k: row[k] for k in ("org_id", "root_id", "file_id", "version_id", "extraction_id")},
-                            "job_id": row["id"], "work_id": row["id"], "stage": stage}, \
-                f"{stage} delivery has unexpected fields or references: {sorted(body)}"
-        sizes = [len(message["Body"].encode()) for message in received.values()]
-        print(f"Inspected {len(received)} {stage} deliveries: 8 fields, {min(sizes)}–{max(sizes)} body bytes.")
-    finally:
-        # Inspection must not consume the work. Actual workers still receive it
-        # later; the read increases SQS receive count but not DB attempt count.
-        for receipt in receipts:
-            sqs.change_message_visibility(QueueUrl=url, ReceiptHandle=receipt, VisibilityTimeout=0)
 
 
 def native_capture():
@@ -486,7 +405,7 @@ def native_capture():
     cli(state, "sync", str(directory), "--id", state["native_root"], "--no-vector")
     assert set(catalog(state, state["native_root"])) == set(state["native_files"])
     assert not sql("SELECT id FROM provider_batches LIMIT 1")
-    inspect_sqs_deliveries(work_rows(state["native_root"]), "transform")
+    assert all(row["status"] == "pending" for row in work_rows(state["native_root"]))
     # No generation pipeline can accept uploads or create background root jobs.
     for endpoint in ("upload", "upload-bundle", "upload/multipart/init", "sync", "sync/init"):
         req = urllib.request.Request(API + f"/roots/{state['native_root']}/{endpoint}",
@@ -507,18 +426,18 @@ def native_capture():
     identity = json.loads(current.stdout)
     assert identity["id"] == state["native_root"]
     assert identity["name"] == request("GET", f"/roots/{state['native_root']}", key=state["key"])["name"]
-    print(f"Captured {len(state['native_files'])} native-format fixtures with execution consumers stopped; retired endpoints absent, root identity persisted.")
+    print(f"Captured {len(state['native_files'])} native-format fixtures with execution workers stopped; retired endpoints absent, root identity persisted.")
 
 
 def native_transformed():
     state = json.loads(STATE.read_text())
     root, directory = state["native_root"], Path(state["native_directory"])
     def ready():
-        rows = work_rows(root)
+        rows = work_rows(root, "index")
         return rows if len(rows) == len(state["native_files"]) and all(
-            r["status"] == "complete" and r["extraction_status"] == "complete" for r in rows) else None
-    rows = eventually("native files to become durable chunks through the SQS consumer", ready, 180)
-    assert all(r["attempt_count"] == 1 and not r["indexed_version_id"] for r in rows)
+            r["status"] == "pending" and r["extraction_status"] == "complete" for r in rows) else None
+    rows = eventually("native files to become durable chunks through the ingestion worker", ready, 180)
+    assert all(r["attempt_count"] == 0 and not r["indexed_version_id"] for r in rows)
     signatures = {}
     total_chunks = 0
     for row in rows:
@@ -555,18 +474,9 @@ def native_transformed():
             assert "Orchid" in "".join(c["content"] for c in records), path
             assert all(c["location"]["record_number"] == 0 for c in records), path
     assert signatures["records.jsonl"] == signatures["sessions/rollout.jsonl"], "filename changed generic JSONL behavior"
-    def delivered():
-        work = work_rows(root, "index")
-        return work if len(work) == len(rows) and all(w["enqueued_at"] is not None for w in work) else None
-    index_work = eventually("native extraction's durable index handoff", delivered, 60)
-    assert all(w["status"] == "pending" and w["attempt_count"] == 0 for w in index_work)
-    inspect_sqs_deliveries(index_work, "index")
     assert not sql("SELECT id FROM provider_batches LIMIT 1"), "native input submitted Gemini work"
-    assert not s3.list_objects_v2(Bucket=BUCKET, Prefix="embeddings/").get("Contents"), "transformation stored vectors"
-    assert not sql("SELECT id FROM file_work WHERE mutation_ref<>'' LIMIT 1"), "transformation created index mutations"
-    # Also drain the preceding handoff-recovery root before stopping this role.
-    wait_queue_empty("transform")
-    print(f"Native transformation produced {total_chunks} verified chunks for {len(rows)} files and delivered index IDs; no indexing ran.")
+    assert not s3.list_objects_v2(Bucket=BUCKET, Prefix="mutations/").get("Contents")
+    print(f"Native transformation produced {total_chunks} verified chunks for {len(rows)} files; publication is pending.")
 
 
 def follow_backlog():
@@ -618,8 +528,8 @@ def follow_backlog():
                 target.write(suffix)
             appended = captured(initial + suffix)
             before, after = assert_source_retained(first), assert_source_retained(appended)
-            assert after["extents"][:len(before["extents"])] == before["extents"], "follow recopied the captured prefix"
-            assert sum(e["length"] for e in after["extents"][len(before["extents"]):]) == len(suffix)
+            assert after["extents"][:len(before["extents"])] == before["extents"]
+            assert sum(extent["length"] for extent in after["extents"][len(before["extents"]):]) == len(suffix)
             source.write_bytes(replacement)
             rewritten = captured(replacement)
             assert assert_source_retained(rewritten)["extents"] != after["extents"], "rewrite retained stale source extents"
@@ -650,88 +560,16 @@ def follow_backlog():
     # File deletion and successful captures must not remove earlier originals.
     for file in state["follow_versions"][:-1]:
         assert_source_retained(file)
-    def delivered():
-        jobs = work_rows(root, "index")
-        return jobs if len(jobs) == 5 and all(w["enqueued_at"] is not None for w in jobs) else None
-    jobs = eventually("all five follow versions to reach index SQS", delivered, 60)
-    assert all(w["status"] == "pending" and w["attempt_count"] == 0 for w in jobs)
-    inspect_sqs_deliveries(jobs, "index")
-    assert not sql("SELECT id FROM provider_batches LIMIT 1")
-    wait_queue_empty("transform")
-    print("One live agent captured create/append/rewrite/truncate/delete as five linked versions; originals retained and all five index jobs remain unexecuted.")
+    jobs = sql("""SELECT w.* FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
+        JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s""", (root,))
+    assert len(jobs) == 5 and len({row["extraction_id"] for row in jobs}) == 5
+    print("One live agent captured create/append/rewrite/truncate/delete as five linked versions; originals retained.")
 
 
-def redeliver_completed_work(work):
-    for row in work:
-        body = {k: row[k] for k in ("org_id", "root_id", "file_id", "version_id", "extraction_id", "stage")}
-        body.update(job_id=row["id"], work_id=row["id"])
-        for _ in range(3):
-            sqs.send_message(QueueUrl=os.environ[f"PUFFERFS_SQS_{row['stage'].upper()}_QUEUE_URL"],
-                MessageBody=json.dumps(body), MessageGroupId=sqs_group_id(row), MessageDeduplicationId=uuid.uuid4().hex)
-
-
-def wait_queue_empty(stage):
-    url = os.environ[f"PUFFERFS_SQS_{stage.upper()}_QUEUE_URL"]
-    settings = sqs.get_queue_attributes(QueueUrl=url,
-        AttributeNames=["VisibilityTimeout", "ReceiveMessageWaitTimeSeconds"])["Attributes"]
-    # Restart can lose a receive response after SQS has made its receipt
-    # invisible. Allow normal production visibility expiry and redelivery.
-    timeout = int(settings["VisibilityTimeout"]) + int(settings["ReceiveMessageWaitTimeSeconds"]) + 60
-    def empty():
-        values = sqs.get_queue_attributes(QueueUrl=url,
-            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible"])["Attributes"]
-        return not any(int(value) for value in values.values())
-    eventually(f"{stage} SQS receipts to be acknowledged", empty, timeout)
-
-
-def native_replay():
-    state = json.loads(STATE.read_text())
-    # The shell has stopped the HTTP worker and restarted only the Go consumer.
-    # A fresh execution attempt would fail, not silently create another artifact.
-    try:
-        urllib.request.urlopen("http://transform:8080/healthz", timeout=3).close()
-    except urllib.error.HTTPError as error:
-        raise AssertionError("transform worker still responds during completed-work replay") from error
-    except urllib.error.URLError:
-        pass
-    else:
-        raise AssertionError("transform worker must be stopped during completed-work replay")
-    before = work_rows(state["native_root"])
-    assert len(before) == len(state["native_files"]) and all(r["status"] == "complete" for r in before)
-    def artifacts():
-        prefix = f"extractions/{state['org']}/{state['native_root']}/"
-        return {item["Key"]: (item["ETag"], item["LastModified"]) for page in
-                s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix)
-                for item in page.get("Contents", [])}
-    saved_artifacts = artifacts()
-    assert len(saved_artifacts) == len(before)
-    redeliver_completed_work(before)
-    wait_queue_empty("transform")
-    assert work_rows(state["native_root"]) == before, "duplicate delivery executed completed work"
-    assert artifacts() == saved_artifacts, "duplicate delivery rewrote durable chunks"
-    index = work_rows(state["native_root"], "index")
-    assert len(index) == len(before) and all(w["status"] == "pending" and w["attempt_count"] == 0 for w in index)
-    url = sqs.get_queue_url(QueueName="file-transform-dlq.fifo")["QueueUrl"]
-    assert not sqs.receive_message(QueueUrl=url, WaitTimeSeconds=1).get("Messages"), "duplicate delivery entered DLQ"
-    print(f"Restarted consumer acknowledged {3 * len(before)} duplicate receipts with the transform worker stopped; no attempts or artifacts changed.")
-
-
-def worker_authentication():
-    # Ordinary HTTP requests to separately running production roles.
-    payload = {"work_id": "untrusted", "attempt_token": "untrusted"}
-    credentials = [{}, *({"secret_key": value} for value in
-        ("", "incorrect", None, 123, [], {}, "incorrect-\u00e9", "incorrect-\ud800"))]
-    for endpoint in ("transform", "index"):
-        for credential in credentials:
-            req = urllib.request.Request(f"http://{endpoint}:8080/", method="POST",
-                data=json.dumps(payload | credential).encode(), headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(req, timeout=180):
-                    raise AssertionError(f"unauthenticated {endpoint} accepted a request")
-            except urllib.error.HTTPError as error:
-                assert error.code == 401, f"unauthenticated {endpoint} returned HTTP {error.code}"
-    print("Transform and index roles reject missing, invalid and malformed credentials.", flush=True)
-
+def wait_work_idle(stage):
+    def idle():
+        return not sql("SELECT id FROM file_work WHERE stage=%s AND status IN ('pending','running') LIMIT 1", (stage,))
+    eventually(f"{stage} work to finish", idle)
 
 def native_published():
     state = json.loads(STATE.read_text())
@@ -768,11 +606,11 @@ def verify():
                 {"path": "activity.jsonl", "lines": {"start": 1, "end": 1}}, key=state["key"], statuses=(404,))
     cli(state, "sync", "/state/workspace", "--id", state["root"], "--no-vector")
     assert catalog(state) == files, "unchanged sync produced work or changed publication"
-    rows = sql("""SELECT f.path,e.id AS extraction_id,e.chunks_ref,e.chunk_count,w.mutation_ref,w.acknowledged_batches,w.mutation_batch_count
+    rows = sql("""SELECT f.path,e.id AS extraction_id,e.chunks_ref,e.chunk_count,w.status AS work_status
         FROM file_catalog f JOIN file_extractions e ON e.id=f.indexed_extraction_id
         JOIN file_work w ON w.extraction_id=e.id AND w.stage='index' WHERE f.root_id=%s""", (state["root"],))
     assert len(rows) == len(files)
-    assert all(row["acknowledged_batches"] == row["mutation_batch_count"] for row in rows)
+    assert all(row["work_status"] == "complete" for row in rows)
     batches = sql("SELECT * FROM provider_batches WHERE root_id=%s", (state["root"],))
     assert batches, "provider-backed fixtures did not produce batch results"
     packed_results = {}
@@ -812,7 +650,7 @@ def verify():
                 "content_excerpt": excerpt, "chunk_count": count, "locations": locations,
                 "provider_jobs": [job["provider_job_id"] for job in jobs]}), flush=True)
             raise AssertionError(f"missing extracted content: {path}")
-        assert row["mutation_ref"], f"publication has no durable mutation artifact: {path}"
+        assert row["chunks_ref"], f"publication has no canonical text artifact: {path}"
     # Verify captured bytes from their actual S3 ranges, independently of the worker.
     for file in files.values():
         assert_source_retained(file)
@@ -823,7 +661,6 @@ def verify():
     for endpoint, method, payload in [(f"/roots/{state['root']}/captured-files", "GET", None),
         (f"/roots/{state['root']}/read", "POST", {"path": "rewrite.txt", "lines": {"start": 1, "end": 1}})]:
         request(method, endpoint, payload, key=state["outsider_key"], statuses=(404,))
-    worker_authentication()
     # No rendered pages or converted clips in durable object storage.
     objects = [item for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET) for item in page.get("Contents", [])]
     assert not any(item["Key"].lower().endswith((".png", ".jpg", ".wav", ".mp4", ".pdf")) for item in objects)
@@ -1014,7 +851,7 @@ def outage():
         assert not result["results"], "capture-time deletion leaked a previous indexed version"
     old = object_json(state["before"]["append.jsonl"]["source_manifest_ref"])
     new = object_json(files["append.jsonl"]["source_manifest_ref"])
-    assert new["extents"][:len(old["extents"])] == old["extents"], "append recopied previous captured bytes"
+    assert new["extents"][:len(old["extents"])] == old["extents"], "append must reuse its verified prefix"
     state["after"] = files
     save(state)
 
@@ -1035,96 +872,9 @@ def resumed():
     for path, file in state["before"].items():
         if path not in {"append.jsonl", "rewrite.txt", "move.txt", "remove.txt"}:
             assert files[path]["version_id"] == file["version_id"], f"unchanged file recaptured: {path}"
-    before = sql("SELECT id,attempt_count,mutation_ref,acknowledged_batches FROM file_work ORDER BY id")
-    work = sql("""SELECT w.id,w.stage,e.id extraction_id,v.id version_id,f.id file_id,f.root_id,r.org_id
-        FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id JOIN file_versions v ON v.id=e.version_id
-        JOIN file_catalog f ON f.id=v.file_id JOIN roots r ON r.id=f.root_id
-        WHERE f.root_id=%s AND f.path='rewrite.txt' AND w.status='complete'""", (state["root"],))
-    redeliver_completed_work(work)
-    for stage in ("transform", "index"):
-        wait_queue_empty(stage)
-    assert before == sql("SELECT id,attempt_count,mutation_ref,acknowledged_batches FROM file_work ORDER BY id")
-    for stage in ("transform", "index"):
-        url = sqs.get_queue_url(QueueName=f"file-{stage}-dlq.fifo")["QueueUrl"]
-        assert not sqs.receive_message(QueueUrl=url, WaitTimeSeconds=1).get("Messages"), "unexpected DLQ message"
-
-
-def malformed_capture():
-    state = json.loads(STATE.read_text()) if STATE.exists() else provision()
-    # Run last, with both consumers stopped and prior work already drained.
-    # The intentional malformed receipt stays queued until isolated cleanup.
-    wait_queue_empty("transform")
-    # A stopped client's outstanding 20-second ReceiveMessage can still take
-    # a newly sent receipt server-side. Let that long poll expire before this
-    # scenario; lost receive responses are exercised separately by native-replay.
-    print("Waiting for any stopped consumer's 20-second SQS long poll to expire.", flush=True)
-    time.sleep(21)
-    directory = Path("/state/malformed-" + uuid.uuid4().hex[:8])
-    directory.mkdir()
-    for name in ("first.txt", "second.txt"):
-        (directory / name).write_text(f"Orchid delivery isolation {name}.\n")
-    root = new_root(state, directory.name, directory, True)
-    state["malformed_root"] = root
-    state["malformed_directory"] = str(directory)
-    save(state)
-    cli(state, "sync", str(directory), "--id", root, "--no-vector")
-    work = work_rows(root)
-    assert len(work) == 2 and all(w["status"] == "pending" and w["enqueued_at"] is not None for w in work)
-    # SQS accepts malformed application JSON. Use a real work's FIFO group so
-    # the consumer can receive valid and malformed bodies in the same batch.
-    sent = sqs.send_message(QueueUrl=os.environ["PUFFERFS_SQS_TRANSFORM_QUEUE_URL"],
-        MessageBody='{"invalid_e2e_delivery":', MessageGroupId=sqs_group_id(work[0]),
-        MessageDeduplicationId=uuid.uuid4().hex)
-    state["malformed_message_id"] = sent["MessageId"]
-    save(state)
-    print("Captured two native files and queued one malformed body beside a valid job; consumers remain stopped.")
-
-
-def malformed_transformed():
-    state = json.loads(STATE.read_text())
-    root = state["malformed_root"]
-    def ready():
-        rows = work_rows(root)
-        return rows if len(rows) == 2 and all(r["status"] == "complete" for r in rows) else None
-    # Much shorter than the production 300-second SQS visibility timeout:
-    # healthy work must execute on this delivery, not after abandoned receipts expire.
-    rows = eventually("valid jobs in a malformed receive batch to transform", ready, 90)
-    for row in rows:
-        assert row["attempt_count"] == 1 and not row["indexed_version_id"]
-        records = list(chunks(row["chunks_ref"]))
-        assert row["chunk_count"] == len(records) == 1
-        expected = (Path(state["malformed_directory"]) / row["path"]).read_text()
-        assert records[0]["content"] == expected
-        assert records[0]["content_hash"] == hashlib.sha256(expected.encode()).hexdigest()
-    for file in catalog(state, root).values():
-        assert_source_retained(file)
-    index = work_rows(root, "index")
-    assert len(index) == 2 and all(w["status"] == "pending" and w["attempt_count"] == 0 for w in index)
-    inspect_sqs_deliveries(index, "index")
-    def only_malformed_inflight():
-        attributes = sqs.get_queue_attributes(QueueUrl=os.environ["PUFFERFS_SQS_TRANSFORM_QUEUE_URL"],
-            AttributeNames=["ApproximateNumberOfMessages", "ApproximateNumberOfMessagesNotVisible",
-                            "ApproximateNumberOfMessagesDelayed"])["Attributes"]
-        return (int(attributes["ApproximateNumberOfMessages"]) == 0
-                and int(attributes["ApproximateNumberOfMessagesNotVisible"]) == 1
-                and int(attributes["ApproximateNumberOfMessagesDelayed"]) == 0)
-    eventually("healthy receipts to be acknowledged while the malformed receipt remains invisible",
-               only_malformed_inflight, 30)
-    print("Both valid jobs transformed once and reached index SQS; only the malformed receipt remains unacknowledged.")
-
-
-def malformed_published():
-    state = json.loads(STATE.read_text())
-    root = state["malformed_root"]
-    files = wait_indexed(state, root)
-    assert set(files) == {"first.txt", "second.txt"}
-    for path in files:
-        result = request("POST", f"/roots/{root}/read",
-            {"path": path, "lines": {"start": 1, "end": 1}}, key=state["key"])
-        assert result["lines"][0]["content"] == f"Orchid delivery isolation {path}."
-    result = request("POST", "/query", {"root_id": root, "query": "Orchid delivery isolation",
-        "mode": "fts", "top_k": 10}, key=state["key"])
-    assert {r["file_path"] for r in result["results"]} == set(files)
+    before = sql("SELECT id,attempt_count,status FROM file_work ORDER BY id")
+    cli(state, "sync", "/state/workspace", "--id", state["root"], "--no-vector")
+    assert before == sql("SELECT id,attempt_count,status FROM file_work ORDER BY id")
 
 
 def cleanup():
@@ -1170,12 +920,8 @@ if __name__ == "__main__":
             raise SystemExit(f"{name} is required: no provider stubs or skipped tests")
     phase = sys.argv[1]
     functions = {"capture": capture, "multipart-recovery": multipart_recovery,
-                 "handoff-outage": handoff_outage, "handoff-recovered": handoff_recovered,
                  "native-capture": native_capture, "native-transformed": native_transformed,
-                 "native-replay": native_replay, "native-published": native_published,
-                 "follow-backlog": follow_backlog,
-                 "malformed-capture": malformed_capture, "malformed-transformed": malformed_transformed,
-                 "malformed-published": malformed_published,
+                 "native-published": native_published, "follow-backlog": follow_backlog,
                  "verify": verify, "authorization": authorization,
                  "outage": outage, "resumed": resumed, "cleanup": cleanup}
     if phase == "retention-security":

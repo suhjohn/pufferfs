@@ -1,0 +1,361 @@
+{
+  "measured_date_utc": "2026-09-17",
+  "base_commit": "f3880decfe6e68b70e3d0c2af810e71eadda9c25",
+  "checkout": "Uncommitted simplified runtime; not deployed",
+  "benchmark_phases": [
+    {
+      "run_id": "3e1dd0d2725749b38ddce45a1132cf16",
+      "phase": "initial",
+      "vector_disabled": false,
+      "capture_seconds": 0.192,
+      "concurrency": 1,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 178.652,
+      "chunks_per_minute": 687.8,
+      "accepted_embedding_tokens": 2535584,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 851572,
+      "write_http_status_counts": {
+        "200": 8,
+        "429": 13
+      },
+      "file_attempts": 8,
+      "embedding_batch_documents": 256
+    },
+    {
+      "run_id": "02a98e6fab1944948d41e7a59b06396a",
+      "phase": "initial",
+      "vector_disabled": true,
+      "capture_seconds": 0.206,
+      "concurrency": 4,
+      "embedding_batch_documents": 256,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 8.232,
+      "chunks_per_minute": 14927.1,
+      "accepted_embedding_tokens": 0,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 0,
+      "write_http_status_counts": {
+        "200": 8
+      },
+      "file_attempts": 8
+    },
+    {
+      "run_id": "02a98e6fab1944948d41e7a59b06396a",
+      "phase": "reindex",
+      "vector_disabled": true,
+      "capture_seconds": 0.091,
+      "concurrency": 4,
+      "embedding_batch_documents": 256,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 6.109,
+      "chunks_per_minute": 20114.6,
+      "accepted_embedding_tokens": 0,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 0,
+      "write_http_status_counts": {
+        "200": 8
+      },
+      "file_attempts": 8
+    },
+    {
+      "run_id": "3e1dd0d2725749b38ddce45a1132cf16",
+      "phase": "reindex",
+      "vector_disabled": false,
+      "capture_seconds": 0.085,
+      "concurrency": 1,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 208.724,
+      "chunks_per_minute": 588.7,
+      "accepted_embedding_tokens": 2535584,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 728881,
+      "write_http_status_counts": {
+        "429": 17,
+        "200": 8,
+        "transport_failed": 1
+      },
+      "file_attempts": 9,
+      "embedding_batch_documents": 256
+    },
+    {
+      "run_id": "21142fd6793e43fe8a10d9c5f42b7090",
+      "phase": "initial",
+      "vector_disabled": false,
+      "capture_seconds": 0.194,
+      "concurrency": 4,
+      "embedding_batch_documents": 256,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 375.598,
+      "chunks_per_minute": 327.2,
+      "accepted_embedding_tokens": 2535584,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 405048,
+      "write_http_status_counts": {
+        "200": 8,
+        "429": 52
+      },
+      "file_attempts": 16
+    },
+    {
+      "run_id": "21142fd6793e43fe8a10d9c5f42b7090",
+      "phase": "reindex",
+      "vector_disabled": false,
+      "capture_seconds": 0.096,
+      "concurrency": 4,
+      "embedding_batch_documents": 256,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 578.194,
+      "chunks_per_minute": 212.5,
+      "accepted_embedding_tokens": 2535584,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 263121,
+      "write_http_status_counts": {
+        "200": 8,
+        "429": 75
+      },
+      "file_attempts": 20
+    },
+    {
+      "run_id": "d856d793ed5b42d8ad72818bccfbcb38",
+      "phase": "initial",
+      "vector_disabled": false,
+      "capture_seconds": 0.199,
+      "concurrency": 4,
+      "embedding_batch_documents": 64,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 68.393,
+      "chunks_per_minute": 1796.7,
+      "accepted_embedding_tokens": 2535584,
+      "repeated_successful_writes": 0,
+      "repeated_embedding_tokens": 0,
+      "accepted_tokens_per_minute": 2224424,
+      "write_http_status_counts": {
+        "200": 32,
+        "429": 8
+      },
+      "file_attempts": 8
+    },
+    {
+      "run_id": "d856d793ed5b42d8ad72818bccfbcb38",
+      "phase": "reindex",
+      "vector_disabled": false,
+      "capture_seconds": 0.09,
+      "concurrency": 4,
+      "embedding_batch_documents": 64,
+      "source_bytes": 8034304,
+      "files": 8,
+      "chunks": 2048,
+      "capture_to_publication_seconds": 108.489,
+      "chunks_per_minute": 1132.6,
+      "accepted_embedding_tokens": 2728664,
+      "repeated_successful_writes": 3,
+      "repeated_embedding_tokens": 193080,
+      "accepted_tokens_per_minute": 1509092,
+      "write_http_status_counts": {
+        "200": 35,
+        "429": 42
+      },
+      "file_attempts": 12
+    }
+  ],
+  "production_snapshot": {
+    "time": {
+      "now": "2026-09-17 12:16:31.516032+00:00"
+    },
+    "stages": [
+      {
+        "stage": "index",
+        "status": "complete",
+        "files": 2702,
+        "chunks": 157658,
+        "source_bytes": 815721175,
+        "earliest_update": "2026-09-16 23:57:58.718848+00:00",
+        "latest_update": "2026-09-17 03:22:42.901351+00:00"
+      },
+      {
+        "stage": "index",
+        "status": "pending",
+        "files": 2728,
+        "chunks": 3240885,
+        "source_bytes": 18128894794,
+        "earliest_update": "2026-09-17 01:39:48.360660+00:00",
+        "latest_update": "2026-09-17 05:57:04.044945+00:00"
+      },
+      {
+        "stage": "transform",
+        "status": "complete",
+        "files": 5430,
+        "chunks": 3398543,
+        "source_bytes": 18944615969,
+        "earliest_update": "2026-09-16 23:57:48.612209+00:00",
+        "latest_update": "2026-09-17 05:52:36.164547+00:00"
+      }
+    ],
+    "index_attempts": [
+      {
+        "error_kind": "",
+        "status": "complete",
+        "files": 1190,
+        "attempts": 1190
+      },
+      {
+        "error_kind": "attempt lease expired; awaiting SQS redelivery",
+        "status": "pending",
+        "files": 2,
+        "attempts": 10
+      },
+      {
+        "error_kind": "BadRequestError",
+        "status": "pending",
+        "files": 1423,
+        "attempts": 7115
+      },
+      {
+        "error_kind": "RateLimitError",
+        "status": "complete",
+        "files": 1512,
+        "attempts": 4787
+      },
+      {
+        "error_kind": "RateLimitError",
+        "status": "pending",
+        "files": 1303,
+        "attempts": 6515
+      }
+    ],
+    "chunk_distribution": {
+      "min": 1,
+      "max": 86126,
+      "percentiles": [
+        116.0,
+        926.4000000000015,
+        2091.350000000003,
+        10408.020000000024
+      ]
+    },
+    "hourly_completed": [
+      {
+        "completed_hour": "2026-09-16 23:00:00+00:00",
+        "files": 122,
+        "chunks": 2288
+      },
+      {
+        "completed_hour": "2026-09-17 00:00:00+00:00",
+        "files": 1165,
+        "chunks": 46476
+      },
+      {
+        "completed_hour": "2026-09-17 01:00:00+00:00",
+        "files": 727,
+        "chunks": 45890
+      },
+      {
+        "completed_hour": "2026-09-17 02:00:00+00:00",
+        "files": 510,
+        "chunks": 45690
+      },
+      {
+        "completed_hour": "2026-09-17 03:00:00+00:00",
+        "files": 178,
+        "chunks": 17314
+      }
+    ]
+  },
+  "local_token_sample": {
+    "method": "2048 size-weighted random 6000-byte windows; local Qwen3-Embedding-8B tokenizer; boundary UTF-8 bytes trimmed; sample estimate, not exact corpus token count",
+    "files": 5431,
+    "source_bytes": 18978184924,
+    "sample_bytes": 12287992,
+    "sample_tokens": 6704573,
+    "tokens_per_byte": 0.5456199027473325,
+    "estimated_tokens": 10354875413,
+    "approximate_95pct_token_interval": [
+      10189103666,
+      10520647159
+    ],
+    "hours_at_default_2M_tokens_per_minute": 86.29,
+    "seconds": 7.0
+  },
+  "local_media_inventory": {
+    "files": 5431,
+    "source_bytes": 18978375520,
+    "data_uri_count": {
+      "image/png": 15074,
+      "image/svg+xml": 598,
+      "audio/mp3": 12,
+      "application/octet-stream": 11,
+      "application/pdf": 26,
+      "font/woff2": 16,
+      "image/jpeg": 14459,
+      "text/javascript": 20,
+      "audio/wav": 78,
+      "image/heif": 4,
+      "image/heic": 4,
+      "image/...": 21,
+      "video/webm": 28,
+      "image/webp": 32,
+      "image/gif": 15,
+      "application/json": 3,
+      "application/vnd.ms-fontobject": 2,
+      "font/woff": 1,
+      "font/ttf": 1,
+      "text/html": 2,
+      "text/plain": 10
+    },
+    "base64_data_uri_bytes": {
+      "image/png": 6550285731,
+      "image/svg+xml": 191559,
+      "audio/mp3": 36,
+      "application/octet-stream": 0,
+      "application/pdf": 0,
+      "font/woff2": 48320,
+      "image/jpeg": 2370388439,
+      "text/javascript": 0,
+      "audio/wav": 69,
+      "image/heif": 0,
+      "image/heic": 0,
+      "image/...": 0,
+      "video/webm": 0,
+      "image/webp": 4452388,
+      "image/gif": 6348,
+      "application/json": 17210,
+      "application/vnd.ms-fontobject": 5464,
+      "font/woff": 1840,
+      "font/ttf": 2524,
+      "text/html": 0,
+      "text/plain": 0
+    },
+    "total_base64_bytes": 8925399928,
+    "base64_share": 0.470293,
+    "seconds": 53.89,
+    "method": "Streaming scan for data:MIME;base64, payloads; counts encoded payload bytes, excludes URI headers; no source content stored or printed"
+  },
+  "limitations": [
+    "Small synthetic benchmark; no full-corpus indexing completion measured.",
+    "Real provider, shared quota; exact account quota unknown.",
+    "Local Docker Postgres and LocalStack S3, not production cloud latency.",
+    "Source scans and production snapshot differ in time; live directory grew.",
+    "Token estimate uses sampled windows, not exact chunk boundaries or provider billing."
+  ]
+}

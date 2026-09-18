@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	productanalytics "github.com/pufferfs/pufferfs/internal/analytics"
 	"github.com/pufferfs/pufferfs/internal/auth"
-	"github.com/pufferfs/pufferfs/internal/queue"
 	"github.com/pufferfs/pufferfs/internal/storage"
 	"github.com/pufferfs/pufferfs/pkg/models"
 )
@@ -26,7 +25,6 @@ type Server struct {
 	db          *DB
 	s3          *storage.Client
 	tp          *TPClient
-	queue       *queue.SQSQueue
 	billing     *StripeClient
 	emails      TransactionalEmailSender
 	jwtSecret   []byte
@@ -50,11 +48,6 @@ func New(db *DB, s3 *storage.Client, tp *TPClient) *Server {
 	}
 	s.routes()
 	return s
-}
-
-// SetQueue connects source registration to SQS delivery.
-func (s *Server) SetQueue(q *queue.SQSQueue) {
-	s.queue = q
 }
 
 // SetTransactionalEmailSender enables best-effort transactional product emails.
@@ -189,60 +182,11 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCLIVersion(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, cliReleaseManifestFromEnv())
-}
-
-func cliReleaseManifestFromEnv() models.CLIReleaseManifest {
-	latest := cleanVersionEnv("PUFFERFS_CLI_LATEST_VERSION")
-	minimum := cleanVersionEnv("PUFFERFS_CLI_MIN_VERSION")
-	if latest == "" {
-		latest = minimum
+	target := strings.TrimSpace(os.Getenv("PUFFERFS_CLI_MANIFEST_URL"))
+	if target == "" {
+		target = "https://pufferfs.com/releases/manifest.json"
 	}
-	if latest == "" {
-		latest = "dev"
-	}
-
-	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("PUFFERFS_CLI_DOWNLOAD_BASE_URL")), "/")
-	if baseURL == "" {
-		baseURL = "https://github.com/suhjohn/pufferfs/releases/download"
-	}
-	downloadVersion := latest
-	if downloadVersion != "dev" && !strings.HasPrefix(downloadVersion, "v") {
-		downloadVersion = "v" + downloadVersion
-	}
-
-	manifest := models.CLIReleaseManifest{
-		Latest:      latest,
-		Minimum:     minimum,
-		ProtocolMin: models.SyncProtocolVersion,
-		ProtocolMax: models.SyncProtocolVersion,
-		Downloads:   make(map[string]models.CLIDownload),
-	}
-	if downloadVersion != "dev" {
-		for _, platform := range []string{"darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64"} {
-			assetOS, assetArch, _ := strings.Cut(platform, "-")
-			assetName := fmt.Sprintf("pufferfs_%s_%s_%s.tar.gz", strings.TrimPrefix(downloadVersion, "v"), assetOS, assetArch)
-			manifest.Downloads[platform] = models.CLIDownload{
-				URL:    fmt.Sprintf("%s/%s/%s", baseURL, downloadVersion, assetName),
-				SHA256: cleanSHAEnv(platform),
-			}
-		}
-		manifest.NotesURL = fmt.Sprintf("%s/%s", baseURL, downloadVersion)
-	}
-	return manifest
-}
-
-func cleanVersionEnv(name string) string {
-	value := strings.TrimSpace(os.Getenv(name))
-	if value == "" {
-		return ""
-	}
-	return strings.TrimPrefix(value, "v")
-}
-
-func cleanSHAEnv(platform string) string {
-	key := "PUFFERFS_CLI_SHA256_" + strings.ToUpper(strings.ReplaceAll(platform, "-", "_"))
-	return strings.TrimSpace(os.Getenv(key))
+	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 }
 
 // ---------------------------------------------------------------------------
@@ -2113,7 +2057,7 @@ type queryStats struct {
 	rawResultCount int
 }
 
-func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string][]models.RootIndexNamespace, queryLimit int) ([]models.QueryResult, queryStats, error) {
+func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string]string, queryLimit int) ([]models.QueryResult, queryStats, error) {
 	stats := queryStats{}
 	results := make([]models.QueryResult, 0)
 	var searches []namespaceSearch
@@ -2126,8 +2070,8 @@ func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *m
 		if req.Mode == "hybrid" && !root.VectorDisabled {
 			rankings = []any{ann, fts}
 		}
-		for _, ns := range namespaces[root.ID] {
-			searches = append(searches, namespaceSearch{rootID: root.ID, namespace: ns.Namespace, rankings: rankings})
+		if namespace := namespaces[root.ID]; namespace != "" {
+			searches = append(searches, namespaceSearch{rootID: root.ID, namespace: namespace, rankings: rankings})
 		}
 	}
 	stats.namespaceCount = len(searches)
@@ -2154,14 +2098,20 @@ func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *m
 	if err != nil {
 		return nil, stats, err
 	}
-	byRoot := make(map[string][][]map[string]any)
+	byRoot := make(map[string][]map[string]any, len(searches))
 	for _, search := range searches {
-		rows := mergeNamespaceRows(search.sets, "hybrid", 0)
-		byRoot[search.rootID] = append(byRoot[search.rootID], rows)
+		if len(search.sets) == 1 {
+			byRoot[search.rootID] = search.sets[0]
+		} else {
+			byRoot[search.rootID] = reciprocalRankFusion(search.sets, 60)
+		}
 	}
 	sets := make([][]map[string]any, len(roots))
 	for i, root := range roots {
-		sets[i] = mergeNamespaceRows(byRoot[root.ID], req.Mode, queryLimit)
+		sets[i] = byRoot[root.ID]
+		if len(sets[i]) > queryLimit {
+			sets[i] = sets[i][:queryLimit]
+		}
 		stats.rawResultCount += len(sets[i])
 	}
 	if err := s.filterSearchRowsAccess(ctx, id, roots, sets); err != nil {

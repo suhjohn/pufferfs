@@ -411,6 +411,11 @@ Read a deterministic slice from one known file. Requires scope `query` / `read`
 and read access to the root/path. This is not search; use it when the caller
 already knows the file path and wants a page or line range.
 
+Reads return published extracted text. New extractions replace explicit base64
+data-URL payloads with `[base64 image]`, as do search results. Surrounding text
+and source line numbers remain intact; the original captured file remains
+unchanged in source storage. See [redaction rules](file-ingestion-and-chunking.md).
+
 Request:
 
 ```json
@@ -560,8 +565,8 @@ Response (`QueryResponse`):
 
 `page_number` is present for page-based results. Image storage paths are not returned.
 For vector search, `score` is the provider's cosine distance and smaller values
-rank first across all roots and shards. For FTS in one shard, `score` is the
-provider's BM25 score (higher ranks first). Hybrid search and FTS across shards
+rank first across all roots. For FTS in one namespace, `score` is the
+provider's BM25 score (higher ranks first). Hybrid search and FTS across namespaces
 use reciprocal rank scores (higher ranks first). Scores across these modes are
 not comparable.
 
@@ -658,20 +663,19 @@ Deletes return `409` while sync jobs are active and report
 | Limit | Value |
 | --- | --- |
 | Registered files per capture | 128 |
-| Source pack | 1–128 MiB |
+| Source pack | 1–128 MiB (multipart uses at most eight 16 MiB parts) |
 | Catalog page | 1–1000 files; default 500 |
 | Capture request body | 4 MiB |
 | Read range | At most 1000 lines or pages per request |
 | Read response content | 32 MiB; request smaller ranges above this |
 | Default query top_k | 10 |
-| Namespace shards per root | 1 default, 256 max |
+| Active namespaces per root | 1 |
 
 ## Per-file capture catalog
 
 Add `processing=true` to include each file's latest registered extraction status.
 The optional `processing` object contains `extraction_id`, `revision`, `stage`,
-`status`, `attempt_count`, `acknowledged_batches`, and optional
-`mutation_batch_count`. States are `pending`, `running`, `waiting_provider`,
+`status`, and `attempt_count`. States are `pending`, `running`, `waiting_provider`,
 `complete`, `failed`, `superseded`, `missing`, or `inconsistent`. `complete`
 requires that exact extraction to be published; matching captured/indexed file
 version IDs alone is insufficient when a newer extraction revision is pending.

@@ -16,7 +16,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop transform-consumer index-consumer transform collector index reconciler || true
+    "${compose[@]}" stop ingestion background || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project for recovery." >&2
       cleanup_failed=1
@@ -30,7 +30,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait postgres aws api api-ready transform index reconciler
+"${compose[@]}" up -d --wait postgres aws api api-ready ingestion background
 runner_started=1
-"${compose[@]}" up -d transform-consumer index-consumer
+"${compose[@]}" up -d ingestion background
 "${compose[@]}" run --rm --no-deps e2e "${1:-retention-security}"

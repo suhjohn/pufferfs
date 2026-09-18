@@ -43,6 +43,31 @@ def remember(state, payloads):
     run.save(state)
 
 
+def empty_root_deletion(state):
+    state["empty_roots"] = []
+    for no_vector in (True, False):
+        directory = Path("/state/empty-root-" + str(no_vector))
+        directory.mkdir()
+        path = directory / "empty.txt"
+        path.write_bytes(b"")
+        root = run.new_root(state, "Empty-only root", directory, no_vector)
+        state["empty_roots"].append(root)
+        run.save(state)
+        options = ["--no-vector"] if no_vector else []
+        run.cli(state, "sync", str(directory), "--id", root, *options)
+        file = run.wait_indexed(state, root)[path.name]
+        assert file["size"] == 0 and not file["deleted"]
+        run.assert_source_retained(file)
+        assert not run.request("POST", "/query", {"root_id": root, "query": "empty", "mode": "fts"},
+                               key=state["key"])["results"]
+        path.unlink()
+        run.cli(state, "sync", str(directory), "--id", root, *options)
+        assert run.wait_indexed(state, root)[path.name]["deleted"]
+        run.request("POST", f"/roots/{root}/read", {"path": path.name, "lines": {"start": 1, "end": 1}},
+                    key=state["key"], statuses=(404,))
+    print("Empty-only roots published and deleted successfully with vectors enabled and disabled.", flush=True)
+
+
 def verify():
     state = run.provision()
     directory = Path("/state/byte-batches")
@@ -115,6 +140,7 @@ def verify():
     check_local_retention(state)
     check_unaccepted_retention(state)
     check_tenant_uploads(state)
+    empty_root_deletion(state)
 
 
 def restarted():

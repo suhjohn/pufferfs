@@ -10,7 +10,7 @@ runner_started=0
 finish() {
   result=$?
   trap - EXIT
-  "${compose[@]}" stop transform-consumer index-consumer transform index reconciler index-relay || true
+  "${compose[@]}" stop ingestion background index-relay || true
   if [[ "$runner_started" == 1 ]] && ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
     echo "Cleanup failed; retained project $project for recovery." >&2
     exit 1
@@ -20,15 +20,14 @@ finish() {
   exit "$result"
 }
 trap finish EXIT
-"${compose[@]}" build api transform e2e
-"${compose[@]}" up -d --no-build --wait --scale api=2 postgres aws api api-ready transform index reconciler
+"${compose[@]}" build
+"${compose[@]}" up -d --no-build --wait --scale api=2 postgres aws api api-ready ingestion background
 runner_started=1
-"${compose[@]}" up -d --no-deps transform-consumer index-consumer
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_checkpoints.py)
 "${driver[@]}" capture
-"${compose[@]}" kill -s SIGKILL index
+"${compose[@]}" kill -s SIGKILL background
 "${driver[@]}" release
-"${compose[@]}" up -d --no-deps --wait index
+"${compose[@]}" up -d --no-deps --wait background
 "${driver[@]}" recovered
 "${compose[@]}" restart api
 "${compose[@]}" run --rm --no-deps api-ready
