@@ -202,8 +202,8 @@ entire corpus; content, rate limits, retries, and batch size affect speed.
 | Measurement | Chunks/minute | Embedding tokens/minute |
 | --- | ---: | ---: |
 | Production smoke test: 258 chunks in 12.21 seconds | **~1,270** | Not measured |
-| Local real-provider benchmark: four index threads, 256 documents/batch (current batch/concurrency settings) | **~330** | **~405,000** |
-| Local real-provider benchmark: four index threads, 64 documents/batch (not deployed) | **~1,800** | **~2.22 million** |
+| Local real-provider benchmark: four index threads, 256 documents/batch (previous default) | **~330** | **~405,000** |
+| Local real-provider benchmark: four index threads, 64 documents/batch (new default) | **~1,800** | **~2.22 million** |
 
 The local benchmark rows each indexed 2,048 synthetic chunks. At the illustrative
 500 tokens/page assumption, their token rates correspond to approximately **810**

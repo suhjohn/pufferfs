@@ -798,6 +798,11 @@ const apiService = new aws.ecs.Service(name("api"), {
   tags,
 });
 
+const embeddingBatchDocuments = cfg.getNumber("embeddingBatchDocuments") ?? 64;
+if (!Number.isInteger(embeddingBatchDocuments) || embeddingBatchDocuments < 1 || embeddingBatchDocuments > 256) {
+  throw new Error("embeddingBatchDocuments must be an integer from 1 to 256");
+}
+
 const workerServices = (["ingestion", "background"] as const).map((stage) => {
   const serviceName = `worker-${stage}`;
   const concurrency =
@@ -808,6 +813,9 @@ const workerServices = (["ingestion", "background"] as const).map((stage) => {
   }
   const task = appTaskDefinition(`${serviceName}-task`, serviceName, stage, [
     { name: "PUFFERFS_WORKER_CONCURRENCY", value: concurrency.toString() },
+    ...(stage === "background" ? [{
+      name: "PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", value: embeddingBatchDocuments.toString(),
+    }] : []),
   ]);
 
   return new aws.ecs.Service(name(serviceName), {

@@ -64,6 +64,7 @@ set_config_if_present pufferfs:turbopufferRegion "${TURBOPUFFER_REGION:-}"
 set_config_if_present pufferfs:turbopufferApiUrl "${TURBOPUFFER_API_URL:-}"
 set_config_if_present pufferfs:workerIngestionConcurrency "${PUFFERFS_INGESTION_CONCURRENCY:-4}"
 set_config_if_present pufferfs:workerBackgroundConcurrency "${PUFFERFS_BACKGROUND_CONCURRENCY:-4}"
+set_config_if_present pufferfs:embeddingBatchDocuments "${PUFFERFS_EMBEDDING_BATCH_DOCUMENTS:-64}"
 set_config_if_present pufferfs:dbMaxConnections "${PUFFERFS_DB_MAX_CONNS:-}"
 
 set_secret_if_present pufferfs:adminKeyHash "${PUFFERFS_ADMIN_KEY_HASH:-}"

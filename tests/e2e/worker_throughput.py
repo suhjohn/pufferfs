@@ -75,7 +75,7 @@ def verify():
         result = {"event": "worker_throughput", "run_id": state["nonce"], "phase": label,
                   "vector_disabled": vector_disabled, "capture_seconds": round(capture_seconds, 3),
                   "concurrency": int(os.environ.get("PUFFERFS_E2E_THROUGHPUT_CONCURRENCY", "4")),
-                  "embedding_batch_documents": int(os.environ.get("PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", "256")),
+                  "embedding_batch_documents": int(os.environ.get("PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", "64")),
                   "source_bytes": sum(len(line.encode()) for lines in expected.values() for line in lines),
                   "files": len(expected), "chunks": sum(map(len, expected.values())),
                   "capture_to_publication_seconds": round(elapsed, 3), "work": rows}

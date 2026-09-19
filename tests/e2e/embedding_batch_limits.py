@@ -1,4 +1,4 @@
-"""Native embedding writes stay within 256 documents, including crash replay."""
+"""Native embedding writes default to 64 documents, including crash replay."""
 import json
 from pathlib import Path
 import sys
@@ -7,6 +7,9 @@ import time
 from api_access import servers
 from index_recovery import relay, held, work, published, object_stamp
 import run
+
+
+EXPECTED_BATCHES = [64, 64, 64, 64, 1]
 
 
 def fixture_lines():
@@ -37,7 +40,7 @@ def capture():
     assert not file['indexed_version_id']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==event['namespace'] and e['operation']=='write']
     assert len(events) == 1 and events[0]['upstream_status'] == 200
-    assert events[0]['upsert_count'] == 256
+    assert events[0]['upsert_count'] == EXPECTED_BATCHES[0]
     assert events[0]['state'] == 'response_held'
     for peer in servers():
         assert not run.request('POST','/query',{'root_id':root,'query':'calibration','mode':'fts'},key=state['key'],server=peer)['results']
@@ -73,10 +76,10 @@ def recovered():
     assert row['chunks_ref'] == case['work']['chunks_ref'] and object_stamp(row['chunks_ref']) == case['stamp']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==case['namespace'] and e['operation']=='write' and e.get('upstream_status') == 200]
     replayed = events[1:]
-    assert [e['upsert_count'] for e in events] == [256,256,1]
+    assert [e['upsert_count'] for e in events] == [EXPECTED_BATCHES[0], *EXPECTED_BATCHES]
     repeated = case['initial_hashes']
     assert [e['payload_sha256'] for e in replayed[:len(repeated)]] == repeated
-    assert len({e['payload_sha256'] for e in events}) == 2
+    assert len({e['payload_sha256'] for e in events}) == len(EXPECTED_BATCHES)
     assert run.assert_index_vectors(state,case["root"],dimensions=4096) == 257
     for mode in ("vector", "hybrid"):
         assert run.request("POST","/query",{"root_id":case["root"],"query":"calibration","mode":mode},key=state["key"])["results"]

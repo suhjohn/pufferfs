@@ -114,6 +114,7 @@ authorization, append, deletion, forced re-extraction and service restarts.
 `scripts/test-e2e-embedding-batches.sh` captures a synthetic 257-chunk file
 with vectors enabled. A network relay records row counts and holds the first
 real Turbopuffer response; the driver kills the index process and waits for
-normal lease recovery. It checks writes of at most 256 documents, stable replay
+normal lease recovery. It checks the default batches of 64, 64, 64, 64 and 1
+documents (below the provider maximum of 256), stable replay
 payloads, exactly 257 native vectors, FTS/vector/hybrid search, exact reads and
 persistence through both API restarts. External providers remain real.

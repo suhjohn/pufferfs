@@ -170,9 +170,11 @@ There are no worker HTTP endpoints or SQS settings.
 
 Turbopuffer provides embeddings internally. Vector-disabled roots support FTS.
 `PUFFERFS_EMBEDDING_BATCH_DOCUMENTS` bounds documents per embedding write
-(1–256, default 256). Lower values can improve admission under the provider's
+(1–256, default 64). Lower values can improve admission under the provider's
 token quota; they increase request count and do not raise that quota. Full-text
-only writes retain their separate 512-document bound.
+only writes retain their separate 512-document bound. The deployment workflow
+reads the same-named GitHub Environment variable (default 64), writes Pulumi
+`embeddingBatchDocuments`, and passes it to the background ECS task.
 Provider extraction settings and optional image fallback are documented below.
 
 ### Transactional email (AWS SES, optional)

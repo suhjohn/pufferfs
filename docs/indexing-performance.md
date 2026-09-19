@@ -4,10 +4,10 @@ These measurements predate the local [base64 redaction change](file-ingestion-an
 Corpus token/cost estimates below describe the unredacted input. They are not
 estimates for newly extracted, redacted text.
 
-Measured September 17, 2026. Production is still the SQS/Modal v0.8.2
-deployment. The benchmarks below use the uncommitted, simplified worker runtime
-in this checkout. Neither that runtime nor the isolated 256-document hotfix has
-been deployed by this investigation.
+Measured September 17, 2026. At that time production used the SQS/Modal v0.8.2
+deployment, and the benchmarks used the uncommitted simplified worker runtime.
+The simplified runtime was subsequently deployed; see
+[production verification](simplification-implementation.md).
 
 ## Sessions capture and production progress
 
@@ -103,10 +103,12 @@ tokens. This is measured wasted work, not just a hypothetical retry concern.
 
 **Recommended tested setting:** four index slots with
 `PUFFERFS_EMBEDDING_BATCH_DOCUMENTS=64`, subject to the account's shared quota.
-The configurable worker setting is implemented locally; its default remains
+At the time of this investigation, the configurable worker setting defaulted to
 256 and neither production configuration nor the isolated legacy hotfix was
-changed to 64 by this investigation. The measurements establish a useful
-improvement, not a universal optimum across content, quotas or providers.
+changed to 64. The September 18 follow-up changes the worker and deployment
+defaults to 64; see [configuration](configuration.md#processing-workers). These
+measurements establish a useful improvement, not a universal optimum across
+content, quotas or providers.
 
 Results are recorded in `tests/e2e/artifacts/worker-throughput.jsonl` and
 `worker-throughput-network.jsonl`. The latter contains request counts,
@@ -139,8 +141,8 @@ do not establish a universal optimum or production-scale completion time.
 
 ```sh
 set -a; source .env; set +a
-PUFFERFS_E2E_THROUGHPUT_CONCURRENCY=1 bash scripts/test-e2e-worker-throughput.sh
-PUFFERFS_E2E_THROUGHPUT_CONCURRENCY=4 bash scripts/test-e2e-worker-throughput.sh
+PUFFERFS_E2E_THROUGHPUT_CONCURRENCY=1 PUFFERFS_EMBEDDING_BATCH_DOCUMENTS=256 bash scripts/test-e2e-worker-throughput.sh
+PUFFERFS_E2E_THROUGHPUT_CONCURRENCY=4 PUFFERFS_EMBEDDING_BATCH_DOCUMENTS=256 bash scripts/test-e2e-worker-throughput.sh
 PUFFERFS_E2E_THROUGHPUT_CONCURRENCY=4 PUFFERFS_EMBEDDING_BATCH_DOCUMENTS=64 \
   bash scripts/test-e2e-worker-throughput.sh
 PUFFERFS_E2E_THROUGHPUT_NO_VECTOR=true bash scripts/test-e2e-worker-throughput.sh
@@ -177,5 +179,6 @@ after validation. These are paid manual benchmarks, not a new mandatory CI gate.
 5. Offer full-text-only indexing when semantic search is unnecessary. It is a
    supported explicit mode, but the sessions root was not changed to that mode.
 
-The raw corpus was not force-reindexed, the production backlog was not redriven,
-and no commit, push, deployment or CLI release was performed.
+The original investigation did not force-reindex the raw corpus or redrive the
+production backlog. Later deployments are recorded in
+[production verification](simplification-implementation.md).

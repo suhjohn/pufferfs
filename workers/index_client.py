@@ -4,7 +4,7 @@ import os
 
 EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 EMBEDDING_DIMENSIONS = 4096
-EMBEDDING_BATCH_DOCUMENTS = int(os.getenv("PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", "256"))
+EMBEDDING_BATCH_DOCUMENTS = int(os.getenv("PUFFERFS_EMBEDDING_BATCH_DOCUMENTS", "64"))
 if not 1 <= EMBEDDING_BATCH_DOCUMENTS <= 256:
     raise ValueError("embedding batch documents must be 1..256")
 

@@ -22,6 +22,10 @@ runs the retirement step, `pulumi up`, service stabilization and health checks.
 Docker, Node, Pulumi and authorized AWS credentials are required. Configuration
 comes from `.env.example` / the selected GitHub Environment.
 
+Native embedding batches default to 64 documents, with a hard maximum of 256.
+`embeddingBatchDocuments` controls the background task setting; GitHub deployments
+populate it from `PUFFERFS_EMBEDDING_BATCH_DOCUMENTS` (default 64).
+
 Worker concurrency defaults to four file jobs per process (1–64).
 `workerIngestionConcurrency`, `workerBackgroundConcurrency`, and each worker
 service's desired count control separate limits. Collection and maintenance
