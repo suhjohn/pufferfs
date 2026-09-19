@@ -193,6 +193,29 @@ Actual charges depend on provider billing, retries, discounts, and your plan.
 - Provider budgets are independent: a Modal spending limit does not cap
   Turbopuffer or AWS charges.
 
+### Measured Indexing Speed
+
+These measurements include capture through searchable publication with native
+embeddings. They are examples, not sustained throughput guarantees for the
+entire corpus; content, rate limits, retries, and batch size affect speed.
+
+| Measurement | Chunks/minute | Embedding tokens/minute |
+| --- | ---: | ---: |
+| Production smoke test: 258 chunks in 12.21 seconds | **~1,270** | Not measured |
+| Local real-provider benchmark: four index threads, 256 documents/batch (current batch/concurrency settings) | **~330** | **~405,000** |
+| Local real-provider benchmark: four index threads, 64 documents/batch (not deployed) | **~1,800** | **~2.22 million** |
+
+The local benchmark rows each indexed 2,048 synthetic chunks. At the illustrative
+500 tokens/page assumption, their token rates correspond to approximately **810**
+and **4,440 text-equivalent pages/minute**, respectively. These are not PDF
+extraction rates, and a chunk is not a page. The production smoke test is too
+short to establish sustained speed; the full corpus has not been rerun since
+base64 replacement was deployed.
+
+See [benchmark measurements](docs/indexing-performance.md) and
+[production verification](docs/simplification-implementation.md#production-verification--september-18-2026-utc)
+for conditions and results.
+
 ## Further Reading
 
 - [Developer Guide](docs/developer-guide.md)
