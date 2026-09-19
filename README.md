@@ -157,6 +157,42 @@ in [Architecture and Functionality](docs/architecture-and-functionality.md).
 See [File Ingestion and Chunking](docs/file-ingestion-and-chunking.md) for the
 full format, extraction, and chunking process.
 
+## Indexing Cost Estimates
+
+These are estimated **backend provider costs**, not hosted-service prices or a
+quote. Rates and measurements below were checked on September 18, 2026.
+
+For a measured corpus of approximately 5,400 text/JSONL files, replacing explicit
+base64 data-URL payloads with `[base64 image]` reduced 19.0 GB of source data to
+10.1 GB of extracted text. A local Qwen tokenizer sample estimated **3.86 billion
+tokens**, and local extraction produced approximately **1.92 million chunks**.
+Original source files remain intact.
+
+| Rerun scope, with fresh extraction | Native embeddings | Index writes | One successful pass |
+| --- | ---: | ---: | ---: |
+| Failed files in this corpus only (about 2,700) | ~$253 | ~$40–80 | **~$295–335** |
+| Entire measured corpus | ~$270 | ~$44–87 | **~$315–360** |
+
+For the full rerun, **$400–450 is a planning budget with room for retries**, not
+an enforced spending cap. The estimate uses Qwen3-Embedding-8B at
+[$0.07 per million tokens](https://turbopuffer.com/docs/embedding), 4,096-dimensional
+vectors, and standard Turbopuffer [write pricing and batch discounts](https://turbopuffer.com/pricing).
+Token counts are sampled estimates; write costs include approximate row metadata.
+Actual charges depend on provider billing, retries, discounts, and your plan.
+
+- Re-extract files to apply `[base64 image]`. Retrying old index work reuses its
+  existing chunks and can still embed the original base64 payloads.
+- The table excludes ongoing infrastructure/storage, AWS request/transfer costs,
+  and search queries. Turbopuffer storage for the full resulting index is
+  estimated at **~$9/month**, separate from retained source storage.
+- This text/JSONL example makes no Gemini or Modal extraction calls. Actual PDFs,
+  images, audio, and video can add extraction-provider charges.
+- As a size comparison, 3.86 billion tokens equals **7.72 million pages at 500
+  tokens/page**, or **3.86 million pages at 1,000 tokens/page**. This is a text-volume
+  equivalent, not a PDF processing cost estimate.
+- Provider budgets are independent: a Modal spending limit does not cap
+  Turbopuffer or AWS charges.
+
 ## Further Reading
 
 - [Developer Guide](docs/developer-guide.md)
