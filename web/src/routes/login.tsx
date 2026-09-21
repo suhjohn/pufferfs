@@ -136,9 +136,7 @@ function Login() {
               {resendAfter > 0 ? `, resend after ${resendAfter}s` : ""}
             </p>
           </form>
-        ) : (
-          <p className="muted">Email login is not available on this deployment.</p>
-        )}
+        ) : null}
         {error && <p className="muted login-error">{error}</p>}
         {providers.google && (
           <>
