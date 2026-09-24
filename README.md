@@ -47,6 +47,9 @@ pufferfs sync ./handbook --name handbook
 pufferfs sync --root /Users/me/handbook
 ```
 
+Sync ignores zero-byte files. If an indexed file becomes empty, its old content
+is removed from search; adding content makes it eligible for indexing again.
+
 Sync a subset of a root:
 
 ```sh

@@ -158,8 +158,25 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 		paths = nil
 	}
 	if paths != nil {
+		remotePaths := make([]string, 0, len(changed))
 		for path := range changed {
-			paths = append(paths, path)
+			remotePaths = append(remotePaths, path)
+		}
+		// Our own accepted versions also arrive through the catalog feed.
+		// Their clean local receipts need no filesystem visit; local changes
+		// are already in ChangedPaths. Other versions still require a scan.
+		err = catalog.walk(remotePaths, func(file models.CapturedFileHead) error {
+			head, err := loadCapturedHead(headsDir, input.Client.baseURL, input.RootID, file.Path)
+			if err != nil {
+				return err
+			}
+			if head == nil || head.Version.VersionID != file.VersionID || head.Dirty || (!file.Deleted && !file.ProofCurrent) {
+				paths = append(paths, file.Path)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("checking changed catalog receipts: %w", err)
 		}
 		paths = compactCapturePaths(paths)
 	}

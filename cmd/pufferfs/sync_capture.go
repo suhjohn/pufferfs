@@ -97,7 +97,7 @@ func discoverCapturePlanForPaths(root string, paths []string, matcher *ignore.Ma
 				return fmt.Errorf("stat symlink target %s: %w", relPath, err)
 			}
 		}
-		if !info.Mode().IsRegular() {
+		if !info.Mode().IsRegular() || info.Size() == 0 {
 			return nil
 		}
 		plan.Present[relPath] = true

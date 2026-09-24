@@ -570,8 +570,10 @@ def follow_backlog():
             rewritten = captured(replacement)
             assert assert_source_retained(rewritten)["extents"] != after["extents"], "rewrite retained stale source extents"
             source.write_bytes(b"")
-            empty = captured(b"")
-            assert not assert_source_retained(empty).get("extents"), "truncation retained source bytes"
+            empty = captured(b"", deleted=True)
+            assert not empty["source_manifest_ref"]
+            source.write_bytes(replacement)
+            captured(replacement)
             source.unlink()
             deleted = captured(b"", deleted=True)
             assert not deleted["source_manifest_ref"]
@@ -590,16 +592,17 @@ def follow_backlog():
     history = sql("""SELECT v.id,v.previous_version_id,v.file_id FROM file_versions v
         JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s ORDER BY v.sequence""", (root,))
     ids = [file["version_id"] for file in state["follow_versions"]]
-    assert [v["id"] for v in history] == ids and len(history) == 5
+    assert [v["id"] for v in history] == ids and len(history) == 6
     assert [v["previous_version_id"] for v in history] == [None] + ids[:-1]
     assert len({v["file_id"] for v in history}) == 1
     # File deletion and successful captures must not remove earlier originals.
-    for file in state["follow_versions"][:-1]:
-        assert_source_retained(file)
+    for file in state["follow_versions"]:
+        if not file["deleted"]:
+            assert_source_retained(file)
     jobs = sql("""SELECT w.* FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
         JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id WHERE f.root_id=%s""", (root,))
-    assert len(jobs) == 5 and len({row["extraction_id"] for row in jobs}) == 5
-    print("One live agent captured create/append/rewrite/truncate/delete as five linked versions; originals retained.")
+    assert len(jobs) == 6 and len({row["extraction_id"] for row in jobs}) == 6
+    print("One live agent captured create/append/rewrite/truncate/restore/delete as six linked versions; originals retained.")
 
 
 def wait_work_idle(stage):

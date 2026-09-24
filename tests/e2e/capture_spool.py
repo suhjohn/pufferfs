@@ -39,7 +39,7 @@ def remember(state, payloads):
     state["spool_expected"] = {path: {"deleted": data is None,
         "size": len(data or b""), "hash": "sha256:" + hashlib.sha256(data or b"").hexdigest(),
         "first_line": data.decode().splitlines()[0] if data else ""}
-        for path, data in payloads.items()}
+        for path, data in payloads.items() if data != b""}
     run.save(state)
 
 
@@ -55,17 +55,28 @@ def empty_root_deletion(state):
         run.save(state)
         options = ["--no-vector"] if no_vector else []
         run.cli(state, "sync", str(directory), "--id", root, *options)
-        file = run.wait_indexed(state, root)[path.name]
-        assert file["size"] == 0 and not file["deleted"]
-        run.assert_source_retained(file)
+        assert not run.catalog(state, root), "zero-byte files must not be captured"
+        preview = json.loads(run.cli(state, "sync", str(directory), "--id", root,
+            "--dry-run", "--json", *options))
+        assert preview["changes"] == 0
         assert not run.request("POST", "/query", {"root_id": root, "query": "empty", "mode": "fts"},
                                key=state["key"])["results"]
-        path.unlink()
+        (directory / "still-empty.txt").write_bytes(b"")
+        path.write_text("Orchid empty-file lifecycle.\n")
+        run.cli(state, "sync", str(directory), "--id", root, *options)
+        assert not run.wait_indexed(state, root)[path.name]["deleted"]
+        run.cli(state, "sync", "wait", "--root", root, "--include", "*.txt", "--timeout", "30s")
+        path.write_bytes(b"")
         run.cli(state, "sync", str(directory), "--id", root, *options)
         assert run.wait_indexed(state, root)[path.name]["deleted"]
         run.request("POST", f"/roots/{root}/read", {"path": path.name, "lines": {"start": 1, "end": 1}},
                     key=state["key"], statuses=(404,))
-    print("Empty-only roots published and deleted successfully with vectors enabled and disabled.", flush=True)
+        assert not run.request("POST", "/query", {"root_id": root, "query": "orchid", "mode": "fts"},
+                               key=state["key"])["results"]
+        path.write_text("Orchid restored document.\n")
+        run.cli(state, "sync", str(directory), "--id", root, *options)
+        assert not run.wait_indexed(state, root)[path.name]["deleted"]
+    print("Zero-byte files were ignored, emptied files left search, and restored files returned with vectors enabled and disabled.", flush=True)
 
 
 def verify():
@@ -99,7 +110,7 @@ def verify():
     cache = local_spools(root)
     pending, = (cache / "pending").iterdir()
     journal = json.loads((pending / "journal.json").read_text())
-    assert [file["path"] for file in journal["request"]["files"]] == ["a.txt", "b.txt"]
+    assert [file["path"] for file in journal["request"]["files"]] == ["a.txt"]
     assert sum(pack["size"] for pack in journal["packs"]) == 4 << 20
     assert not run.catalog(state, root)
 
@@ -107,7 +118,7 @@ def verify():
     first = published(state)
     receipts = [json.loads(path.read_text()) for path in (cache / "completed").glob("*/journal.json")]
     assert len(receipts) == 3
-    assert sum(len(receipt["request"]["files"]) for receipt in receipts) == len(payloads)
+    assert sum(len(receipt["request"]["files"]) for receipt in receipts) == len(state["spool_expected"])
     retried, = [receipt for receipt in receipts if receipt["request"]["capture_id"] == journal["request"]["capture_id"]]
     assert retried["request"] == journal["request"] and retried["accepted"]
     assert not list((cache / "pending").iterdir())

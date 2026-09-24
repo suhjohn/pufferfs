@@ -377,6 +377,15 @@ func selectedLocalState(rootPath string, spec compiledSyncSubsetSpec, policy ign
 		if err != nil {
 			return fmt.Errorf("stat %s: %w", relPath, err)
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			info, err = os.Stat(absPath)
+			if err != nil {
+				return fmt.Errorf("stat symlink target %s: %w", relPath, err)
+			}
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return nil
+		}
 		fileState, err := fileStateForPath(absPath, info)
 		if err != nil {
 			return fmt.Errorf("hash %s: %w", relPath, err)

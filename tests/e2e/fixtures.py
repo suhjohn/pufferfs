@@ -83,7 +83,8 @@ def create_native(directory):
     (root / "contact.vcf").write_text("BEGIN:VCARD\nVERSION:3.0\nFN:Orchid Contact\nEND:VCARD\n")
     (root / "event.ics").write_text("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n"
                                    "SUMMARY:Orchid event\nEND:VEVENT\nEND:VCALENDAR\n")
-    return sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()), expected
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                  if path.is_file() and path.stat().st_size > 0), expected
 
 
 def create(directory):
@@ -158,7 +159,8 @@ def create(directory):
         "py", "eml", "vcf", "ics", "xlsx", "xls", "csv", "tsv", "docx", "pptx",
         "pdf", "png", "jpg", "webp", "tiff")}
     expectations.update(create_media(root))
-    files = sorted(str(path.relative_to(root)) for path in root.rglob("*") if path.is_file() and path.name != ".env")
+    files = sorted(str(path.relative_to(root)) for path in root.rglob("*")
+                   if path.is_file() and path.stat().st_size > 0 and path.name != ".env")
     return files, expectations
 
 
