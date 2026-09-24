@@ -36,8 +36,15 @@ maintenance window; ordinary later releases can use rolling deployments.
    before publishing. The deployment workflow handles existing and new stacks.
 3. Run `scripts/deploy/retire-old-workers.sh` from `infra/pulumi`. It stops only
    the four retired PufferFS CPU apps and old ECS API/consumer services. It
-   leaves the shared vision endpoint alone. The one-time step needs the old
-   Modal environment credentials and is skipped after `pipelineVersion=3`.
+   validates Modal's app-list fields and waits for stopped apps with zero
+   containers before proceeding. It leaves the shared vision endpoint alone.
+   The one-time step needs the old Modal environment credentials and is
+   skipped after `pipelineVersion=3`. To repair leftover Modal apps after that
+   cutover, run `python3 scripts/deploy/retire-modal-workers.py` from the
+   repository root with Modal installed, `MODAL_ENVIRONMENT` set, and the
+   intended workspace's credentials configured through a Modal profile or
+   `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET`. This standalone cleanup is safe to
+   repeat and does not stop the current ECS services.
 4. Apply Pulumi. The API applies production migrations on startup; workers
    retry database operations while startup/migration is in progress. Pulumi
    removes SQS resources, old consumers and the Modal worker IAM/OIDC role.

@@ -112,8 +112,10 @@ the partial-failure and cancellation vision suites also passed separately.
   `maintenance/root-deletions/` objects after 30 days of object age. An already
   old object can expire after deployment. Back up referenced legacy artifacts
   as well as Postgres if an old-version rollback must remain possible.
-- Old writers were stopped before migrations 048–050. This deployment did not
-  publish a CLI release or change provider spend limits.
+- Old ECS writers were stopped before migrations 048–050. The four retired
+  Modal CPU apps were mistakenly left deployed; see the September 23 correction
+  below. This deployment did not publish a CLI release or change provider spend
+  limits.
 - The cutover script checked other IAM roles before removing the stack-owned
   Modal OIDC provider. The AWS infrastructure update and ECS rollout succeeded.
 - The default deployment keeps one ingestion and one background ECS task
@@ -145,3 +147,27 @@ The new scheduler preserves their attempt counts and reports exhausted jobs as
 failed; deployment does not reset or re-extract them. Existing extracted text
 needs a new extraction to receive the base64 marker. No full-corpus reindex was
 launched during deployment.
+
+## Modal retirement correction — September 23, 2026 PDT
+
+The original cutover script selected `Description`, `State`, and `App ID` from
+Modal CLI JSON. Modal 1.5.5 returns `description`, `state`, and `app_id`, so the
+selection silently found no apps. Subsequent deployments skipped the one-time
+cutover because the stack already reported `pipelineVersion=3`.
+
+The retired collector and reconciliation apps continued their schedules and
+failed with `UndefinedColumn: column w.enqueued_at does not exist` against the
+migrated schema. The retired transform and index HTTP apps were still deployed
+but had no running containers when inspected.
+
+All four apps were stopped in the production Modal environment. A subsequent
+inventory verified `stopped` and zero containers for each; the same 24 unrelated
+live app IDs remained. The API returned healthy, and ECS retained two API tasks,
+one ingestion task and one background task with completed deployments.
+
+`retire-old-workers.sh` now uses `retire-modal-workers.py`, which validates the
+CLI JSON fields and waits for stopped apps with zero containers before allowing
+the schema cutover. The helper can also repair a stack that already completed
+the ECS migration without stopping its current services. Running the helper
+against the repaired production environment passed. Shell/Python syntax checks
+passed; the application E2E suite was not rerun for this deployment-script fix.

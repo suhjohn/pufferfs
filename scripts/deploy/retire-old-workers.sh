@@ -25,13 +25,7 @@ fi
 : "${MODAL_TOKEN_SECRET:?Old Modal apps must be stopped before schema migration}"
 : "${MODAL_ENVIRONMENT:?Set the old Modal environment}"
 python3 -m pip install 'modal>=1.5.5,<2'
-apps="$(python3 -m modal app list --env "$MODAL_ENVIRONMENT" --json)"
-for app in pufferfs-transform pufferfs-batch-collector pufferfs-index pufferfs-reconciliation; do
-  mapfile -t ids < <(jq -r --arg app "$app" '.[] | select(.Description == $app and .State != "stopped") | .["App ID"]' <<< "$apps")
-  for id in "${ids[@]}"; do
-    python3 -m modal app stop "$id" --env "$MODAL_ENVIRONMENT" --yes
-  done
-done
+python3 "$(dirname "$0")/retire-modal-workers.py"
 mapfile -t candidates < <(jq -r '(.workerServiceArns[]?), .apiServiceArn // empty' <<< "$outputs")
 services="$(aws ecs describe-services --cluster "$cluster" --services "${candidates[@]}")"
 if jq -e '.failures[]? | select(.reason != "MISSING")' <<< "$services" >/dev/null; then
