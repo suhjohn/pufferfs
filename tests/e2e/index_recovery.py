@@ -36,7 +36,8 @@ def held(fault_id, state):
 
 
 def work(root, version):
-    rows = run.sql("""SELECT w.id,w.status,w.attempt_count,w.attempt_token,e.chunks_ref,w.extraction_id
+    rows = run.sql("""SELECT w.id,w.status,w.attempt_count,w.attempt_token,w.lease_until::text,
+        w.index_cursor,e.chunks_ref,w.extraction_id
         FROM file_work w JOIN file_extractions e ON e.id=w.extraction_id
         JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
         WHERE f.root_id=%s AND v.id=%s""", (root, version))

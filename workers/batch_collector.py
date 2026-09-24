@@ -12,6 +12,7 @@ from provider_retry import MAX_REQUEST_ATTEMPTS
 from gemini_contract import result_chunks
 from source_io import iter_chunks, write_chunks
 from vision_fallback import fallback_results
+from decoded_segments import prepare_decoded_segments
 
 ASSEMBLY_MEMORY_BYTES = 64 * 1024 * 1024
 
@@ -102,7 +103,7 @@ def collect_batch(batch, client, s3, bucket, *, connect=database):
 
 def assemble_extraction(extraction_id, s3, bucket, token, *, connect=database):
     with connect() as conn:
-        extraction = conn.execute("""SELECT e.*,f.root_id,r.org_id,r.deleting_at,
+        extraction = conn.execute("""SELECT e.*,f.root_id,f.id AS file_id,r.org_id,r.deleting_at,
             f.captured_version_id,f.deleted FROM file_extractions e
             JOIN file_versions v ON v.id=e.version_id JOIN file_catalog f ON f.id=v.file_id
             JOIN roots r ON r.id=f.root_id WHERE e.id=%s""", (extraction_id,)).fetchone()
@@ -110,11 +111,9 @@ def assemble_extraction(extraction_id, s3, bucket, token, *, connect=database):
             return False
         stale = (extraction["deleting_at"] or extraction["deleted"]
                  or extraction["captured_version_id"] != extraction["version_id"])
-        summary = conn.execute("""SELECT SUM(request_count) AS count,MIN(ordinal_start) AS first,
-            MAX(ordinal_start+request_count) AS last,BOOL_AND(status='complete' AND output_ref<>'') AS ready,
-            BOOL_OR(status='failed') AS failed FROM provider_batches WHERE extraction_id=%s""",
-            (extraction_id,)).fetchone()
-        if stale or summary["failed"]:
+        failed = conn.execute("""SELECT EXISTS(SELECT 1 FROM provider_batches
+            WHERE extraction_id=%s AND status='failed') AS failed""", (extraction_id,)).fetchone()['failed']
+        if stale or failed:
             status = "superseded" if stale else "failed"
             conn.execute("UPDATE file_extractions SET status=%s,updated_at=NOW() WHERE id=%s AND status='waiting_provider'",
                          (status, extraction_id))
@@ -122,49 +121,69 @@ def assemble_extraction(extraction_id, s3, bucket, token, *, connect=database):
                 WHERE extraction_id=%s AND stage='transform' AND status='waiting_provider'""", (status, extraction_id))
             return False
     expected = extraction["prepared_request_count"]
-    if (type(expected) is not int or expected < 1 or summary["count"] != expected
-            or summary["first"] != 0 or summary["last"] != expected or not summary["ready"]):
+    # finish_preparation already sealed and validated the complete immutable
+    # request range. Seek the next batch; do not rescan every prior batch each turn.
+    if type(expected) is not int or expected < 1:
         return False
+    start = extraction['provider_assembly_cursor']
+    with connect() as conn:
+        batch = conn.execute("""SELECT * FROM provider_batches WHERE extraction_id=%s AND ordinal_start=%s""",
+            (extraction_id, start)).fetchone()
+    if batch is None:
+        raise RuntimeError("provider assembly range is missing")
+    if batch['status'] != 'complete' or not batch['output_ref']:
+        return False
+    next_cursor = start + batch['request_count']
+    complete = next_cursor == expected
+    if not 0 <= start < next_cursor <= expected:
+        raise ValueError("invalid provider assembly cursor")
 
     def chunks():
-        ordinal, start = 0, 0
-        while start < expected:
-            with connect() as conn:
-                batches = conn.execute("""SELECT * FROM provider_batches WHERE extraction_id=%s
-                    AND ordinal_start>=%s ORDER BY ordinal_start LIMIT 16""", (extraction_id, start)).fetchall()
-            if not batches:
-                raise RuntimeError("provider result ranges are missing")
-            for batch in batches:
-                if batch["ordinal_start"] != start or batch["status"] != "complete":
-                    raise RuntimeError("provider result ranges changed during assembly")
-                manifest = read_manifest(s3, bucket, batch, batch["output_ref"], "result")
-                requests = manifest["requests"]
-                if any(r["status"] != "complete" for r in requests):
-                    raise ValueError("incomplete provider result manifest")
-                by_ref, selected = defaultdict(set), {}
-                for request in requests:
-                    by_ref[request["result_ref"]].add(request["request_key"])
-                    selected[request["request_key"]] = []
-                retained = 0
-                for ref, keys in by_ref.items():
-                    with closing(iter_chunks(s3, bucket, ref)) as records:
-                        for chunk in records:
-                            key = chunk.pop("request_key")
-                            if key not in keys:
-                                continue
-                            retained += json_memory_size(chunk) + sys.getsizeof(None)
-                            if retained > ASSEMBLY_MEMORY_BYTES:
-                                raise ValueError("provider assembly window exceeds 64 MiB")
-                            selected[key].append(chunk)
-                for request in requests:
-                    for chunk in selected.pop(request["request_key"]):
-                        chunk["chunk_index"] = ordinal
-                        ordinal += 1
-                        yield chunk
-                start += batch["request_count"]
+        ordinal = extraction['provider_assembly_chunk_count']
+        manifest = read_manifest(s3, bucket, batch, batch["output_ref"], "result")
+        requests = manifest["requests"]
+        if any(r["status"] != "complete" for r in requests):
+            raise ValueError("incomplete provider result manifest")
+        by_ref, selected = defaultdict(set), {}
+        for request in requests:
+            by_ref[request["result_ref"]].add(request["request_key"])
+            selected[request["request_key"]] = []
+        retained = 0
+        for ref, keys in by_ref.items():
+            with closing(iter_chunks(s3, bucket, ref)) as records:
+                for chunk in records:
+                    key = chunk.pop("request_key")
+                    if key not in keys:
+                        continue
+                    retained += json_memory_size(chunk) + sys.getsizeof(None)
+                    if retained > ASSEMBLY_MEMORY_BYTES:
+                        raise ValueError("provider assembly window exceeds 64 MiB")
+                    selected[key].append(chunk)
+        for request in requests:
+            for chunk in selected.pop(request["request_key"]):
+                chunk["chunk_index"] = ordinal
+                ordinal += 1
+                yield chunk
 
-    prefix = f"extractions/{extraction['org_id']}/{extraction['root_id']}/{extraction_id}/chunks"
-    artifact, count = write_chunks(s3, bucket, prefix, chunks())
+    job = {**extraction, "extraction_id": extraction_id, "attempt_token": token}
+
+    def lock_owner(conn, current):
+        row = conn.execute("""SELECT e.chunk_count FROM file_work w
+            JOIN file_extractions e ON e.id=w.extraction_id
+            WHERE w.extraction_id=%s AND w.stage='transform' AND w.status='waiting_provider'
+              AND w.attempt_token=%s AND w.lease_until>NOW() AND e.status='waiting_provider'
+            FOR UPDATE OF w,e""", (extraction_id, token)).fetchone()
+        if row is None or row["chunk_count"] != current["chunk_count"]:
+            raise RuntimeError("provider segment assembly lost ownership")
+
+    with connect() as conn:
+        lock_owner(conn, job)
+        conn.execute("UPDATE file_extractions SET row_format=2 WHERE id=%s", (extraction_id,))
+    job["row_format"] = 2
+    # One completed provider batch per collection turn. The same durable file
+    # job then indexes that prepared prefix before requesting the next batch.
+    artifact, count = prepare_decoded_segments(job, s3, bucket, chunks(), lock_owner,
+        start_ordinal=extraction['provider_assembly_chunk_count'], manifest=complete)
     with connect() as conn:
         # Lock root against deletion only for this short publication transaction.
         root = conn.execute("SELECT deleting_at FROM roots WHERE id=%s FOR UPDATE", (extraction["root_id"],)).fetchone()
@@ -175,9 +194,12 @@ def assemble_extraction(extraction_id, s3, bucket, token, *, connect=database):
             (extraction_id, token)).fetchone()
         if owner is None:
             return False
-        updated = conn.execute("""UPDATE file_extractions SET status='complete',chunks_ref=%s,
-                                  chunk_count=%s,updated_at=NOW() WHERE id=%s AND status='waiting_provider'
-                                  RETURNING id""", (artifact, count, extraction_id)).fetchone()
+        updated = conn.execute("""UPDATE file_extractions SET
+            status=CASE WHEN %s THEN 'complete' ELSE 'waiting_provider' END,
+            chunks_ref=%s,source_verified=%s,chunk_count=%s,
+            provider_assembly_cursor=%s,provider_assembly_chunk_count=%s,updated_at=NOW()
+            WHERE id=%s AND status='waiting_provider' RETURNING id""",
+            (complete, artifact, complete, count, next_cursor, count, extraction_id)).fetchone()
         if updated is None:
             return False
         conn.execute("""UPDATE file_work SET stage='index',status='pending',attempt_count=0,

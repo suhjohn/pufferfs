@@ -38,8 +38,8 @@ maintenance window; ordinary later releases can use rolling deployments.
    the four retired PufferFS CPU apps and old ECS API/consumer services. It
    validates Modal's app-list fields and waits for stopped apps with zero
    containers before proceeding. It leaves the shared vision endpoint alone.
-   The one-time step needs the old Modal environment credentials and is
-   skipped after `pipelineVersion=3`. To repair leftover Modal apps after that
+   The one-time step needs the old Modal environment credentials. The
+   Modal-specific step is skipped after `pipelineVersion=3`. To repair leftover Modal apps after that
    cutover, run `python3 scripts/deploy/retire-modal-workers.py` from the
    repository root with Modal installed, `MODAL_ENVIRONMENT` set, and the
    intended workspace's credentials configured through a Modal profile or
@@ -62,6 +62,33 @@ maintenance window; ordinary later releases can use rolling deployments.
 Do not roll an old image onto the new schema. Rollback requires stopping new
 writers and restoring the matching database backup and old deployment. This is
 why the one-time migration is separate from an ordinary rolling release.
+
+## Segmented pipeline upgrade (pipeline version 4)
+
+Migration 056 adds shared segments. Old API/worker images cannot interpret
+new append memberships, so this is another coordinated cutover. The deployment
+retirement script stops the current ECS API and both worker services when the
+stack reports pipeline version 3, waits for them to drain, and then permits
+Pulumi to start the new roles and migrations. It does not require Modal
+deployment credentials for this cutover. Captures remain durable in Postgres/S3;
+expired attempts resume from their last committed checkpoints. Keep a database
+backup and the previous images. Once format-2 data exists, rolling back to an old
+binary requires restoring a matching backup, not merely reversing the schema.
+
+Publish the new CLI after the backend exposes `/catalog-changes` and
+`/capture-summary`. Existing CLI versions retain the older API endpoints.
+No existing corpus needs to be reindexed. Legacy artifacts stay readable and
+pending legacy index jobs can finish unchanged. New extractions select the
+segmented format; append reuse begins once a predecessor has that format.
+
+Configure identical `embeddingRequestsPerMinute` / `embeddingTokensPerMinute`
+in every API/background role; the deployment exposes their `PUFFERFS_…`
+environment settings. These are shared account/model budgets, not worker-local
+limits. The initial limits persist in `provider_capacity`; changing them requires
+draining embedding producers and updating that row before deploying matching
+configuration. Search limits use `searchConcurrency` and
+`searchTenantConcurrency` across API replicas. See the
+[implementation and verification record](flow-optimization-implementation.md).
 
 ## GitHub workflows
 

@@ -46,6 +46,12 @@ func main() {
 
 	// Server
 	srv := server.New(db, s3Client, tpClient)
+	if err := srv.ConfigureSearchAdmissionFromEnv(); err != nil {
+		log.Fatalf("configuring search admission: %v", err)
+	}
+	if err := srv.ConfigureEmbeddingBudgetFromEnv(); err != nil {
+		log.Fatalf("configuring embedding budget: %v", err)
+	}
 	posthogEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("POSTHOG_ENABLED")), "true")
 	posthogKey := strings.TrimSpace(os.Getenv("POSTHOG_KEY"))
 	analyticsClient := productanalytics.New(productanalytics.Config{

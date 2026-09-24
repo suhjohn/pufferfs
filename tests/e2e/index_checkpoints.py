@@ -34,6 +34,7 @@ def capture():
     assert len(records) == 1025
     assert [r['chunk_index'] for r in records] == list(range(1025))
     assert row['status'] == 'running' and row['attempt_count'] == 1
+    assert row['index_cursor'] == 512
     assert not file['indexed_version_id']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==event['namespace'] and e['operation']=='write']
     assert len(events) == 2 and all(e.get('upstream_status') == 200 for e in events)
@@ -67,31 +68,47 @@ def recovered():
     case = state['checkpoint_cases'][-1]
     published(state,case['root'],case['version'])
     row = work(case['root'],case['version'])
-    assert row['status'] == 'complete' and row['attempt_count'] == 2
+    # Successful bounded turns reset retry attempts before the final segment.
+    assert row['status'] == 'complete' and row['attempt_count'] == case.get('final_attempt_count', 1)
+    assert row['index_cursor'] == 1025
     assert row['attempt_token'] != case['work']['attempt_token']
     assert row['chunks_ref'] == case['work']['chunks_ref'] and object_stamp(row['chunks_ref']) == case['stamp']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==case['namespace'] and e['operation']=='write' and e.get('upstream_status') == 200]
     replayed = events[2:]
-    assert len(events) == 5
-    repeated = case['initial_hashes']
-    assert [e['payload_sha256'] for e in replayed[:len(repeated)]] == repeated
+    second_confirmed = case.get('drained') or case.get('confirmed_second')
+    assert len(events) == (3 if second_confirmed else 4)
+    assert sum(e['payload_sha256'] == case['initial_hashes'][0] for e in events) == 1
+    if not second_confirmed:
+        assert replayed[0]['payload_sha256'] == case['initial_hashes'][1]
     assert len({e['payload_sha256'] for e in events}) == 3
     verify_reads(state,case)
     run.wait_work_idle('index')
-    print(f"Recovered from canonical chunks: replayed {len(replayed)} batches, exact bytes and all 1025 lines verified on both APIs.",flush=True)
+    print(f"Resumed from confirmed chunks: {len(replayed)} remaining writes, exact bytes and all 1025 lines verified on both APIs.",flush=True)
+
+
+def drained():
+    state = json.loads(run.STATE.read_text())
+    case = state['checkpoint_cases'][-1]
+    row = work(case['root'],case['version'])
+    assert row['status'] == 'pending' and row['index_cursor'] == 1024, row
+    assert row['attempt_count'] == 0 and row['lease_until'] is None and row['attempt_token'] is None
+    assert not run.catalog(state,case['root'])['record.txt']['indexed_version_id']
+    case['drained'] = True
+    run.save(state)
+    print('SIGTERM saved both confirmed writes and released ownership without consuming an attempt.',flush=True)
 
 
 def restarted():
     state = json.loads(run.STATE.read_text())
     for case in state['checkpoint_cases']:
         verify_reads(state,case)
-    print('Full-replay results survived both API restarts.',flush=True)
+    print('Checkpointed results survived both API restarts.',flush=True)
 
 
 if __name__ == '__main__':
     phase=sys.argv[1]
     phases={'capture':capture,
-        'recovered':recovered,'restarted':restarted,'release':lambda:relay('POST','/release')}
+        'recovered':recovered,'drained':drained,'restarted':restarted,'release':lambda:relay('POST','/release')}
     started,status=time.monotonic(),'failed'
     try:
         phases[phase]()

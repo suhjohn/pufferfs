@@ -14,7 +14,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop ingestion background provider-relay provider-manifest-relay || true
+    "${compose[@]}" stop ingestion background provider-relay provider-manifest-relay index-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project." >&2
       cleanup_failed=1
@@ -28,7 +28,7 @@ finish() {
 }
 trap finish EXIT
 "${compose[@]}" build
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion provider-relay provider-manifest-relay
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion provider-relay provider-manifest-relay index-relay
 runner_started=1
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e)
 "${driver[@]}" /e2e/vision_fallback.py capture

@@ -163,6 +163,9 @@ func NewMatcherForPathsWithPolicy(rootDir string, relPaths []string, policy Poli
 			}
 			dir = parent
 		}
+		if info, err := os.Stat(filepath.Join(rootDir, filepath.FromSlash(relPath))); err == nil && info.IsDir() {
+			m.loadIgnoreFilesBelow(rootDir, filepath.Join(rootDir, filepath.FromSlash(relPath)))
+		}
 	}
 
 	return m
@@ -226,8 +229,12 @@ func (m *Matcher) loadPatternScanner(scanner *bufio.Scanner, pathParts []string)
 }
 
 func (m *Matcher) loadIgnoreFiles(rootDir string) {
+	m.loadIgnoreFilesBelow(rootDir, rootDir)
+}
+
+func (m *Matcher) loadIgnoreFilesBelow(rootDir, scanDir string) {
 	rootDir = filepath.Clean(rootDir)
-	_ = filepath.WalkDir(rootDir, func(filePath string, entry os.DirEntry, err error) error {
+	_ = filepath.WalkDir(scanDir, func(filePath string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
 			return nil
 		}

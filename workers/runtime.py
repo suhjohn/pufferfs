@@ -10,8 +10,9 @@ import threading
 import time
 
 from aws_clients import client
-from file_runtime import claim_due_work, fail_attempt, work_lease
+from file_runtime import claim_due_work, fail_attempt, work_lease, yield_index
 from index_client import turbopuffer_client
+from provider_capacity import ProviderDeferred, limits as embedding_limits
 
 
 def process_files(stage, stopped):
@@ -27,10 +28,18 @@ def process_files(stage, stopped):
                 continue
             with work_lease(job) as check_lease, closing(client("s3")) as s3:
                 if stage == "transform":
-                    transform(job, s3, check_lease)
+                    transform(job, s3, check_lease, stopping=stopped)
                 else:
-                    with turbopuffer_client() as tp:
-                        publish_extraction(job, s3, os.environ["AWS_BUCKET_NAME"], tp, check_lease)
+                    # Each actual native embedding attempt must be admitted;
+                    # hidden SDK retries would spend unreserved capacity.
+                    with turbopuffer_client(max_retries=0) as tp:
+                        publish_extraction(job, s3, os.environ["AWS_BUCKET_NAME"], tp, check_lease, stopped)
+        except ProviderDeferred as error:
+            if job is not None:
+                try:
+                    yield_index(job, delay=error.delay)
+                except Exception as failure:
+                    print(f"capacity deferral recovery deferred: {type(failure).__name__}", flush=True)
         except Exception as error:
             print(f"{stage} attempt failed: {type(error).__name__}", flush=True)
             if job is not None:
@@ -58,6 +67,7 @@ def main():
     concurrency = int(os.environ.get("PUFFERFS_WORKER_CONCURRENCY", "4"))
     if not 1 <= concurrency <= 64:
         raise ValueError("worker concurrency must be 1..64")
+    embedding_limits()
     for name in ("DATABASE_URL", "AWS_BUCKET_NAME", "GEMINI_API_KEY", "TURBOPUFFER_API_KEY"):
         if not os.environ.get(name):
             raise ValueError(f"{name} is required")

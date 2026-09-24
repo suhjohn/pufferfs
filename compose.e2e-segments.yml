@@ -1,0 +1,20 @@
+services:
+  source-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/upload_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      aws: {condition: service_healthy}
+  ingestion:
+    environment:
+      AWS_ENDPOINT_URL: http://source-relay:8080
+      PUFFERFS_WORKER_CONCURRENCY: '1'
+    depends_on:
+      source-relay: {condition: service_healthy}
+  background:
+    environment:
+      PUFFERFS_WORKER_CONCURRENCY: '1'

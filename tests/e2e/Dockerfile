@@ -13,6 +13,8 @@ COPY internal/ ./internal/
 COPY pkg/ ./pkg/
 COPY migrations/ ./migrations/
 RUN CGO_ENABLED=0 go build -o /pufferfs ./cmd/pufferfs
+COPY cmd/pufferfs-source-digest/ ./cmd/pufferfs-source-digest/
+RUN CGO_ENABLED=0 go build -o /pufferfs-source-digest ./cmd/pufferfs-source-digest
 
 FROM python:3.12-slim-trixie AS worker-base
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -20,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core ca-certificates espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app/workers
+COPY --from=cli /pufferfs-source-digest /usr/local/bin/pufferfs-source-digest
 COPY workers/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt 'fastapi[standard]'
 ENV PYTHONUNBUFFERED=1

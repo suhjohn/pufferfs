@@ -75,7 +75,7 @@ def claim_assembly(*, connect=database):
 
 @contextmanager
 def assembly_lease(work, *, connect=database):
-    stopped, errors = threading.Event(), []
+    stopped = threading.Event()
 
     def renew():
         while not stopped.wait(60):
@@ -86,16 +86,15 @@ def assembly_lease(work, *, connect=database):
                         (work["id"], work["attempt_token"])).rowcount
                 if changed != 1:
                     raise RuntimeError("provider assembly lease lost")
-            except Exception as error:
-                errors.append(error)
+            except Exception:
                 return
 
     thread = threading.Thread(target=renew, daemon=True)
     thread.start()
     try:
         yield
-        if errors:
-            raise errors[0]
+        # Assembly publishes/yields with its current lease token. Renewal can
+        # race that successful handoff; the final fenced write is authoritative.
     finally:
         stopped.set()
         thread.join(timeout=20)

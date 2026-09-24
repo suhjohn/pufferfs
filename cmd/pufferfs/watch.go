@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -67,6 +68,7 @@ type followOptions struct {
 	MaxBackoff           time.Duration
 	MaxSameFailures      int
 	MaxSameFailureWindow time.Duration
+	ReconcileInterval    time.Duration
 }
 
 func defaultFollowOptions() followOptions {
@@ -75,6 +77,7 @@ func defaultFollowOptions() followOptions {
 		MaxBackoff:           60 * time.Second,
 		MaxSameFailures:      8,
 		MaxSameFailureWindow: 10 * time.Minute,
+		ReconcileInterval:    15 * time.Minute,
 	}
 }
 
@@ -84,6 +87,7 @@ func addFollowFlags(cmd *cobra.Command, options *followOptions) {
 	cmd.Flags().DurationVar(&options.MaxBackoff, "max-backoff", options.MaxBackoff, "Maximum retry backoff while following")
 	cmd.Flags().IntVar(&options.MaxSameFailures, "max-same-failures", options.MaxSameFailures, "Exit after this many consecutive identical sync failures")
 	cmd.Flags().DurationVar(&options.MaxSameFailureWindow, "max-same-failure-window", options.MaxSameFailureWindow, "Exit after identical sync failures persist for this long")
+	cmd.Flags().DurationVar(&options.ReconcileInterval, "reconcile-interval", options.ReconcileInterval, "Interval between full filesystem reconciliations while following")
 }
 
 func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, options followOptions) error {
@@ -94,121 +98,74 @@ func runFollow(cfg *appconfig.Config, dir, name, rootID string, noVector bool, o
 	if _, err := os.Stat(dir); err != nil {
 		return fmt.Errorf("watched directory unavailable: %w", err)
 	}
-
-	fmt.Println("Running initial sync...")
-	failures := followFailureTracker{}
-	initialDirty := false
-	for {
-		captureDirty, err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options)
-		if err != nil {
-			return fmt.Errorf("initial sync: %w", err)
-		}
-		if !failures.Active {
-			initialDirty = captureDirty
-			break
-		}
-		delay := failures.NextDelay(options)
-		log.Printf("initial sync failed; retrying in %s: %v", delay, failures.LastError)
-		time.Sleep(delay)
-	}
-
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("creating watcher: %w", err)
 	}
 	defer watcher.Close()
-
-	matcher := ignore.NewMatcher(dir)
-
-	if err := addWatchDirs(watcher, dir, matcher); err != nil {
+	if err := addWatchDirs(watcher, dir, ignore.NewMatcher(dir)); err != nil {
 		return fmt.Errorf("adding watch dirs: %w", err)
 	}
-
-	fmt.Printf("Following %s for changes (debounce: %s)...\n", dir, options.Debounce)
-
+	changes := newFollowChanges()
+	go changes.observe(ctx, watcher, dir)
+	changes.mark(nil)
+	// Watching starts before the initial scan, closing the scan-to-watch gap.
+	fmt.Println("Running initial sync...")
 	timer := time.NewTimer(0)
-	if !timer.Stop() {
-		<-timer.C
-	}
-	pending := false
-	dirty := initialDirty
-	if dirty {
-		resetFollowTimer(timer, &pending, followCaptureReconcileDelay(options))
-	}
-
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-
+	defer timer.Stop()
+	pending := true
+	metadata := time.NewTicker(30 * time.Second)
+	defer metadata.Stop()
+	reconcile := time.NewTicker(options.ReconcileInterval)
+	defer reconcile.Stop()
+	failures := followFailureTracker{}
+	initial := true
 	for {
 		select {
-		case sig := <-signals:
-			fmt.Printf("\nReceived %s; stopping follow.\n", sig)
+		case <-ctx.Done():
+			fmt.Println("Stopping follow.")
 			return nil
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
-
-			relPath, err := filepath.Rel(dir, event.Name)
-			if err != nil {
-				continue
-			}
-			relPath = filepath.ToSlash(relPath)
-
-			if matcher.ShouldIgnore(relPath, false) {
-				continue
-			}
-
-			// If a new directory was created, add it to the watcher
-			if event.Has(fsnotify.Create) {
-				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					if !matcher.ShouldIgnore(relPath, true) {
-						_ = watcher.Add(event.Name)
-					}
-				}
-			}
-
-			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) ||
-				event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
-				dirty = true
-				if !pending {
-					resetFollowTimer(timer, &pending, options.Debounce)
-				}
-			}
-
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return nil
-			}
-			log.Printf("watcher error: %v", err)
-			dirty = true
+		case <-metadata.C:
+			changes.mark([]string{})
+		case <-reconcile.C:
+			changes.mark(nil)
+		case <-changes.notice:
 			if !pending {
 				resetFollowTimer(timer, &pending, options.Debounce)
 			}
-
 		case <-timer.C:
 			pending = false
-			if !dirty {
-				continue
-			}
 			if _, err := os.Stat(dir); err != nil {
 				return fmt.Errorf("watched directory unavailable: %w", err)
 			}
-			fmt.Println("\nChanges detected, syncing...")
-			captureDirty, err := runFollowSync(cfg, dir, name, rootID, noVector, &failures, options)
+			paths := changes.take()
+			if paths == nil {
+				if err := addWatchDirs(watcher, dir, ignore.NewMatcher(dir)); err != nil {
+					return fmt.Errorf("repairing watches: %w", err)
+				}
+			}
+			dirty, err := runFollowSync(ctx, cfg, dir, name, rootID, noVector, &failures, options, paths)
+			if ctx.Err() != nil {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
 			if failures.Active {
-				dirty = true
+				changes.mark(paths)
 				delay := failures.NextDelay(options)
 				log.Printf("sync failed; retrying in %s: %v", delay, failures.LastError)
 				resetFollowTimer(timer, &pending, delay)
 				continue
 			}
-			dirty = captureDirty
-			if dirty {
+			if initial {
+				fmt.Printf("Following %s for changes (debounce: %s)...\n", dir, options.Debounce)
+				initial = false
+			}
+			if len(dirty) > 0 {
+				changes.mark(dirty)
 				resetFollowTimer(timer, &pending, followCaptureReconcileDelay(options))
 			}
 		}
@@ -229,6 +186,9 @@ func normalizeFollowOptions(options followOptions) followOptions {
 	if options.MaxSameFailureWindow <= 0 {
 		options.MaxSameFailureWindow = defaults.MaxSameFailureWindow
 	}
+	if options.ReconcileInterval <= 0 {
+		options.ReconcileInterval = defaults.ReconcileInterval
+	}
 	return options
 }
 
@@ -245,21 +205,24 @@ func resetFollowTimer(timer *time.Timer, pending *bool, delay time.Duration) {
 	*pending = true
 }
 
-func runFollowSync(cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions) (bool, error) {
-	result, err := runSync(cfg, dir, name, rootID, "org", noVector, false, false, os.Stdout)
+func runFollowSync(ctx context.Context, cfg *appconfig.Config, dir, name, rootID string, noVector bool, failures *followFailureTracker, options followOptions, paths []string) ([]string, error) {
+	result, err := runSyncSelection(ctx, cfg, dir, syncSubsetSpec{}, name, rootID, "org", noVector, false, false, os.Stdout, paths)
 	if err == nil {
 		failures.Reset()
-		return result != nil && len(result.dirtyPaths) > 0, nil
+		if result != nil {
+			return result.dirtyPaths, nil
+		}
+		return nil, nil
 	}
 	class := classifyFollowError(err)
 	failures.Record(err, class)
 	if class.Permanent {
-		return false, fmt.Errorf("permanent sync failure: %w", err)
+		return nil, fmt.Errorf("permanent sync failure: %w", err)
 	}
 	if failures.ShouldExit(options) {
-		return false, fmt.Errorf("same sync failure repeated %d times over %s: %w", failures.SameCount, time.Since(failures.FirstSeen).Round(time.Second), err)
+		return nil, fmt.Errorf("same sync failure repeated %d times over %s: %w", failures.SameCount, time.Since(failures.FirstSeen).Round(time.Second), err)
 	}
-	return false, nil
+	return nil, nil
 }
 
 func followCaptureReconcileDelay(options followOptions) time.Duration {
@@ -372,7 +335,11 @@ func normalizeErrorString(err error) string {
 }
 
 func addWatchDirs(watcher *fsnotify.Watcher, root string, matcher *ignore.Matcher) error {
-	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	return addWatchDirsBelow(watcher, root, root, matcher)
+}
+
+func addWatchDirsBelow(watcher *fsnotify.Watcher, root, below string, matcher *ignore.Matcher) error {
+	return filepath.WalkDir(below, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

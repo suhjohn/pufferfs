@@ -417,6 +417,10 @@ type compiledSyncSubsetSpec struct {
 }
 
 func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, noVector, force, dryRun bool, log io.Writer) (*syncCommandResult, error) {
+	return runSyncSelection(context.Background(), cfg, rootPath, spec, name, rootID, rootScope, noVector, force, dryRun, log, nil)
+}
+
+func runSyncSelection(ctx context.Context, cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, name, rootID, rootScope string, noVector, force, dryRun bool, log io.Writer, changedPaths []string) (*syncCommandResult, error) {
 	canonical, err := canonicalLocalPath(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolving sync root: %w", err)
@@ -460,8 +464,8 @@ func runSyncSubset(cfg *appconfig.Config, rootPath string, spec syncSubsetSpec, 
 	if err != nil {
 		return nil, err
 	}
-	input := captureSyncInput{Client: client, Dir: canonical, Name: root.Name, RootID: rootID, Policy: policy, Select: compiled.matches, Force: force, Log: log}
-	result, err := runFileCaptureSync(context.Background(), input, fileCaptureCacheDir(input))
+	input := captureSyncInput{Client: client, Dir: canonical, Name: root.Name, RootID: rootID, Policy: policy, Select: compiled.matches, Force: force, Log: log, ChangedPaths: changedPaths}
+	result, err := runFileCaptureSync(ctx, input, fileCaptureCacheDir(input))
 	if err != nil {
 		return result, err
 	}

@@ -11,6 +11,7 @@ import time
 from file_runtime import database
 
 MAX_TARGETS = 25
+MAX_PREFIX_PAGES = 10
 
 
 def root_mutation(target):
@@ -21,7 +22,7 @@ def root_mutation(target):
 
 
 def clear_prefix(s3, bucket, target, *, deadline=float("inf"), clock=time.monotonic):
-    """One object page and at most ten abandoned multipart uploads per pass."""
+    """Drain bounded pages from the first remaining key; never skip late keys."""
     root, org, prefix = target["root_id"], target["org_id"], target["target"]
     extraction = target.get("extraction_id")
     if extraction is not None:
@@ -34,33 +35,41 @@ def clear_prefix(s3, bucket, target, *, deadline=float("inf"), clock=time.monoto
         allowed = {f"{kind}/{org}/{root}/" for kind in ("sources", "extractions", "mutations")}
     if prefix not in allowed:
         raise ValueError("invalid root cleanup prefix")
-    page = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
-    keys = [item["Key"] for item in page.get("Contents", [])]
-    if len(keys) > 1000 or any(not key.startswith(prefix) for key in keys):
-        raise ValueError("cleanup listing contains foreign objects")
-    if keys:
+    for _ in range(MAX_PREFIX_PAGES):
         if clock() >= deadline:
             return True
-        result = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True})
-        if result.get("Errors"):
-            raise RuntimeError("root object deletion was incomplete")
-    if page.get("IsTruncated"):
-        return True  # Start at the remaining first page on the next pass.
-    if clock() >= deadline:
+        page = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1000)
+        keys = [item["Key"] for item in page.get("Contents", [])]
+        if len(keys) > 1000 or any(not key.startswith(prefix) for key in keys):
+            raise ValueError("cleanup listing contains foreign objects")
+        if keys:
+            if clock() >= deadline:
+                return True
+            result = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True})
+            if result.get("Errors"):
+                raise RuntimeError("root object deletion was incomplete")
+        if not page.get("IsTruncated"):
+            break
+    else:
         return True
-    page = s3.list_multipart_uploads(Bucket=bucket, Prefix=prefix, MaxUploads=10)
-    uploads = page.get("Uploads", [])
-    if len(uploads) > 10 or any(not item["Key"].startswith(prefix) or not item["UploadId"] for item in uploads):
-        raise ValueError("cleanup listing contains foreign multipart uploads")
-    for item in uploads:
+    for _ in range(MAX_PREFIX_PAGES):
         if clock() >= deadline:
             return True
-        try:
-            s3.abort_multipart_upload(Bucket=bucket, Key=item["Key"], UploadId=item["UploadId"])
-        except Exception as error:
-            if getattr(error, "response", {}).get("Error", {}).get("Code") != "NoSuchUpload":
-                raise
-    return bool(page.get("IsTruncated"))
+        page = s3.list_multipart_uploads(Bucket=bucket, Prefix=prefix, MaxUploads=10)
+        uploads = page.get("Uploads", [])
+        if len(uploads) > 10 or any(not item["Key"].startswith(prefix) or not item["UploadId"] for item in uploads):
+            raise ValueError("cleanup listing contains foreign multipart uploads")
+        for item in uploads:
+            if clock() >= deadline:
+                return True
+            try:
+                s3.abort_multipart_upload(Bucket=bucket, Key=item["Key"], UploadId=item["UploadId"])
+            except Exception as error:
+                if getattr(error, "response", {}).get("Error", {}).get("Code") != "NoSuchUpload":
+                    raise
+        if not page.get("IsTruncated"):
+            return False
+    return True
 
 
 def cleanup_deleted_roots(s3, bucket, apply_write, *, connect=database,
@@ -75,8 +84,13 @@ def cleanup_deleted_roots(s3, bucket, apply_write, *, connect=database,
         for target in targets:
             conn.execute("""UPDATE root_cleanup_targets SET due_at=NOW()+INTERVAL '5 minutes'
                 WHERE root_id=%s AND kind=%s AND target=%s""", (target["root_id"], target["kind"], target["target"]))
-    for target in targets:
+    for position, target in enumerate(targets):
         if clock() >= deadline:
+            with connect() as conn:
+                for deferred in targets[position:]:
+                    conn.execute("""UPDATE root_cleanup_targets SET due_at=NOW()
+                        WHERE root_id=%s AND kind=%s AND target=%s""",
+                        (deferred["root_id"], deferred["kind"], deferred["target"]))
             break
         try:
             with connect() as conn:
@@ -96,9 +110,13 @@ def cleanup_deleted_roots(s3, bucket, apply_write, *, connect=database,
                 if remaining is not None and type(remaining) is not bool:
                     raise ValueError("invalid root index cleanup response")
             else:
-                remaining = clear_prefix(s3, bucket, target, deadline=deadline, clock=clock)
+                remaining = clear_prefix(s3, bucket, target, deadline=min(deadline, clock() + 5), clock=clock)
             if remaining:
                 result["partial"] += 1
+                with connect() as conn:
+                    conn.execute("""UPDATE root_cleanup_targets SET due_at=NOW()
+                        WHERE root_id=%s AND kind=%s AND target=%s""",
+                        (target["root_id"], target["kind"], target["target"]))
                 continue
             with connect() as conn:
                 conn.execute("""UPDATE root_cleanup_targets SET last_checked_at=NOW(),due_at=NOW()+INTERVAL '1 day'

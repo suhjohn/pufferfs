@@ -26,6 +26,7 @@ runner_started=1
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/api_access.py)
 "${driver[@]}" verify
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/api_search.py verify
+"${compose[@]}" logs --no-color api | python3 tests/e2e/search_metrics.py
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/api_keys.py verify
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/api_groups.py verify
 "${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/api_reads.py

@@ -29,21 +29,26 @@ type capturePlan struct {
 }
 
 type captureSyncInput struct {
-	Client *apiClient
-	Dir    string
-	Name   string
-	RootID string
-	Policy ignore.PolicyPatternSet
-	Select func(string) bool
-	Force  bool
-	Log    io.Writer
+	Client       *apiClient
+	Dir          string
+	Name         string
+	RootID       string
+	Policy       ignore.PolicyPatternSet
+	Select       func(string) bool
+	Force        bool
+	Log          io.Writer
+	ChangedPaths []string // nil reconciles the entire root; otherwise scan only these paths/subtrees.
 }
 
 func discoverCapturePlan(root string, matcher *ignore.Matcher, baseState, hashCache map[string]models.FileState, dirty map[string]bool, selectPath func(string) bool, force bool, excludedDirs ...string) (capturePlan, error) {
+	return discoverCapturePlanForPaths(root, nil, matcher, baseState, hashCache, dirty, selectPath, force, excludedDirs...)
+}
+
+func discoverCapturePlanForPaths(root string, paths []string, matcher *ignore.Matcher, baseState, hashCache map[string]models.FileState, dirty map[string]bool, selectPath func(string) bool, force bool, excludedDirs ...string) (capturePlan, error) {
 	plan := capturePlan{Present: make(map[string]bool)}
 
 	root = filepath.Clean(root)
-	err := filepath.WalkDir(root, func(absPath string, entry os.DirEntry, walkErr error) error {
+	visit := func(absPath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, os.ErrNotExist) && absPath != root {
 				return nil
@@ -107,9 +112,20 @@ func discoverCapturePlan(root string, matcher *ignore.Matcher, baseState, hashCa
 		}
 		plan.Candidates = append(plan.Candidates, captureCandidate{Path: relPath, Size: info.Size()})
 		return nil
-	})
-	if err != nil {
-		return capturePlan{}, err
+	}
+	if paths == nil {
+		if err := filepath.WalkDir(root, visit); err != nil {
+			return capturePlan{}, err
+		}
+	} else {
+		for _, path := range paths {
+			if !filepath.IsLocal(path) || path == "." {
+				return capturePlan{}, errors.New("invalid changed capture path")
+			}
+			if err := filepath.WalkDir(filepath.Join(root, filepath.FromSlash(path)), visit); err != nil {
+				return capturePlan{}, err
+			}
+		}
 	}
 	sort.Slice(plan.Candidates, func(i, j int) bool { return plan.Candidates[i].Path < plan.Candidates[j].Path })
 	return plan, nil

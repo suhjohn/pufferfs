@@ -31,6 +31,9 @@ def cleanup_record(file):
             ["root_id", "Eq", file["root_id"]],
             ["file_path", "Eq", file["file_path"]],
             ["file_id", "Eq", file["file_id"]],
+            # Shared segments can belong to a newer publication while their
+            # rows still carry an older version. Segment GC owns those rows.
+            ["segment_id", "Eq", None],
             ["Or", older],
         ]], "delete_by_filter_allow_partial": True,
     }}
@@ -63,16 +66,14 @@ def cleanup_index(apply_write, *, connect=database, limit=MAX_FILES,
             conn.execute("UPDATE file_catalog SET index_cleanup_due_at=NOW()+INTERVAL '5 minutes' WHERE id=ANY(%s)",
                          ([file["file_id"] for file in files],))
 
-    pending = [(file, cleanup_record(file)) for file in files]
-
     # Only the index IO runs concurrently. The cutoff is a snapshot of durable publication state,
-    # validated first; no thread holds a database connection or mutates the
+    # validated per file; no thread holds a database connection or mutates the
     # captured cleanup data. The local task list is bounded by MAX_FILES.
-    def remove_rows(item):
-        file, record = item
+    def remove_rows(file):
         if clock() >= deadline:
             return file, None
         try:
+            record = cleanup_record(file)
             remaining = apply_write(record["namespace"], record["write"], file["vector_disabled"])
             if remaining is True:
                 return file, "partial"
@@ -82,14 +83,20 @@ def cleanup_index(apply_write, *, connect=database, limit=MAX_FILES,
         except Exception:
             return file, "failed"
 
-    if pending:
+    if files:
         succeeded = []
+        continued = []
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            for file, status in executor.map(remove_rows, pending):
+            for file, status in executor.map(remove_rows, files):
                 if status == "checked":
                     succeeded.append(file)
                 elif status:
                     result[status] += 1
+                if status == "partial" or status is None:
+                    continued.append(file["file_id"])
+        if continued:
+            with connect() as conn:
+                conn.execute("UPDATE file_catalog SET index_cleanup_due_at=NOW() WHERE id=ANY(%s)", (continued,))
         if succeeded:
             try:
                 with connect() as conn:

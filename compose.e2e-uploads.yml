@@ -1,0 +1,14 @@
+services:
+  upload-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/upload_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  api:
+    environment:
+      AWS_ENDPOINT_URL: http://upload-relay:8080
+    depends_on:
+      upload-relay: {condition: service_healthy}

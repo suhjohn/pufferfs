@@ -12,6 +12,7 @@ import pymupdf
 
 import run
 from api_access import servers
+from index_recovery import relay as index_relay
 
 
 def relay(method, path, payload=None):
@@ -75,6 +76,9 @@ def lost_capture():
     assert not run.sql("SELECT id FROM file_work WHERE extraction_id=%s AND stage='index'", (inputs[0]["extraction_id"],))
     reservation_counts(1, 64)
     state.update(lost_event=event, lost_inputs=inputs, lost_input_ref=batch["input_ref"])
+    namespaces = run.sql('SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL', (state['root'],))
+    state['segment_index_fault'] = index_relay('POST','/fault',{'mode':'hold_response',
+        'namespaces':[row['namespace'] for row in namespaces]})['fault_id']
     run.save(state)
     print("Gemini accepted 64 pages with one input manifest and one batch row; response held before the final page or count seal.", flush=True)
 
@@ -102,6 +106,11 @@ def verify_pages(state):
     run.assert_source_retained(file)
     extraction, = run.sql("""SELECT e.* FROM file_extractions e
         JOIN file_catalog f ON f.indexed_extraction_id=e.id WHERE f.id=%s""", (file["file_id"],))
+    assert extraction['row_format'] == 2 and extraction['source_verified']
+    assert extraction['provider_assembly_cursor'] == extraction['prepared_request_count']
+    assert extraction['provider_assembly_chunk_count'] == extraction['chunk_count']
+    assert run.sql('SELECT COUNT(*) AS unfinished FROM extraction_segments m JOIN file_segments s ON s.id=m.segment_id WHERE m.extraction_id=%s AND s.indexed_at IS NULL',
+        (extraction['id'],))[0]['unfinished'] == 0
     records = list(run.chunks(extraction["chunks_ref"]))
     assert [row["chunk_index"] for row in records] == list(range(len(records)))
     print(json.dumps({"extraction_id": extraction["id"], "chunks": records}), flush=True)
@@ -119,6 +128,22 @@ def verify_pages(state):
 
 def lost_recovered():
     state = json.loads(run.STATE.read_text())
+    try:
+        event = run.eventually('first provider batch indexed before final assembly', lambda: next((
+            e for e in index_relay('GET','/status')['events']
+            if e['fault_id'] == state['segment_index_fault'] and e['state'] == 'response_held'), None), 1800)
+        assert event['upstream_status'] == 200
+        extraction, = run.sql("""SELECT e.* FROM file_catalog f JOIN file_extractions e ON e.version_id=f.captured_version_id
+            WHERE f.root_id=%s""", (state['root'],))
+        assert extraction['status'] == 'waiting_provider' and extraction['provider_assembly_cursor'] == 64
+        assert extraction['chunk_count'] > 0 and not extraction['chunks_ref']
+        assert not next(iter(run.catalog(state).values()))['indexed_version_id']
+        for peer in servers():
+            assert not run.request('POST','/query',{'root_id':state['root'],'query':'observatory','mode':'fts'},
+                key=state['key'],server=peer)['results']
+        print('First 64 provider pages reached real indexing in a separate turn; incomplete file remains unpublished.', flush=True)
+    finally:
+        index_relay('POST','/release')
     verify_pages(state)
     event = state["lost_event"]
     batch, = run.sql("SELECT status,provider_job_id,input_ref FROM provider_batches WHERE id=%s", (event["batch_id"],))

@@ -12,7 +12,7 @@ finish() {
   trap - EXIT
   cleanup_failed=0
   if [[ "$runner_started" == 1 ]]; then
-    "${compose[@]}" stop ingestion background provider-relay provider-manifest-relay || true
+    "${compose[@]}" stop ingestion background provider-relay provider-manifest-relay index-relay || true
     if ! "${compose[@]}" run --rm --no-deps e2e cleanup; then
       echo "Cleanup failed; retained Compose project $project. Retry cleanup before down --volumes." >&2
       cleanup_failed=1
@@ -27,7 +27,7 @@ finish() {
 trap finish EXIT
 "${compose[@]}" build
 # Keep collection stopped until the accepted response has been lost.
-"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion provider-relay provider-manifest-relay
+"${compose[@]}" up -d --wait --scale api=2 postgres aws api api-ready ingestion provider-relay provider-manifest-relay index-relay
 runner_started=1
 driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/provider_recovery.py)
 "${driver[@]}" manifest-capture

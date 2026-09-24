@@ -9,10 +9,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/pufferfs/pufferfs/internal/sourcecapture"
 	"github.com/pufferfs/pufferfs/pkg/models"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -212,43 +215,88 @@ func resumeCaptureJournal(ctx context.Context, client *apiClient, dir string) (m
 }
 
 func uploadCapturePacks(ctx context.Context, client *apiClient, dir string, root *os.Root, journal *captureJournal) error {
-	for i := range journal.Packs {
-		pack := &journal.Packs[i]
+	concurrency := 4
+	if value := os.Getenv("PUFFERFS_UPLOAD_CONCURRENCY"); value != "" {
+		var err error
+		concurrency, err = strconv.Atoi(value)
+		if err != nil || concurrency < 1 || concurrency > 16 {
+			return errors.New("PUFFERFS_UPLOAD_CONCURRENCY must be 1..16")
+		}
+	}
+	slots := make(chan struct{}, concurrency)
+	// Each transfer owns its mutable pack. Only this writer replaces snapshots
+	// in the shared journal, including acknowledgements arriving out of order.
+	packs := make([]journalPack, len(journal.Packs))
+	for i, pack := range journal.Packs {
+		packs[i] = copyJournalPack(pack)
+	}
+	var writer sync.Mutex
+	group, transferContext := errgroup.WithContext(ctx)
+	group.SetLimit(concurrency)
+	for i := range packs {
+		pack := &packs[i]
 		if pack.Complete {
 			continue
 		}
-		if !filepath.IsLocal(pack.Name) || filepath.Base(pack.Name) != pack.Name || strings.HasPrefix(pack.Name, ".") || pack.Name == "journal.json" || pack.Size < 1 || pack.Size > 128<<20 {
-			return errors.New("invalid journal pack")
-		}
-		// Confirm an earlier PUT before uploading again after an ambiguous reply.
-		if pack.ObjectKey != "" && pack.Multipart == nil {
-			err := client.completeSourcePack(ctx, journal.RootID, pack.ObjectKey)
-			if err == nil {
-				pack.Complete = true
-				if err = saveCaptureJournal(dir, *journal); err != nil {
-					return err
-				}
-				continue
-			}
-			var apiErr *apiError
-			if !errors.As(err, &apiErr) || apiErr.StatusCode != 409 || retiredPackKeys(err) != nil {
+		group.Go(func() error {
+			if err := transferContext.Err(); err != nil {
 				return err
 			}
-		}
-		source, err := root.Open(pack.Name)
-		if err != nil {
-			return err
-		}
-		err = uploadJournalPack(ctx, client, dir, journal, pack, source)
-		source.Close()
-		if err != nil {
-			return err
-		}
+			save := func() error {
+				writer.Lock()
+				defer writer.Unlock()
+				journal.Packs[i] = copyJournalPack(*pack)
+				return saveCaptureJournal(dir, *journal)
+			}
+			if !filepath.IsLocal(pack.Name) || filepath.Base(pack.Name) != pack.Name || strings.HasPrefix(pack.Name, ".") || pack.Name == "journal.json" || pack.Size < 1 || pack.Size > 128<<20 {
+				return errors.New("invalid journal pack")
+			}
+			// Confirm an ambiguous earlier PUT before uploading its bytes again.
+			if pack.ObjectKey != "" && pack.Multipart == nil {
+				err := client.completeSourcePack(transferContext, journal.RootID, pack.ObjectKey)
+				if err == nil {
+					pack.Complete = true
+					return save()
+				}
+				var apiErr *apiError
+				if !errors.As(err, &apiErr) || apiErr.StatusCode != 409 || retiredPackKeys(err) != nil {
+					return err
+				}
+			}
+			source, err := root.Open(pack.Name)
+			if err != nil {
+				return err
+			}
+			defer source.Close()
+			return uploadJournalPack(transferContext, client, journal.RootID, pack, source, save, slots)
+		})
 	}
-	return nil
+	return group.Wait()
 }
 
-func uploadJournalPack(ctx context.Context, client *apiClient, dir string, journal *captureJournal, pack *journalPack, source *os.File) error {
+func copyJournalPack(pack journalPack) journalPack {
+	if pack.Multipart != nil {
+		multipart := *pack.Multipart
+		multipart.Parts = append([]models.SourceMultipartPart(nil), multipart.Parts...)
+		pack.Multipart = &multipart
+	}
+	return pack
+}
+
+func captureTransfer(ctx context.Context, slots chan struct{}, transfer func() error) error {
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return transfer()
+}
+
+func uploadJournalPack(ctx context.Context, client *apiClient, rootID string, pack *journalPack, source *os.File, save func() error, slots chan struct{}) error {
 	info, err := source.Stat()
 	if err != nil {
 		return err
@@ -264,23 +312,25 @@ func uploadJournalPack(ctx context.Context, client *apiClient, dir string, journ
 		return errors.New("captured pack digest changed")
 	}
 	if pack.Multipart != nil || (pack.ObjectKey == "" && pack.Size >= 32<<20) {
-		return uploadJournalMultipart(ctx, client, dir, journal, pack, source)
+		return uploadJournalMultipart(ctx, client, rootID, pack, source, save, slots)
 	}
-	upload, err := client.initSourcePack(ctx, journal.RootID, pack.Size, pack.ObjectKey)
+	upload, err := client.initSourcePack(ctx, rootID, pack.Size, pack.ObjectKey)
 	if err != nil {
 		return err
 	}
 	pack.ObjectKey = upload.ObjectKey
 	// Persist identity before the PUT. Signed URLs and headers stay memory-only.
-	if err = saveCaptureJournal(dir, *journal); err != nil {
+	if err = save(); err != nil {
 		return err
 	}
-	if err = client.putSourcePack(ctx, upload, source, pack.Size); err != nil {
+	if err = captureTransfer(ctx, slots, func() error {
+		return client.putSourcePack(ctx, upload, source, pack.Size)
+	}); err != nil {
 		return err
 	}
-	if err = client.completeSourcePack(ctx, journal.RootID, pack.ObjectKey); err != nil {
+	if err = client.completeSourcePack(ctx, rootID, pack.ObjectKey); err != nil {
 		return err
 	}
 	pack.Complete = true
-	return saveCaptureJournal(dir, *journal)
+	return save()
 }

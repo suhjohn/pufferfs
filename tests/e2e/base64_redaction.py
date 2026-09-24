@@ -86,10 +86,8 @@ def verify_files(state):
         assert [line["content"] for line in result["lines"]] == lines
     assert run.assert_index_vectors(state, state["root"], dimensions=4096) == total
     namespace = run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (state["root"],))[0]["namespace"]
-    extractions = [row["id"] for row in run.sql("""SELECT e.id FROM file_catalog f
-        JOIN file_extractions e ON e.id=f.indexed_extraction_id WHERE f.root_id=%s AND NOT f.deleted""", (state["root"],))]
     result = run.request("POST", f"/v2/namespaces/{namespace}/query", {
-        "rank_by": ["id", "asc"], "limit": 1000, "filters": ["extraction_id", "In", extractions],
+        "rank_by": ["id", "asc"], "limit": 1000, "filters": run.published_index_filter(state["root"]),
         "include_attributes": ["content", "content_hash"]}, key=os.environ["TURBOPUFFER_API_KEY"],
         server=os.environ["TURBOPUFFER_API_URL"])
     assert len(result["rows"]) == total < 1000

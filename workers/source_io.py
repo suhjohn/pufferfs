@@ -97,10 +97,32 @@ def iter_source_bytes(s3, bucket: str, manifest: dict) -> Iterator[bytes]:
     Callers must exhaust this iterator before marking an extraction complete.
     A partial read is not verification of the source.
     """
-    validate_manifest(manifest)
     digest = hashlib.sha256()
+    for data in iter_source_range(s3, bucket, manifest, 0, manifest["size"]):
+        digest.update(data)
+        yield data
+    if "sha256:" + digest.hexdigest() != manifest["content_hash"]:
+        raise ValueError("captured source hash mismatch")
+
+
+def iter_source_range(s3, bucket: str, manifest: dict, start: int, end: int) -> Iterator[bytes]:
+    """Read an immutable logical range; this alone does NOT verify a file hash.
+
+    Full readers use iter_source_bytes. Resumable readers must continue their
+    authenticated digest checkpoint and verify the final declared file hash
+    before publication. Physical pack boundaries never become text boundaries.
+    """
+    validate_manifest(manifest)
+    if type(start) is not int or type(end) is not int or not 0 <= start <= end <= manifest["size"]:
+        raise ValueError("invalid source range")
+    position = 0
     for extent in manifest.get("extents") or []:
-        offset, length = extent["offset"], extent["length"]
+        extent_end = position + extent["length"]
+        left, right = max(start, position), min(end, extent_end)
+        offset, length = extent["offset"] + left - position, right - left
+        position = extent_end
+        if length <= 0:
+            continue
         response = s3.get_object(
             Bucket=bucket,
             Key=extent["object_key"],
@@ -115,10 +137,10 @@ def iter_source_bytes(s3, bucket: str, manifest: dict) -> Iterator[bytes]:
                 if len(data) > remaining:
                     raise ValueError("source response exceeded requested extent")
                 remaining -= len(data)
-                digest.update(data)
+                metric_count("source_bytes_read", len(data))
                 yield data
-    if "sha256:" + digest.hexdigest() != manifest["content_hash"]:
-        raise ValueError("captured source hash mismatch")
+        if position >= end:
+            break
 
 
 def materialize_source(s3, bucket: str, manifest: dict, destination: str) -> None:
@@ -155,10 +177,47 @@ def write_chunks(s3, bucket: str, prefix: str, chunks: Iterable[dict], *, max_re
     return key, count
 
 
-def iter_chunks(s3, bucket: str, key: str, *, max_record_bytes: int = 1024 * 1024) -> Iterator[dict]:
+def artifact_records(s3, bucket: str, key: str, *, max_record_bytes: int = 1024 * 1024) -> Iterator[dict]:
     response = s3.get_object(Bucket=bucket, Key=key)
     with response["Body"] as body, gzip.GzipFile(fileobj=body, mode="rb") as records:
         while raw := records.readline(max_record_bytes + 2):
             if len(raw) > max_record_bytes + 1 or not raw.endswith(b"\n"):
                 raise ValueError("artifact record exceeds size limit or is truncated")
             yield json.loads(raw)
+
+
+def iter_chunks(s3, bucket: str, key: str, *, max_record_bytes: int = 1024 * 1024) -> Iterator[dict]:
+    """Expand a segment manifest in bounded memory; legacy artifacts remain valid."""
+    from contextlib import closing
+    with closing(artifact_records(s3, bucket, key, max_record_bytes=max_record_bytes)) as records:
+        first = next(records, None)
+        if first is None:
+            return
+        if first.get("kind") != "segment_manifest":
+            yield first
+            yield from records
+            return
+        match = re.fullmatch(r"extractions/([A-Za-z0-9_-]+)/([A-Za-z0-9_-]+)/[A-Za-z0-9_-]+/manifests/[0-9a-f]{64}\.jsonl\.gz", key)
+        if (match is None or first.get("format") != 2 or type(first.get("chunk_count")) is not int
+                or first["chunk_count"] < 0):
+            raise ValueError("invalid extraction segment manifest")
+        owner = f"extractions/{match[1]}/{match[2]}/"
+        position = 0
+        for segment in records:
+            ref, length = segment.get("chunks_ref"), segment.get("chunk_count")
+            if (not isinstance(ref, str) or not re.fullmatch(re.escape(owner) + r"[A-Za-z0-9_-]+/segments/[0-9a-f]{64}\.jsonl\.gz", ref)
+                    or type(length) is not int or not 1 <= length <= 64
+                    or segment.get("ordinal_start") != position or position + length > first["chunk_count"]):
+                raise ValueError("invalid extraction segment descriptor")
+            seen = 0
+            with closing(artifact_records(s3, bucket, ref, max_record_bytes=max_record_bytes)) as chunks:
+                for chunk in chunks:
+                    if seen >= length or chunk.get("chunk_index") != position:
+                        raise ValueError("invalid extraction segment ordinals")
+                    seen += 1
+                    position += 1
+                    yield chunk
+            if seen != length:
+                raise ValueError("extraction segment length mismatch")
+        if position != first["chunk_count"]:
+            raise ValueError("extraction manifest length mismatch")

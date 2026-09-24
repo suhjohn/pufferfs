@@ -10,7 +10,7 @@ if not 1 <= EMBEDDING_BATCH_DOCUMENTS <= 256:
 
 SCHEMA = {
     **{name: {"type": "string"} for name in (
-        "file_path", "absolute_path", "file_id", "root_id", "version_id", "extraction_id",
+        "file_path", "absolute_path", "file_id", "root_id", "version_id", "extraction_id", "segment_id",
         "content_hash", "file_hash", "file_type", "source_manifest_ref", "location_json",
     )},
     **{name: {"type": "uint"} for name in ("chunk_index", "version_sequence", "extraction_sequence", "page_number", "line_start", "line_end")},

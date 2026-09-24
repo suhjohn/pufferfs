@@ -130,3 +130,52 @@ late/stale write --> cannot publish newer head --> cleanup removes obsolete rows
 Postgres publication is still necessary: external writes can succeed partially,
 and a newer version may arrive during a write. Native embeddings remove model
 orchestration, but do not make the catalog and provider one transaction.
+
+## Pipeline version 4
+
+The optimization work keeps the same separately deployed roles and Postgres
+queue. The flow below describes pipeline version 4 after migration 056; the
+earlier section records the September 18 deployment. Verification is tracked in
+[flow-optimization-implementation.md](flow-optimization-implementation.md).
+
+```text
+Local agent --changed paths + cached catalog cursor--> API server
+Local agent --bounded concurrent pack/part uploads---> S3
+API server  --atomic capture + job-------------------> Postgres file_work
+
+Ingestion worker --claim a tenant's next transform turn--> Postgres
+                 --read up to 4 MiB of native source-----> S3
+                 --save parser/digest + chunk segments---> S3
+                 --checkpoint + yield job for indexing---> Postgres file_work
+
+Background worker --claim a tenant's next index turn-----> Postgres
+                  --read selected immutable segments----> S3
+                  --reserve shared embedding capacity----> Postgres
+                  --write bounded text batch-------------> Turbopuffer [black box]
+                  --checkpoint confirmed prefix----------> Postgres
+                  --more native input? yield transform---> Postgres file_work
+                  --more provider output? yield collector-> Postgres file_work
+                  --all input verified and indexed?
+                      publish whole-file catalog head----> Postgres
+
+API server --shared search admission + published-segment checks--> Postgres
+           --search / bounded line-page reads-------------------> Turbopuffer [black box]
+```
+
+Provider collection now hands off one completed provider batch at a time;
+native transformation resumes its byte stream. Whole-input document decoders
+still need their source container, but persist bounded output segments and use
+the same bounded index turns. Worker processes yield between turns so a large
+file does not retain an index slot until completion.
+
+On append, verified immutable source extents prove an unchanged prefix. The new
+extraction references its predecessor's fully indexed segments and resumes a
+pre-EOF parser checkpoint for the tail. Search/read validate segment membership
+against the published file and use that publication's hash for content proofs.
+Cleanup retires unreferenced segments before deletion; shared segments keep
+their owning artifacts alive. No unchanged prefix is sent for embedding again.
+
+Status returns a summary; catalog cursors return committed changes; the local
+follower watches changed paths with periodic full reconciliation. Upload packing
+and durable journals remain. The deployment runbook describes the required
+coordinated cutover and shared capacity settings.

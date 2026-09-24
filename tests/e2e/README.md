@@ -48,7 +48,15 @@ Do not edit a shell driver while that same file is executing.
 | `test-e2e.sh` | Native/corpus formats; live follow; 1,024-file capture; multipart recovery; all search/read modes; authorization; updates/deletes; worker outage and API restart |
 | `test-e2e-capture-handoff.sh` | Atomic scheduling; capture replay through two APIs; concurrent duplicate prevention; API restart; multiple worker replicas |
 | `test-e2e-index-recovery.sh` | Lost write response; worker SIGKILL; lease expiry; database restart; bounded claims; stale writes; root cleanup |
-| `test-e2e-index-checkpoints.sh` | Multi-batch partial writes, full replay and API restart |
+| `test-e2e-index-checkpoints.sh` | Confirmed-batch checkpoints, ambiguous-write replay after SIGKILL, SIGTERM draining and exact reads/search after API restart |
+| `test-e2e-concurrent-uploads.sh` | Shared pack/part concurrency bound, out-of-order durable acknowledgments, CLI SIGKILL, exact retained bytes and replacement publication |
+| `test-e2e-search-admission.sh` | Shared global/tenant capacity across two APIs, competing tenants, client cancellation, provider timeout and API crash lease expiry |
+| `test-e2e-cleanup-pages.sh` | Multiple object/multipart pages, failed-root isolation, prompt partial continuation and worker restart |
+| `test-e2e-capture-summary.sh` | 1,025-file bounded status response, selected path/hash status, fresh ACLs and publication/read/search after API restart |
+| `test-e2e-catalog-changes.sh` | Concurrent captures, durable paged CLI cache, SIGKILL/resume, zero-file unchanged deltas, ACL cursor reset and publication/tombstones |
+| `test-e2e-follow-changes.sh` | Changed-path capture without unrelated tree access, nested directory moves, ignore changes, real OS event overflow, offline rewrite/restart and append extent reuse |
+| `test-e2e-embedding-capacity.sh` | Shared token/request windows across two APIs/two background workers, measured token settlement, normal expiry/restart and repeated external 429 recovery |
+| `test-e2e-segments.sh` | Large native source/parser checkpoints, SIGTERM/SIGKILL, unchanged-prefix download/index reuse, pre-EOF base64 tail, shared-segment proofs/cleanup, rewrite/truncation, deletion and restarts |
 | `test-e2e-index-renewal.sh` | Live lease-renewal failure during a real database outage |
 | `test-e2e-installer.sh` | Generated release manifest, installer, current CLI self-upgrade and checksum-verified real release archives in isolated HTTP/client containers |
 | `test-e2e-upgrade.sh` | Old v0.8.2 processes create published and pending data; production migrations; new processes resume exact reads/search/deletion |
@@ -87,6 +95,16 @@ well as ingestion, recovery, migration, media and vision workflows.
   runs as root only within its isolated fixture container.
 - Retention tests configure shorter supported retention periods; leases and
   heartbeat timing are ordinary production values.
+- Embedding capacity tests configure a 12-request/32,768-token minute to
+  exercise backpressure cheaply. Their HTTP 429s originate at a network fault
+  relay; every successful embedding/search still comes from Turbopuffer.
+- The watcher scenario runs its CLI as UID 1000 and overfills the actual Linux
+  inotify queue while that process is stopped. It verifies Linux overflow
+  recovery; macOS uses a different native event implementation.
+- Segment tests use an S3 observation relay to count real source ranges, and
+  wait for ordinary worker lease expiry after SIGKILL. Native text can resume
+  its parser and digest. Whole-input format decoders still require their source
+  containers; their output artifacts and indexing use bounded segments.
 - `cloud_index.py` optionally provisions isolated managed Postgres and real AWS
   S3 with resource-scoped STS credentials, keeping processes in Compose. It does
   not verify ECS scheduling. This optional cloud run is not implicitly verified

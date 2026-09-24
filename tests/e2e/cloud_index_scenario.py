@@ -122,8 +122,6 @@ def verify_vector_ranking(state, empty_root):
     expected = {}
     for root_id in (state["root"], root):
         namespaces = run.sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root_id,))
-        publications = [row["indexed_extraction_id"] for row in run.sql(
-            "SELECT indexed_extraction_id FROM file_catalog WHERE root_id=%s AND NOT deleted", (root_id,))]
         counts = []
         distances = {}
         for namespace in namespaces:
@@ -131,7 +129,7 @@ def verify_vector_ranking(state, empty_root):
             # created through CLI capture and the ordinary publication pipeline.
             rows = run.request("POST", f"/v2/namespaces/{namespace['namespace']}/query",
                 {"rank_by": ["content", "ANN", ["Embed", query]], "limit": 200,
-                 "filters": ["extraction_id", "In", publications],
+                 "filters": run.published_index_filter(root_id),
                  "include_attributes": ["file_path", "chunk_index"]},
                 key=os.environ["TURBOPUFFER_API_KEY"], server=os.environ["TURBOPUFFER_API_URL"], statuses=(200, 404))
             rows = rows.get("rows", [])

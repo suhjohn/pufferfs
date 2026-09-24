@@ -15,7 +15,8 @@ old,repo=map(Path,sys.argv[1:])
 services={name:{'environment':{'PUFFERFS_TP_NAMESPACE_SHARDS':'1'}} for name in
     ('api','transform','index','collector','reconciler','transform-consumer','index-consumer')}
 services['e2e']={'build':{'context':str(repo),'dockerfile':'tests/e2e/Dockerfile','target':'runner'},
-    'volumes':[str(repo/'tests/e2e/artifacts')+':/artifacts','e2e-state:/state','e2e-cli:/root/.tpfs']}
+    'volumes':[str(repo/'tests/e2e/artifacts')+':/artifacts','e2e-state:/state','e2e-cli:/root/.tpfs',
+               str(old/'old-pufferfs')+':/usr/local/bin/pufferfs:ro']}
 (old/'upgrade.json').write_text(json.dumps({'services':services}))
 PY
 old=(docker compose --env-file /dev/null --profile test -p "$project" -f "$previous/compose.e2e.yml" -f "$previous/upgrade.json")
@@ -39,15 +40,22 @@ finish() {
 }
 trap finish EXIT
 "${old[@]}" build
+# Exercise the old client/server contract before upgrading both. The current
+# client uses the new incremental catalog API, absent from the old release.
+docker build -f "$previous/tests/e2e/Dockerfile" --target cli -t "$project-old-cli" "$previous"
+binary_container="$(docker create "$project-old-cli")"
+docker cp "$binary_container:/pufferfs" "$previous/old-pufferfs"
+docker rm "$binary_container"
 "${old[@]}" up -d --wait postgres aws api api-ready transform index collector reconciler transform-consumer index-consumer
 started=1
-driver=("${new[@]}" run --rm --no-deps --entrypoint python e2e /e2e/upgrade.py)
+driver=("${old[@]}" run --rm --no-deps --entrypoint python e2e /e2e/upgrade.py)
 "${driver[@]}" baseline
 "${old[@]}" stop index-consumer index collector reconciler
 "${driver[@]}" pending
 "${old[@]}" stop transform-consumer transform api
 # Keep the actual Postgres and S3 processes/data. Only application roles change.
 "${new[@]}" build api ingestion e2e
+driver=("${new[@]}" run --rm --no-deps --entrypoint python e2e /e2e/upgrade.py)
 "${new[@]}" run --rm --no-deps aws-init
 "${new[@]}" up -d --no-deps api
 "${new[@]}" run --rm --no-deps api-ready

@@ -24,6 +24,8 @@ def cleanup_obsolete_extractions(s3, bucket, *, connect=database, limit=5, time_
               AND e.updated_at<NOW()-make_interval(secs=>%s) AND r.deleting_at IS NULL
               AND v.id IS DISTINCT FROM f.captured_version_id
               AND v.id IS DISTINCT FROM f.indexed_version_id
+              AND NOT EXISTS (SELECT 1 FROM file_segments s
+                  WHERE s.owner_extraction_id=e.id AND s.retired_at IS NULL)
               AND NOT EXISTS (SELECT 1 FROM file_work w WHERE w.extraction_id=e.id
                   AND (w.status NOT IN ('complete','superseded') OR w.updated_at>=NOW()-make_interval(secs=>%s)))
               AND NOT EXISTS (SELECT 1 FROM provider_batches b
@@ -41,8 +43,11 @@ def cleanup_obsolete_extractions(s3, bucket, *, connect=database, limit=5, time_
             conn.execute("""UPDATE file_extractions SET artifact_cleanup_due_at=NOW()+INTERVAL '5 minutes'
                 WHERE id=ANY(%s)""", ([row["extraction_id"] for row in pending],))
     result = {"retired": len(retired), "deleted": 0, "partial": 0, "failed": 0}
-    for target in pending:
+    for position, target in enumerate(pending):
         if time.monotonic() >= deadline:
+            with connect() as conn:
+                conn.execute("UPDATE file_extractions SET artifact_cleanup_due_at=NOW() WHERE id=ANY(%s)",
+                             ([row["extraction_id"] for row in pending[position:]],))
             break
         try:
             partial = False
@@ -54,6 +59,9 @@ def cleanup_obsolete_extractions(s3, bucket, *, connect=database, limit=5, time_
                 partial = clear_prefix(s3, bucket, dict(target, target=prefix), deadline=deadline) or partial
             if partial:
                 result["partial"] += 1
+                with connect() as conn:
+                    conn.execute("UPDATE file_extractions SET artifact_cleanup_due_at=NOW() WHERE id=%s",
+                                 (target["extraction_id"],))
                 continue
             with connect() as conn:
                 conn.execute("""UPDATE file_extractions SET artifacts_deleted_at=COALESCE(artifacts_deleted_at,NOW()),

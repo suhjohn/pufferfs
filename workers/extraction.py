@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import hashlib
-from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import PurePath
 
-from base64_redaction import redacted_spans
 
 CHUNK_BYTES = 6000
 
@@ -76,87 +74,14 @@ def utf8_boundary(data: bytes | bytearray, end: int) -> int:
 
 
 def text_chunks(blocks: Iterable[bytes], *, target_bytes: int = CHUNK_BYTES, byte_start: int = 0, line_start: int = 1) -> Iterator[dict]:
-    """Redact explicit base64 data URLs before chunking, retaining source bounds.
+    """Stream bounded text chunks; segment workers can persist the same parser."""
+    from text_stream import TextStream
 
-    Newlines are unchanged. A chunk intersecting a replacement marker covers
-    the original payload's byte range, even if the marker spans two chunks.
-    """
-    replacements = deque()
-    shift = 0
-
-    def redacted():
-        source, output = byte_start, byte_start
-        for data, consumed, changed in redacted_spans(blocks):
-            if changed:
-                replacements.append((output, output + len(data), source, source + consumed))
-            source += consumed
-            output += len(data)
-            yield data
-
-    def source_boundary(position, *, end):
-        delta = shift
-        for left, right, source_left, source_right in replacements:
-            if position <= left:
-                return position + delta
-            if position < right:
-                return source_right if end else source_left
-            delta = source_right - right
-        return position + delta
-
-    for chunk in _text_chunks(redacted(), target_bytes=target_bytes, byte_start=byte_start, line_start=line_start):
-        location = chunk["location"]
-        left, right = location["byte_start"], location["byte_end"]
-        location["byte_start"] = source_boundary(left, end=False)
-        location["byte_end"] = source_boundary(right, end=True)
-        if any(a < right and b > left for a, b, _, _ in replacements):
-            location["redacted"] = True
-        while replacements and replacements[0][1] <= right:
-            _, output_end, _, source_end = replacements.popleft()
-            shift = source_end - output_end
-        yield chunk
-
-
-def _text_chunks(blocks: Iterable[bytes], *, target_bytes: int, byte_start: int, line_start: int) -> Iterator[dict]:
-    """Group whole lines/JSONL records where possible; split oversized records.
-
-    No JSON parsing/re-serialization or session detection. The caller supplies
-    text with any explicit base64 data-URL payloads already redacted.
-    Invalid UTF-8 or binary data is an explicit extraction error.
-    """
-    if target_bytes < 4 or byte_start < 0 or line_start < 1:
-        raise ValueError("invalid text chunk boundaries")
-    pending = bytearray()
-    ordinal = 0
-
-    def emit(end: int) -> dict:
-        nonlocal byte_start, line_start, ordinal
-        piece = bytes(pending[:end])
-        content = piece.decode("utf-8", errors="strict")
-        if "\x00" in content:
-            raise ValueError("binary input is not a text file")
-        line_end = line_start + piece.count(b"\n") - int(piece.endswith(b"\n"))
-        chunk = chunk_record(content, {
-            "byte_start": byte_start, "byte_end": byte_start + end,
-            "line_start": line_start, "line_end": max(line_start, line_end),
-        }, ordinal)
-        line_start += piece.count(b"\n")
-        byte_start += end
-        ordinal += 1
-        del pending[:end]
-        return chunk
-
+    stream = TextStream(target_bytes=target_bytes, byte_start=byte_start, line_start=line_start)
     for block in blocks:
-        # Do not duplicate an arbitrarily large caller-supplied block in the
-        # pending buffer. Normal source IO yields 64 KiB blocks.
-        for offset in range(0, len(block), target_bytes):
-            pending.extend(block[offset:offset + target_bytes])
-            while len(pending) > target_bytes:
-                end = pending.rfind(b"\n", 0, target_bytes) + 1
-                if not end:
-                    end = utf8_boundary(pending, target_bytes)
-                yield emit(end)
-    if pending:
-        yield emit(len(pending))
+        for offset in range(0, len(block), 65536):
+            yield from stream.feed(block[offset:offset + 65536])
+    yield from stream.feed(None)
 
 
 def page_chunks(markdown: str, page_number: int, *, target_bytes: int = CHUNK_BYTES) -> Iterator[dict]:

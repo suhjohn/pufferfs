@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
+import time
 from pathlib import Path
 import urllib.request
 
@@ -21,7 +22,8 @@ def relay(method, path, body=None):
 def read_calls():
     patterns = ("SELECT f.indexed_extraction_id,n.namespace%", "SELECT id, org_id, root_id, namespace%",
                 "%FROM root_acls%UNION ALL SELECT%FROM file_content_proofs%",
-                "SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at%FROM root_acls%")
+                "SELECT id, org_id, root_id, path_prefix, grant_to, permission, created_at%FROM root_acls%",
+                "SELECT s.id,m.ordinal_start,m.ordinal_start+s.chunk_count%FROM extraction_segments%")
     return [run.sql("SELECT COALESCE(sum(calls),0)::bigint AS n FROM pg_stat_statements WHERE query LIKE %s",
                     (pattern,))[0]["n"] for pattern in patterns]
 
@@ -57,6 +59,9 @@ def verify():
         files = run.wait_indexed(state, root)
         publications = {row["path"]: row["indexed_extraction_id"] for row in run.sql(
             "SELECT path,indexed_extraction_id FROM file_catalog WHERE root_id=%s", (root,))}
+        segments = {path: {row['segment_id'] for row in run.sql(
+            'SELECT segment_id FROM extraction_segments WHERE extraction_id=%s', (extraction,))}
+            for path, extraction in publications.items()}
         namespaces = run.sql("SELECT namespace,xmin::text AS revision FROM root_index_namespaces WHERE root_id=%s ORDER BY namespace", (root,))
         names = [row["namespace"] for row in namespaces]
         read_path = f"/roots/{root}/read"
@@ -77,17 +82,19 @@ def verify():
                 events_before = {e["id"] for e in relay("GET", "/status")["events"]}
                 result = request("POST", read_path, dict(read, path=path))
                 assert result["lines"] and result["lines"][0]["content"] == expected, "read lost or duplicated bytes"
-                assert [b-a for a,b in zip(before, read_calls())] == [1, 0, 1, 1], "read routing/access round trips changed"
+                segment_pages = len(segments[path]) // 8 + 1
+                assert [b-a for a,b in zip(before, read_calls())] == [1, 0, 1, 1, segment_pages], "read routing/access/segment round trips changed"
                 events = [e for e in relay("GET", "/status")["events"] if e["id"] not in events_before]
                 assert len(events) >= minimum_queries, "fixture did not exercise expected provider queries"
-                assert all(e["publication_ids"] == [publications[path]] for e in events)
+                assert all(not e['publication_ids'] and set(e['segment_ids']) <= segments[path] for e in events)
+                assert set().union(*(set(e['segment_ids']) for e in events)) == segments[path]
                 before = read_calls()
                 events_before = {e["id"] for e in relay("GET", "/status")["events"]}
                 error = request("POST", read_path, dict(read, path=path, lines={"start": 9, "end": 9}), statuses=(400,))
                 assert "indexed line range is 1:1" in error["error"]
-                assert [b-a for a,b in zip(before, read_calls())] == [1, 0, 1, 1], "empty range reloaded routing/publication"
+                assert [b-a for a,b in zip(before, read_calls())] == [1, 0, 1, 1, 2], "empty range reloaded routing/publication"
                 events = [e for e in relay("GET", "/status")["events"] if e["id"] not in events_before]
-                assert len(events) == 2 and events[-1]["response_rows"] > 0
+                assert len(events) == 1 and events[-1]["response_rows"] > 0
                 assert all(e["response_content_bytes"] == 0 for e in events), "metadata fallback downloaded chunk content"
             request("POST", read_path, dict(read, path="missing.txt"), statuses=(404,))
             request("POST", read_path, dict(read, path="missing.txt", lines={"start": 0, "end": 1}), statuses=(400,))
@@ -101,6 +108,14 @@ def verify():
             return future
 
         with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                started = time.monotonic()
+                future = hold(pool, read_path, read, reader, (504,))
+                future.result(timeout=40)
+                assert 25 <= time.monotonic()-started < 40, 'pinned read exceeded its bounded lifetime'
+            finally:
+                relay('POST', '/release')
+            assert run.request('POST', read_path, read, key=reader, server=peers[1])['lines'][0]['content'] == short.rstrip('\n')
             for path, body, statuses in ((read_path, read, (400,)), ("/query", search, (200,))):
                 acl = None
                 try:
@@ -117,8 +132,8 @@ def verify():
                     relay("POST", "/release")
                     if acl:
                         run.request("DELETE", f"/roots/{root}/acls/{acl['id']}", key=acl_key, server=peers[1])
-            # Publish a replacement between the empty-range query and metadata fallback.
-            # Both queries must retain the original extraction ID, even if old rows expire.
+            # The database knows the range is empty. Hold its metadata fallback
+            # while publishing a replacement; it must retain the old membership.
             events_before = {e["id"] for e in relay("GET", "/status")["events"]}
             try:
                 future = hold(pool, read_path, dict(read, lines={"start": 9, "end": 9}), state["key"], (400,))
@@ -131,7 +146,7 @@ def verify():
                 result = future.result(timeout=90)
                 assert "indexed line range is 1:2" not in result["error"]
                 events = [e for e in relay("GET", "/status")["events"] if e["id"] not in events_before]
-                assert len(events) == 2 and all(e["publication_ids"] == [publications["protected/short.txt"]] for e in events)
+                assert len(events) == 1 and set(events[0]['segment_ids']) == segments['protected/short.txt']
             finally:
                 relay("POST", "/release")
         for peer in peers:

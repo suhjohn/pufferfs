@@ -563,6 +563,22 @@ const appEnv: { name: string; value: pulumi.Input<string> }[] = [
   { name: "POSTHOG_ENABLED", value: posthogEnabled ? "true" : "false" },
 ];
 
+for (const [config, variable, fallback, minimum, maximum] of [
+  ["embeddingRequestsPerMinute", "PUFFERFS_EMBEDDING_REQUESTS_PER_MINUTE", 1024, 1, 1000000],
+  ["embeddingTokensPerMinute", "PUFFERFS_EMBEDDING_TOKENS_PER_MINUTE", 2000000, 32768, 1000000000000],
+  ["searchConcurrency", "PUFFERFS_SEARCH_CONCURRENCY", 32, 1, 4096],
+  ["searchTenantConcurrency", "PUFFERFS_SEARCH_TENANT_CONCURRENCY", 16, 1, 4096],
+] as const) {
+  const value = cfg.getNumber(config) ?? fallback;
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${config} must be an integer from ${minimum} to ${maximum}`);
+  }
+  appEnv.push({name: variable, value: value.toString()});
+}
+if ((cfg.getNumber("searchTenantConcurrency") ?? 16) > (cfg.getNumber("searchConcurrency") ?? 32)) {
+  throw new Error("searchTenantConcurrency cannot exceed searchConcurrency");
+}
+
 for (const [variable, config] of Object.entries({
   PUFFERFS_VISION_BASE_URL: "visionBaseUrl", PUFFERFS_VISION_MODEL: "visionModel",
   TURBOPUFFER_REGION: "turbopufferRegion", TURBOPUFFER_API_URL: "turbopufferApiUrl",
@@ -888,4 +904,4 @@ export const ecsClusterArn = cluster.arn;
 export const apiServiceArn = apiService.id;
 export const workerServiceArns = workerServices.map((service) => service.id);
 
-export const pipelineVersion = 3;
+export const pipelineVersion = 4;

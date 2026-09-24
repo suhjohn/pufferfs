@@ -23,6 +23,24 @@ jobs:
             script: scripts/test-e2e-base64-redaction.sh
           - suite: index-recovery
             script: scripts/test-e2e-index-recovery.sh
+          - suite: index-checkpoints
+            script: scripts/test-e2e-index-checkpoints.sh
+          - suite: concurrent-uploads
+            script: scripts/test-e2e-concurrent-uploads.sh
+          - suite: search-admission
+            script: scripts/test-e2e-search-admission.sh
+          - suite: cleanup-pages
+            script: scripts/test-e2e-cleanup-pages.sh
+          - suite: capture-summary
+            script: scripts/test-e2e-capture-summary.sh
+          - suite: catalog-changes
+            script: scripts/test-e2e-catalog-changes.sh
+          - suite: follow-changes
+            script: scripts/test-e2e-follow-changes.sh
+          - suite: embedding-capacity
+            script: scripts/test-e2e-embedding-capacity.sh
+          - suite: segments
+            script: scripts/test-e2e-segments.sh
           - suite: database-scheduling
             script: scripts/test-e2e-capture-handoff.sh
           - suite: lease-renewal

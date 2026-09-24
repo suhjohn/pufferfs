@@ -10,6 +10,7 @@ import re
 import time
 
 from file_runtime import database
+from root_cleanup import MAX_PREFIX_PAGES
 ELIGIBLE_VERSION = """v.source_retired_at IS NULL
     AND v.created_at<NOW()-make_interval(secs=>%s) AND r.deleting_at IS NULL
     AND v.id IS DISTINCT FROM f.captured_version_id AND v.id IS DISTINCT FROM f.indexed_version_id
@@ -33,7 +34,7 @@ def cleanup_source_packs(s3, bucket, *, connect=database, limit=100, time_budget
     if retention < 60 or not 1 <= limit <= 100 or not 0 < time_budget <= 30:
         raise ValueError("invalid source retention bounds")
     deadline = time.monotonic() + time_budget
-    result = {"versions_retired": 0, "packs_retired": 0, "deleted": 0, "failed": 0}
+    result = {"versions_retired": 0, "packs_retired": 0, "deleted": 0, "partial": 0, "failed": 0}
     with connect() as conn:
         versions = conn.execute(f"""SELECT v.id,f.root_id FROM file_versions v
             JOIN file_catalog f ON f.id=v.file_id JOIN roots r ON r.id=f.root_id
@@ -70,8 +71,10 @@ def cleanup_source_packs(s3, bucket, *, connect=database, limit=100, time_budget
             conn.execute("UPDATE source_objects SET cleanup_due_at=NOW()+INTERVAL '5 minutes' WHERE object_key=ANY(%s)",
                          ([row["object_key"] for row in pending],))
     keys = []
-    for pack in pending:
+    continued = []
+    for position, pack in enumerate(pending):
         if time.monotonic() >= deadline:
+            continued.extend(row["object_key"] for row in pending[position:])
             break
         key = pack["object_key"]
         prefix = f"sources/{pack['org_id']}/{pack['root_id']}/"
@@ -82,20 +85,37 @@ def cleanup_source_packs(s3, bucket, *, connect=database, limit=100, time_budget
             if key.startswith(prefix + "multipart/"):
                 # Include uploads whose creation response never reached our
                 # DB; exact-key filtering prevents a prefix-neighbor abort.
-                page = s3.list_multipart_uploads(Bucket=bucket, Prefix=key, MaxUploads=10)
-                for upload in page.get("Uploads", []):
-                    if upload["Key"] != key:
-                        raise ValueError("foreign source multipart cleanup target")
-                    try:
-                        s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload["UploadId"])
-                    except Exception as error:
-                        if getattr(error, "response", {}).get("Error", {}).get("Code") != "NoSuchUpload":
-                            raise
-                if page.get("IsTruncated"):
+                complete = False
+                for _ in range(MAX_PREFIX_PAGES):
+                    if time.monotonic() >= deadline:
+                        break
+                    page = s3.list_multipart_uploads(Bucket=bucket, Prefix=key, MaxUploads=10)
+                    for upload in page.get("Uploads", []):
+                        if upload["Key"] != key:
+                            raise ValueError("foreign source multipart cleanup target")
+                        if time.monotonic() >= deadline:
+                            break
+                        try:
+                            s3.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload["UploadId"])
+                        except Exception as error:
+                            if getattr(error, "response", {}).get("Error", {}).get("Code") != "NoSuchUpload":
+                                raise
+                    else:
+                        if not page.get("IsTruncated"):
+                            complete = True
+                    if complete:
+                        break
+                if not complete:
+                    continued.append(key)
                     continue
             keys.append(key)
         except Exception:
             result["failed"] += 1
+    if continued:
+        with connect() as conn:
+            conn.execute("UPDATE source_objects SET cleanup_due_at=NOW() WHERE object_key=ANY(%s) AND retired_at IS NOT NULL",
+                         (continued,))
+        result["partial"] = len(continued)
     if keys:
         response = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": key} for key in keys]})
         failed = {item["Key"] for item in response.get("Errors", [])}

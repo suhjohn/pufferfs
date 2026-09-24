@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,29 +24,31 @@ import (
 
 // Server holds the dependencies for HTTP handlers.
 type Server struct {
-	db          *DB
-	s3          *storage.Client
-	tp          *TPClient
-	billing     *StripeClient
-	emails      TransactionalEmailSender
-	jwtSecret   []byte
-	cookie      auth.CookieConfig
-	frontend    string
-	emailLogin  bool
-	googleLogin bool
-	analytics   productanalytics.Capturer
-	mux         *http.ServeMux
+	db           *DB
+	s3           *storage.Client
+	tp           *TPClient
+	billing      *StripeClient
+	emails       TransactionalEmailSender
+	jwtSecret    []byte
+	cookie       auth.CookieConfig
+	frontend     string
+	emailLogin   bool
+	googleLogin  bool
+	analytics    productanalytics.Capturer
+	mux          *http.ServeMux
+	searchLimits searchLimits
 }
 
 // New creates a new Server with all dependencies.
 func New(db *DB, s3 *storage.Client, tp *TPClient) *Server {
 	s := &Server{
-		db:         db,
-		s3:         s3,
-		tp:         tp,
-		emailLogin: true,
-		analytics:  productanalytics.Noop{},
-		mux:        http.NewServeMux(),
+		db:           db,
+		s3:           s3,
+		tp:           tp,
+		emailLogin:   true,
+		analytics:    productanalytics.Noop{},
+		mux:          http.NewServeMux(),
+		searchLimits: searchLimits{global: 32, tenant: 16},
 	}
 	s.routes()
 	return s
@@ -147,6 +151,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /roots/{id}/sources/multipart/complete", s.handleCaptureMultipartComplete)
 	s.mux.HandleFunc("POST /roots/{id}/versions", s.handleRegisterFileVersions)
 	s.mux.HandleFunc("GET /roots/{id}/captured-files", s.handleListCapturedFiles)
+	s.mux.HandleFunc("GET /roots/{id}/capture-summary", s.handleCaptureSummary)
+	s.mux.HandleFunc("POST /roots/{id}/capture-summary", s.handleCaptureSummary)
+	s.mux.HandleFunc("GET /roots/{id}/catalog-changes", s.handleCatalogChanges)
 	s.mux.HandleFunc("POST /roots/{id}/captured-proofs", s.handleCapturedProofs)
 	s.mux.HandleFunc("POST /roots/{id}/read", s.handleReadFile)
 
@@ -1509,6 +1516,11 @@ func (s *Server) handleDeleteACL(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
+	// A pinned publication must finish before the segment collector's one-minute
+	// grace period can retire it after a concurrent replacement.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	id := auth.IdentityFromContext(r.Context())
 	if id == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -1576,6 +1588,8 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusInternalServerError
 			} else if errors.Is(err, errQueryRootNotFound) {
 				status = http.StatusNotFound
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
 			}
 			writeJSON(w, status, map[string]string{"error": err.Error()})
 			return
@@ -1590,6 +1604,8 @@ func (s *Server) handleReadFile(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusInternalServerError
 		} else if errors.Is(err, errQueryRootNotFound) {
 			status = http.StatusNotFound
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			status = http.StatusGatewayTimeout
 		}
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
@@ -1607,7 +1623,7 @@ func (s *Server) readFilePages(ctx context.Context, id *auth.Identity, root *mod
 		pageFilters = append(pageFilters, []any{"page_number", "Gt", startPage - 1})
 	}
 	filters := []any{"And", pageFilters}
-	rows, err := s.readFileRows(ctx, snapshot, filters)
+	rows, err := s.readFileRows(ctx, snapshot, filters, segmentReadRange{kind: "page", start: startPage, end: endPage})
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
@@ -1659,7 +1675,7 @@ func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *mod
 		[]any{"line_end", "Gt", req.Lines.Start - 1},
 		[]any{"line_start", "Lte", req.Lines.End},
 	}}
-	rows, err := s.readFileRows(ctx, snapshot, filters)
+	rows, err := s.readFileRows(ctx, snapshot, filters, segmentReadRange{kind: "line", start: req.Lines.Start, end: req.Lines.End})
 	if err != nil {
 		return models.ReadFileResponse{}, err
 	}
@@ -1668,8 +1684,7 @@ func (s *Server) readFileLines(ctx context.Context, id *auth.Identity, root *mod
 		return models.ReadFileResponse{}, err
 	}
 	if len(rows) == 0 {
-		metadataRows, metaErr := s.tp.Query(ctx, snapshot.namespace, TPQuery{RankBy: []any{"chunk_index", "asc"}, Limit: 1000,
-			Filters: snapshot.filters(nil), ExcludeAttributes: append(readExcludedAttrs(), "content")})
+		metadataRows, metaErr := s.readFileMetadata(ctx, snapshot)
 		if metaErr != nil {
 			return models.ReadFileResponse{}, fmt.Errorf("line range %d:%d unavailable for %s; could not inspect indexed file metadata: %w", req.Lines.Start, req.Lines.End, req.Path, metaErr)
 		}
@@ -1931,6 +1946,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	allResults, stats, err := s.querySearchRoots(r.Context(), id, &req, selection.roots, namespaces, queryLimit)
+	log.Printf("search_metrics org_id=%s namespaces=%d provider_calls=%d publication_passes=%d publication_retries=%d rejected_candidates=%d admission_denied=%t failed=%t",
+		id.OrgID, stats.namespaceCount, stats.providerCalls, stats.publicationPasses,
+		stats.publicationRetries, stats.rejectedCandidates, errors.Is(err, errSearchAdmissionFull), err != nil)
 	if err != nil {
 		writeQueryError(w, err)
 		return
@@ -1949,14 +1967,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.captureBackendEvent(r.Context(), id, "query_submitted", map[string]any{
-		"mode":             req.Mode,
-		"top_k":            req.TopK,
-		"has_glob":         req.Glob != "",
-		"query_scope":      selection.scope,
-		"roots_searched":   len(selection.roots),
-		"namespace_count":  stats.namespaceCount,
-		"raw_result_count": stats.rawResultCount,
-		"result_count":     len(allResults),
+		"mode":                req.Mode,
+		"top_k":               req.TopK,
+		"has_glob":            req.Glob != "",
+		"query_scope":         selection.scope,
+		"roots_searched":      len(selection.roots),
+		"namespace_count":     stats.namespaceCount,
+		"raw_result_count":    stats.rawResultCount,
+		"result_count":        len(allResults),
+		"provider_calls":      stats.providerCalls,
+		"publication_passes":  stats.publicationPasses,
+		"publication_retries": stats.publicationRetries,
+		"rejected_candidates": stats.rejectedCandidates,
 	})
 
 	writeJSON(w, http.StatusOK, models.QueryResponse{
@@ -1968,7 +1990,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeQueryError(w http.ResponseWriter, err error) {
+	var embeddingBusy *embeddingCapacityError
+	if errors.As(err, &embeddingBusy) {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(embeddingBusy.delay)))))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"code": "embedding_capacity_busy", "error": embeddingBusy.Error()})
+		return
+	}
 	switch {
+	case errors.Is(err, errSearchAdmissionFull):
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"code": "search_capacity_busy", "error": errSearchAdmissionFull.Error()})
 	case errors.Is(err, errQueryRootNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "root not found"})
 	case errors.Is(err, errSearchPublicationBusy):
@@ -2053,11 +2084,16 @@ func (s *Server) resolveQueryRoots(ctx context.Context, id *auth.Identity, req *
 }
 
 type queryStats struct {
-	namespaceCount int
-	rawResultCount int
+	namespaceCount     int
+	rawResultCount     int
+	providerCalls      int
+	publicationPasses  int
+	publicationRetries int
+	rejectedCandidates int
 }
 
 func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *models.QueryRequest, roots []models.RootMetadata, namespaces map[string]string, queryLimit int) ([]models.QueryResult, queryStats, error) {
+	ctx = context.WithValue(ctx, embeddingTenantKey{}, id.OrgID)
 	stats := queryStats{}
 	results := make([]models.QueryResult, 0)
 	var searches []namespaceSearch
@@ -2080,7 +2116,13 @@ func (s *Server) querySearchRoots(ctx context.Context, id *auth.Identity, req *m
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	err := s.queryPublishedRows(ctx, id.OrgID, searches, func(search namespaceSearch, visibility any) ([][]map[string]any, error) {
+	width := min(len(searches), maxConcurrentSearchNamespaces, s.searchLimits.global, s.searchLimits.tenant)
+	release, err := s.admitSearch(ctx, id.OrgID, width)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer release()
+	err = s.queryPublishedRows(ctx, id.OrgID, searches, width, &stats, func(search namespaceSearch, visibility any) ([][]map[string]any, error) {
 		filters := []any{visibility}
 		if req.Glob != "" {
 			filters = append(filters, []any{"file_path", "Glob", req.Glob})

@@ -14,7 +14,8 @@ from index_recovery import relay as write_relay
 
 def calls():
     patterns = ("SELECT r.id,COALESCE(CASE WHEN EXISTS (%", "SELECT id, org_id, root_id, namespace%",
-                "SELECT q.slot,r.id IS NOT NULL,f.path,%", "WITH requested AS (%FROM root_acls%")
+                "SELECT q.slot,r.id IS NOT NULL,f.path,%", "WITH requested AS (%FROM root_acls%",
+                "SELECT q.slot,q.path,q.segment,q.extraction%")
     return [run.sql("SELECT COALESCE(sum(calls),0)::bigint AS n FROM pg_stat_statements WHERE query LIKE %s", (p,))[0]["n"] for p in patterns]
 
 
@@ -22,7 +23,7 @@ def observed_query(peer, key, body, expected_roots, namespaces, hits):
     before = calls()
     previous = {event["id"] for event in relay("GET", "/status")["events"]}
     result = run.request("POST", "/query", body, key=key, server=peer)
-    assert [b-a for a,b in zip(before, calls())] == [1, 0, int(bool(hits)), int(bool(hits))], "routing/publication/access reads were not batched"
+    assert [b-a for a,b in zip(before, calls())] == [1, 0, int(bool(hits)), int(bool(hits)), int(bool(hits))], "routing/publication/access/membership reads were not batched"
     events = [event for event in relay("GET", "/status")["events"] if event["id"] not in previous]
     assert len(events) == len(namespaces) and {event["namespace"] for event in events} == set(namespaces), "query called an empty root or missed a populated one"
     assert result["roots_searched"] == expected_roots
@@ -149,7 +150,7 @@ def stale_round(state, peers, roots, directory, namespaces):
         before = calls()
         previous = {event["id"] for event in relay("GET", "/status")["events"]}
         result = run.request("POST", "/query", {"root_ids": roots, "query": "Heliotrope", "mode": "fts"}, key=state["key"], server=peers[0])
-        assert [b-a for a,b in zip(before, calls())] == [1, 0, 1, 1]
+        assert [b-a for a,b in zip(before, calls())] == [1, 0, 1, 1, 1]
         assert len(result["results"]) == 6 and not any("pending zircon" in hit["content"] for hit in result["results"])
         events = [event for event in relay("GET", "/status")["events"] if event["id"] not in previous]
         expected = Counter(namespaces)
@@ -162,6 +163,17 @@ def stale_round(state, peers, roots, directory, namespaces):
     for peer in peers:
         result = run.request("POST", "/query", {"root_ids": roots, "query": "zircon", "mode": "fts"}, key=state["key"], server=peer)
         assert result["results"] and all("pending zircon" in hit["content"] for hit in result["results"])
+    # Later assertions measure a single clean provider call. Wait for the real
+    # recurring collector to retire/delete the old tail; until then the correct
+    # behavior is an additional publication retry, already asserted above.
+    def obsolete_rows_collected():
+        return run.sql("""SELECT COUNT(*) AS remaining FROM file_segments s
+            JOIN file_catalog f ON f.id=s.file_id WHERE f.root_id=%s
+              AND NOT EXISTS (SELECT 1 FROM extraction_segments m
+                  WHERE m.extraction_id=f.indexed_extraction_id AND m.segment_id=s.id)
+              AND (s.retired_at IS NULL OR s.index_cleanup_due_at<NOW()+INTERVAL '1 hour')""",
+            (roots[0],))[0]['remaining'] == 0
+    run.eventually('obsolete segment index rows collected before clean query-count checks', obsolete_rows_collected, 180)
     print("One SQL publication read checked populated roots; only the stale namespace retried, then both APIs saw the newly published version.", flush=True)
 
 
@@ -218,7 +230,7 @@ def root_scoped_proofs(state, peers, directory):
                 for selection in (roots, roots[::-1]):
                     before = calls()
                     hits = run.request("POST", "/query", {"root_ids": selection, "query": "Heliotrope", "mode": "fts"}, key=reader, server=peer)["results"]
-                    assert [b-a for a,b in zip(before, calls())] == [1, 0, 1, 1]
+                    assert [b-a for a,b in zip(before, calls())] == [1, 0, 1, 1, 1]
                     assert {hit["root_id"] for hit in hits} == set(expected), "proof matched the same path in another root or an obsolete hash"
         check([])
         prove(0)

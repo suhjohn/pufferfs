@@ -132,6 +132,37 @@ type CapturedFilesResponse struct {
 	NextCursor string             `json:"next_cursor,omitempty"`
 }
 
+type CatalogChangesResponse struct {
+	Files  []CapturedFileHead `json:"files"`
+	Cursor string             `json:"cursor"`
+	More   bool               `json:"more"`
+}
+
+type CaptureStatusSelection struct {
+	Path        string `json:"path"`
+	ContentHash string `json:"content_hash"`
+	Size        int64  `json:"size"`
+}
+
+type CaptureStatusRequest struct {
+	Files []CaptureStatusSelection `json:"files"`
+}
+
+type CaptureStatusExample struct {
+	Path       string                `json:"path"`
+	VersionID  string                `json:"version_id,omitempty"`
+	Status     string                `json:"status"`
+	Processing *FileProcessingStatus `json:"processing,omitempty"`
+}
+
+type CaptureStatusResponse struct {
+	RootID   string                 `json:"root_id"`
+	Status   string                 `json:"status"`
+	Total    int                    `json:"total"`
+	States   map[string]int         `json:"states"`
+	Examples []CaptureStatusExample `json:"examples,omitempty"`
+}
+
 type CapturedFileProof struct {
 	Path        string `json:"path"`
 	VersionID   string `json:"version_id"`

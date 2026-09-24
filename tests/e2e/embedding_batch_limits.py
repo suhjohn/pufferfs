@@ -26,7 +26,7 @@ def capture():
     root = run.new_root(state,'Embedding batch limit',directory,False)
     state['root'] = root
     names = run.sql('SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL',(root,))
-    fault = relay('POST','/fault',{'namespaces':[n['namespace'] for n in names],'mode':'hold_response','skip':0})['fault_id']
+    fault = relay('POST','/fault',{'namespaces':[n['namespace'] for n in names],'mode':'hold_response','skip':1})['fault_id']
     run.save(state)
     run.cli(state,'sync',str(directory),'--id',root)
     event = held(fault,'response_held')
@@ -37,11 +37,12 @@ def capture():
     assert len(records) == 257
     assert [r['chunk_index'] for r in records] == list(range(257))
     assert row['status'] == 'running' and row['attempt_count'] == 1
+    assert row['index_cursor'] == EXPECTED_BATCHES[0]
     assert not file['indexed_version_id']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==event['namespace'] and e['operation']=='write']
-    assert len(events) == 1 and events[0]['upstream_status'] == 200
-    assert events[0]['upsert_count'] == EXPECTED_BATCHES[0]
-    assert events[0]['state'] == 'response_held'
+    assert len(events) == 2 and all(e['upstream_status'] == 200 for e in events)
+    assert [e['upsert_count'] for e in events] == EXPECTED_BATCHES[:2]
+    assert events[0]['state'] == 'response_released' and events[1]['state'] == 'response_held'
     for peer in servers():
         assert not run.request('POST','/query',{'root_id':root,'query':'calibration','mode':'fts'},key=state['key'],server=peer)['results']
     case = {'root':root,'version':file['version_id'],'work':row,
@@ -49,7 +50,7 @@ def capture():
         'stamp':object_stamp(row['chunks_ref'])}
     state.setdefault('checkpoint_cases',[]).append(case)
     run.save(state)
-    print(f"Canonical chunks durable; one provider write accepted, nothing published.",flush=True)
+    print('First batch checkpointed; second response lost, nothing published.',flush=True)
 
 
 def verify_reads(state,case):
@@ -71,14 +72,16 @@ def recovered():
     case = state['checkpoint_cases'][-1]
     published(state,case['root'],case['version'])
     row = work(case['root'],case['version'])
-    assert row['status'] == 'complete' and row['attempt_count'] == 2
+    # The interrupted turn retries; later completed segments start fresh turns.
+    assert row['status'] == 'complete' and row['attempt_count'] == 1
+    assert row['index_cursor'] == 257
     assert row['attempt_token'] != case['work']['attempt_token']
     assert row['chunks_ref'] == case['work']['chunks_ref'] and object_stamp(row['chunks_ref']) == case['stamp']
     events = [e for e in relay('GET','/status')['events'] if e['namespace']==case['namespace'] and e['operation']=='write' and e.get('upstream_status') == 200]
-    replayed = events[1:]
-    assert [e['upsert_count'] for e in events] == [EXPECTED_BATCHES[0], *EXPECTED_BATCHES]
-    repeated = case['initial_hashes']
-    assert [e['payload_sha256'] for e in replayed[:len(repeated)]] == repeated
+    replayed = events[2:]
+    assert [e['upsert_count'] for e in events] == [*EXPECTED_BATCHES[:2], *EXPECTED_BATCHES[1:]]
+    assert sum(e['payload_sha256'] == case['initial_hashes'][0] for e in events) == 1
+    assert replayed[0]['payload_sha256'] == case['initial_hashes'][1]
     assert len({e['payload_sha256'] for e in events}) == len(EXPECTED_BATCHES)
     assert run.assert_index_vectors(state,case["root"],dimensions=4096) == 257
     for mode in ("vector", "hybrid"):
@@ -92,7 +95,7 @@ def restarted():
     state = json.loads(run.STATE.read_text())
     for case in state['checkpoint_cases']:
         verify_reads(state,case)
-    print('Full-replay results survived both API restarts.',flush=True)
+    print('Checkpointed results survived both API restarts.',flush=True)
 
 
 if __name__ == '__main__':

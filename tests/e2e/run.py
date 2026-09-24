@@ -73,13 +73,27 @@ def vector_bytes(value, dimensions):
 
 
 
+def published_index_filter(root):
+    legacy = sql("""SELECT e.id FROM file_catalog f JOIN file_extractions e ON e.id=f.indexed_extraction_id
+        WHERE f.root_id=%s AND NOT f.deleted AND e.row_format=1""", (root,))
+    segments = sql("""SELECT m.segment_id FROM file_catalog f
+        JOIN extraction_segments m ON m.extraction_id=f.indexed_extraction_id
+        WHERE f.root_id=%s AND NOT f.deleted""", (root,))
+    choices = []
+    if legacy:
+        choices.append(["extraction_id", "In", [row['id'] for row in legacy]])
+    if segments:
+        choices.append(["segment_id", "In", [row['segment_id'] for row in segments]])
+    return ["Or", choices] if choices else ["extraction_id", "Eq", ""]
+
+
 def assert_index_vectors(state, root, *, dimensions):
     """Inspect provider state created only through CLI/API capture and workers."""
     namespaces = sql("SELECT namespace FROM root_index_namespaces WHERE root_id=%s AND retired_at IS NULL", (root,))
     extractions = sql("""SELECT e.id,e.chunk_count FROM file_catalog f
         JOIN file_extractions e ON e.id=f.indexed_extraction_id
         WHERE f.root_id=%s AND NOT f.deleted""", (root,))
-    ids = [row["id"] for row in extractions]
+    publication_filter = published_index_filter(root)
     seen = 0
     for entry in namespaces:
         namespace = entry["namespace"]
@@ -95,7 +109,7 @@ def assert_index_vectors(state, root, *, dimensions):
             assert schema["content"]["embed"]["model"] == "qwen/qwen3-embedding-8b"
         after = None
         while True:
-            filters = [["extraction_id", "In", ids]]
+            filters = [publication_filter]
             if after is not None:
                 filters.append(["id", "Gt", after])
             response = request("POST", f"/v2/namespaces/{namespace}/query",
@@ -181,8 +195,30 @@ def object_json(key):
 
 def chunks(key):
     with s3.get_object(Bucket=BUCKET, Key=key)["Body"] as body, gzip.GzipFile(fileobj=body) as stream:
-        for line in stream:
-            yield json.loads(line)
+        first = next(stream, None)
+        if first is None:
+            return
+        record = json.loads(first)
+        if record.get('kind') == 'segment_manifest':
+            assert record['format'] == 2
+            position = 0
+            owner = '/'.join(key.split('/')[:3])+'/'
+            for line in stream:
+                segment = json.loads(line)
+                assert segment['ordinal_start'] == position and 1 <= segment['chunk_count'] <= 64
+                assert segment['chunks_ref'].startswith(owner) and '/segments/' in segment['chunks_ref']
+                seen = 0
+                for chunk in chunks(segment['chunks_ref']):
+                    assert chunk['chunk_index'] == position
+                    seen += 1
+                    position += 1
+                    yield chunk
+                assert seen == segment['chunk_count']
+            assert position == record['chunk_count']
+        else:
+            yield record
+            for line in stream:
+                yield json.loads(line)
 
 
 def assert_source_retained(file):
@@ -230,7 +266,7 @@ def multipart_recovery():
         # hooks in production code. Poll the durable journal, not Go internals.
         with tempfile.TemporaryFile(mode="w+") as log:
             process = subprocess.Popen(["pufferfs", "sync", str(directory), "--id", root, "--no-vector"],
-                env=dict(os.environ, PUFFERFS_API_KEY=state["key"]), stdout=log, stderr=log, text=True)
+                env=dict(os.environ, PUFFERFS_API_KEY=state["key"], PUFFERFS_UPLOAD_CONCURRENCY="1"), stdout=log, stderr=log, text=True)
             observed = None
             try:
                 deadline = time.monotonic() + 90

@@ -29,6 +29,13 @@ driver=("${compose[@]}" run --rm --no-deps --entrypoint python e2e /e2e/index_ch
 "${driver[@]}" release
 "${compose[@]}" up -d --no-deps --wait background
 "${driver[@]}" recovered
+"${driver[@]}" capture
+"${compose[@]}" kill -s SIGTERM background
+"${driver[@]}" release
+"${compose[@]}" wait background
+"${driver[@]}" drained
+"${compose[@]}" up -d --no-deps --wait background
+"${driver[@]}" recovered
 "${compose[@]}" restart api
 "${compose[@]}" run --rm --no-deps api-ready
 "${driver[@]}" restarted

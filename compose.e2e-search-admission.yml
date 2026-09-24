@@ -1,0 +1,5 @@
+services:
+  api:
+    environment:
+      PUFFERFS_SEARCH_CONCURRENCY: "3"
+      PUFFERFS_SEARCH_TENANT_CONCURRENCY: "2"

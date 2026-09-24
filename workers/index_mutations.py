@@ -19,7 +19,7 @@ def deletion_mutation(job):
     ]], "delete_by_filter_allow_partial": True}
 
 
-def index_row(job, chunk):
+def index_row(job, chunk, segment=None):
     ordinal = chunk["chunk_index"]
     if type(ordinal) is not int or ordinal < 0:
         raise ValueError("invalid chunk ordinal")
@@ -38,22 +38,33 @@ def index_row(job, chunk):
     for key in ("page_number", "line_start", "line_end"):
         if key in chunk["location"]:
             row[key] = chunk["location"][key]
+    if segment is not None:
+        if (job["row_format"] != 2 or segment["owner_extraction_id"] != job["extraction_id"]
+                or not segment["ordinal_start"] <= ordinal < segment["ordinal_start"] + segment["chunk_count"]):
+            raise ValueError("index row does not belong to its immutable segment")
+        row["segment_id"] = segment["id"]
+        row["id"] = stable_id(job["org_id"], job["root_id"], job["file_id"], segment["id"], str(ordinal))
     return row
 
 
-def mutation_batches(rows, *, max_rows=512, max_bytes=8 * 1024 * 1024):
+def mutation_batches(rows, *, max_rows=512, max_bytes=8 * 1024 * 1024, max_tokens=None):
     """Bounded JSON write payloads regenerated from canonical chunks on retry."""
     if max_rows < 1 or max_bytes < 32:
         raise ValueError("invalid mutation bounds")
-    batch, size = [], len(b'{"upsert_rows":[]}')
+    batch, size, tokens = [], len(b'{"upsert_rows":[]}'), 0
     for row in rows:
         length = len(json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode())
         if length + len(b'{"upsert_rows":[]}') > max_bytes:
             raise ValueError("index row exceeds mutation byte limit")
-        if batch and (len(batch) >= max_rows or size + length + 1 > max_bytes):
+        cost = len(row["content"].encode()) + 128
+        if max_tokens is not None and cost > max_tokens:
+            raise ValueError("index row exceeds embedding token budget")
+        if batch and (len(batch) >= max_rows or size + length + 1 > max_bytes
+                or (max_tokens is not None and tokens + cost > max_tokens)):
             yield {"upsert_rows": batch}
-            batch, size = [], len(b'{"upsert_rows":[]}')
+            batch, size, tokens = [], len(b'{"upsert_rows":[]}'), 0
         size += length + int(bool(batch))
+        tokens += cost
         batch.append(row)
     if batch:
         yield {"upsert_rows": batch}

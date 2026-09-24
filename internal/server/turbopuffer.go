@@ -16,10 +16,11 @@ import (
 
 // TPClient talks to the Turbopuffer API.
 type TPClient struct {
-	apiKey       string
-	region       string
-	httpClient   *http.Client
-	baseOverride string
+	apiKey          string
+	region          string
+	httpClient      *http.Client
+	baseOverride    string
+	embeddingBudget *providerBudget
 }
 
 type tpHTTPError struct {
@@ -163,6 +164,10 @@ func (t *TPClient) MultiQuery(ctx context.Context, ns string, queries []TPQuery)
 }
 
 func (t *TPClient) requestContext(ctx context.Context, method, path string, body any) ([]byte, error) {
+	tokens := queryEmbeddingTokens(body)
+	if tokens > 0 && t.embeddingBudget == nil {
+		return nil, errors.New("embedding budget is not configured")
+	}
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -189,6 +194,13 @@ func (t *TPClient) requestContext(ctx context.Context, method, path string, body
 		}
 		req.Header.Set("Authorization", "Bearer "+t.apiKey)
 		req.Header.Set("Content-Type", "application/json")
+		var reservation string
+		if tokens > 0 {
+			reservation, err = t.embeddingBudget.reserve(ctx, tokens)
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
@@ -203,7 +215,13 @@ func (t *TPClient) requestContext(ctx context.Context, method, path string, body
 		}
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if reservation != "" {
+				t.embeddingBudget.settle(reservation, respBody)
+			}
 			return respBody, nil
+		}
+		if resp.StatusCode == http.StatusTooManyRequests && reservation != "" {
+			return nil, t.embeddingBudget.throttled(reservation, resp.Header)
 		}
 		lastErr = &tpHTTPError{StatusCode: resp.StatusCode, Body: string(respBody)}
 		if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {

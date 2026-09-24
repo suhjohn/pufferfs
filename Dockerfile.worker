@@ -1,3 +1,8 @@
+FROM golang:1.25 AS source-digest
+WORKDIR /src
+COPY cmd/pufferfs-source-digest/main.go ./main.go
+RUN CGO_ENABLED=0 go build -o /pufferfs-source-digest main.go
+
 FROM python:3.12-slim-trixie
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libreoffice-core libreoffice-writer libreoffice-impress libreoffice-calc \
@@ -7,6 +12,7 @@ WORKDIR /app/worker
 COPY workers/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY workers/ ./
+COPY --from=source-digest /pufferfs-source-digest /usr/local/bin/pufferfs-source-digest
 ENV PYTHONUNBUFFERED=1 SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 RUN useradd --create-home worker
 USER worker

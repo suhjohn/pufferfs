@@ -140,7 +140,30 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 	remote := make(map[string]models.CapturedFileHead)
 	base, cache := make(map[string]models.FileState), make(map[string]models.FileState)
 	dirty := make(map[string]bool)
-	err = input.Client.walkCapturedFiles(ctx, input.RootID, false, func(file models.CapturedFileHead) error {
+	catalog, err := openCapturedCatalog(input, cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	defer catalog.db.Close()
+	changed, reset, err := catalog.refresh(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refreshing captured catalog: %w", err)
+	}
+	stamp, policyChanged, err := catalog.policyStamp(input.Policy)
+	if err != nil {
+		return nil, err
+	}
+	paths := input.ChangedPaths
+	if reset || policyChanged || input.Force {
+		paths = nil
+	}
+	if paths != nil {
+		for path := range changed {
+			paths = append(paths, path)
+		}
+		paths = compactCapturePaths(paths)
+	}
+	err = catalog.walk(paths, func(file models.CapturedFileHead) error {
 		remote[file.Path] = file
 		if file.Deleted {
 			return nil
@@ -158,8 +181,13 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 	if err != nil {
 		return nil, fmt.Errorf("loading captured catalog: %w", err)
 	}
-	matcher := ignore.NewMatcherWithPolicy(input.Dir, input.Policy)
-	plan, err := discoverCapturePlan(input.Dir, matcher, base, cache, dirty, input.Select, input.Force, excludedDirs...)
+	var matcher *ignore.Matcher
+	if paths == nil {
+		matcher = ignore.NewMatcherWithPolicy(input.Dir, input.Policy)
+	} else {
+		matcher = ignore.NewMatcherForPathsWithPolicy(input.Dir, paths, input.Policy)
+	}
+	plan, err := discoverCapturePlanForPaths(input.Dir, paths, matcher, base, cache, dirty, input.Select, input.Force, excludedDirs...)
 	if err != nil {
 		return nil, err
 	}
@@ -216,5 +244,28 @@ func runFileCaptureSync(ctx context.Context, input captureSyncInput, cacheDir st
 	if result.Status == "unchanged" {
 		fmt.Fprintln(input.Log, "No capture changes detected.")
 	}
+	if policyChanged || len(changed) > 0 {
+		if err := catalog.savePolicy(stamp); err != nil {
+			return result, err
+		}
+	}
 	return result, nil
+}
+
+func compactCapturePaths(paths []string) []string {
+	sort.Strings(paths)
+	result := make([]string, 0, len(paths))
+	seen := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		covered := seen[path]
+		for parent := filepath.ToSlash(filepath.Dir(path)); !covered && parent != "."; parent = filepath.ToSlash(filepath.Dir(parent)) {
+			covered = seen[parent]
+		}
+		if covered {
+			continue
+		}
+		result = append(result, path)
+		seen[path] = true
+	}
+	return result
 }

@@ -1,0 +1,6 @@
+services:
+  background:
+    environment:
+      AWS_ENDPOINT_URL: http://upload-relay:8080
+    depends_on:
+      upload-relay: {condition: service_healthy}

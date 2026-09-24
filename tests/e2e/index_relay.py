@@ -87,7 +87,7 @@ async def arm(request: Request):
     config = json.loads(body)
     names = config.get("namespaces")
     if (config.get("operation", "write") not in {"write", "query"}
-            or config.get("mode") not in {"hold_request", "hold_response"}
+            or config.get("mode") not in {"hold_request", "hold_response", "reject_429"}
             or type(config.get("skip", 0)) is not int or not 0 <= config.get("skip", 0) <= 100
             or type(config.get("count", 1)) is not int or not 1 <= config.get("count", 1) <= 64
             or not isinstance(names, list) or not 1 <= len(names) <= 256
@@ -140,6 +140,7 @@ async def write(namespace: str, request: Request):
                 selected = fault
                 selected["remaining"] -= 1
     event = {"id": uuid.uuid4().hex, "namespace": namespace,
+             "client": request.client.host if request.client else None,
              "operation": "delete" if is_deletion else operation,
              "upsert_count": len(json.loads(payload).get("upsert_rows", [])),
              "wire_sha256": hashlib.sha256(body).hexdigest(),
@@ -148,16 +149,22 @@ async def write(namespace: str, request: Request):
              "state": "received",
              "fault_id": selected["id"] if selected else None}
     if operation == "query":
-        def publications(value):
+        def identities(value, attribute, operator):
             if not isinstance(value, list):
                 return []
-            if len(value) == 3 and value[:2] == ["extraction_id", "Eq"]:
-                return [value[2]]
-            return [item for child in value for item in publications(child)]
-        event["publication_ids"] = publications(json.loads(payload).get("filters"))
+            if len(value) == 3 and value[:2] == [attribute, operator]:
+                return value[2] if operator == 'In' else [value[2]]
+            return [item for child in value for item in identities(child, attribute, operator)]
+        event["publication_ids"] = identities(json.loads(payload).get("filters"), 'extraction_id', 'Eq')
+        event["segment_ids"] = identities(json.loads(payload).get("filters"), 'segment_id', 'In')
     events.append(event)
     del payload
     try:
+        if selected and selected["mode"] == "reject_429":
+            event["state"] = "rate_limited"
+            event["response_status"] = 429
+            return Response(json.dumps({"error": "external rate-limit fault"}), status_code=429,
+                media_type="application/json", headers={"Retry-After": "5"})
         if is_deletion and deletions_paused:
             await asyncio.wait_for(deletions_gate.wait(), timeout=1200)
         if selected and selected["mode"] == "hold_request":

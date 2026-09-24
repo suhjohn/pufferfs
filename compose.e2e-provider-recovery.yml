@@ -25,6 +25,16 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
+  index-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/index_relay.py]
+    environment:
+      E2E_TURBOPUFFER_UPSTREAM: ${TURBOPUFFER_API_URL:-https://${TURBOPUFFER_REGION:-gcp-us-central1}.turbopuffer.com}
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
   ingestion:
     environment:
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
@@ -34,8 +44,10 @@ services:
       provider-manifest-relay: {condition: service_healthy}
   background:
     environment:
+      TURBOPUFFER_API_URL: http://index-relay:8080
       GOOGLE_GEMINI_BASE_URL: http://provider-relay:8080
       AWS_ENDPOINT_URL_S3: http://provider-manifest-relay:8080
     depends_on:
+      index-relay: {condition: service_healthy}
       provider-relay: {condition: service_healthy}
       provider-manifest-relay: {condition: service_healthy}

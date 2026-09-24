@@ -1,0 +1,9 @@
+services:
+  catalog-relay:
+    image: ${COMPOSE_PROJECT_NAME}-worker
+    entrypoint: [python, /e2e/catalog_relay.py]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=3)"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

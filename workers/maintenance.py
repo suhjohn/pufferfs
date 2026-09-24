@@ -28,13 +28,22 @@ def reconcile():
     from botocore.config import Config
     from file_runtime import retire_exhausted_work
     from index_cleanup import cleanup_index
+    from segment_cleanup import cleanup_segments
     from root_cleanup import cleanup_deleted_roots
     from artifact_cleanup import cleanup_obsolete_extractions
     from source_cleanup import cleanup_source_packs
     from index_client import turbopuffer_client
 
-    result = {"exhausted_work": retire_exhausted_work()}
-    report_backlog()
+    result = {}
+
+    def perform(name, operation):
+        try:
+            result[name] = operation()
+        except Exception as error:
+            result[name] = {"error": type(error).__name__}
+
+    perform("exhausted_work", retire_exhausted_work)
+    perform("backlog", report_backlog)
     with closing(client("s3", config=Config(connect_timeout=10, read_timeout=20,
                                                   retries={"total_max_attempts": 2}))) as s3:
         with turbopuffer_client(timeout=20, max_retries=0) as tp:
@@ -44,9 +53,11 @@ def reconcile():
                 response = tp.namespace(namespace).write(**mutation)
                 return getattr(response, "rows_remaining", None)
 
-            result["root_cleanup"] = cleanup_deleted_roots(s3, os.environ["AWS_BUCKET_NAME"], apply)
-            result["index_cleanup"] = cleanup_index(apply)
-            result["artifact_cleanup"] = cleanup_obsolete_extractions(s3, os.environ["AWS_BUCKET_NAME"])
-            result["source_cleanup"] = cleanup_source_packs(s3, os.environ["AWS_BUCKET_NAME"])
+            bucket = os.environ["AWS_BUCKET_NAME"]
+            perform("root_cleanup", lambda: cleanup_deleted_roots(s3, bucket, apply))
+            perform("index_cleanup", lambda: cleanup_index(apply))
+            perform("segment_cleanup", lambda: cleanup_segments(apply))
+            perform("artifact_cleanup", lambda: cleanup_obsolete_extractions(s3, bucket))
+            perform("source_cleanup", lambda: cleanup_source_packs(s3, bucket))
     print(result, flush=True)
     return result

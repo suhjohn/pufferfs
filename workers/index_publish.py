@@ -16,7 +16,10 @@ def publish_head(job, *, connect=database):
                 FROM file_catalog f LEFT JOIN file_extractions e ON e.id=f.indexed_extraction_id
                 WHERE f.id=%s FOR UPDATE OF f
             ) SELECT file.*
-            FROM file CROSS JOIN file_work w WHERE w.id=%s AND w.attempt_token=%s
+            FROM file CROSS JOIN file_work w JOIN file_extractions prepared ON prepared.id=w.extraction_id
+            WHERE w.id=%s AND w.attempt_token=%s
+                AND w.index_cursor=prepared.chunk_count
+                AND prepared.status='complete' AND (prepared.row_format=1 OR prepared.source_verified)
                 AND w.status='running' AND w.lease_until>NOW() FOR UPDATE OF w""",
             (job["file_id"], job["id"], job["attempt_token"])).fetchone()
         if current is None:

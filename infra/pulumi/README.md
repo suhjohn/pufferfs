@@ -7,6 +7,8 @@ CloudWatch logs and current-work alarms. Postgres is supplied externally.
 
 See the [deployment runbook](../../docs/production-deployment.md) for the
 coordinated upgrade; do not run old writers against migrations 048–050.
+The segmented pipeline also requires a coordinated API/worker cutover for
+migration 056; `pipelineVersion=4` records that transition.
 
 ```sh
 cd infra/pulumi
@@ -25,6 +27,12 @@ comes from `.env.example` / the selected GitHub Environment.
 Native embedding batches default to 64 documents, with a hard maximum of 256.
 `embeddingBatchDocuments` controls the background task setting; GitHub deployments
 populate it from `PUFFERFS_EMBEDDING_BATCH_DOCUMENTS` (default 64).
+
+`embeddingRequestsPerMinute` / `embeddingTokensPerMinute` configure the shared
+API/worker provider budget (defaults 1,024 requests and 2,000,000 estimated tokens
+per minute). `searchConcurrency` / `searchTenantConcurrency` configure aggregate
+and per-tenant search admission (defaults 32/16). Initialized provider budgets
+are persisted in Postgres; follow the runbook when changing their values.
 
 Worker concurrency defaults to four file jobs per process (1–64).
 `workerIngestionConcurrency`, `workerBackgroundConcurrency`, and each worker
